@@ -1,0 +1,17 @@
+[package]
+name = "vdj_assign"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Seeded, banded affine V(D)J germline assignment with placement-DAG adjudication"
+
+[dependencies]
+
+[[bin]]
+name = "vdj-assign"
+path = "src/bin/assign.rs"
+doc = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

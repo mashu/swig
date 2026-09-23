@@ -1,0 +1,277 @@
+//! Declarative engine configuration and construction of the default assigner.
+//!
+//! Configuration is plain data; [`crate::profiles::CallingProfile`] produces
+//! the note's calling profiles as values of [`EngineConfig`]. Settings that
+//! can be *derived* losslessly from the admission gates (the D L-mer length
+//! and the D traceback score floor) are derived here, so a profile change can
+//! never make the prefilters silently drop admissible D hits.
+
+use std::fmt;
+use std::sync::Arc;
+
+use crate::adjudicate::{DPresencePenalty, EngineeringObjective, PlacementDag, VdjGrammar};
+use crate::admission::{AnyOf, DistributedEvidence, ExactRunFloor};
+use crate::align::InterSequenceGotoh;
+use crate::germline::{GermlineSet, SegmentKind};
+use crate::index::IndexError;
+use crate::pipeline::{Assigner, AssignerOptions};
+use crate::refine::NoRefine;
+use crate::retrieve::{
+    AmbiguityBudget, LmerMaskRetriever, SeedVoteParams, SeedVoteRetriever, UngappedParams, UngappedPrefilter,
+    MAX_LMER,
+};
+use crate::scoring::{AffineScoring, Score};
+use crate::seed::SeedShape;
+use crate::segment::{KeepPolicy, PreparedSegment, SegmentStage};
+use crate::window::{ExpandedResidual, WithAnchorWindow};
+
+/// V or J: seeded, banded, vote-ranked, optionally ungapped-pre-ranked.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VjSegmentConfig {
+    pub scoring: AffineScoring,
+    pub primary: SeedShape,
+    pub fallback: Option<SeedShape>,
+    pub seeds: SeedVoteParams,
+    pub budget: AmbiguityBudget,
+    /// Ungapped diagonal pre-ranking before banded DP (`None` = off).
+    pub ungapped: Option<UngappedParams>,
+    pub keep: KeepPolicy,
+}
+
+/// D: L-mer prefilter, unbanded DP inside junction windows, admission gates.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DSegmentConfig {
+    pub scoring: AffineScoring,
+    /// L-mer length of the prefilter; `None` derives the largest L that is
+    /// lossless for the configured gates (see [`DSegmentConfig::lossless_lmer`]).
+    pub lmer: Option<usize>,
+    pub keep: KeepPolicy,
+    /// `min_d_match`.
+    pub min_exact_run: u32,
+    /// Distributed-D gate (`None` = disabled; the note makes it AER-R only).
+    pub distributed: Option<DistributedEvidence>,
+}
+
+impl DSegmentConfig {
+    /// Largest L for which "shares ≥ 1 L-mer" is implied by every enabled gate:
+    /// an exact run of `min_exact_run` contains an L-mer for `L ≤ min_exact_run`;
+    /// ≥ 80 % identity forces an exact run ≥ 4 (pigeonhole), so distributed-D caps L at 4.
+    pub fn lossless_lmer(&self) -> usize {
+        let run = self.min_exact_run.max(1) as usize;
+        let distributed_cap = if self.distributed.is_some() { 4 } else { usize::MAX };
+        run.min(distributed_cap).min(MAX_LMER)
+    }
+
+    /// Traceback score floor implied by the gates: an alignment containing an
+    /// exact run of `k` has local score `≥ k·m`; a distributed-D hit rescored
+    /// under the D tuple itself scores `≥ min_rescore`. The configured floor is
+    /// lowered to that bound, never raised above it.
+    pub fn lossless_min_score(&self) -> Score {
+        let run_floor = self.scoring.matched * self.min_exact_run as Score;
+        let floor = match &self.distributed {
+            None => run_floor,
+            Some(gate) if gate.scoring == self.scoring => run_floor.min(gate.min_rescore),
+            Some(_) => self.keep.min_score.min(run_floor),
+        };
+        floor.max(self.keep.min_score.min(floor))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EngineConfig {
+    pub v: VjSegmentConfig,
+    pub d: DSegmentConfig,
+    pub j: VjSegmentConfig,
+    pub d_window: ExpandedResidual,
+    /// Add the conserved-anchor D window when alleles carry `anchor=` positions.
+    pub anchor_window: bool,
+    pub grammar: VdjGrammar,
+    pub objective: EngineeringObjective,
+    /// Minimum retained query bases after clipping, per [`SegmentKind::index`].
+    pub min_retained: [u32; 3],
+    pub options: AssignerOptions,
+}
+
+impl VjSegmentConfig {
+    pub fn v_default() -> Self {
+        Self {
+            scoring: AffineScoring::new(2, -3, -5, -1),
+            primary: SeedShape::contiguous(9),
+            fallback: Some(SeedShape::contiguous(7)),
+            seeds: SeedVoteParams::default(),
+            budget: AmbiguityBudget::default(),
+            ungapped: Some(UngappedParams::default()),
+            keep: KeepPolicy { top: 8, slack: 10, min_score: 20, cap: 16, prescore_above: 8 },
+        }
+    }
+
+    pub fn j_default() -> Self {
+        Self {
+            scoring: AffineScoring::new(2, -3, -17, -2),
+            primary: SeedShape::contiguous(7),
+            fallback: Some(SeedShape::contiguous(5)),
+            seeds: SeedVoteParams::default(),
+            budget: AmbiguityBudget::default(),
+            ungapped: Some(UngappedParams::default()),
+            keep: KeepPolicy { top: 4, slack: 10, min_score: 10, cap: 8, prescore_above: 4 },
+        }
+    }
+}
+
+impl Default for DSegmentConfig {
+    fn default() -> Self {
+        Self {
+            scoring: AffineScoring::new(2, -3, -13, -1),
+            lmer: None,
+            keep: KeepPolicy { top: 16, slack: Score::MAX / 4, min_score: 0, cap: 32, prescore_above: 0 },
+            min_exact_run: 6,
+            distributed: None,
+        }
+    }
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            v: VjSegmentConfig::v_default(),
+            d: DSegmentConfig::default(),
+            j: VjSegmentConfig::j_default(),
+            d_window: ExpandedResidual::default(),
+            anchor_window: true,
+            grammar: VdjGrammar::VDJ,
+            objective: EngineeringObjective {
+                pair_bonus: 24,
+                d_presence: DPresencePenalty::R_OPTIMIZED,
+                tandem_d_penalty: 12,
+                insertion_per_base: 0,
+            },
+            min_retained: [10, 3, 6],
+            options: AssignerOptions::default(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum BuildError {
+    Index { kind: SegmentKind, source: IndexError },
+    WrongKind { expected: SegmentKind, found: SegmentKind },
+    Empty(SegmentKind),
+}
+
+impl fmt::Display for BuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Index { kind, source } => write!(f, "{} index: {source}", kind.label()),
+            Self::WrongKind { expected, found } => {
+                write!(f, "expected a {} germline set, got {}", expected.label(), found.label())
+            }
+            Self::Empty(kind) => write!(f, "the {} germline set is empty", kind.label()),
+        }
+    }
+}
+
+impl std::error::Error for BuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Index { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+fn check(set: &GermlineSet, expected: SegmentKind) -> Result<(), BuildError> {
+    if set.kind() != expected {
+        return Err(BuildError::WrongKind { expected, found: set.kind() });
+    }
+    if set.is_empty() {
+        return Err(BuildError::Empty(expected));
+    }
+    Ok(())
+}
+
+/// Retriever of the default V and J stages.
+pub type DefaultVjRetriever = UngappedPrefilter<SeedVoteRetriever>;
+
+fn vj_stage(set: GermlineSet, config: &VjSegmentConfig) -> Result<SegmentStage<DefaultVjRetriever>, BuildError> {
+    let kind = set.kind();
+    let seeds = SeedVoteRetriever::build(
+        &set,
+        config.primary.clone(),
+        config.fallback.clone(),
+        config.seeds,
+        config.budget,
+    )
+    .map_err(|source| BuildError::Index { kind, source })?;
+    let segment = Arc::new(PreparedSegment::new(set, &config.scoring, config.scoring.gaps));
+    let retriever = UngappedPrefilter::new(seeds, Arc::clone(&segment), config.ungapped);
+    Ok(SegmentStage::new(segment, retriever, config.keep))
+}
+
+fn d_stage(set: GermlineSet, config: &DSegmentConfig) -> SegmentStage<LmerMaskRetriever> {
+    let lmer = config.lmer.unwrap_or_else(|| config.lossless_lmer());
+    let retriever = LmerMaskRetriever::build(&set, lmer, 1);
+    let segment = PreparedSegment::new(set, &config.scoring, config.scoring.gaps);
+    let floor = config.lossless_min_score();
+    // A shared L-mer is an exact run of L, so every retrieved candidate already
+    // scores ≥ L·m. When that meets the floor, the score-only pre-pass can only
+    // prune through `top`, so it runs only above `top` candidates.
+    let floor_implied = lmer as Score * config.scoring.matched >= floor;
+    let prescore_above =
+        if floor_implied { config.keep.prescore_above.max(config.keep.top) } else { config.keep.prescore_above };
+    let keep = KeepPolicy { min_score: floor, prescore_above, ..config.keep };
+    SegmentStage::new(Arc::new(segment), retriever, keep)
+}
+
+/// The default engine: batched banded Gotoh (AVX2 inter-sequence kernel when
+/// available), seed-vote + ungapped V/J retrieval,
+/// L-mer D prefilter, expanded residual + anchor D windows,
+/// exact-run-or-distributed admission, placement DAG.
+pub type DefaultAssigner = Assigner;
+
+impl Assigner {
+    pub fn from_config(
+        config: &EngineConfig,
+        v: GermlineSet,
+        d: Option<GermlineSet>,
+        j: GermlineSet,
+    ) -> Result<Self, BuildError> {
+        check(&v, SegmentKind::V)?;
+        check(&j, SegmentKind::J)?;
+        if let Some(d) = &d {
+            check(d, SegmentKind::D)?;
+        }
+        let d_window = if config.anchor_window {
+            WithAnchorWindow::new(config.d_window, &v, &j)
+        } else {
+            WithAnchorWindow::disabled(config.d_window)
+        };
+        let grammar = if d.is_some() { config.grammar } else { VdjGrammar { max_d: 0, ..config.grammar } };
+        Ok(Assigner {
+            v: vj_stage(v, &config.v)?,
+            j: vj_stage(j, &config.j)?,
+            d: d.map(|set| d_stage(set, &config.d)),
+            aligner: InterSequenceGotoh::new(),
+            d_window,
+            d_admission: AnyOf(ExactRunFloor { min_run: config.d.min_exact_run }, config.d.distributed),
+            adjudicator: PlacementDag::new(grammar, config.objective, config.min_retained),
+            refiner: NoRefine,
+            options: config.options,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derived_d_settings_are_lossless_bounds() {
+        let mut d = DSegmentConfig::default();
+        assert_eq!((d.lossless_lmer(), d.lossless_min_score()), (6, 12));
+        d.min_exact_run = 4;
+        assert_eq!((d.lossless_lmer(), d.lossless_min_score()), (4, 8));
+        d.min_exact_run = 6;
+        d.distributed = Some(DistributedEvidence::default());
+        assert_eq!((d.lossless_lmer(), d.lossless_min_score()), (4, 12));
+    }
+}
