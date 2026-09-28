@@ -15,7 +15,9 @@ use crate::annotate::{annotate, AlleleAnnotation, AnnotateOptions, DatabaseAnnot
 use crate::germline::{GermlineError, GermlineSet, MergedDuplicate, SegmentKind};
 
 fn label(annotations: &[AlleleAnnotation], id: u32) -> Option<String> {
-    annotations.get(id as usize).map(|a| format!("annotation={}", a.source.label()))
+    annotations
+        .get(id as usize)
+        .map(|a| format!("annotation={}", a.source.label()))
 }
 
 pub struct PreparedDatabase {
@@ -33,12 +35,21 @@ pub fn prepare(
     options: AnnotateOptions,
 ) -> Result<PreparedDatabase, GermlineError> {
     let mut merged = Vec::new();
-    for set in [Some(&mut v), d.as_mut(), Some(&mut j)].into_iter().flatten() {
+    for set in [Some(&mut v), d.as_mut(), Some(&mut j)]
+        .into_iter()
+        .flatten()
+    {
         let kind = set.kind();
         merged.extend(set.deduplicate()?.into_iter().map(|m| (kind, m)));
     }
     let annotation = annotate(&mut v, Some(&mut j), options);
-    Ok(PreparedDatabase { v, d, j, merged, annotation })
+    Ok(PreparedDatabase {
+        v,
+        d,
+        j,
+        merged,
+        annotation,
+    })
 }
 
 impl PreparedDatabase {
@@ -75,7 +86,8 @@ impl PreparedDatabase {
         self.j.write_fasta(&mut out, |id| label(j_labels, id))?;
         out.flush()?;
         let mut out = BufWriter::new(File::create(dir.join("annotation.tsv"))?);
-        self.annotation.write_tsv(&mut out, &self.v, Some(&self.j))?;
+        self.annotation
+            .write_tsv(&mut out, &self.v, Some(&self.j))?;
         out.flush()
     }
 }

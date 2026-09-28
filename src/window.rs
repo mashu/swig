@@ -12,15 +12,25 @@ use crate::placement::Placement;
 
 pub trait DWindowPolicy: Send + Sync {
     /// `v` and `j` are sorted best-first. Append windows to `out`.
-    fn windows(&self, query_len: usize, v: &[Placement], j: &[Placement], out: &mut Vec<Range<usize>>);
+    fn windows(
+        &self,
+        query_len: usize,
+        v: &[Placement],
+        j: &[Placement],
+        out: &mut Vec<Range<usize>>,
+    );
 }
 
 fn residual(query_len: usize, v: &[Placement], j: &[Placement], margin: u32) -> Range<usize> {
     let v_best = v.first();
     let j_best = j.first();
     let floor = v_best.map_or(0, |p| p.q_start() as usize);
-    let start = v_best.map_or(0, |p| p.q_end().saturating_sub(margin) as usize).max(floor);
-    let end = j_best.map_or(query_len, |p| (p.q_start() + margin) as usize).min(query_len);
+    let start = v_best
+        .map_or(0, |p| p.q_end().saturating_sub(margin) as usize)
+        .max(floor);
+    let end = j_best
+        .map_or(query_len, |p| (p.q_start() + margin) as usize)
+        .min(query_len);
     start..end
 }
 
@@ -31,7 +41,13 @@ pub struct ResidualWindow {
 }
 
 impl DWindowPolicy for ResidualWindow {
-    fn windows(&self, query_len: usize, v: &[Placement], j: &[Placement], out: &mut Vec<Range<usize>>) {
+    fn windows(
+        &self,
+        query_len: usize,
+        v: &[Placement],
+        j: &[Placement],
+        out: &mut Vec<Range<usize>>,
+    ) {
         let window = residual(query_len, v, j, self.overlap_margin);
         if !window.is_empty() {
             out.push(window);
@@ -54,12 +70,21 @@ pub struct ExpandedResidual {
 
 impl Default for ExpandedResidual {
     fn default() -> Self {
-        Self { reclaim: 24, min_width: 4 }
+        Self {
+            reclaim: 24,
+            min_width: 4,
+        }
     }
 }
 
 impl DWindowPolicy for ExpandedResidual {
-    fn windows(&self, query_len: usize, v: &[Placement], j: &[Placement], out: &mut Vec<Range<usize>>) {
+    fn windows(
+        &self,
+        query_len: usize,
+        v: &[Placement],
+        j: &[Placement],
+        out: &mut Vec<Range<usize>>,
+    ) {
         let window = residual(query_len, v, j, self.reclaim);
         if window.len() >= self.min_width {
             out.push(window);
@@ -88,17 +113,39 @@ impl<P> WithAnchorWindow<P> {
 
     /// Same policy with no anchor window (anchors ignored).
     pub fn disabled(inner: P) -> Self {
-        Self { inner, v_anchor: Vec::new(), j_anchor: Vec::new() }
+        Self {
+            inner,
+            v_anchor: Vec::new(),
+            j_anchor: Vec::new(),
+        }
     }
 }
 
 impl<P: DWindowPolicy> DWindowPolicy for WithAnchorWindow<P> {
-    fn windows(&self, query_len: usize, v: &[Placement], j: &[Placement], out: &mut Vec<Range<usize>>) {
+    fn windows(
+        &self,
+        query_len: usize,
+        v: &[Placement],
+        j: &[Placement],
+        out: &mut Vec<Range<usize>>,
+    ) {
         self.inner.windows(query_len, v, j, out);
-        let (Some(vb), Some(jb)) = (v.first(), j.first()) else { return };
-        let v_anchor = self.v_anchor.get(vb.primary_allele() as usize).copied().flatten();
-        let j_anchor = self.j_anchor.get(jb.primary_allele() as usize).copied().flatten();
-        let (Some(va), Some(ja)) = (v_anchor, j_anchor) else { return };
+        let (Some(vb), Some(jb)) = (v.first(), j.first()) else {
+            return;
+        };
+        let v_anchor = self
+            .v_anchor
+            .get(vb.primary_allele() as usize)
+            .copied()
+            .flatten();
+        let j_anchor = self
+            .j_anchor
+            .get(jb.primary_allele() as usize)
+            .copied()
+            .flatten();
+        let (Some(va), Some(ja)) = (v_anchor, j_anchor) else {
+            return;
+        };
         let start = (vb.clip.project_reference(va) + 3).clamp(0, query_len as i64) as usize;
         let end = jb.clip.project_reference(ja).clamp(0, query_len as i64) as usize;
         if start < end {

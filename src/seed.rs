@@ -55,7 +55,10 @@ impl SeedShape {
     /// Contiguous k-mer. Panics unless `1 <= k <= MAX_SPAN` (a programming error,
     /// like an out-of-range slice index).
     pub fn contiguous(k: usize) -> Self {
-        assert!((1..=MAX_SPAN).contains(&k), "k must be in 1..={MAX_SPAN}, got {k}");
+        assert!(
+            (1..=MAX_SPAN).contains(&k),
+            "k must be in 1..={MAX_SPAN}, got {k}"
+        );
         Self::from_pattern(&"1".repeat(k)).expect("an all-ones pattern of valid length is valid")
     }
 
@@ -82,7 +85,11 @@ impl SeedShape {
             .map(|(p, _)| u8::try_from(2 * (span - 1 - p)).expect("span <= 31 keeps shifts < 64"))
             .collect::<Vec<_>>();
         let contiguous = shifts.len() == span;
-        Ok(Self { span, shifts, contiguous })
+        Ok(Self {
+            span,
+            shifts,
+            contiguous,
+        })
     }
 
     /// Number of query bases a seed covers.
@@ -193,7 +200,13 @@ mod tests {
 
     #[test]
     fn rejects_bad_patterns() {
-        assert_eq!(SeedShape::from_pattern("0110"), Err(SeedShapeError::NotAnchored));
-        assert_eq!(SeedShape::from_pattern("1x1"), Err(SeedShapeError::InvalidSymbol('x')));
+        assert_eq!(
+            SeedShape::from_pattern("0110"),
+            Err(SeedShapeError::NotAnchored)
+        );
+        assert_eq!(
+            SeedShape::from_pattern("1x1"),
+            Err(SeedShapeError::InvalidSymbol('x'))
+        );
     }
 }

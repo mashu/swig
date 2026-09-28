@@ -68,14 +68,20 @@ impl Admission for DistributedEvidence {
         e.match_columns >= self.min_columns
             && e.matches >= self.min_matches
             && e.identity() >= self.min_identity
-            && rescore(placement.alignment.columns(), query, reference, &self.scoring) >= self.min_rescore
+            && rescore(
+                placement.alignment.columns(),
+                query,
+                reference,
+                &self.scoring,
+            ) >= self.min_rescore
     }
 }
 
 /// A disabled gate (`None`) admits nothing, so `AnyOf<G, Option<H>>` reduces to `G`.
 impl<A: Admission> Admission for Option<A> {
     fn admit(&self, placement: &Placement, query: &[u8], reference: &[u8]) -> bool {
-        self.as_ref().is_some_and(|gate| gate.admit(placement, query, reference))
+        self.as_ref()
+            .is_some_and(|gate| gate.admit(placement, query, reference))
     }
 }
 

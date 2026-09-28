@@ -64,7 +64,13 @@ impl RegionStarts {
 
     pub fn from_values(values: [Option<u32>; 5]) -> Self {
         let [fr1, cdr1, fr2, cdr2, fr3] = values;
-        Self { fr1, cdr1, fr2, cdr2, fr3 }
+        Self {
+            fr1,
+            cdr1,
+            fr2,
+            cdr2,
+            fr3,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -86,7 +92,9 @@ impl RegionStarts {
             previous = Some((key, value));
         }
         match (previous, anchor) {
-            (Some((key, at)), Some(anchor)) if at > anchor => Err(format!("{key}={at} follows anchor={anchor}")),
+            (Some((key, at)), Some(anchor)) if at > anchor => {
+                Err(format!("{key}={at} follows anchor={anchor}"))
+            }
             _ => Ok(()),
         }
     }
@@ -125,10 +133,21 @@ pub struct MergedDuplicate {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GermlineError {
     Fasta(FastaError),
-    EmptySequence { name: String },
-    BadAttribute { name: String, key: String, value: String },
-    BadRegions { name: String, reason: String },
-    ConflictingDuplicate { name: String },
+    EmptySequence {
+        name: String,
+    },
+    BadAttribute {
+        name: String,
+        key: String,
+        value: String,
+    },
+    BadRegions {
+        name: String,
+        reason: String,
+    },
+    ConflictingDuplicate {
+        name: String,
+    },
 }
 
 impl fmt::Display for GermlineError {
@@ -141,7 +160,10 @@ impl fmt::Display for GermlineError {
             }
             Self::BadRegions { name, reason } => write!(f, "allele '{name}': {reason}"),
             Self::ConflictingDuplicate { name } => {
-                write!(f, "allele name '{name}' occurs twice with different sequences")
+                write!(
+                    f,
+                    "allele name '{name}' occurs twice with different sequences"
+                )
             }
         }
     }
@@ -165,16 +187,23 @@ pub struct GermlineSet {
 }
 
 fn parse_position(name: &str, key: &str, value: &str) -> Result<u32, GermlineError> {
-    value.parse::<u32>().map_err(|_| GermlineError::BadAttribute {
-        name: name.to_string(),
-        key: key.to_string(),
-        value: value.to_string(),
-    })
+    value
+        .parse::<u32>()
+        .map_err(|_| GermlineError::BadAttribute {
+            name: name.to_string(),
+            key: key.to_string(),
+            value: value.to_string(),
+        })
 }
 
 impl GermlineSet {
     pub fn new(kind: SegmentKind) -> Self {
-        Self { kind, alleles: Vec::new(), genes: Vec::new(), gene_ids: HashMap::new() }
+        Self {
+            kind,
+            alleles: Vec::new(),
+            genes: Vec::new(),
+            gene_ids: HashMap::new(),
+        }
     }
 
     /// Gene part of an allele label (`IGHV1-2*02` → `IGHV1-2`).
@@ -190,18 +219,28 @@ impl GermlineSet {
         anchor: Option<u32>,
     ) -> Result<AlleleId, GermlineError> {
         if sequence.is_empty() {
-            return Err(GermlineError::EmptySequence { name: name.to_string() });
+            return Err(GermlineError::EmptySequence {
+                name: name.to_string(),
+            });
         }
         self.push_codes(name, alphabet::encode(sequence), anchor)
     }
 
-    fn push_codes(&mut self, name: &str, codes: Vec<u8>, anchor: Option<u32>) -> Result<AlleleId, GermlineError> {
+    fn push_codes(
+        &mut self,
+        name: &str,
+        codes: Vec<u8>,
+        anchor: Option<u32>,
+    ) -> Result<AlleleId, GermlineError> {
         let gene_name = Self::gene_of_name(name);
         let next_gene = GeneId::try_from(self.genes.len()).expect("gene count fits u32");
-        let gene = *self.gene_ids.entry(gene_name.to_string()).or_insert_with(|| {
-            self.genes.push(gene_name.to_string());
-            next_gene
-        });
+        let gene = *self
+            .gene_ids
+            .entry(gene_name.to_string())
+            .or_insert_with(|| {
+                self.genes.push(gene_name.to_string());
+                next_gene
+            });
         let id = AlleleId::try_from(self.alleles.len()).expect("allele count fits u32");
         self.alleles.push(Allele {
             name: name.to_string(),
@@ -220,7 +259,12 @@ impl GermlineSet {
         let mut set = Self::new(kind);
         for record in parse_fasta(text)? {
             let name = record.id();
-            let position = |key: &str| record.attribute(key).map(|v| parse_position(name, key, v)).transpose();
+            let position = |key: &str| {
+                record
+                    .attribute(key)
+                    .map(|v| parse_position(name, key, v))
+                    .transpose()
+            };
             let anchor = position("anchor")?;
             let mut values = [None; 5];
             for (slot, key) in values.iter_mut().zip(RegionStarts::KEYS) {
@@ -229,7 +273,10 @@ impl GermlineSet {
             let regions = RegionStarts::from_values(values);
             regions
                 .check(anchor, record.sequence.len())
-                .map_err(|reason| GermlineError::BadRegions { name: name.to_string(), reason })?;
+                .map_err(|reason| GermlineError::BadRegions {
+                    name: name.to_string(),
+                    reason,
+                })?;
             if anchor.is_some_and(|a| a as usize + 3 > record.sequence.len()) {
                 return Err(GermlineError::BadRegions {
                     name: name.to_string(),
@@ -240,7 +287,11 @@ impl GermlineSet {
             let allele = &mut set.alleles[id as usize];
             allele.regions = regions;
             if let Some(list) = record.attribute("aliases") {
-                allele.aliases = list.split(',').filter(|a| !a.is_empty()).map(str::to_string).collect();
+                allele.aliases = list
+                    .split(',')
+                    .filter(|a| !a.is_empty())
+                    .map(str::to_string)
+                    .collect();
             }
         }
         Ok(set)
@@ -262,7 +313,10 @@ impl GermlineSet {
                     for name in allele.names() {
                         if name != target.name && !target.aliases.iter().any(|a| a == name) {
                             target.aliases.push(name.to_string());
-                            merged.push(MergedDuplicate { kept: target.name.clone(), merged: name.to_string() });
+                            merged.push(MergedDuplicate {
+                                kept: target.name.clone(),
+                                merged: name.to_string(),
+                            });
                         }
                     }
                     by_name.entry(allele.name.clone()).or_insert(index);
@@ -290,7 +344,11 @@ impl GermlineSet {
 
     /// Write as FASTA with every known annotation in the header; `extra`
     /// appends further `key=value` tokens per allele.
-    pub fn write_fasta<W: Write>(&self, out: &mut W, extra: impl Fn(AlleleId) -> Option<String>) -> io::Result<()> {
+    pub fn write_fasta<W: Write>(
+        &self,
+        out: &mut W,
+        extra: impl Fn(AlleleId) -> Option<String>,
+    ) -> io::Result<()> {
         for (id, allele) in self.alleles.iter().enumerate() {
             write!(out, ">{}", allele.name)?;
             if let Some(anchor) = allele.anchor {
@@ -313,8 +371,12 @@ impl GermlineSet {
     }
 
     /// Mutable access for annotation passes (sequence and name stay fixed).
-    pub fn annotate_mut(&mut self) -> impl Iterator<Item = (&[u8], &mut Option<u32>, &mut RegionStarts)> {
-        self.alleles.iter_mut().map(|a| (a.codes.as_slice(), &mut a.anchor, &mut a.regions))
+    pub fn annotate_mut(
+        &mut self,
+    ) -> impl Iterator<Item = (&[u8], &mut Option<u32>, &mut RegionStarts)> {
+        self.alleles
+            .iter_mut()
+            .map(|a| (a.codes.as_slice(), &mut a.anchor, &mut a.regions))
     }
 
     pub fn kind(&self) -> SegmentKind {
@@ -364,14 +426,20 @@ mod tests {
 
     #[test]
     fn parses_regions_and_round_trips_annotated_fasta() {
-        let text = ">V1*01 anchor=12 fr1=0 cdr1=3 fr2=6 cdr2=9 fr3=9 aliases=V1D*01\nACGTACGTACGTTGT\n";
+        let text =
+            ">V1*01 anchor=12 fr1=0 cdr1=3 fr2=6 cdr2=9 fr3=9 aliases=V1D*01\nACGTACGTACGTTGT\n";
         let set = GermlineSet::from_fasta(SegmentKind::V, text).unwrap();
         let allele = set.allele(0);
-        assert_eq!(allele.regions.values(), [Some(0), Some(3), Some(6), Some(9), Some(9)]);
+        assert_eq!(
+            allele.regions.values(),
+            [Some(0), Some(3), Some(6), Some(9), Some(9)]
+        );
         assert_eq!(allele.names().collect::<Vec<_>>(), ["V1*01", "V1D*01"]);
         let mut written = Vec::new();
-        set.write_fasta(&mut written, |_| Some("annotation=header".into())).unwrap();
-        let again = GermlineSet::from_fasta(SegmentKind::V, std::str::from_utf8(&written).unwrap()).unwrap();
+        set.write_fasta(&mut written, |_| Some("annotation=header".into()))
+            .unwrap();
+        let again = GermlineSet::from_fasta(SegmentKind::V, std::str::from_utf8(&written).unwrap())
+            .unwrap();
         assert_eq!(again.allele(0).regions, allele.regions);
         assert_eq!(again.allele(0).anchor, Some(12));
         assert!(GermlineSet::from_fasta(SegmentKind::V, ">V anchor=2 fr2=5\nACGTACGT\n").is_err());
@@ -385,8 +453,18 @@ mod tests {
         let merged = set.deduplicate().unwrap();
         assert_eq!(set.len(), 2);
         assert_eq!(set.allele(0).aliases, ["B*01"]);
-        assert_eq!(merged, [MergedDuplicate { kept: "A*01".into(), merged: "B*01".into() }]);
-        let mut conflict = GermlineSet::from_fasta(SegmentKind::V, ">A*01\nACGT\n>A*01\nTTTT\n").unwrap();
-        assert!(matches!(conflict.deduplicate(), Err(GermlineError::ConflictingDuplicate { .. })));
+        assert_eq!(
+            merged,
+            [MergedDuplicate {
+                kept: "A*01".into(),
+                merged: "B*01".into()
+            }]
+        );
+        let mut conflict =
+            GermlineSet::from_fasta(SegmentKind::V, ">A*01\nACGT\n>A*01\nTTTT\n").unwrap();
+        assert!(matches!(
+            conflict.deduplicate(),
+            Err(GermlineError::ConflictingDuplicate { .. })
+        ));
     }
 }

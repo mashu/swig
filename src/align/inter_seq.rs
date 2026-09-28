@@ -69,7 +69,9 @@ pub struct InterSequenceGotoh {
 impl InterSequenceGotoh {
     /// Detect AVX2 at run time.
     pub fn new() -> Self {
-        Self { simd: avx2_available() }
+        Self {
+            simd: avx2_available(),
+        }
     }
 
     /// Never use SIMD (reference behaviour, non-x86 targets).
@@ -118,7 +120,14 @@ struct Lane {
 impl Lane {
     /// Code of cell `(i, j)` (1-based) in a group's trace, `None` outside the
     /// lane's band or matrix — the contract of `traceback_with`.
-    fn trace_code<const DIAG: bool>(&self, trace: &[[u8; LANES]], width: usize, lane: usize, i: usize, j: usize) -> Option<u8> {
+    fn trace_code<const DIAG: bool>(
+        &self,
+        trace: &[[u8; LANES]],
+        width: usize,
+        lane: usize,
+        i: usize,
+        j: usize,
+    ) -> Option<u8> {
         if i == 0 || j == 0 || i > self.n || j > self.m {
             return None;
         }
@@ -152,13 +161,25 @@ fn lane_of(job_index: usize, job: &AlignJob<'_>) -> Option<Lane> {
         return None;
     }
     let bound = i64::from(job.profile.max_score().max(0)) * n.min(m) as i64;
-    let floor = i64::from(job.profile.min_score().min(job.gaps.open).min(job.gaps.extend));
+    let floor = i64::from(
+        job.profile
+            .min_score()
+            .min(job.gaps.open)
+            .min(job.gaps.extend),
+    );
     if bound > MAX_SCORE || floor < MIN_STEP {
         return None;
     }
     match job.band {
-        Band::Full => (n <= MAX_DIM && m <= MAX_DIM)
-            .then_some(Lane { job: job_index, shift: 0, lo: 0, width: m, rows: n, n, m }),
+        Band::Full => (n <= MAX_DIM && m <= MAX_DIM).then_some(Lane {
+            job: job_index,
+            shift: 0,
+            lo: 0,
+            width: m,
+            rows: n,
+            n,
+            m,
+        }),
         Band::Diagonals { lo, hi } => {
             if hi < lo {
                 return None;
@@ -166,9 +187,19 @@ fn lane_of(job_index: usize, job: &AlignJob<'_>) -> Option<Lane> {
             let width = (i64::from(hi) - i64::from(lo) + 1) as usize;
             let shift = lo.max(0) as usize;
             let last = (n as i64).min(m as i64 + i64::from(hi));
-            let rows = usize::try_from(last - shift as i64).ok().filter(|&rows| rows > 0)?;
+            let rows = usize::try_from(last - shift as i64)
+                .ok()
+                .filter(|&rows| rows > 0)?;
             (width <= MAX_DIM && rows <= MAX_DIM && lo.unsigned_abs() as usize <= MAX_DIM)
-                .then_some(Lane { job: job_index, shift, lo, width, rows, n, m })
+                .then_some(Lane {
+                    job: job_index,
+                    shift,
+                    lo,
+                    width,
+                    rows,
+                    n,
+                    m,
+                })
         }
     }
 }
@@ -242,7 +273,11 @@ fn build<const DIAG: bool>(
             query[r - 1][l] = i16::from(job.query[r + lane.shift - 1].min(N));
         }
         // Diagonal layout: position t holds reference index j0 = t − width + shift − lo.
-        let offset = if DIAG { width as i64 - lane.shift as i64 + i64::from(lane.lo) } else { 0 };
+        let offset = if DIAG {
+            width as i64 - lane.shift as i64 + i64::from(lane.lo)
+        } else {
+            0
+        };
         for code in 0..CODES {
             let row = job.profile.row(code as u8);
             let column = &mut profile[code * positions..(code + 1) * positions];
@@ -310,7 +345,11 @@ mod kernel {
         let neg = _mm256_set1_epi16(NEG);
         let (open, extend, step) = (load(&shape.open), load(&shape.extend), load(&shape.step));
         let lane_width = load(&shape.lane_width);
-        let (one, two, three) = (_mm256_set1_epi16(1), _mm256_set1_epi16(2), _mm256_set1_epi16(3));
+        let (one, two, three) = (
+            _mm256_set1_epi16(1),
+            _mm256_set1_epi16(2),
+            _mm256_set1_epi16(3),
+        );
         let (ins_bit, del_bit) = (_mm256_set1_epi16(4), _mm256_set1_epi16(8));
         let sentinel = _mm256_set1_epi16(SENTINEL);
         let (mut best, mut best_row, mut best_k) = (zero, zero, zero);
@@ -329,9 +368,18 @@ mod kernel {
 
             for step_index in 0..width {
                 // Diagonal layout walks k downwards (left neighbour is k + 1).
-                let k = if DIAG { width - 1 - step_index } else { step_index };
+                let k = if DIAG {
+                    width - 1 - step_index
+                } else {
+                    step_index
+                };
                 let (h_up, i_up, h_diag, t) = if DIAG {
-                    (load(&h[k]), load(&ins[k]), load(&h[k + 1]), r + width - 1 - k)
+                    (
+                        load(&h[k]),
+                        load(&ins[k]),
+                        load(&h[k + 1]),
+                        r + width - 1 - k,
+                    )
                 } else {
                     let up = load(&h[k + 1]);
                     let diag = h_diag_carry;
@@ -340,7 +388,10 @@ mod kernel {
                 };
                 let mut s = past_query;
                 for (c, mask) in code_mask.iter().enumerate() {
-                    s = _mm256_or_si256(s, _mm256_and_si256(load(&profile[c * positions + t]), *mask));
+                    s = _mm256_or_si256(
+                        s,
+                        _mm256_and_si256(load(&profile[c * positions + t]), *mask),
+                    );
                 }
 
                 let ins_open = _mm256_adds_epi16(h_up, open);
@@ -359,7 +410,10 @@ mod kernel {
                         _mm256_and_si256(_mm256_cmpgt_epi16(ins_extend, ins_open), ins_bit),
                         _mm256_and_si256(del_extends, del_bit),
                     );
-                    store_codes(&mut trace[(r - 1) * width + k], _mm256_or_si256(source, bits));
+                    store_codes(
+                        &mut trace[(r - 1) * width + k],
+                        _mm256_or_si256(source, bits),
+                    );
                 }
 
                 let del_open = _mm256_adds_epi16(t_all, open);
@@ -385,7 +439,11 @@ mod kernel {
                 best_k = _mm256_blendv_epi8(best_k, k_vector, improved);
             }
         }
-        let mut out = LaneBest { score: [0; LANES], row: [0; LANES], k: [0; LANES] };
+        let mut out = LaneBest {
+            score: [0; LANES],
+            row: [0; LANES],
+            k: [0; LANES],
+        };
         store(&mut out.score, best);
         store(&mut out.row, best_row);
         store(&mut out.k, best_k);
@@ -401,7 +459,17 @@ impl InterSequenceGotoh {
         ws: &mut InterSequenceWorkspace,
         mut emit: impl FnMut(usize, Option<LaneResult>),
     ) {
-        let InterSequenceWorkspace { scalar_jobs, diagonal, rectangular, query, profile, h, ins, trace, .. } = ws;
+        let InterSequenceWorkspace {
+            scalar_jobs,
+            diagonal,
+            rectangular,
+            query,
+            profile,
+            h,
+            ins,
+            trace,
+            ..
+        } = ws;
         scalar_jobs.clear();
         diagonal.clear();
         rectangular.clear();
@@ -430,7 +498,8 @@ impl InterSequenceGotoh {
             ) {
                 let shape = build::<DIAG>(jobs, lanes, query, profile);
                 // SAFETY: only reached when AVX2 was detected at construction.
-                let best = unsafe { kernel::fill::<DIAG, TRACE>(&shape, query, profile, h, ins, trace) };
+                let best =
+                    unsafe { kernel::fill::<DIAG, TRACE>(&shape, query, profile, h, ins, trace) };
                 for (l, lane) in lanes.iter().enumerate() {
                     let score = Score::from(best.score[l]);
                     if score <= 0 {
@@ -439,9 +508,21 @@ impl InterSequenceGotoh {
                     }
                     let (row, col) = lane.cell_of::<DIAG>(best.row[l] as usize, best.k[l] as usize);
                     let start = TRACE.then(|| {
-                        traceback_with(|i, j| lane.trace_code::<DIAG>(trace, shape.width, l, i, j), row, col)
+                        traceback_with(
+                            |i, j| lane.trace_code::<DIAG>(trace, shape.width, l, i, j),
+                            row,
+                            col,
+                        )
                     });
-                    emit(lane.job, Some(LaneResult { score, row, col, start }));
+                    emit(
+                        lane.job,
+                        Some(LaneResult {
+                            score,
+                            row,
+                            col,
+                            start,
+                        }),
+                    );
                 }
             }
             for chunk in diagonal.chunks(LANES) {
@@ -492,19 +573,34 @@ impl Aligner for InterSequenceGotoh {
         BandedGotoh.align(query, profile, gaps, band, &mut workspace.scalar)
     }
 
-    fn score_batch(&self, jobs: &[AlignJob<'_>], ws: &mut InterSequenceWorkspace, out: &mut Vec<Option<ScoreHit>>) {
+    fn score_batch(
+        &self,
+        jobs: &[AlignJob<'_>],
+        ws: &mut InterSequenceWorkspace,
+        out: &mut Vec<Option<ScoreHit>>,
+    ) {
         out.clear();
         out.resize(jobs.len(), None);
         self.simd_groups::<false>(jobs, ws, |job, result| {
-            out[job] = result.map(|r| ScoreHit { score: r.score, q_end: r.row as u32, r_end: r.col as u32 });
+            out[job] = result.map(|r| ScoreHit {
+                score: r.score,
+                q_end: r.row as u32,
+                r_end: r.col as u32,
+            });
         });
         for &index in &ws.scalar_jobs {
             let job = &jobs[index];
-            out[index] = BandedGotoh.score(job.query, job.profile, job.gaps, job.band, &mut ws.scalar);
+            out[index] =
+                BandedGotoh.score(job.query, job.profile, job.gaps, job.band, &mut ws.scalar);
         }
     }
 
-    fn align_batch(&self, jobs: &[AlignJob<'_>], ws: &mut InterSequenceWorkspace, out: &mut Vec<Option<Alignment>>) {
+    fn align_batch(
+        &self,
+        jobs: &[AlignJob<'_>],
+        ws: &mut InterSequenceWorkspace,
+        out: &mut Vec<Option<Alignment>>,
+    ) {
         out.clear();
         out.resize(jobs.len(), None);
         self.simd_groups::<true>(jobs, ws, |job, result| {
@@ -522,7 +618,8 @@ impl Aligner for InterSequenceGotoh {
         });
         for &index in &ws.scalar_jobs {
             let job = &jobs[index];
-            out[index] = BandedGotoh.align(job.query, job.profile, job.gaps, job.band, &mut ws.scalar);
+            out[index] =
+                BandedGotoh.align(job.query, job.profile, job.gaps, job.band, &mut ws.scalar);
         }
     }
 }
@@ -590,7 +687,12 @@ mod tests {
             let profiles: Vec<_> = cases
                 .iter()
                 .enumerate()
-                .map(|(k, (_, r, _))| (SubstitutionProfile::build(&scorings[k % 4], r), scorings[k % 4].gaps))
+                .map(|(k, (_, r, _))| {
+                    (
+                        SubstitutionProfile::build(&scorings[k % 4], r),
+                        scorings[k % 4].gaps,
+                    )
+                })
                 .collect();
             let jobs: Vec<AlignJob> = cases
                 .iter()
@@ -600,18 +702,36 @@ mod tests {
                         0 => Band::Full,
                         1 => Band::around(*lead, 3 + (next() % 30) as i32),
                         2 => Band::around(*lead + (next() % 9) as i32 - 4, 28),
-                        _ => Band::Diagonals { lo: *lead - 5, hi: *lead + 60 },
+                        _ => Band::Diagonals {
+                            lo: *lead - 5,
+                            hi: *lead + 60,
+                        },
                     };
-                    AlignJob { query: q, profile, gaps: *gaps, band }
+                    AlignJob {
+                        query: q,
+                        profile,
+                        gaps: *gaps,
+                        band,
+                    }
                 })
                 .collect();
             simd.score_batch(&jobs, &mut ws, &mut hits);
             simd.align_batch(&jobs, &mut ws, &mut alignments);
             for (k, job) in jobs.iter().enumerate() {
-                let expected_hit = BandedGotoh.score(job.query, job.profile, job.gaps, job.band, &mut scalar_ws);
-                let expected_aln = BandedGotoh.align(job.query, job.profile, job.gaps, job.band, &mut scalar_ws);
-                assert_eq!(hits[k], expected_hit, "score, batch {batch} job {k} band {:?}", job.band);
-                assert_eq!(alignments[k], expected_aln, "alignment, batch {batch} job {k} band {:?}", job.band);
+                let expected_hit =
+                    BandedGotoh.score(job.query, job.profile, job.gaps, job.band, &mut scalar_ws);
+                let expected_aln =
+                    BandedGotoh.align(job.query, job.profile, job.gaps, job.band, &mut scalar_ws);
+                assert_eq!(
+                    hits[k], expected_hit,
+                    "score, batch {batch} job {k} band {:?}",
+                    job.band
+                );
+                assert_eq!(
+                    alignments[k], expected_aln,
+                    "alignment, batch {batch} job {k} band {:?}",
+                    job.band
+                );
             }
         }
     }
@@ -621,10 +741,31 @@ mod tests {
         let scoring = AffineScoring::new(100, -3, -5, -1);
         let reference: Vec<u8> = (0..200).map(|i| (i % 4) as u8).collect();
         let profile = SubstitutionProfile::build(&scoring, &reference);
-        assert!(lane_of(0, &AlignJob { query: &reference, profile: &profile, gaps: scoring.gaps, band: Band::Full }).is_none());
-        let jobs = vec![AlignJob { query: &reference, profile: &profile, gaps: scoring.gaps, band: Band::Full }; 3];
+        assert!(lane_of(
+            0,
+            &AlignJob {
+                query: &reference,
+                profile: &profile,
+                gaps: scoring.gaps,
+                band: Band::Full
+            }
+        )
+        .is_none());
+        let jobs = vec![
+            AlignJob {
+                query: &reference,
+                profile: &profile,
+                gaps: scoring.gaps,
+                band: Band::Full
+            };
+            3
+        ];
         let mut out = Vec::new();
-        InterSequenceGotoh::new().score_batch(&jobs, &mut InterSequenceWorkspace::default(), &mut out);
+        InterSequenceGotoh::new().score_batch(
+            &jobs,
+            &mut InterSequenceWorkspace::default(),
+            &mut out,
+        );
         assert!(out.iter().all(|hit| hit.map(|h| h.score) == Some(20_000)));
     }
 }

@@ -35,11 +35,24 @@ impl ReadRecord {
 pub enum ReadError {
     Io(io::Error),
     Gzip,
-    UnknownFormat { line: usize, found: char },
-    SequenceBeforeHeader { line: usize },
-    ExpectedFastqHeader { line: usize },
-    MissingSeparator { header: String },
-    QualityLength { header: String, sequence: usize, quality: usize },
+    UnknownFormat {
+        line: usize,
+        found: char,
+    },
+    SequenceBeforeHeader {
+        line: usize,
+    },
+    ExpectedFastqHeader {
+        line: usize,
+    },
+    MissingSeparator {
+        header: String,
+    },
+    QualityLength {
+        header: String,
+        sequence: usize,
+        quality: usize,
+    },
 }
 
 impl fmt::Display for ReadError {
@@ -91,7 +104,14 @@ pub struct ReadReader<R> {
 
 impl<R: BufRead> ReadReader<R> {
     pub fn new(input: R) -> Self {
-        Self { input, format: None, started: false, line: 0, buffer: String::new(), pending_header: None }
+        Self {
+            input,
+            format: None,
+            started: false,
+            line: 0,
+            buffer: String::new(),
+            pending_header: None,
+        }
     }
 
     /// Detected format, `None` for empty input.
@@ -105,7 +125,11 @@ impl<R: BufRead> ReadReader<R> {
 
     /// Append up to `max` records to `out`; returns how many were appended
     /// (0 at end of input).
-    pub fn read_batch(&mut self, max: usize, out: &mut Vec<ReadRecord>) -> Result<usize, ReadError> {
+    pub fn read_batch(
+        &mut self,
+        max: usize,
+        out: &mut Vec<ReadRecord>,
+    ) -> Result<usize, ReadError> {
         let mut count = 0;
         while count < max {
             match self.next_record()? {
@@ -152,7 +176,10 @@ impl<R: BufRead> ReadReader<R> {
             return match symbol {
                 b'>' => Ok(Some(ReadFormat::Fasta)),
                 b'@' => Ok(Some(ReadFormat::Fastq)),
-                other => Err(ReadError::UnknownFormat { line: self.line + 1, found: char::from(other) }),
+                other => Err(ReadError::UnknownFormat {
+                    line: self.line + 1,
+                    found: char::from(other),
+                }),
             };
         }
     }
@@ -225,7 +252,11 @@ impl<R: BufRead> ReadReader<R> {
             quality += self.buffer.trim().len();
         }
         if quality != sequence.len() {
-            return Err(ReadError::QualityLength { header, sequence: sequence.len(), quality });
+            return Err(ReadError::QualityLength {
+                header,
+                sequence: sequence.len(),
+                quality,
+            });
         }
         Ok(Some(ReadRecord { header, sequence }))
     }
@@ -248,13 +279,19 @@ mod tests {
     }
 
     fn record(header: &str, sequence: &str) -> ReadRecord {
-        ReadRecord { header: header.into(), sequence: sequence.as_bytes().to_vec() }
+        ReadRecord {
+            header: header.into(),
+            sequence: sequence.as_bytes().to_vec(),
+        }
     }
 
     #[test]
     fn reads_multiline_fasta() {
         let records = read_all(b"\n>r1 desc\nACGT\nac-gt\n>r2\r\nTTTT\r\n").unwrap();
-        assert_eq!(records, vec![record("r1 desc", "ACGTacgt"), record("r2", "TTTT")]);
+        assert_eq!(
+            records,
+            vec![record("r1 desc", "ACGTacgt"), record("r2", "TTTT")]
+        );
         assert_eq!(records[0].id(), "r1");
     }
 
@@ -262,17 +299,43 @@ mod tests {
     fn reads_fastq_including_multiline_and_awkward_qualities() {
         let text = b"@r1\nACGT\n+\nIIII\n\n@r2 x\nAC\nGT\n+r2 x\n@+II\n\n@r3\n\n+\n\n";
         let records = read_all(text).unwrap();
-        assert_eq!(records, vec![record("r1", "ACGT"), record("r2 x", "ACGT"), record("r3", "")]);
+        assert_eq!(
+            records,
+            vec![
+                record("r1", "ACGT"),
+                record("r2 x", "ACGT"),
+                record("r3", "")
+            ]
+        );
     }
 
     #[test]
     fn detects_format_and_reports_problems() {
         let mut reader = ReadReader::new(&b"@r\nAC\n+\nII\n"[..]);
         assert_eq!(reader.format().unwrap(), Some(ReadFormat::Fastq));
-        assert!(matches!(read_all(b"@r\nACGT\n+\nII\n"), Err(ReadError::QualityLength { sequence: 4, quality: 2, .. })));
-        assert!(matches!(read_all(b"@r\nACGT\n"), Err(ReadError::MissingSeparator { .. })));
-        assert!(matches!(read_all(b"ACGT\n"), Err(ReadError::UnknownFormat { line: 1, found: 'A' })));
-        assert!(matches!(read_all(&[0x1f, 0x8b, 8, 0]), Err(ReadError::Gzip)));
+        assert!(matches!(
+            read_all(b"@r\nACGT\n+\nII\n"),
+            Err(ReadError::QualityLength {
+                sequence: 4,
+                quality: 2,
+                ..
+            })
+        ));
+        assert!(matches!(
+            read_all(b"@r\nACGT\n"),
+            Err(ReadError::MissingSeparator { .. })
+        ));
+        assert!(matches!(
+            read_all(b"ACGT\n"),
+            Err(ReadError::UnknownFormat {
+                line: 1,
+                found: 'A'
+            })
+        ));
+        assert!(matches!(
+            read_all(&[0x1f, 0x8b, 8, 0]),
+            Err(ReadError::Gzip)
+        ));
         assert!(read_all(b"").unwrap().is_empty());
         assert!(read_all(b"\n  \n").unwrap().is_empty());
     }
@@ -285,6 +348,9 @@ mod tests {
         assert_eq!(reader.read_batch(2, &mut out).unwrap(), 2);
         assert_eq!(reader.read_batch(2, &mut out).unwrap(), 1);
         assert_eq!(reader.read_batch(2, &mut out).unwrap(), 0);
-        assert_eq!(out.iter().map(|r| r.id()).collect::<Vec<_>>(), ["a", "b", "c"]);
+        assert_eq!(
+            out.iter().map(|r| r.id()).collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
     }
 }

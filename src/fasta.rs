@@ -52,10 +52,15 @@ pub fn parse_fasta(text: &str) -> Result<Vec<FastaRecord>, FastaError> {
         if let Some(header) = line.strip_prefix('>') {
             if let Some(last) = records.last() {
                 if last.sequence.is_empty() {
-                    return Err(FastaError::EmptyRecord { header: last.header.clone() });
+                    return Err(FastaError::EmptyRecord {
+                        header: last.header.clone(),
+                    });
                 }
             }
-            records.push(FastaRecord { header: header.trim().to_string(), sequence: Vec::new() });
+            records.push(FastaRecord {
+                header: header.trim().to_string(),
+                sequence: Vec::new(),
+            });
         } else if !line.is_empty() {
             let record = records
                 .last_mut()
@@ -67,7 +72,9 @@ pub fn parse_fasta(text: &str) -> Result<Vec<FastaRecord>, FastaError> {
     }
     if let Some(last) = records.last() {
         if last.sequence.is_empty() {
-            return Err(FastaError::EmptyRecord { header: last.header.clone() });
+            return Err(FastaError::EmptyRecord {
+                header: last.header.clone(),
+            });
         }
     }
     Ok(records)

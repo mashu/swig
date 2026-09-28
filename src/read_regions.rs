@@ -49,13 +49,31 @@ impl Projected<'_> {
     }
 }
 
-fn called<'a, C: AlleleCatalog>(call: &'a Call, catalog: &'a C, kind: SegmentKind) -> Option<Projected<'a>> {
+fn called<'a, C: AlleleCatalog>(
+    call: &'a Call,
+    catalog: &'a C,
+    kind: SegmentKind,
+) -> Option<Projected<'a>> {
     let path = call.path.as_ref()?;
-    let mut segments = path.segments.iter().filter(|s| call.placements[s.placement].kind == kind);
-    let called = if kind == SegmentKind::J { segments.last()? } else { segments.next()? };
+    let mut segments = path
+        .segments
+        .iter()
+        .filter(|s| call.placements[s.placement].kind == kind);
+    let called = if kind == SegmentKind::J {
+        segments.last()?
+    } else {
+        segments.next()?
+    };
     let placement = &call.placements[called.placement];
-    let allele = catalog.segment(kind)?.set().allele(placement.primary_allele());
-    Some(Projected { called, placement, allele })
+    let allele = catalog
+        .segment(kind)?
+        .set()
+        .allele(placement.primary_allele());
+    Some(Projected {
+        called,
+        placement,
+        allele,
+    })
 }
 
 /// `[start, end)` clamped to `[floor, ceil)`, if non-empty.
@@ -75,7 +93,8 @@ impl ReadRegions {
         if let Some(v) = &v {
             let r = &v.allele.regions;
             let floor = i64::from(v.called.span.q_lo);
-            let [fr1, cdr1, fr2, cdr2, fr3] = [r.fr1, r.cdr1, r.fr2, r.cdr2, r.fr3].map(|x| v.at(x));
+            let [fr1, cdr1, fr2, cdr2, fr3] =
+                [r.fr1, r.cdr1, r.fr2, r.cdr2, r.fr3].map(|x| v.at(x));
             out.fwr1 = interval(fr1, cdr1, floor, n);
             out.cdr1 = interval(cdr1, fr2, floor, n);
             out.fwr2 = interval(fr2, cdr2, floor, n);
@@ -95,7 +114,12 @@ impl ReadRegions {
         }
         // Stop codons in the V reading frame from the V alignment start to the J end.
         if let (Some(v), Some(c)) = (&v, cys104) {
-            let end = j.as_ref().map_or(i64::from(v.called.span.q_hi), |j| i64::from(j.called.span.q_hi)).min(n);
+            let end = j
+                .as_ref()
+                .map_or(i64::from(v.called.span.q_hi), |j| {
+                    i64::from(j.called.span.q_hi)
+                })
+                .min(n);
             let start = i64::from(v.called.span.q_lo);
             let first = start + (c - start).rem_euclid(3);
             let q = &call.query;
@@ -104,7 +128,10 @@ impl ReadRegions {
                 .any(|p| codon(q[p as usize], q[p as usize + 1], q[p as usize + 2]) == STOP);
             out.stop_codon = Some(stop);
         }
-        out.productive = out.vj_in_frame.zip(out.stop_codon).map(|(in_frame, stop)| in_frame && !stop);
+        out.productive = out
+            .vj_in_frame
+            .zip(out.stop_codon)
+            .map(|(in_frame, stop)| in_frame && !stop);
         out
     }
 }

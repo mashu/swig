@@ -40,7 +40,13 @@ pub fn codon(a: u8, b: u8, c: u8) -> u8 {
 
 /// Translate complete codons starting at `frame` (0, 1 or 2), appending to `out`.
 pub fn translate_into(codes: &[u8], frame: usize, out: &mut Vec<u8>) {
-    out.extend(codes.get(frame..).unwrap_or_default().chunks_exact(3).map(|c| codon(c[0], c[1], c[2])));
+    out.extend(
+        codes
+            .get(frame..)
+            .unwrap_or_default()
+            .chunks_exact(3)
+            .map(|c| codon(c[0], c[1], c[2])),
+    );
 }
 
 pub fn translate(codes: &[u8], frame: usize) -> Vec<u8> {

@@ -1,26 +1,32 @@
-//! The method note's calling profiles as configuration values.
+//! Swig calling profiles as configuration values.
+//!
+//! [`EngineConfig::default`](crate::config::EngineConfig::default) is R-optimized,
+//! which is Swig's default (`aer_robust` + `r_optimized`).
 
 use crate::adjudicate::DPresencePenalty;
-use crate::admission::DistributedEvidence;
 use crate::config::EngineConfig;
+use crate::germline::SegmentKind;
 use crate::scoring::AffineScoring;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CallingProfile {
-    /// Default production tuples: V (2,−3,−5,−1), D (2,−3,−13,−1), J (2,−3,−17,−2);
-    /// exact-run D admission only (distributed-D is an AER-R feature).
+    /// Legacy human-IGH tuples. V gap-open −5, `min_d_match` 6, no D-presence cost.
     TruthOptimized,
-    /// AER-R: V gap-open −9, `min_d_match` 5, distributed-D gate on.
+    /// Swig default. V gap-open −9, `min_d_match` 4, distributed-D, `P_D` 12 relaxed to 10.
     ROptimized,
-    /// D (2,−4,−11,−1).
+    /// IgBLAST-agreement: D `(2,−4,−11,−1)`, J `(2,−4,−13,−1)`, `min_d_match` 5.
     IgBlastAgreement,
-    /// Fixed `P_D` 10, `min_d_match` 4.
+    /// R-optimized scoring with a fixed D-presence cost of 10.
     SensitiveD,
 }
 
 impl CallingProfile {
-    pub const ALL: [CallingProfile; 4] =
-        [Self::TruthOptimized, Self::ROptimized, Self::IgBlastAgreement, Self::SensitiveD];
+    pub const ALL: [CallingProfile; 4] = [
+        Self::TruthOptimized,
+        Self::ROptimized,
+        Self::IgBlastAgreement,
+        Self::SensitiveD,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -32,24 +38,38 @@ impl CallingProfile {
     }
 
     pub fn from_name(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|p| p.name() == name)
+        match name {
+            "truth" | "truth_optimized" => Some(Self::TruthOptimized),
+            "r" | "r_optimized" | "r-optimized" => Some(Self::ROptimized),
+            "igblast" | "igblast_compatible" => Some(Self::IgBlastAgreement),
+            "sensitive-d" | "sensitive_d" => Some(Self::SensitiveD),
+            _ => None,
+        }
     }
 
     pub fn config(self) -> EngineConfig {
         let mut config = EngineConfig::default();
         match self {
-            Self::TruthOptimized => {}
-            Self::ROptimized => {
-                config.v.scoring = AffineScoring::new(2, -3, -9, -1);
-                config.d.min_exact_run = 5;
-                config.d.distributed = Some(DistributedEvidence::default());
+            Self::ROptimized => {}
+            Self::TruthOptimized => {
+                config.v.scoring = AffineScoring::new(2, -3, -5, -1);
+                config.d.min_exact_run = 6;
+                config.d.distributed = None;
+                config.min_retained[SegmentKind::D.index()] = 6;
+                config.objective.d_presence = DPresencePenalty::NONE;
+                config.options.junction_tie = false;
             }
             Self::IgBlastAgreement => {
+                config.v.scoring = AffineScoring::new(2, -3, -5, -1);
                 config.d.scoring = AffineScoring::new(2, -4, -11, -1);
+                config.j.scoring = AffineScoring::new(2, -4, -13, -1);
+                config.d.min_exact_run = 5;
+                config.d.distributed = None;
+                config.min_retained[SegmentKind::D.index()] = 5;
+                config.objective.d_presence = DPresencePenalty::NONE;
+                config.options.junction_tie = false;
             }
             Self::SensitiveD => {
-                config.d.min_exact_run = 4;
-                config.d.distributed = Some(DistributedEvidence::default());
                 config.objective.d_presence = DPresencePenalty::SENSITIVE_D;
             }
         }
@@ -73,6 +93,33 @@ mod tests {
             }
         }
         assert!(CallingProfile::ROptimized.config().d.distributed.is_some());
-        assert!(CallingProfile::TruthOptimized.config().d.distributed.is_none());
+        assert!(CallingProfile::TruthOptimized
+            .config()
+            .d
+            .distributed
+            .is_none());
+        let r = CallingProfile::ROptimized.config();
+        assert_eq!(r.v.scoring, AffineScoring::new(2, -3, -9, -1));
+        assert_eq!(r.d.min_exact_run, 4);
+        assert_eq!(r.objective.d_presence, DPresencePenalty::R_OPTIMIZED);
+        assert!(r.options.junction_tie);
+        assert_eq!(EngineConfig::default().d.min_exact_run, 4);
+        let sensitive = CallingProfile::SensitiveD.config();
+        assert_eq!(sensitive.v.scoring, r.v.scoring);
+        assert_eq!(
+            sensitive.objective.d_presence,
+            DPresencePenalty::SENSITIVE_D
+        );
+        let igblast = CallingProfile::IgBlastAgreement.config();
+        assert_eq!(igblast.j.scoring, AffineScoring::new(2, -4, -13, -1));
+        assert_eq!(igblast.d.min_exact_run, 5);
+        assert_eq!(
+            CallingProfile::from_name("r_optimized"),
+            Some(CallingProfile::ROptimized)
+        );
+        assert_eq!(
+            CallingProfile::from_name("sensitive_d"),
+            Some(CallingProfile::SensitiveD)
+        );
     }
 }

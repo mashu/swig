@@ -24,16 +24,16 @@
 //!
 //! ```ignore
 //! use vdj_assign::prelude::*;
-//! let assigner = DefaultAssigner::from_config(&CallingProfile::TruthOptimized.config(), v, Some(d), j)?;
+//! let assigner = DefaultAssigner::from_config(&CallingProfile::ROptimized.config(), v, Some(d), j)?;
 //! let mut ws = assigner.workspace();
 //! let call = assigner.assign(&encode(b"CAGGTGCAG..."), &mut ws);
 //! ```
 
 pub mod adjudicate;
 pub mod admission;
-pub mod annotate;
 pub mod align;
 pub mod alphabet;
+pub mod annotate;
 pub mod band;
 pub mod batch;
 pub mod clip;
@@ -62,15 +62,19 @@ pub mod window;
 /// The names most programs need.
 pub mod prelude {
     pub use crate::adjudicate::{
-        Adjudicator, CallPath, CalledSegment, DPresencePenalty, EngineeringObjective, Grammar, PathModel,
-        PathScore, PlacementDag, ResidualAdjudicator, VdjGrammar,
+        Adjudicator, CallPath, CalledSegment, DPresencePenalty, EngineeringObjective, Grammar,
+        PathModel, PathScore, PlacementDag, ResidualAdjudicator, VdjGrammar,
     };
-    pub use crate::admission::{Admission, AdmitAll, AllOf, AnyOf, DistributedEvidence, ExactRunFloor};
+    pub use crate::admission::{
+        Admission, AdmitAll, AllOf, AnyOf, DistributedEvidence, ExactRunFloor,
+    };
     pub use crate::align::{AlignJob, Aligner, BandedGotoh, InterSequenceGotoh};
     pub use crate::alphabet::{decode, encode};
     pub use crate::band::Band;
     pub use crate::batch::{assign_all, assign_map};
-    pub use crate::config::{BuildError, DefaultAssigner, DSegmentConfig, EngineConfig, VjSegmentConfig};
+    pub use crate::config::{
+        BuildError, DSegmentConfig, DefaultAssigner, EngineConfig, VjSegmentConfig,
+    };
     pub use crate::germline::{GermlineSet, SegmentKind};
     pub use crate::orient::{Orientation, OrientationPolicy};
     pub use crate::pipeline::{AlleleCatalog, Assigner, AssignerOptions, Call, VdjAssigner};

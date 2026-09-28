@@ -112,7 +112,10 @@ impl ClipIndex {
             prefix.push(total);
             previous = Some(op);
         }
-        debug_assert_eq!(total, alignment.score, "column rescoring must reproduce the DP score");
+        debug_assert_eq!(
+            total, alignment.score,
+            "column rescoring must reproduce the DP score"
+        );
 
         let mut first_m_from = vec![NONE; q_len + 1];
         for t in (0..q_len).rev() {
@@ -252,10 +255,20 @@ mod tests {
 
     const SCORING: AffineScoring = AffineScoring::new(2, -3, -5, -1);
 
-    fn naive_clip_score(aln: &Alignment, query: &[u8], reference: &[u8], lo: u32, hi: u32) -> Option<Score> {
+    fn naive_clip_score(
+        aln: &Alignment,
+        query: &[u8],
+        reference: &[u8],
+        lo: u32,
+        hi: u32,
+    ) -> Option<Score> {
         let cols: Vec<_> = aln.columns().collect();
-        let first = cols.iter().position(|&(op, q, _)| op == Op::Match && q >= lo)?;
-        let last = cols.iter().rposition(|&(op, q, _)| op == Op::Match && q < hi)?;
+        let first = cols
+            .iter()
+            .position(|&(op, q, _)| op == Op::Match && q >= lo)?;
+        let last = cols
+            .iter()
+            .rposition(|&(op, q, _)| op == Op::Match && q < hi)?;
         if first > last {
             return None;
         }
@@ -278,14 +291,23 @@ mod tests {
         let query = encode(b"TTACGTTGCAAGCGGGTTGACCGTAGCTAACGTTAGCCATGG");
         let profile = SubstitutionProfile::build(&SCORING, &reference);
         let mut ws = GotohWorkspace::default();
-        let aln = BandedGotoh.align(&query, &profile, SCORING.gaps, Band::Full, &mut ws).unwrap();
-        assert!(aln.ops.iter().any(|&op| op != Op::Match), "test wants a gapped alignment");
+        let aln = BandedGotoh
+            .align(&query, &profile, SCORING.gaps, Band::Full, &mut ws)
+            .unwrap();
+        assert!(
+            aln.ops.iter().any(|&op| op != Op::Match),
+            "test wants a gapped alignment"
+        );
         let clip = ClipIndex::build(&aln, &query, &profile, SCORING.gaps);
         assert_eq!(clip.full().score, aln.score);
         for lo in 0..query.len() as u32 {
             for hi in lo + 1..=query.len() as u32 {
                 let fast = clip.span(lo, hi).map(|s| s.score);
-                assert_eq!(fast, naive_clip_score(&aln, &query, &reference, lo, hi), "[{lo},{hi})");
+                assert_eq!(
+                    fast,
+                    naive_clip_score(&aln, &query, &reference, lo, hi),
+                    "[{lo},{hi})"
+                );
             }
         }
     }
@@ -296,7 +318,9 @@ mod tests {
         let query = encode(b"GGGACGTTGCAAGCTTGACC");
         let profile = SubstitutionProfile::build(&SCORING, &reference);
         let mut ws = GotohWorkspace::default();
-        let aln = BandedGotoh.align(&query, &profile, SCORING.gaps, Band::Full, &mut ws).unwrap();
+        let aln = BandedGotoh
+            .align(&query, &profile, SCORING.gaps, Band::Full, &mut ws)
+            .unwrap();
         let clip = ClipIndex::build(&aln, &query, &profile, SCORING.gaps);
         assert_eq!(clip.project_reference(0), 3);
         assert_eq!(clip.project_reference(10), 13);

@@ -29,16 +29,25 @@ pub struct OrientationPolicy {
 
 impl Default for OrientationPolicy {
     fn default() -> Self {
-        Self { try_reverse: true, prune_reverse_at: Some(160) }
+        Self {
+            try_reverse: true,
+            prune_reverse_at: Some(160),
+        }
     }
 }
 
 impl OrientationPolicy {
     /// Forward only (pre-oriented input).
-    pub const FORWARD_ONLY: Self = Self { try_reverse: false, prune_reverse_at: None };
+    pub const FORWARD_ONLY: Self = Self {
+        try_reverse: false,
+        prune_reverse_at: None,
+    };
 
     pub fn wants_reverse(&self, forward_strength: u32) -> bool {
-        self.try_reverse && self.prune_reverse_at.map_or(true, |limit| forward_strength < limit)
+        self.try_reverse
+            && self
+                .prune_reverse_at
+                .map_or(true, |limit| forward_strength < limit)
     }
 
     /// Strictly stronger reverse evidence flips the strand; ties stay forward.

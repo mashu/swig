@@ -10,11 +10,11 @@ Zero dependencies, Rust ≥ 1.75, edition 2021.
 
 ```sh
 cargo build --release                             # always benchmark/run the release build
-cargo test                                        # 42 unit + 7 annotation + 10 integration tests
+cargo test                                        # 45 unit + 7 annotation + 10 integration tests
 cargo run --release --example throughput 20000    # synthetic IGH-sized benchmark
 
 target/release/vdj-assign --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta \
-    [--profile truth|r|igblast|sensitive-d] [--threads N] [--tandem-d] \
+    [--profile r|truth|igblast|sensitive-d] [--threads N] [--tandem-d] \
     [--chain heavy|light] [--forward-only] [--no-anchor-window] [--residual] reads.fastq > calls.tsv
 
 zcat reads.fastq.gz | target/release/vdj-assign --v V.fasta --d D.fasta --j J.fasta - > calls.tsv
@@ -52,7 +52,7 @@ As a library:
 ```rust
 use vdj_assign::prelude::*;
 
-let config = CallingProfile::TruthOptimized.config();
+let config = CallingProfile::ROptimized.config();
 let assigner = DefaultAssigner::from_config(&config, v_set, Some(d_set), j_set)?;
 let mut workspace = assigner.workspace();                  // one per thread
 let call = assigner.assign(&encode(b"CAGGTG..."), &mut workspace);
@@ -414,34 +414,38 @@ on the workers (`assign_map`).
 
 ## Calling profiles
 
-| Profile | V tuple | D tuple | J tuple | `min_d_match` | Distributed-D | `P_D` |
-|---|---|---|---|---|---|---|
-| `truth` (default) | (2,−3,−5,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 6 | off | 12 / 10 |
-| `r` (AER-R) | (2,−3,−9,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 5 | on | 12 / 10 |
-| `igblast` | (2,−3,−5,−1) | (2,−4,−11,−1) | (2,−3,−17,−2) | 6 | off | 12 / 10 |
-| `sensitive-d` | (2,−3,−5,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 4 | on | 10 fixed |
+The default is Swig's default: AER-R adjudication with the R-optimized profile.
+`r_optimized` is accepted as an alias of `r`.
 
-`P_D` relaxes from 12 to 10 when the D hit has an exact run ≥ 10. A with-D
-path must strictly beat the no-D path; ties go to fewer D segments.
+| Profile | V tuple | D tuple | J tuple | `min_d_match` | Distributed-D | `P_D` | Junction tie |
+|---|---|---|---|---|---|---|---|
+| `r` (default) | (2,−3,−9,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 4 | on | 12, or 10 if score ≥ 20 or the exact tract is in two D sequences | on |
+| `sensitive-d` | (2,−3,−9,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 4 | on | 10 fixed | on |
+| `truth` | (2,−3,−5,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 6 | off | 0 | off |
+| `igblast` | (2,−3,−5,−1) | (2,−4,−11,−1) | (2,−4,−13,−1) | 5 | off | 0 | off |
+
+Every profile requires 60% identity, at least 24 V substitution columns and 10 J
+substitution columns, and stitches the co-linear V prefix and J suffix back
+onto the local alignment before ranking. A with-D path must strictly beat the
+no-D path; ties go to fewer D segments.
 
 ## Assumptions and deviations — please review
 
 The note leaves several of these unspecified; each is a named field you can change.
 
-1. **Unspecified values.**
-   - `min_d_match`: 5 in R-optimised and 4 in Sensitive-D.
-   - Strong evidence for relaxing `P_D` = exact run ≥ 10.
-   - A tandem D costs an extra 12.
+1. **Tandem D.** A second D costs an extra 12. Swig's double-D screen is a
+   separate opt-in and is not this penalty.
 2. **Retrieval constants.**
+   - V keeps 3 genes and walks up to 16 while votes stay within `max(8, 5%)`.
+   - J keeps 3 genes.
+   - Traceback keeps the top 3 V and top 2 J local scores, plus whatever is tied with the last of those. A hit that fails the length or identity floor does not occupy a slot.
    - `weak_votes` 16 triggers the fallback seed.
    - `max_occurrences` 256.
-   - Minimum retained bases after clipping: V 10, D 3, J 6.
-3. **Keep policies.**
-   - V: top 8, slack 10, min 20, cap 16.
-   - J: top 4, slack 10, min 10, cap 8.
-   - D: top 16, cap 32, with the derived lossless floor.
-4. **J agreement tuple.** The note gives no J agreement tuple, so every profile
-   uses the truth-optimised J tuple.
+   - Minimum substitution columns: V 24, J 10, D `min_d_match`. Identity floor 0.60.
+3. **D keep.** D keeps a wide lossless set (top 16, cap 32) so a distributed
+   hit below the ordinary top-2 is not dropped. Swig reaches the same hits
+   with a second D pass.
+4. **IgBLAST J tuple** is `(2, −4, −13, −1)`, matching Swig's agreement profile.
 5. **Boundary rescue.** The 24/10 rescue is realised as `ExpandedResidual`
    (reclaim 24 into V/J) plus the DAG's exact cut choice, not as a separate
    post-hoc step.
@@ -449,9 +453,10 @@ The note leaves several of these unspecified; each is a named field you can chan
    when the residual is weak.
 7. **D retrieval.** The note's k = 5/3 D seeds are replaced by the lossless
    L-mer bitset prefilter.
-8. **Distributed-D.** Admission is off in the default truth profile, following
-   the note's "AER-R only"; it is on in `r` and `sensitive-d`.
-9. **Ungapped pre-ranking.** This is new, and is the only lossy acceleration.
+8. **Distributed-D.** On for `r` and `sensitive-d`. Off for `truth` and `igblast`,
+   which are the legacy non-AER-R profiles.
+9. **Ungapped pre-ranking.** Available, and off by default, because it can drop
+   an allele Swig would align. Set `ungapped: Some(UngappedParams::default())` to enable it.
 10. **Gap cost constraint.** `GapCosts::new` requires `open ≤ extend ≤ 0`. With
     cheaper opening, Gotoh prices gap runs as repeated opens and the "consecutive
     gap columns extend" convention (used by clipping and reporting) no longer
@@ -514,6 +519,5 @@ The note leaves several of these unspecified; each is a named field you can chan
 
 **Engineering.**
 - Arena allocation for placements.
-- Terminal-substitution and high-SHM tie extension as `Refiner`s.
 - A reporting threshold on E-value / minimum score.
 - C-segment assignment.

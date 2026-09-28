@@ -59,10 +59,19 @@ pub fn find_j(codes: &[u8], tail_prior: Option<u32>, frames: &mut [Vec<u8>; 3]) 
                 None => 3 * i32::from(TYPICAL_TAIL_NT.contains(&tail)),
             };
             let stops = aa[codon..].iter().filter(|&&a| a == STOP).count() as i32;
-            let score = 20 + 5 * i32::from(glycine1) + 5 * i32::from(glycine3) + i32::from(middle) + prior
-                - STOP_PENALTY * stops;
-            let hit = JHit { frame, codon, residue, score, confident: glycine1 && glycine3 && stops == 0 };
-            if best.map_or(true, |b| (hit.score, hit.confident) > (b.score, b.confident)) {
+            let score =
+                20 + 5 * i32::from(glycine1) + 5 * i32::from(glycine3) + i32::from(middle) + prior
+                    - STOP_PENALTY * stops;
+            let hit = JHit {
+                frame,
+                codon,
+                residue,
+                score,
+                confident: glycine1 && glycine3 && stops == 0,
+            };
+            if best.map_or(true, |b| {
+                (hit.score, hit.confident) > (b.score, b.confident)
+            }) {
                 best = Some(hit);
             }
         }

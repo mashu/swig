@@ -30,11 +30,23 @@ pub struct VdjGrammar {
 
 impl VdjGrammar {
     /// Heavy-chain default: VJ or VDJ, partial reads allowed.
-    pub const VDJ: Self = Self { max_d: 1, require_v: false, require_j: false };
+    pub const VDJ: Self = Self {
+        max_d: 1,
+        require_v: false,
+        require_j: false,
+    };
     /// Tandem D as a first-class topology: VJ, VDJ, VDDJ.
-    pub const TANDEM_D: Self = Self { max_d: 2, require_v: false, require_j: false };
+    pub const TANDEM_D: Self = Self {
+        max_d: 2,
+        require_v: false,
+        require_j: false,
+    };
     /// Light chains: no D.
-    pub const VJ: Self = Self { max_d: 0, require_v: false, require_j: false };
+    pub const VJ: Self = Self {
+        max_d: 0,
+        require_v: false,
+        require_j: false,
+    };
 }
 
 impl Default for VdjGrammar {
@@ -83,22 +95,42 @@ pub trait PathModel: Send + Sync {
     }
 }
 
-/// `P_D`: base penalty, relaxed when the D shows a long exact run.
+/// `P_D`: base penalty for introducing D, relaxed for a strong hypothesis.
+///
+/// Swig relaxes R-optimized's 12 down to 10 when the D scores at least 20, or
+/// when its exact ungapped tract occurs in two different D sequences
+/// ([`Placement::relaxes_d_cost`]). Sensitive-D uses a fixed 10. Legacy
+/// profiles charge nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DPresencePenalty {
     pub base: Score,
     pub relaxed: Score,
-    pub strong_run: u32,
+    /// Unclipped D score that earns `relaxed`.
+    pub strong_score: Score,
 }
 
 impl DPresencePenalty {
-    /// R-optimised: 12, relaxed to 10 for strong evidence.
-    pub const R_OPTIMIZED: Self = Self { base: 12, relaxed: 10, strong_run: 10 };
+    /// R-optimised: 12, relaxed to 10 when the D scores at least 20 or is a repeated exact tract.
+    pub const R_OPTIMIZED: Self = Self {
+        base: 12,
+        relaxed: 10,
+        strong_score: 20,
+    };
     /// Sensitive-D: fixed 10.
-    pub const SENSITIVE_D: Self = Self { base: 10, relaxed: 10, strong_run: 0 };
+    pub const SENSITIVE_D: Self = Self {
+        base: 10,
+        relaxed: 10,
+        strong_score: 0,
+    };
+    /// Truth and IgBLAST-agreement: D is free apart from having to beat the no-D path.
+    pub const NONE: Self = Self {
+        base: 0,
+        relaxed: 0,
+        strong_score: 0,
+    };
 
     pub fn penalty(&self, placement: &Placement) -> Score {
-        if placement.evidence.longest_exact_run >= self.strong_run {
+        if placement.score() >= self.strong_score || placement.relaxes_d_cost {
             self.relaxed
         } else {
             self.base
@@ -134,7 +166,11 @@ impl PathModel for EngineeringObjective {
     fn segment_bonus(&self, placement: &Placement, d_ordinal: u8) -> Score {
         match placement.kind {
             SegmentKind::D => {
-                let tandem = if d_ordinal >= 2 { self.tandem_d_penalty } else { 0 };
+                let tandem = if d_ordinal >= 2 {
+                    self.tandem_d_penalty
+                } else {
+                    0
+                };
                 -self.d_presence.penalty(placement) - tandem
             }
             SegmentKind::V | SegmentKind::J => 0,

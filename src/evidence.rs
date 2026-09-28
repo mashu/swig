@@ -110,9 +110,17 @@ mod tests {
         }
         cols.push((Op::Ins, 8, 8));
         let e = Evidence::from_columns(cols.iter().copied(), &query, &reference);
-        assert_eq!((e.matches, e.mismatches, e.gap_columns, e.gap_opens), (7, 1, 1, 1));
+        assert_eq!(
+            (e.matches, e.mismatches, e.gap_columns, e.gap_opens),
+            (7, 1, 1, 1)
+        );
         assert_eq!(e.longest_exact_run, 4);
-        let s = rescore(cols.iter().copied(), &query, &reference, &AffineScoring::new(2, -3, -13, -1));
+        let s = rescore(
+            cols.iter().copied(),
+            &query,
+            &reference,
+            &AffineScoring::new(2, -3, -13, -1),
+        );
         assert_eq!(s, 7 * 2 - 3 - 13);
     }
 }

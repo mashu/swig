@@ -72,13 +72,25 @@ impl RelativeIndex {
             }
         }
         let counts = vec![0; kmers.len()];
-        Self { offsets, postings, kmers, counts, touched: Vec::new() }
+        Self {
+            offsets,
+            postings,
+            kmers,
+            counts,
+            touched: Vec::new(),
+        }
     }
 
     /// Most similar `eligible` allele to `target` (most shared 8-mers, lowest
     /// index on ties), if it shares enough to count as a relative.
     pub fn nearest(&mut self, target: usize, eligible: &[bool]) -> Option<usize> {
-        let Self { offsets, postings, kmers, counts, touched } = self;
+        let Self {
+            offsets,
+            postings,
+            kmers,
+            counts,
+            touched,
+        } = self;
         for &key in &kmers[target] {
             let key = usize::from(key);
             for &allele in &postings[offsets[key] as usize..offsets[key + 1] as usize] {
@@ -88,7 +100,8 @@ impl RelativeIndex {
                 counts[allele as usize] += 1;
             }
         }
-        let needed = MIN_SHARED_KMERS.max((MIN_SHARED_FRACTION * kmers[target].len() as f64).ceil() as usize);
+        let needed = MIN_SHARED_KMERS
+            .max((MIN_SHARED_FRACTION * kmers[target].len() as f64).ceil() as usize);
         let best = touched
             .iter()
             .map(|&a| (a as usize, counts[a as usize] as usize))
@@ -129,10 +142,14 @@ fn map_position(alignment: &Alignment, r: u32, query_len: usize) -> Option<u32> 
     } else if r >= alignment.r_end {
         i64::from(alignment.q_end) + i64::from(r - alignment.r_end)
     } else {
-        let (_, q, _) = alignment.columns().find(|&(op, _, rc)| op != Op::Ins && rc == r)?;
+        let (_, q, _) = alignment
+            .columns()
+            .find(|&(op, _, rc)| op != Op::Ins && rc == r)?;
         i64::from(q)
     };
-    u32::try_from(mapped).ok().filter(|&q| (q as usize) < query_len)
+    u32::try_from(mapped)
+        .ok()
+        .filter(|&q| (q as usize) < query_len)
 }
 
 /// Map annotated `positions` of `reference` onto `query`.
@@ -144,7 +161,12 @@ pub fn transfer(
 ) -> Option<Vec<Option<u32>>> {
     let profile = SubstitutionProfile::build(&SCORING, reference);
     let alignment = BandedGotoh.align(query, &profile, SCORING.gaps, Band::Full, workspace)?;
-    Some(positions.iter().map(|p| p.and_then(|r| map_position(&alignment, r, query.len()))).collect())
+    Some(
+        positions
+            .iter()
+            .map(|p| p.and_then(|r| map_position(&alignment, r, query.len())))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -156,8 +178,23 @@ mod tests {
     fn transfers_positions_across_substitutions_and_indels() {
         let reference = encode(b"GATTACACCGGTTAACCGGTACGTAGCTAGCTAGGATCCAGTC");
         // Same sequence with one substitution and a 2-nt deletion before position 30.
-        let query = encode(b"GATTACACCGGTTTACCGGTACGTAGCTAGATAGGATCCAGTC".as_slice().iter().enumerate().filter(|&(i, _)| i != 28 && i != 29).map(|(_, &b)| b).collect::<Vec<_>>().as_slice());
-        let mapped = transfer(&query, &reference, &[Some(5), Some(35), None], &mut GotohWorkspace::default()).unwrap();
+        let query = encode(
+            b"GATTACACCGGTTTACCGGTACGTAGCTAGATAGGATCCAGTC"
+                .as_slice()
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| i != 28 && i != 29)
+                .map(|(_, &b)| b)
+                .collect::<Vec<_>>()
+                .as_slice(),
+        );
+        let mapped = transfer(
+            &query,
+            &reference,
+            &[Some(5), Some(35), None],
+            &mut GotohWorkspace::default(),
+        )
+        .unwrap();
         assert_eq!(mapped, vec![Some(5), Some(33), None]);
         assert!(shared(&kmers(&reference), &kmers(&query)) >= MIN_SHARED_KMERS);
     }
@@ -168,7 +205,8 @@ mod tests {
         let mut b = a.clone();
         b[20] = (b[20] + 1) % 4;
         let unrelated = encode(b"TTTGGGCCCAAATTTGGGCCCAAATTTGGGCCCAAATTTGGGCCCAAATTTGGGCCCAAAT");
-        let mut index = RelativeIndex::build([a.as_slice(), unrelated.as_slice(), b.as_slice()].into_iter());
+        let mut index =
+            RelativeIndex::build([a.as_slice(), unrelated.as_slice(), b.as_slice()].into_iter());
         assert_eq!(index.nearest(2, &[true, true, true]), Some(0));
         assert_eq!(index.nearest(1, &[true, true, true]), None);
         assert_eq!(index.nearest(2, &[false, true, true]), None);

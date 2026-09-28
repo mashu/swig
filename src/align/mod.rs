@@ -118,15 +118,31 @@ pub trait Aligner {
 
     /// Score every job; `out[k]` answers `jobs[k]`. Results must equal
     /// [`Aligner::score`] job by job.
-    fn score_batch(&self, jobs: &[AlignJob<'_>], workspace: &mut Self::Workspace, out: &mut Vec<Option<ScoreHit>>) {
+    fn score_batch(
+        &self,
+        jobs: &[AlignJob<'_>],
+        workspace: &mut Self::Workspace,
+        out: &mut Vec<Option<ScoreHit>>,
+    ) {
         out.clear();
-        out.extend(jobs.iter().map(|job| self.score(job.query, job.profile, job.gaps, job.band, workspace)));
+        out.extend(
+            jobs.iter()
+                .map(|job| self.score(job.query, job.profile, job.gaps, job.band, workspace)),
+        );
     }
 
     /// Align every job; `out[k]` answers `jobs[k]`. Results must equal
     /// [`Aligner::align`] job by job.
-    fn align_batch(&self, jobs: &[AlignJob<'_>], workspace: &mut Self::Workspace, out: &mut Vec<Option<Alignment>>) {
+    fn align_batch(
+        &self,
+        jobs: &[AlignJob<'_>],
+        workspace: &mut Self::Workspace,
+        out: &mut Vec<Option<Alignment>>,
+    ) {
         out.clear();
-        out.extend(jobs.iter().map(|job| self.align(job.query, job.profile, job.gaps, job.band, workspace)));
+        out.extend(
+            jobs.iter()
+                .map(|job| self.align(job.query, job.profile, job.gaps, job.band, workspace)),
+        );
     }
 }

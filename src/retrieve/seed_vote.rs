@@ -19,8 +19,8 @@
 //! **Two-tier seeds.** Primary seeds vote with weight 4. Only when the best
 //! primary cluster is weak are fallback (shorter) seeds added with weight 1.
 
-use super::{AlleleVote, Candidate, CandidateBudget, RetrievalScratch, Retriever};
 use super::budget::AmbiguityBudget;
+use super::{AlleleVote, Candidate, CandidateBudget, RetrievalScratch, Retriever};
 use crate::band::Band;
 use crate::germline::{GeneId, GermlineSet};
 use crate::index::{IndexError, KmerIndex};
@@ -73,7 +73,9 @@ const DIAGONAL_BIAS: i64 = 1 << 31;
 
 #[inline]
 fn pack(allele: u32, diagonal: i64, weight: u8) -> u64 {
-    (u64::from(allele) << 40) | ((((diagonal + DIAGONAL_BIAS) as u64) & 0xFFFF_FFFF) << 8) | u64::from(weight)
+    (u64::from(allele) << 40)
+        | ((((diagonal + DIAGONAL_BIAS) as u64) & 0xFFFF_FFFF) << 8)
+        | u64::from(weight)
 }
 
 #[inline]
@@ -102,7 +104,9 @@ impl<B: CandidateBudget> SeedVoteRetriever<B> {
     ) -> Result<Self, IndexError> {
         Ok(Self {
             primary: KmerIndex::build(set, primary)?,
-            fallback: fallback.map(|shape| KmerIndex::build(set, shape)).transpose()?,
+            fallback: fallback
+                .map(|shape| KmerIndex::build(set, shape))
+                .transpose()?,
             allele_gene: set.alleles().iter().map(|a| a.gene).collect(),
             gene_count: set.gene_count(),
             params,
@@ -138,8 +142,18 @@ impl<B: CandidateBudget> SeedVoteRetriever<B> {
         let mut i = 0;
         while i < keys.len() {
             let (allele, d0, w0) = unpack(keys[i]);
-            let mut best = AlleleVote { allele, votes: 0, d_lo: d0, d_hi: d0 };
-            let mut current = AlleleVote { allele, votes: w0, d_lo: d0, d_hi: d0 };
+            let mut best = AlleleVote {
+                allele,
+                votes: 0,
+                d_lo: d0,
+                d_hi: d0,
+            };
+            let mut current = AlleleVote {
+                allele,
+                votes: w0,
+                d_lo: d0,
+                d_hi: d0,
+            };
             i += 1;
             while i < keys.len() {
                 let (a, d, w) = unpack(keys[i]);
@@ -153,7 +167,12 @@ impl<B: CandidateBudget> SeedVoteRetriever<B> {
                     if current.votes > best.votes {
                         best = current;
                     }
-                    current = AlleleVote { allele, votes: w, d_lo: d, d_hi: d };
+                    current = AlleleVote {
+                        allele,
+                        votes: w,
+                        d_lo: d,
+                        d_hi: d,
+                    };
                 }
                 i += 1;
             }
@@ -180,7 +199,14 @@ impl<B: CandidateBudget> SeedVoteRetriever<B> {
 impl<B: CandidateBudget> Retriever for SeedVoteRetriever<B> {
     fn retrieve(&self, query: &[u8], scratch: &mut RetrievalScratch, out: &mut Vec<Candidate>) {
         out.clear();
-        let RetrievalScratch { keys, votes, gene_votes, gene_order, ranked, .. } = scratch;
+        let RetrievalScratch {
+            keys,
+            votes,
+            gene_votes,
+            gene_order,
+            ranked,
+            ..
+        } = scratch;
         keys.clear();
         self.cast_votes(&self.primary, self.params.primary_weight, query, keys);
         let mut strongest = self.cluster(keys, votes);
@@ -200,8 +226,15 @@ impl<B: CandidateBudget> Retriever for SeedVoteRetriever<B> {
             gene_votes[g] = gene_votes[g].max(v.votes);
         }
         gene_order.clear();
-        gene_order.extend((0..self.gene_count as GeneId).filter(|&g| gene_votes[g as usize] >= self.params.min_votes));
-        gene_order.sort_by(|&a, &b| gene_votes[b as usize].cmp(&gene_votes[a as usize]).then(a.cmp(&b)));
+        gene_order.extend(
+            (0..self.gene_count as GeneId)
+                .filter(|&g| gene_votes[g as usize] >= self.params.min_votes),
+        );
+        gene_order.sort_by(|&a, &b| {
+            gene_votes[b as usize]
+                .cmp(&gene_votes[a as usize])
+                .then(a.cmp(&b))
+        });
         ranked.clear();
         ranked.extend(gene_order.iter().map(|&g| gene_votes[g as usize]));
         let keep = self.budget.genes_to_keep(ranked);
@@ -211,11 +244,16 @@ impl<B: CandidateBudget> Retriever for SeedVoteRetriever<B> {
         }
 
         votes.retain(|v| {
-            v.votes >= self.params.min_votes && gene_votes[self.allele_gene[v.allele as usize] as usize] == KEPT
+            v.votes >= self.params.min_votes
+                && gene_votes[self.allele_gene[v.allele as usize] as usize] == KEPT
         });
         votes.sort_by(|a, b| b.votes.cmp(&a.votes).then(a.allele.cmp(&b.allele)));
         votes.truncate(self.params.max_alleles);
-        out.extend(votes.iter().map(|v| Candidate { allele: v.allele, band: self.band_for(v), votes: v.votes }));
+        out.extend(votes.iter().map(|v| Candidate {
+            allele: v.allele,
+            band: self.band_for(v),
+            votes: v.votes,
+        }));
     }
 }
 
@@ -237,8 +275,10 @@ mod tests {
     #[test]
     fn finds_the_right_allele_and_diagonal() {
         let mut set = GermlineSet::new(SegmentKind::V);
-        set.push("X1*01", b"ACGTTGCAAGCTTGACCGTAGGCTAACGTTAGCCATTGCA", None).unwrap();
-        set.push("X2*01", b"TTGACCATGCAGTCAGGATCCAGTACGATCAGGTCAACCT", None).unwrap();
+        set.push("X1*01", b"ACGTTGCAAGCTTGACCGTAGGCTAACGTTAGCCATTGCA", None)
+            .unwrap();
+        set.push("X2*01", b"TTGACCATGCAGTCAGGATCCAGTACGATCAGGTCAACCT", None)
+            .unwrap();
         let retriever = SeedVoteRetriever::build(
             &set,
             SeedShape::contiguous(9),
@@ -252,6 +292,9 @@ mod tests {
         let mut out = Vec::new();
         retriever.retrieve(&query, &mut scratch, &mut out);
         assert_eq!(out[0].allele, 1);
-        assert!(out[0].band.contains(10, 5), "diagonal +5 must be inside the band");
+        assert!(
+            out[0].band.contains(10, 5),
+            "diagonal +5 must be inside the band"
+        );
     }
 }

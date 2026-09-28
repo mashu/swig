@@ -15,14 +15,14 @@ use crate::align::InterSequenceGotoh;
 use crate::germline::{GermlineSet, SegmentKind};
 use crate::index::IndexError;
 use crate::pipeline::{Assigner, AssignerOptions};
-use crate::refine::NoRefine;
+use crate::refine::{NoRefine, OuterExtend};
 use crate::retrieve::{
-    AmbiguityBudget, LmerMaskRetriever, SeedVoteParams, SeedVoteRetriever, UngappedParams, UngappedPrefilter,
-    MAX_LMER,
+    AmbiguityBudget, LmerMaskRetriever, SeedVoteParams, SeedVoteRetriever, UngappedParams,
+    UngappedPrefilter, MAX_LMER,
 };
 use crate::scoring::{AffineScoring, Score};
 use crate::seed::SeedShape;
-use crate::segment::{KeepPolicy, PreparedSegment, SegmentStage};
+use crate::segment::{HitAcceptance, KeepPolicy, PreparedSegment, SegmentStage};
 use crate::window::{ExpandedResidual, WithAnchorWindow};
 
 /// V or J: seeded, banded, vote-ranked, optionally ungapped-pre-ranked.
@@ -34,8 +34,13 @@ pub struct VjSegmentConfig {
     pub seeds: SeedVoteParams,
     pub budget: AmbiguityBudget,
     /// Ungapped diagonal pre-ranking before banded DP (`None` = off).
+    /// Off by default: it is lossy, and Swig aligns the seed candidates directly.
     pub ungapped: Option<UngappedParams>,
     pub keep: KeepPolicy,
+    /// Co-linear flank stitched back onto the local alignment before ranking.
+    pub outer: OuterExtend,
+    /// Minimum substitution columns and identity of an accepted local hit.
+    pub accept: HitAcceptance,
 }
 
 /// D: L-mer prefilter, unbanded DP inside junction windows, admission gates.
@@ -58,7 +63,11 @@ impl DSegmentConfig {
     /// ≥ 80 % identity forces an exact run ≥ 4 (pigeonhole), so distributed-D caps L at 4.
     pub fn lossless_lmer(&self) -> usize {
         let run = self.min_exact_run.max(1) as usize;
-        let distributed_cap = if self.distributed.is_some() { 4 } else { usize::MAX };
+        let distributed_cap = if self.distributed.is_some() {
+            4
+        } else {
+            usize::MAX
+        };
         run.min(distributed_cap).min(MAX_LMER)
     }
 
@@ -93,27 +102,61 @@ pub struct EngineConfig {
 }
 
 impl VjSegmentConfig {
+    /// Swig R-optimized V: gap-open −9, at least 24 substitution columns, identity ≥ 0.60.
+    /// The vote budget keeps 3 genes and walks up to 16 while votes stay within the AER margin.
     pub fn v_default() -> Self {
         Self {
-            scoring: AffineScoring::new(2, -3, -5, -1),
+            scoring: AffineScoring::new(2, -3, -9, -1),
             primary: SeedShape::contiguous(9),
             fallback: Some(SeedShape::contiguous(7)),
             seeds: SeedVoteParams::default(),
             budget: AmbiguityBudget::default(),
-            ungapped: Some(UngappedParams::default()),
-            keep: KeepPolicy { top: 8, slack: 10, min_score: 20, cap: 16, prescore_above: 8 },
+            ungapped: None,
+            // Score-screen to Swig's top_v of 3. Traceback stops once three
+            // alignments pass acceptance, including the tie group at that score.
+            keep: KeepPolicy {
+                top: 3,
+                slack: 0,
+                min_score: 1,
+                cap: 64,
+                prescore_above: 4,
+                screen: true,
+            },
+            outer: OuterExtend::Prefix,
+            accept: HitAcceptance {
+                min_subst: 24,
+                min_identity: 0.60,
+            },
         }
     }
 
+    /// Swig J: `(2, −3, −17, −2)`, three candidates (`max(top_j, 3)`), identity ≥ 0.60.
     pub fn j_default() -> Self {
         Self {
             scoring: AffineScoring::new(2, -3, -17, -2),
             primary: SeedShape::contiguous(7),
             fallback: Some(SeedShape::contiguous(5)),
             seeds: SeedVoteParams::default(),
-            budget: AmbiguityBudget::default(),
-            ungapped: Some(UngappedParams::default()),
-            keep: KeepPolicy { top: 4, slack: 10, min_score: 10, cap: 8, prescore_above: 4 },
+            budget: AmbiguityBudget {
+                base: 3,
+                max: 3,
+                ..AmbiguityBudget::default()
+            },
+            ungapped: None,
+            // Score-screen to Swig's top_j of 2, plus the exact-score tie group.
+            keep: KeepPolicy {
+                top: 2,
+                slack: 0,
+                min_score: 1,
+                cap: 64,
+                prescore_above: 3,
+                screen: true,
+            },
+            outer: OuterExtend::Suffix,
+            accept: HitAcceptance {
+                min_subst: 10,
+                min_identity: 0.60,
+            },
         }
     }
 }
@@ -123,9 +166,16 @@ impl Default for DSegmentConfig {
         Self {
             scoring: AffineScoring::new(2, -3, -13, -1),
             lmer: None,
-            keep: KeepPolicy { top: 16, slack: Score::MAX / 4, min_score: 0, cap: 32, prescore_above: 0 },
-            min_exact_run: 6,
-            distributed: None,
+            keep: KeepPolicy {
+                top: 16,
+                slack: Score::MAX / 4,
+                min_score: 0,
+                cap: 32,
+                prescore_above: 0,
+                screen: false,
+            },
+            min_exact_run: 4,
+            distributed: Some(crate::admission::DistributedEvidence::default()),
         }
     }
 }
@@ -145,16 +195,27 @@ impl Default for EngineConfig {
                 tandem_d_penalty: 12,
                 insertion_per_base: 0,
             },
-            min_retained: [10, 3, 6],
-            options: AssignerOptions::default(),
+            // Swig: V ≥ 24 aligned bases, J ≥ 10, D ≥ min_d_match. Query bases
+            // retained after a clip use the same floors.
+            min_retained: [24, 4, 10],
+            options: AssignerOptions {
+                junction_tie: true,
+                ..AssignerOptions::default()
+            },
         }
     }
 }
 
 #[derive(Debug)]
 pub enum BuildError {
-    Index { kind: SegmentKind, source: IndexError },
-    WrongKind { expected: SegmentKind, found: SegmentKind },
+    Index {
+        kind: SegmentKind,
+        source: IndexError,
+    },
+    WrongKind {
+        expected: SegmentKind,
+        found: SegmentKind,
+    },
     Empty(SegmentKind),
 }
 
@@ -163,7 +224,12 @@ impl fmt::Display for BuildError {
         match self {
             Self::Index { kind, source } => write!(f, "{} index: {source}", kind.label()),
             Self::WrongKind { expected, found } => {
-                write!(f, "expected a {} germline set, got {}", expected.label(), found.label())
+                write!(
+                    f,
+                    "expected a {} germline set, got {}",
+                    expected.label(),
+                    found.label()
+                )
             }
             Self::Empty(kind) => write!(f, "the {} germline set is empty", kind.label()),
         }
@@ -181,7 +247,10 @@ impl std::error::Error for BuildError {
 
 fn check(set: &GermlineSet, expected: SegmentKind) -> Result<(), BuildError> {
     if set.kind() != expected {
-        return Err(BuildError::WrongKind { expected, found: set.kind() });
+        return Err(BuildError::WrongKind {
+            expected,
+            found: set.kind(),
+        });
     }
     if set.is_empty() {
         return Err(BuildError::Empty(expected));
@@ -192,7 +261,10 @@ fn check(set: &GermlineSet, expected: SegmentKind) -> Result<(), BuildError> {
 /// Retriever of the default V and J stages.
 pub type DefaultVjRetriever = UngappedPrefilter<SeedVoteRetriever>;
 
-fn vj_stage(set: GermlineSet, config: &VjSegmentConfig) -> Result<SegmentStage<DefaultVjRetriever>, BuildError> {
+fn vj_stage(
+    set: GermlineSet,
+    config: &VjSegmentConfig,
+) -> Result<SegmentStage<DefaultVjRetriever>, BuildError> {
     let kind = set.kind();
     let seeds = SeedVoteRetriever::build(
         &set,
@@ -202,9 +274,16 @@ fn vj_stage(set: GermlineSet, config: &VjSegmentConfig) -> Result<SegmentStage<D
         config.budget,
     )
     .map_err(|source| BuildError::Index { kind, source })?;
-    let segment = Arc::new(PreparedSegment::new(set, &config.scoring, config.scoring.gaps));
+    let segment = Arc::new(PreparedSegment::new(
+        set,
+        &config.scoring,
+        config.scoring.gaps,
+    ));
     let retriever = UngappedPrefilter::new(seeds, Arc::clone(&segment), config.ungapped);
-    Ok(SegmentStage::new(segment, retriever, config.keep))
+    let mut stage = SegmentStage::new(segment, retriever, config.keep);
+    stage.accept = config.accept;
+    stage.outer = config.outer;
+    Ok(stage)
 }
 
 fn d_stage(set: GermlineSet, config: &DSegmentConfig) -> SegmentStage<LmerMaskRetriever> {
@@ -216,10 +295,22 @@ fn d_stage(set: GermlineSet, config: &DSegmentConfig) -> SegmentStage<LmerMaskRe
     // scores ≥ L·m. When that meets the floor, the score-only pre-pass can only
     // prune through `top`, so it runs only above `top` candidates.
     let floor_implied = lmer as Score * config.scoring.matched >= floor;
-    let prescore_above =
-        if floor_implied { config.keep.prescore_above.max(config.keep.top) } else { config.keep.prescore_above };
-    let keep = KeepPolicy { min_score: floor, prescore_above, ..config.keep };
-    SegmentStage::new(Arc::new(segment), retriever, keep)
+    let prescore_above = if floor_implied {
+        config.keep.prescore_above.max(config.keep.top)
+    } else {
+        config.keep.prescore_above
+    };
+    let keep = KeepPolicy {
+        min_score: floor,
+        prescore_above,
+        ..config.keep
+    };
+    let mut stage = SegmentStage::new(Arc::new(segment), retriever, keep);
+    stage.accept = HitAcceptance {
+        min_subst: config.min_exact_run,
+        min_identity: 0.60,
+    };
+    stage
 }
 
 /// The default engine: batched banded Gotoh (AVX2 inter-sequence kernel when
@@ -245,14 +336,26 @@ impl Assigner {
         } else {
             WithAnchorWindow::disabled(config.d_window)
         };
-        let grammar = if d.is_some() { config.grammar } else { VdjGrammar { max_d: 0, ..config.grammar } };
+        let grammar = if d.is_some() {
+            config.grammar
+        } else {
+            VdjGrammar {
+                max_d: 0,
+                ..config.grammar
+            }
+        };
         Ok(Assigner {
             v: vj_stage(v, &config.v)?,
             j: vj_stage(j, &config.j)?,
             d: d.map(|set| d_stage(set, &config.d)),
             aligner: InterSequenceGotoh::new(),
             d_window,
-            d_admission: AnyOf(ExactRunFloor { min_run: config.d.min_exact_run }, config.d.distributed),
+            d_admission: AnyOf(
+                ExactRunFloor {
+                    min_run: config.d.min_exact_run,
+                },
+                config.d.distributed,
+            ),
             adjudicator: PlacementDag::new(grammar, config.objective, config.min_retained),
             refiner: NoRefine,
             options: config.options,
@@ -267,10 +370,10 @@ mod tests {
     #[test]
     fn derived_d_settings_are_lossless_bounds() {
         let mut d = DSegmentConfig::default();
-        assert_eq!((d.lossless_lmer(), d.lossless_min_score()), (6, 12));
-        d.min_exact_run = 4;
         assert_eq!((d.lossless_lmer(), d.lossless_min_score()), (4, 8));
+        d.distributed = None;
         d.min_exact_run = 6;
+        assert_eq!((d.lossless_lmer(), d.lossless_min_score()), (6, 12));
         d.distributed = Some(DistributedEvidence::default());
         assert_eq!((d.lossless_lmer(), d.lossless_min_score()), (4, 12));
     }

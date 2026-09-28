@@ -34,7 +34,11 @@ pub struct UngappedParams {
 
 impl Default for UngappedParams {
     fn default() -> Self {
-        Self { keep_top: 3, slack: 30, radius: 2 }
+        Self {
+            keep_top: 3,
+            slack: 30,
+            radius: 2,
+        }
     }
 }
 
@@ -47,7 +51,11 @@ pub struct UngappedPrefilter<R> {
 
 impl<R> UngappedPrefilter<R> {
     pub fn new(inner: R, segment: Arc<PreparedSegment>, params: Option<UngappedParams>) -> Self {
-        Self { inner, segment, params }
+        Self {
+            inner,
+            segment,
+            params,
+        }
     }
 }
 
@@ -93,7 +101,9 @@ impl<R: Retriever> Retriever for UngappedPrefilter<R> {
             ranked
                 .iter()
                 .enumerate()
-                .take_while(|&(rank, &(score, _))| rank < params.keep_top || score >= best.saturating_sub(params.slack))
+                .take_while(|&(rank, &(score, _))| {
+                    rank < params.keep_top || score >= best.saturating_sub(params.slack)
+                })
                 .map(|(_, &(_, candidate))| candidate),
         );
     }

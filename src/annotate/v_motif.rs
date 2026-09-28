@@ -84,7 +84,10 @@ pub struct VSearch {
 
 #[inline]
 fn at(aa: &[u8], k: isize) -> u8 {
-    usize::try_from(k).ok().and_then(|k| aa.get(k).copied()).unwrap_or(b'-')
+    usize::try_from(k)
+        .ok()
+        .and_then(|k| aa.get(k).copied())
+        .unwrap_or(b'-')
 }
 
 /// `YYC` dominates germline Cys104 contexts; `F`/`H` variants score less.
@@ -100,7 +103,10 @@ fn cys104_context(aa: &[u8], k: usize) -> (i32, bool) {
         b'F' => 3,
         _ => 0,
     };
-    let flank3 = matches!(at(aa, k - 3), b'V' | b'A' | b'T' | b'M' | b'I' | b'L' | b'D' | b'G' | b'E' | b'S');
+    let flank3 = matches!(
+        at(aa, k - 3),
+        b'V' | b'A' | b'T' | b'M' | b'I' | b'L' | b'D' | b'G' | b'E' | b'S'
+    );
     (flank1 + flank2 + i32::from(flank3), flank1 + flank2 > 0)
 }
 
@@ -115,18 +121,26 @@ fn trp41_context(aa: &[u8], k: usize) -> (i32, bool, i8) {
         b'Q' => -1,
         _ => 0,
     };
-    let score = 3 * i32::from(proline) + 3 * i32::from(glycine) + 2 * i32::from(glutamine)
+    let score = 3 * i32::from(proline)
+        + 3 * i32::from(glycine)
+        + 2 * i32::from(glutamine)
         + i32::from(matches!(second, b'R' | b'Q'));
     (score, proline || glycine, vote)
 }
 
 fn cys23_context(aa: &[u8], k: usize) -> i32 {
     let k = k as isize;
-    2 * i32::from(matches!(at(aa, k - 1), b'S' | b'T')) + i32::from(matches!(at(aa, k - 2), b'V' | b'I' | b'L' | b'M'))
+    2 * i32::from(matches!(at(aa, k - 1), b'S' | b'T'))
+        + i32::from(matches!(at(aa, k - 2), b'V' | b'I' | b'L' | b'M'))
 }
 
 /// Best `(position, score)` of `residue` over codons `range`, scored by `context`.
-fn best_in(aa: &[u8], range: std::ops::RangeInclusive<isize>, residue: u8, context: impl Fn(usize) -> i32) -> Option<(usize, i32)> {
+fn best_in(
+    aa: &[u8],
+    range: std::ops::RangeInclusive<isize>,
+    residue: u8,
+    context: impl Fn(usize) -> i32,
+) -> Option<(usize, i32)> {
     let lo = (*range.start()).max(0) as usize;
     let hi = (*range.end()).min(aa.len() as isize - 1);
     if hi < 0 {
@@ -144,7 +158,10 @@ pub fn find_v(codes: &[u8], search: VSearch, frames: &mut [Vec<u8>; 3]) -> Optio
     let n = codes.len();
     let mut best: Option<VHit> = None;
     for (frame, aa) in frames.iter().enumerate() {
-        let fixed = search.fixed_anchor.filter(|&a| a as usize % 3 == frame).map(|a| a as usize / 3);
+        let fixed = search
+            .fixed_anchor
+            .filter(|&a| a as usize % 3 == frame)
+            .map(|a| a as usize / 3);
         if search.fixed_anchor.is_some() && fixed.is_none() {
             continue;
         }
@@ -165,7 +182,10 @@ pub fn find_v(codes: &[u8], search: VSearch, frames: &mut [Vec<u8>; 3]) -> Optio
             let k = cys104 as isize;
             let (near, far) = match search.fr3_codons {
                 Some(l) => (14 + l as isize, 26 + l as isize),
-                None => (*TRP41_TO_CYS104.start() as isize, *TRP41_TO_CYS104.end() as isize),
+                None => (
+                    *TRP41_TO_CYS104.start() as isize,
+                    *TRP41_TO_CYS104.end() as isize,
+                ),
             };
             let trp = best_in(aa, k - far..=k - near, b'W', |w| trp41_context(aa, w).0);
             let (mut trp41_ok, mut chain_vote) = (false, 0);
@@ -175,16 +195,24 @@ pub fn find_v(codes: &[u8], search: VSearch, frames: &mut [Vec<u8>; 3]) -> Optio
                 trp41_ok = ok;
                 chain_vote = vote;
             }
-            let prior = search.cys23_prior.filter(|&(f, _)| f == frame).map(|(_, c)| c);
+            let prior = search
+                .cys23_prior
+                .filter(|&(f, _)| f == frame)
+                .map(|(_, c)| c);
             let window = trp.map(|(w, _)| {
                 let w = w as isize;
                 w - *CYS23_TO_TRP41.end() as isize..=w - *CYS23_TO_TRP41.start() as isize
             });
             let cys = window.clone().and_then(|window| {
-                best_in(aa, window, b'C', |c| cys23_context(aa, c) + CYS23_PRIOR_WEIGHT * i32::from(prior == Some(c)))
+                best_in(aa, window, b'C', |c| {
+                    cys23_context(aa, c) + CYS23_PRIOR_WEIGHT * i32::from(prior == Some(c))
+                })
             });
             let cys23_alternatives = window.map_or(0, |window| {
-                window.filter(|&c| c >= 0 && at(aa, c) == b'C').count().saturating_sub(1)
+                window
+                    .filter(|&c| c >= 0 && at(aa, c) == b'C')
+                    .count()
+                    .saturating_sub(1)
             });
             if let Some((_, bonus)) = cys {
                 score += 12 + bonus;
@@ -201,7 +229,9 @@ pub fn find_v(codes: &[u8], search: VSearch, frames: &mut [Vec<u8>; 3]) -> Optio
                 chain_vote,
                 cys23_alternatives,
             };
-            if best.map_or(true, |b| (hit.score, hit.confident) > (b.score, b.confident)) {
+            if best.map_or(true, |b| {
+                (hit.score, hit.confident) > (b.score, b.confident)
+            }) {
                 best = Some(hit);
             }
         }

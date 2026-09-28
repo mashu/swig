@@ -22,7 +22,11 @@ pub struct ResidualAdjudicator {
 
 impl Default for ResidualAdjudicator {
     fn default() -> Self {
-        Self { pair_bonus: 24, max_vj_overlap: 16, min_retained: [10, 3, 6] }
+        Self {
+            pair_bonus: 24,
+            max_vj_overlap: 16,
+            min_retained: [10, 3, 6],
+        }
     }
 }
 
@@ -43,7 +47,12 @@ struct Pick {
 
 impl Pick {
     fn segment(self) -> CalledSegment {
-        CalledSegment { placement: self.placement, entry: self.entry, exit: self.exit, span: self.span }
+        CalledSegment {
+            placement: self.placement,
+            entry: self.entry,
+            exit: self.exit,
+            span: self.span,
+        }
     }
 }
 
@@ -55,7 +64,12 @@ impl ResidualAdjudicator {
     fn clipped(&self, placements: &[Placement], i: usize, entry: u32, exit: u32) -> Option<Pick> {
         let p = &placements[i];
         let span = p.clip.span(entry, exit)?;
-        self.keeps(p.kind, &span).then_some(Pick { placement: i, entry, exit, span })
+        self.keeps(p.kind, &span).then_some(Pick {
+            placement: i,
+            entry,
+            exit,
+            span,
+        })
     }
 
     fn full(&self, placements: &[Placement], i: usize) -> Option<Pick> {
@@ -64,7 +78,12 @@ impl ResidualAdjudicator {
     }
 
     /// Best V/J pair with the optimal cut through their overlap.
-    fn best_pair(&self, placements: &[Placement], v: usize, j: usize) -> Option<(Score, Pick, Pick)> {
+    fn best_pair(
+        &self,
+        placements: &[Placement],
+        v: usize,
+        j: usize,
+    ) -> Option<(Score, Pick, Pick)> {
         let (pv, pj) = (&placements[v], &placements[j]);
         if pj.q_start() <= pv.q_start() {
             return None;
@@ -92,7 +111,12 @@ impl ResidualAdjudicator {
 impl Adjudicator for ResidualAdjudicator {
     type Scratch = ResidualScratch;
 
-    fn adjudicate(&self, query_len: usize, placements: &[Placement], scratch: &mut ResidualScratch) -> Option<CallPath> {
+    fn adjudicate(
+        &self,
+        query_len: usize,
+        placements: &[Placement],
+        scratch: &mut ResidualScratch,
+    ) -> Option<CallPath> {
         let ResidualScratch { v, d, j } = scratch;
         for list in [&mut *v, &mut *d, &mut *j] {
             list.clear();
@@ -143,7 +167,17 @@ impl Adjudicator for ResidualAdjudicator {
             });
 
         let d_score = pd.map_or(0, |p| p.span.score.max(0) / 2);
-        let segments: Vec<CalledSegment> = [pv, pd, pj].into_iter().flatten().map(Pick::segment).collect();
-        Some(CallPath { segments, score: PathScore { score: flank_score + d_score, d_count: u8::from(pd.is_some()) } })
+        let segments: Vec<CalledSegment> = [pv, pd, pj]
+            .into_iter()
+            .flatten()
+            .map(Pick::segment)
+            .collect();
+        Some(CallPath {
+            segments,
+            score: PathScore {
+                score: flank_score + d_score,
+                d_count: u8::from(pd.is_some()),
+            },
+        })
     }
 }

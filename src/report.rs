@@ -19,9 +19,9 @@ use crate::evidence::Evidence;
 use crate::germline::SegmentKind;
 use crate::pipeline::{AlleleCatalog, Call};
 use crate::read_regions::ReadRegions;
-use crate::translate::translate;
 use crate::scoring::Score;
 use crate::stats::KarlinAltschul;
+use crate::translate::translate;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SegmentReport {
@@ -108,12 +108,14 @@ fn segment_report<C: AlleleCatalog>(
 
     // Co-optimal alleles on the called interval.
     let mut names: Vec<&str> = Vec::new();
-    let tied = std::iter::once(placement).chain(
-        call.placements
-            .iter()
-            .filter(|p| p.kind == kind)
-            .filter(|p| p.clip.span(called.entry, called.exit).is_some_and(|s| s.score == span.score)),
-    );
+    let tied =
+        std::iter::once(placement).chain(call.placements.iter().filter(|p| p.kind == kind).filter(
+            |p| {
+                p.clip
+                    .span(called.entry, called.exit)
+                    .is_some_and(|s| s.score == span.score)
+            },
+        ));
     for p in tied {
         for &allele in &p.alleles {
             for name in set.allele(allele).names() {
@@ -136,7 +138,11 @@ fn segment_report<C: AlleleCatalog>(
             Op::Match => {
                 let (a, b) = (call.query[q as usize], reference[r as usize]);
                 let symbol = if a < N && a == b { '=' } else { 'X' };
-                (symbol, char::from(decode_base(a)), char::from(decode_base(b)))
+                (
+                    symbol,
+                    char::from(decode_base(a)),
+                    char::from(decode_base(b)),
+                )
             }
             Op::Ins => ('I', char::from(decode_base(call.query[q as usize])), '-'),
             Op::Del => ('D', '-', char::from(decode_base(reference[r as usize]))),
@@ -159,7 +165,8 @@ fn segment_report<C: AlleleCatalog>(
 
     let evidence = Evidence::from_columns(placement.clip.columns(span), &call.query, reference);
     let db_len: usize = set.alleles().iter().map(|a| a.codes.len()).sum();
-    let evalue = support[kind.index()].map(|ka| ka.evalue(span.score, call.query.len(), db_len, set.len()));
+    let evalue =
+        support[kind.index()].map(|ka| ka.evalue(span.score, call.query.len(), db_len, set.len()));
 
     Some(SegmentReport {
         call: names.join(","),
@@ -199,14 +206,20 @@ impl AirrRecord {
             regions: ReadRegions::from_call(call, catalog),
             oriented: decode(&call.query),
         };
-        let Some(path) = &call.path else { return record };
+        let Some(path) = &call.path else {
+            return record;
+        };
         record.path_score = Some(path.score.score);
 
         let mut junctions = Vec::with_capacity(3);
         for (i, called) in path.segments.iter().enumerate() {
             if i > 0 {
                 let (from, to) = (path.segments[i - 1].span.q_hi, called.span.q_lo);
-                junctions.push(if to > from { decode(&call.query[from as usize..to as usize]) } else { String::new() });
+                junctions.push(if to > from {
+                    decode(&call.query[from as usize..to as usize])
+                } else {
+                    String::new()
+                });
             }
             let report = segment_report(call, called, catalog, support);
             let slot = match call.placements[called.placement].kind {
@@ -225,7 +238,11 @@ impl AirrRecord {
     }
 
     pub fn tsv_header() -> String {
-        let mut columns = vec!["sequence_id".to_string(), "sequence".to_string(), "rev_comp".to_string()];
+        let mut columns = vec![
+            "sequence_id".to_string(),
+            "sequence".to_string(),
+            "rev_comp".to_string(),
+        ];
         for prefix in ["v", "d", "d2", "j"] {
             columns.extend(SEGMENT_FIELDS.iter().map(|f| format!("{prefix}_{f}")));
         }
@@ -235,11 +252,23 @@ impl AirrRecord {
         }
         columns.push("path_score".to_string());
         for (name, _) in REGION_COLUMNS {
-            columns.extend([name.to_string(), format!("{name}_start"), format!("{name}_end")]);
+            columns.extend([
+                name.to_string(),
+                format!("{name}_start"),
+                format!("{name}_end"),
+            ]);
         }
         columns.extend(
-            ["cdr3_aa", "junction", "junction_length", "junction_aa", "vj_in_frame", "stop_codon", "productive"]
-                .map(str::to_string),
+            [
+                "cdr3_aa",
+                "junction",
+                "junction_length",
+                "junction_aa",
+                "vj_in_frame",
+                "stop_codon",
+                "productive",
+            ]
+            .map(str::to_string),
         );
         columns.join("\t")
     }
@@ -275,23 +304,40 @@ impl AirrRecord {
             }
         }
         fields.push(self.path_score.map_or_else(String::new, |s| s.to_string()));
-        let slice = |range: &std::ops::Range<u32>| &self.oriented[range.start as usize..range.end as usize];
+        let slice =
+            |range: &std::ops::Range<u32>| &self.oriented[range.start as usize..range.end as usize];
         for (_, get) in REGION_COLUMNS {
             match get(&self.regions) {
-                Some(range) => fields.extend([slice(range).to_string(), (range.start + 1).to_string(), range.end.to_string()]),
+                Some(range) => fields.extend([
+                    slice(range).to_string(),
+                    (range.start + 1).to_string(),
+                    range.end.to_string(),
+                ]),
                 None => fields.extend([String::new(), String::new(), String::new()]),
             }
         }
         let aa = |range: &std::ops::Range<u32>| {
-            String::from_utf8(translate(&crate::alphabet::encode(slice(range).as_bytes()), 0)).expect("amino-acid letters are ASCII")
+            String::from_utf8(translate(
+                &crate::alphabet::encode(slice(range).as_bytes()),
+                0,
+            ))
+            .expect("amino-acid letters are ASCII")
         };
         fields.push(self.regions.cdr3.as_ref().map_or_else(String::new, aa));
         match &self.regions.junction {
-            Some(range) => fields.extend([slice(range).to_string(), range.len().to_string(), aa(range)]),
+            Some(range) => {
+                fields.extend([slice(range).to_string(), range.len().to_string(), aa(range)])
+            }
             None => fields.extend([String::new(), String::new(), String::new()]),
         }
-        let flag = |value: Option<bool>| value.map_or_else(String::new, |v| (if v { "T" } else { "F" }).to_string());
-        fields.extend([flag(self.regions.vj_in_frame), flag(self.regions.stop_codon), flag(self.regions.productive)]);
+        let flag = |value: Option<bool>| {
+            value.map_or_else(String::new, |v| (if v { "T" } else { "F" }).to_string())
+        };
+        fields.extend([
+            flag(self.regions.vj_in_frame),
+            flag(self.regions.stop_codon),
+            flag(self.regions.productive),
+        ]);
         fields.join("\t")
     }
 }

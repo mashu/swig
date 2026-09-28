@@ -21,7 +21,10 @@ pub enum Band {
 impl Band {
     /// Symmetric band of half-width `half_width` around diagonal `center`.
     pub fn around(center: i32, half_width: i32) -> Self {
-        Band::Diagonals { lo: center - half_width, hi: center + half_width }
+        Band::Diagonals {
+            lo: center - half_width,
+            hi: center + half_width,
+        }
     }
 
     /// Inclusive 1-based column range of 1-based `row`, or `None` if empty.

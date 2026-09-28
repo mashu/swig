@@ -42,7 +42,8 @@ impl KarlinAltschul {
             return None;
         }
         let mgf = |lambda: f64| {
-            p_match * (lambda * f64::from(reward)).exp() + p_mismatch * (lambda * f64::from(penalty)).exp()
+            p_match * (lambda * f64::from(reward)).exp()
+                + p_mismatch * (lambda * f64::from(penalty)).exp()
         };
         let (mut lo, mut hi) = (1e-9, 1.0);
         while mgf(hi) < 1.0 {
@@ -120,9 +121,17 @@ mod tests {
     fn reproduces_known_ungapped_parameters() {
         let pm1 = KarlinAltschul::ungapped(&AffineScoring::new(1, -1, -5, -1)).unwrap();
         assert!(close(pm1.lambda, 3f64.ln(), 1e-9));
-        assert!(close(pm1.k, 1.0 / 3.0, 1e-6), "±1 walk has K = (q−p)²/q = 1/3, got {}", pm1.k);
+        assert!(
+            close(pm1.k, 1.0 / 3.0, 1e-6),
+            "±1 walk has K = (q−p)²/q = 1/3, got {}",
+            pm1.k
+        );
         let ncbi = KarlinAltschul::ungapped(&AffineScoring::new(1, -3, -5, -2)).unwrap();
-        assert!(close(ncbi.lambda, 1.374, 1e-3) && close(ncbi.k, 0.711, 1e-3) && close(ncbi.h, 1.31, 1e-2));
+        assert!(
+            close(ncbi.lambda, 1.374, 1e-3)
+                && close(ncbi.k, 0.711, 1e-3)
+                && close(ncbi.h, 1.31, 1e-2)
+        );
         assert!(KarlinAltschul::ungapped(&AffineScoring::new(2, 0, -5, -1)).is_none());
     }
 

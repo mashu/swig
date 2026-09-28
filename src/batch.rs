@@ -46,16 +46,26 @@ where
                         let end = (start + CHUNK).min(queries.len());
                         calls.clear();
                         assigner.assign_many(&queries[start..end], &mut workspace, &mut calls);
-                        let outputs = calls.drain(..).enumerate().map(|(offset, call)| map(start + offset, call)).collect();
+                        let outputs = calls
+                            .drain(..)
+                            .enumerate()
+                            .map(|(offset, call)| map(start + offset, call))
+                            .collect();
                         done.push((start, outputs));
                     }
                 })
             })
             .collect();
-        workers.into_iter().flat_map(|w| w.join().expect("assignment worker panicked")).collect()
+        workers
+            .into_iter()
+            .flat_map(|w| w.join().expect("assignment worker panicked"))
+            .collect()
     });
     chunks.sort_unstable_by_key(|&(start, _)| start);
-    chunks.into_iter().flat_map(|(_, outputs)| outputs).collect()
+    chunks
+        .into_iter()
+        .flat_map(|(_, outputs)| outputs)
+        .collect()
 }
 
 /// Assign every query, returning calls in input order.

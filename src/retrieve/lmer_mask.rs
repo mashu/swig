@@ -39,7 +39,10 @@ pub struct LmerMaskRetriever {
 impl LmerMaskRetriever {
     /// Panics unless `1 <= l <= MAX_LMER` (a configuration programming error).
     pub fn build(set: &GermlineSet, l: usize, min_shared: u32) -> Self {
-        assert!((1..=MAX_LMER).contains(&l), "L-mer length must be in 1..={MAX_LMER}, got {l}");
+        assert!(
+            (1..=MAX_LMER).contains(&l),
+            "L-mer length must be in 1..={MAX_LMER}, got {l}"
+        );
         let shape = SeedShape::contiguous(l);
         let allele_count = set.len();
         let words = allele_count.div_ceil(64).max(1);
@@ -49,7 +52,13 @@ impl LmerMaskRetriever {
                 masks[key as usize * words + id / 64] |= 1u64 << (id % 64);
             }
         }
-        Self { shape, words, masks, allele_count, min_shared }
+        Self {
+            shape,
+            words,
+            masks,
+            allele_count,
+            min_shared,
+        }
     }
 }
 
@@ -74,7 +83,11 @@ impl Retriever for LmerMaskRetriever {
                 .iter()
                 .enumerate()
                 .filter(|&(_, &c)| c >= self.min_shared.max(1))
-                .map(|(id, &c)| Candidate { allele: id as AlleleId, band: Band::Full, votes: c }),
+                .map(|(id, &c)| Candidate {
+                    allele: id as AlleleId,
+                    band: Band::Full,
+                    votes: c,
+                }),
         );
         out.sort_by(|a, b| b.votes.cmp(&a.votes).then(a.allele.cmp(&b.allele)));
     }
@@ -90,7 +103,8 @@ mod tests {
     fn counts_shared_lmers() {
         let mut set = GermlineSet::new(SegmentKind::D);
         set.push("D1*01", b"GTATTACGATATTTTGACTGG", None).unwrap();
-        set.push("D2*01", b"AGGATATTGTAGTAGTACCAGCTGCTATGCC", None).unwrap();
+        set.push("D2*01", b"AGGATATTGTAGTAGTACCAGCTGCTATGCC", None)
+            .unwrap();
         set.push("D3*01", b"CCCCCCCCCC", None).unwrap();
         let retriever = LmerMaskRetriever::build(&set, 4, 1);
         let mut scratch = RetrievalScratch::default();

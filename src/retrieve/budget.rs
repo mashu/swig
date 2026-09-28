@@ -15,11 +15,11 @@ impl CandidateBudget for FixedBudget {
     }
 }
 
-/// The AER rule: refine deeper when the vote ranking is ambiguous.
+/// Swig's AER V budget.
 ///
-/// If the runner-up gene is within `relative` (fraction of the leader) or
-/// `absolute` weighted votes of the leader, keep up to `max` genes, otherwise
-/// keep `base`.
+/// Always keep `base` genes (3, which is `max(top_v, 3)`). Then keep each
+/// further gene whose votes sit within `max(absolute, relative · leader)` of
+/// the leader, up to `max` (16). J uses `base == max == 3`, so it does not expand.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AmbiguityBudget {
     pub base: usize,
@@ -30,24 +30,35 @@ pub struct AmbiguityBudget {
 
 impl Default for AmbiguityBudget {
     fn default() -> Self {
-        Self { base: 4, max: 16, relative: 0.05, absolute: 8 }
+        Self {
+            base: 3,
+            max: 16,
+            relative: 0.05,
+            absolute: 8,
+        }
     }
 }
 
 impl AmbiguityBudget {
-    fn ambiguous(&self, leader: u32, other: u32) -> bool {
-        let gap = leader.saturating_sub(other);
-        gap <= self.absolute || f64::from(gap) <= self.relative * f64::from(leader)
+    fn margin(&self, leader: u32) -> u32 {
+        let relative = (f64::from(leader) * self.relative) as u32;
+        self.absolute.max(relative)
     }
 }
 
 impl CandidateBudget for AmbiguityBudget {
     fn genes_to_keep(&self, ranked_gene_votes: &[u32]) -> usize {
-        let keep = match ranked_gene_votes {
-            [leader, second, ..] if self.ambiguous(*leader, *second) => self.max,
-            _ => self.base,
+        let Some(&leader) = ranked_gene_votes.first() else {
+            return 0;
         };
-        keep.min(ranked_gene_votes.len())
+        let mut keep = self.base.min(ranked_gene_votes.len());
+        let margin = self.margin(leader);
+        while keep < self.max.min(ranked_gene_votes.len())
+            && leader.saturating_sub(ranked_gene_votes[keep]) <= margin
+        {
+            keep += 1;
+        }
+        keep
     }
 }
 
@@ -58,10 +69,27 @@ mod tests {
     #[test]
     fn ambiguity_widens_the_pool() {
         let budget = AmbiguityBudget::default();
-        let clear: Vec<u32> = [400, 200].into_iter().chain(std::iter::repeat(10).take(20)).collect();
-        let tied: Vec<u32> = [400, 395].into_iter().chain(std::iter::repeat(10).take(20)).collect();
-        assert_eq!(budget.genes_to_keep(&clear), 4);
-        assert_eq!(budget.genes_to_keep(&tied), 16);
+        let clear: Vec<u32> = [400, 200]
+            .into_iter()
+            .chain(std::iter::repeat(10).take(20))
+            .collect();
+        let near: Vec<u32> = [400, 395, 390]
+            .into_iter()
+            .chain(std::iter::repeat(10).take(20))
+            .collect();
+        let deep = vec![100u32; 20];
+        assert_eq!(budget.genes_to_keep(&clear), 3);
+        assert_eq!(budget.genes_to_keep(&near), 3);
+        assert_eq!(budget.genes_to_keep(&deep), 16);
+        assert_eq!(
+            AmbiguityBudget {
+                base: 3,
+                max: 3,
+                ..budget
+            }
+            .genes_to_keep(&deep),
+            3
+        );
         assert_eq!(FixedBudget(3).genes_to_keep(&[5]), 1);
     }
 }

@@ -67,7 +67,11 @@ impl fmt::Display for IndexError {
                 "allele '{allele}' is {len} nt; seed postings support at most {} nt",
                 MAX_POSITION + 1
             ),
-            Self::TooManyAlleles(n) => write!(f, "{n} alleles exceed the posting limit of {}", MAX_ALLELE + 1),
+            Self::TooManyAlleles(n) => write!(
+                f,
+                "{n} alleles exceed the posting limit of {}",
+                MAX_ALLELE + 1
+            ),
         }
     }
 }
@@ -97,7 +101,10 @@ impl KmerIndex {
         let mut pairs: Vec<(u64, Posting)> = Vec::new();
         for (id, allele) in set.alleles().iter().enumerate() {
             if allele.codes.len() > MAX_POSITION as usize + 1 {
-                return Err(IndexError::SequenceTooLong { allele: allele.name.clone(), len: allele.codes.len() });
+                return Err(IndexError::SequenceTooLong {
+                    allele: allele.name.clone(),
+                    len: allele.codes.len(),
+                });
             }
             let id = AlleleId::try_from(id).expect("checked against MAX_ALLELE");
             pairs.extend(
@@ -131,7 +138,11 @@ impl KmerIndex {
             offsets.push(pairs.len() as u32);
             Lookup::Sorted { keys, offsets }
         };
-        Ok(Self { shape, lookup, postings })
+        Ok(Self {
+            shape,
+            lookup,
+            postings,
+        })
     }
 
     pub fn shape(&self) -> &SeedShape {
@@ -179,14 +190,26 @@ mod tests {
         let mut set = set();
         set.push("C*01", b"GGATCCATTGACCAGTAAGC", None).unwrap();
         let small = KmerIndex::build(&set, SeedShape::contiguous(4)).unwrap();
-        let key = SeedShape::contiguous(4).kmers(&encode(b"ACGT")).next().unwrap().1;
-        let hits: Vec<_> = small.postings(key).iter().map(|p| (p.allele(), p.position())).collect();
+        let key = SeedShape::contiguous(4)
+            .kmers(&encode(b"ACGT"))
+            .next()
+            .unwrap()
+            .1;
+        let hits: Vec<_> = small
+            .postings(key)
+            .iter()
+            .map(|p| (p.allele(), p.position()))
+            .collect();
         assert_eq!(hits, vec![(0, 0), (0, 4), (1, 2)]);
 
         let shape13 = SeedShape::contiguous(13);
         let large = KmerIndex::build(&set, shape13.clone()).unwrap();
         let key13 = shape13.kmers(&encode(b"ATCCATTGACCAG")).next().unwrap().1;
-        let hits: Vec<_> = large.postings(key13).iter().map(|p| (p.allele(), p.position())).collect();
+        let hits: Vec<_> = large
+            .postings(key13)
+            .iter()
+            .map(|p| (p.allele(), p.position()))
+            .collect();
         assert_eq!(hits, vec![(2, 2)]);
         assert!(large.postings(key13 ^ 1).is_empty());
     }

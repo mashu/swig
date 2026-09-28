@@ -42,7 +42,11 @@ pub struct PlacementDag<G = VdjGrammar, M = EngineeringObjective> {
 
 impl Default for PlacementDag {
     fn default() -> Self {
-        Self { grammar: VdjGrammar::VDJ, model: EngineeringObjective::default(), min_retained: [10, 3, 6] }
+        Self {
+            grammar: VdjGrammar::VDJ,
+            model: EngineeringObjective::default(),
+            min_retained: [10, 3, 6],
+        }
     }
 }
 
@@ -101,10 +105,9 @@ pub struct DagScratch {
 }
 
 fn upsert(states: &mut Vec<State>, candidate: State) {
-    match states
-        .iter_mut()
-        .find(|s| s.entry == candidate.entry && s.d_used == candidate.d_used && s.first == candidate.first)
-    {
+    match states.iter_mut().find(|s| {
+        s.entry == candidate.entry && s.d_used == candidate.d_used && s.first == candidate.first
+    }) {
         Some(existing) if candidate.score > existing.score => *existing = candidate,
         Some(_) => {}
         None => states.push(candidate),
@@ -112,7 +115,12 @@ fn upsert(states: &mut Vec<State>, candidate: State) {
 }
 
 /// Group a node's states by `(d_used, first)` and build prefix maxima by entry position.
-fn rank_states(states: &[State], perm: &mut Vec<u32>, ranked: &mut Vec<Ranked>, groups: &mut Vec<Group>) {
+fn rank_states(
+    states: &[State],
+    perm: &mut Vec<u32>,
+    ranked: &mut Vec<Ranked>,
+    groups: &mut Vec<Group>,
+) {
     perm.clear();
     perm.extend(0..states.len() as u32);
     perm.sort_by_key(|&i| {
@@ -123,15 +131,29 @@ fn rank_states(states: &[State], perm: &mut Vec<u32>, ranked: &mut Vec<Ranked>, 
     groups.clear();
     for &i in perm.iter() {
         let s = &states[i as usize];
-        let new_group = groups.last().map_or(true, |g| g.d_used != s.d_used || g.first != s.first);
+        let new_group = groups
+            .last()
+            .map_or(true, |g| g.d_used != s.d_used || g.first != s.first);
         if new_group {
-            groups.push(Group { d_used: s.d_used, first: s.first, start: ranked.len(), end: ranked.len() });
+            groups.push(Group {
+                d_used: s.d_used,
+                first: s.first,
+                start: ranked.len(),
+                end: ranked.len(),
+            });
         }
         let running = match ranked.last() {
             Some(prev) if !new_group && prev.best_key >= s.key() => *prev,
-            _ => Ranked { q_lo: s.q_lo, best_key: s.key(), state: i },
+            _ => Ranked {
+                q_lo: s.q_lo,
+                best_key: s.key(),
+                state: i,
+            },
         };
-        ranked.push(Ranked { q_lo: s.q_lo, ..running });
+        ranked.push(Ranked {
+            q_lo: s.q_lo,
+            ..running
+        });
         groups.last_mut().expect("pushed above").end = ranked.len();
     }
 }
@@ -145,7 +167,11 @@ fn best_up_to(ranked: &[Ranked], threshold: i64) -> Option<Ranked> {
 
 impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
     pub fn new(grammar: G, model: M, min_retained: [u32; 3]) -> Self {
-        Self { grammar, model, min_retained }
+        Self {
+            grammar,
+            model,
+            min_retained,
+        }
     }
 
     #[inline]
@@ -157,9 +183,20 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
 impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
     type Scratch = DagScratch;
 
-    fn adjudicate(&self, _query_len: usize, placements: &[Placement], scratch: &mut DagScratch) -> Option<CallPath> {
+    fn adjudicate(
+        &self,
+        _query_len: usize,
+        placements: &[Placement],
+        scratch: &mut DagScratch,
+    ) -> Option<CallPath> {
         let n = placements.len();
-        let DagScratch { order, states, perm, ranked, groups } = scratch;
+        let DagScratch {
+            order,
+            states,
+            perm,
+            ranked,
+            groups,
+        } = scratch;
         order.clear();
         order.extend(0..n as u32);
         order.sort_by_key(|&i| {
@@ -202,15 +239,31 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
 
             // Paths ending at b (b unclipped on the right).
             if let Some(exit) = b.clip.exit(b.q_end()) {
-                for g in groups.iter().filter(|g| self.grammar.can_end(g.first, b.kind)) {
-                    let Some(r) = best_up_to(&ranked[g.start..g.end], i64::from(exit.q) - min_b) else { continue };
+                for g in groups
+                    .iter()
+                    .filter(|g| self.grammar.can_end(g.first, b.kind))
+                {
+                    let Some(r) = best_up_to(&ranked[g.start..g.end], i64::from(exit.q) - min_b)
+                    else {
+                        continue;
+                    };
                     let total = r.best_key
                         + exit.prefix
                         + self.model.segment_bonus(b, g.d_used)
                         + self.model.end(g.first, b.kind, g.d_used);
-                    let candidate = PathScore { score: total, d_count: g.d_used };
+                    let candidate = PathScore {
+                        score: total,
+                        d_count: g.d_used,
+                    };
                     if best.map_or(true, |(current, _)| candidate > current) {
-                        best = Some((candidate, Back { node: pos as u32, state: r.state, exit: b.q_end() }));
+                        best = Some((
+                            candidate,
+                            Back {
+                                node: pos as u32,
+                                state: r.state,
+                                exit: b.q_end(),
+                            },
+                        ));
                     }
                 }
             }
@@ -235,18 +288,33 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
                     let d_next = g.d_used + u8::from(e.kind == SegmentKind::D);
                     let bonus = self.model.segment_bonus(b, g.d_used);
                     let group = &ranked[g.start..g.end];
-                    let cuts = if overlapping { first_cut..=last_cut } else { 0..=0 };
+                    let cuts = if overlapping {
+                        first_cut..=last_cut
+                    } else {
+                        0..=0
+                    };
                     for c in cuts {
-                        let (exit_at, entry_at) = if overlapping { (c, c) } else { (b.q_end(), e.q_start()) };
-                        let (Some(xb), Some(en)) = (b.clip.exit(exit_at), e.clip.entry(entry_at)) else { continue };
+                        let (exit_at, entry_at) = if overlapping {
+                            (c, c)
+                        } else {
+                            (b.q_end(), e.q_start())
+                        };
+                        let (Some(xb), Some(en)) = (b.clip.exit(exit_at), e.clip.entry(entry_at))
+                        else {
+                            continue;
+                        };
                         if e.q_end() < en.q + min_e {
                             continue;
                         }
-                        let Some(r) = best_up_to(group, i64::from(xb.q) - min_b) else { continue };
+                        let Some(r) = best_up_to(group, i64::from(xb.q) - min_b) else {
+                            continue;
+                        };
                         let score = r.best_key
                             + xb.prefix
                             + bonus
-                            + self.model.junction(b.kind, e.kind, en.q.saturating_sub(xb.q));
+                            + self
+                                .model
+                                .junction(b.kind, e.kind, en.q.saturating_sub(xb.q));
                         upsert(
                             &mut states[epos],
                             State {
@@ -256,7 +324,11 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
                                 d_used: d_next,
                                 first: g.first,
                                 score,
-                                back: Some(Back { node: pos as u32, state: r.state, exit: exit_at }),
+                                back: Some(Back {
+                                    node: pos as u32,
+                                    state: r.state,
+                                    exit: exit_at,
+                                }),
                             },
                         );
                     }
@@ -273,7 +345,12 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
                 .clip
                 .span(state.entry, at.exit)
                 .expect("DAG only records spans that keep min_retained bases");
-            segments.push(CalledSegment { placement, entry: state.entry, exit: at.exit, span });
+            segments.push(CalledSegment {
+                placement,
+                entry: state.entry,
+                exit: at.exit,
+                span,
+            });
             match state.back {
                 Some(back) => at = back,
                 None => break,

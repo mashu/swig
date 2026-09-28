@@ -37,7 +37,10 @@ pub struct GapCosts {
 impl GapCosts {
     /// Panics unless `open <= extend <= 0` (a configuration programming error).
     pub const fn new(open: Score, extend: Score) -> Self {
-        assert!(open <= extend && extend <= 0, "affine gaps need open <= extend <= 0");
+        assert!(
+            open <= extend && extend <= 0,
+            "affine gaps need open <= extend <= 0"
+        );
         Self { open, extend }
     }
 
@@ -64,7 +67,11 @@ pub struct AffineScoring {
 
 impl AffineScoring {
     pub const fn new(matched: Score, mismatch: Score, gap_open: Score, gap_extend: Score) -> Self {
-        Self { matched, mismatch, gaps: GapCosts::new(gap_open, gap_extend) }
+        Self {
+            matched,
+            mismatch,
+            gaps: GapCosts::new(gap_open, gap_extend),
+        }
     }
 
     /// Uniform substitution score; ambiguous bases score 0.
@@ -100,7 +107,11 @@ impl SubstitutionProfile {
     pub fn build<M: SubstitutionModel + ?Sized>(model: &M, reference: &[u8]) -> Self {
         let len = reference.len();
         let mut rows = vec![0; ALPHABET_SIZE * len];
-        for (code, row) in rows.chunks_exact_mut(len.max(1)).enumerate().take(ALPHABET_SIZE) {
+        for (code, row) in rows
+            .chunks_exact_mut(len.max(1))
+            .enumerate()
+            .take(ALPHABET_SIZE)
+        {
             let code = u8::try_from(code).expect("alphabet is tiny");
             for (j, slot) in row.iter_mut().enumerate() {
                 *slot = model.score(code, reference, j);
@@ -108,7 +119,12 @@ impl SubstitutionProfile {
         }
         let max = rows.iter().copied().max().unwrap_or(0);
         let min = rows.iter().copied().min().unwrap_or(0);
-        Self { len, rows, max, min }
+        Self {
+            len,
+            rows,
+            max,
+            min,
+        }
     }
 
     /// Largest single-cell score; bounds any alignment score by `max × min(n, m)`.

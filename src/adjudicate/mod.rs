@@ -36,7 +36,9 @@ pub struct PathScore {
 
 impl Ord for PathScore {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.score.cmp(&other.score).then(other.d_count.cmp(&self.d_count))
+        self.score
+            .cmp(&other.score)
+            .then(other.d_count.cmp(&self.d_count))
     }
 }
 
@@ -68,5 +70,10 @@ pub struct CallPath {
 pub trait Adjudicator: Send + Sync {
     type Scratch: Default + Send;
 
-    fn adjudicate(&self, query_len: usize, placements: &[Placement], scratch: &mut Self::Scratch) -> Option<CallPath>;
+    fn adjudicate(
+        &self,
+        query_len: usize,
+        placements: &[Placement],
+        scratch: &mut Self::Scratch,
+    ) -> Option<CallPath>;
 }

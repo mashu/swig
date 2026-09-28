@@ -101,7 +101,13 @@ fn fill<const TRACE: bool>(
     if n == 0 || m == 0 {
         return None;
     }
-    let GotohWorkspace { h, ins, trace, row_first_col, row_offset } = ws;
+    let GotohWorkspace {
+        h,
+        ins,
+        trace,
+        row_first_col,
+        row_offset,
+    } = ws;
     h.clear();
     h.resize(m + 1, 0);
     ins.clear();
@@ -118,7 +124,11 @@ fn fill<const TRACE: bool>(
     // D(i,j+1) = max(S(i,j) + go, D(i,j) + ge) with S = max(t, D), t = max(0, diag, I):
     //          = max(t + go, D + max(go, ge)).  `t` is off the loop-carried chain.
     let del_step = open.max(extend);
-    let mut best = Best { score: 0, row: 0, col: 0 };
+    let mut best = Best {
+        score: 0,
+        row: 0,
+        col: 0,
+    };
 
     for i in 1..=n {
         let Some((lo, hi)) = band.columns(i, m) else {
@@ -149,7 +159,12 @@ fn fill<const TRACE: bool>(
         let mut del_extends = false;
         let mut row_max: Score = 0;
 
-        for (k, ((h_cell, ins_cell), &s)) in h_row.iter_mut().zip(ins_row.iter_mut()).zip(substitution).enumerate() {
+        for (k, ((h_cell, ins_cell), &s)) in h_row
+            .iter_mut()
+            .zip(ins_row.iter_mut())
+            .zip(substitution)
+            .enumerate()
+        {
             let h_up = *h_cell;
             let ins_open = h_up + open;
             let ins_extend = *ins_cell + extend;
@@ -165,7 +180,8 @@ fn fill<const TRACE: bool>(
                 let source = u8::from(diag > 0) * SRC_DIAG;
                 let source = source + u8::from(ins_score > t0) * (SRC_INS - source);
                 let source = source + u8::from(del > t) * (SRC_DEL - source);
-                trace_row[k] = source | (u8::from(ins_extend > ins_open) << 2) | (u8::from(del_extends) << 3);
+                trace_row[k] =
+                    source | (u8::from(ins_extend > ins_open) << 2) | (u8::from(del_extends) << 3);
             }
 
             let del_open = t + open;
@@ -178,8 +194,15 @@ fn fill<const TRACE: bool>(
             row_max = max_branchless(row_max, score);
         }
         if row_max > best.score {
-            let k = h_row.iter().position(|&x| x == row_max).expect("row maximum is attained in the row");
-            best = Best { score: row_max, row: i, col: lo + k };
+            let k = h_row
+                .iter()
+                .position(|&x| x == row_max)
+                .expect("row maximum is attained in the row");
+            best = Best {
+                score: row_max,
+                row: i,
+                col: lo + k,
+            };
         }
     }
     (best.score > 0).then_some(best)
@@ -190,7 +213,11 @@ fn fill<const TRACE: bool>(
 /// `cell(i, j)` returns the code of an in-band cell and `None` for row 0,
 /// column 0 and out-of-band cells. Every kernel that produces the same codes
 /// therefore produces the same alignment.
-pub(super) fn traceback_with(cell: impl Fn(usize, usize) -> Option<u8>, row: usize, col: usize) -> (usize, usize, Vec<Op>) {
+pub(super) fn traceback_with(
+    cell: impl Fn(usize, usize) -> Option<u8>,
+    row: usize,
+    col: usize,
+) -> (usize, usize, Vec<Op>) {
     enum State {
         Diagonal,
         Insertion,
@@ -249,7 +276,11 @@ impl Aligner for BandedGotoh {
         workspace: &mut GotohWorkspace,
     ) -> Option<ScoreHit> {
         let best = fill::<false>(query, profile, gaps, band, workspace)?;
-        Some(ScoreHit { score: best.score, q_end: best.row as u32, r_end: best.col as u32 })
+        Some(ScoreHit {
+            score: best.score,
+            q_end: best.row as u32,
+            r_end: best.col as u32,
+        })
     }
 
     fn align(
@@ -261,7 +292,8 @@ impl Aligner for BandedGotoh {
         workspace: &mut GotohWorkspace,
     ) -> Option<Alignment> {
         let best = fill::<true>(query, profile, gaps, band, workspace)?;
-        let (q_start, r_start, ops) = traceback_with(|i, j| workspace.trace_cell(i, j), best.row, best.col);
+        let (q_start, r_start, ops) =
+            traceback_with(|i, j| workspace.trace_cell(i, j), best.row, best.col);
         Some(Alignment {
             q_start: q_start as u32,
             q_end: best.row as u32,
@@ -315,9 +347,14 @@ mod tests {
         let reference = encode(b"ACGTACGGTACCA");
         let profile = SubstitutionProfile::build(&SCORING, &reference);
         let mut ws = GotohWorkspace::default();
-        let aln = BandedGotoh.align(&reference, &profile, SCORING.gaps, Band::Full, &mut ws).unwrap();
+        let aln = BandedGotoh
+            .align(&reference, &profile, SCORING.gaps, Band::Full, &mut ws)
+            .unwrap();
         assert_eq!(aln.score, 26);
-        assert_eq!((aln.q_start, aln.q_end, aln.r_start, aln.r_end), (0, 13, 0, 13));
+        assert_eq!(
+            (aln.q_start, aln.q_end, aln.r_start, aln.r_end),
+            (0, 13, 0, 13)
+        );
         assert!(aln.ops.iter().all(|&op| op == Op::Match));
     }
 
@@ -327,7 +364,9 @@ mod tests {
         let query = encode(b"ACGTACGGTAGGGCCATTGACCA");
         let profile = SubstitutionProfile::build(&SCORING, &reference);
         let mut ws = GotohWorkspace::default();
-        let aln = BandedGotoh.align(&query, &profile, SCORING.gaps, Band::Full, &mut ws).unwrap();
+        let aln = BandedGotoh
+            .align(&query, &profile, SCORING.gaps, Band::Full, &mut ws)
+            .unwrap();
         assert_eq!(aln.score, 20 * 2 + SCORING.gaps.cost(3));
         assert_eq!(aln.ops.iter().filter(|&&op| op == Op::Ins).count(), 3);
         assert_eq!(rescore(&aln, &query, &reference), aln.score);
@@ -351,10 +390,16 @@ mod tests {
             }
             let profile = SubstitutionProfile::build(&SCORING, &reference);
             let full = BandedGotoh.score(&query, &profile, SCORING.gaps, Band::Full, &mut ws);
-            let banded =
-                BandedGotoh.score(&query, &profile, SCORING.gaps, Band::around(0, 100), &mut ws);
+            let banded = BandedGotoh.score(
+                &query,
+                &profile,
+                SCORING.gaps,
+                Band::around(0, 100),
+                &mut ws,
+            );
             assert_eq!(full, banded);
-            let aln = BandedGotoh.align(&query, &profile, SCORING.gaps, Band::around(0, 8), &mut ws);
+            let aln =
+                BandedGotoh.align(&query, &profile, SCORING.gaps, Band::around(0, 8), &mut ws);
             if let Some(aln) = aln {
                 assert_eq!(rescore(&aln, &query, &reference), aln.score);
                 assert_eq!(aln.ops.first(), Some(&Op::Match));
@@ -394,7 +439,11 @@ mod tests {
                 _ => (-1, -4), // opening cheaper than extending: score still exact
             };
             let affine = open <= extend;
-            let scoring = AffineScoring { matched: 2, mismatch: -3, gaps: GapCosts { open, extend } };
+            let scoring = AffineScoring {
+                matched: 2,
+                mismatch: -3,
+                gaps: GapCosts { open, extend },
+            };
             let len = 20 + (next() % 30) as usize;
             let reference = random_codes(&mut next, len);
             let mut query = reference.clone();
@@ -407,10 +456,19 @@ mod tests {
                 query.insert(p, (next() % 4) as u8);
             }
             let profile = SubstitutionProfile::build(&scoring, &reference);
-            let fast = BandedGotoh.score(&query, &profile, scoring.gaps, Band::Full, &mut ws).map_or(0, |h| h.score);
-            assert_eq!(fast, naive_local_score(&query, &reference, &scoring), "case {case}");
+            let fast = BandedGotoh
+                .score(&query, &profile, scoring.gaps, Band::Full, &mut ws)
+                .map_or(0, |h| h.score);
+            assert_eq!(
+                fast,
+                naive_local_score(&query, &reference, &scoring),
+                "case {case}"
+            );
             // Column accounting ("consecutive gaps extend") is only defined for open <= extend.
-            if let Some(aln) = BandedGotoh.align(&query, &profile, scoring.gaps, Band::Full, &mut ws).filter(|_| affine) {
+            if let Some(aln) = BandedGotoh
+                .align(&query, &profile, scoring.gaps, Band::Full, &mut ws)
+                .filter(|_| affine)
+            {
                 assert_eq!(aln.score, fast);
                 let mut rescored = 0;
                 let mut previous = None;
@@ -422,7 +480,10 @@ mod tests {
                     };
                     previous = Some(op);
                 }
-                assert_eq!(rescored, fast, "traceback must realise the optimum (case {case})");
+                assert_eq!(
+                    rescored, fast,
+                    "traceback must realise the optimum (case {case})"
+                );
             }
         }
     }

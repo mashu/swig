@@ -34,7 +34,8 @@ are merged and reported under all their names. `prepare` writes the result as
 annotated FASTA plus annotation.tsv for review; header values always win.
 
 options:
-  --profile NAME       truth (default) | r | igblast | sensitive-d
+  --profile NAME       r (default) | truth | igblast | sensitive-d
+                       r is Swig's r_optimized; also accepts r_optimized, truth_optimized, sensitive_d
   --threads N          worker threads (default: all cores)
   --chain TYPE         heavy | light (default: voted from the database)
   --tandem-d           allow VDDJ paths (second D as a first-class node)
@@ -90,14 +91,22 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--j" => set_once(&mut args.j, "--j", value("--j")?)?,
             "--out" if args.prepare => set_once(&mut args.out, "--out", value("--out")?)?,
             "--chain" => set_once(&mut args.chain, "--chain", value("--chain")?)?,
-            "--profile" if !args.prepare => set_once(&mut args.profile, "--profile", value("--profile")?)?,
-            "--threads" if !args.prepare => set_once(&mut args.threads, "--threads", value("--threads")?)?,
+            "--profile" if !args.prepare => {
+                set_once(&mut args.profile, "--profile", value("--profile")?)?
+            }
+            "--threads" if !args.prepare => {
+                set_once(&mut args.threads, "--threads", value("--threads")?)?
+            }
             "--tandem-d" if !args.prepare => args.tandem_d = true,
             "--forward-only" if !args.prepare => args.forward_only = true,
             "--no-anchor-window" if !args.prepare => args.no_anchor_window = true,
             "--residual" if !args.prepare => args.residual = true,
             flag if flag.starts_with("--") => {
-                let mode = if args.prepare { "prepare" } else { "assignment" };
+                let mode = if args.prepare {
+                    "prepare"
+                } else {
+                    "assignment"
+                };
                 return Err(format!("unknown option '{flag}' for {mode}"));
             }
             path if !args.prepare => set_once(&mut args.reads, "the reads file", path.to_string())?,
@@ -120,15 +129,34 @@ fn load_set(kind: SegmentKind, option: &str, path: &str) -> Result<GermlineSet, 
 
 fn load_database(args: &Args) -> Result<PreparedDatabase, Box<dyn Error>> {
     let chain = match args.chain.as_deref() {
-        Some(name) => Some(ChainType::from_name(name).ok_or_else(|| format!("--chain expects heavy or light, got '{name}'"))?),
+        Some(name) => Some(
+            ChainType::from_name(name)
+                .ok_or_else(|| format!("--chain expects heavy or light, got '{name}'"))?,
+        ),
         None => None,
     };
-    let v = load_set(SegmentKind::V, "--v", args.v.as_deref().ok_or("--v is required")?)?;
-    let d = args.d.as_deref().map(|path| load_set(SegmentKind::D, "--d", path)).transpose()?;
-    let j = load_set(SegmentKind::J, "--j", args.j.as_deref().ok_or("--j is required")?)?;
+    let v = load_set(
+        SegmentKind::V,
+        "--v",
+        args.v.as_deref().ok_or("--v is required")?,
+    )?;
+    let d = args
+        .d
+        .as_deref()
+        .map(|path| load_set(SegmentKind::D, "--d", path))
+        .transpose()?;
+    let j = load_set(
+        SegmentKind::J,
+        "--j",
+        args.j.as_deref().ok_or("--j is required")?,
+    )?;
     let started = Instant::now();
     let database = prepare(v, d, j, AnnotateOptions { chain })?;
-    eprintln!("vdj-assign: database prepared in {:.1} ms: {}", started.elapsed().as_secs_f64() * 1e3, database.summary());
+    eprintln!(
+        "vdj-assign: database prepared in {:.1} ms: {}",
+        started.elapsed().as_secs_f64() * 1e3,
+        database.summary()
+    );
     if database.annotation.uncertain() > 0 {
         eprintln!(
             "vdj-assign: {} alleles have transferred, low-confidence or missing anchors; see `vdj-assign prepare` annotation.tsv",
@@ -153,14 +181,21 @@ fn stream<R: BufRead, T: VdjAssigner + AlleleCatalog + Sync>(
     let mut batch = Vec::with_capacity(BATCH);
     loop {
         batch.clear();
-        if reads.read_batch(BATCH, &mut batch).map_err(|e| format!("{source}: {e}"))? == 0 {
+        if reads
+            .read_batch(BATCH, &mut batch)
+            .map_err(|e| format!("{source}: {e}"))?
+            == 0
+        {
             break;
         }
         let encoded: Vec<Vec<u8>> = batch.iter().map(|r| encode(&r.sequence)).collect();
         let rows = assign_map(assigner, &encoded, threads, |i, call| {
             let sequence = String::from_utf8_lossy(&batch[i].sequence);
             let has_path = call.path.is_some();
-            (AirrRecord::from_call(batch[i].id(), &sequence, &call, assigner, support).to_tsv(), has_path)
+            (
+                AirrRecord::from_call(batch[i].id(), &sequence, &call, assigner, support).to_tsv(),
+                has_path,
+            )
         });
         for (row, has_path) in rows {
             writeln!(out, "{row}")?;
@@ -182,7 +217,13 @@ fn stream_input<T: VdjAssigner + AlleleCatalog + Sync>(
         "-" => stream(io::stdin().lock(), "stdin", assigner, threads, support),
         _ => {
             let file = File::open(path).map_err(|e| format!("{path}: {e}"))?;
-            stream(BufReader::with_capacity(1 << 20, file), path, assigner, threads, support)
+            stream(
+                BufReader::with_capacity(1 << 20, file),
+                path,
+                assigner,
+                threads,
+                support,
+            )
         }
     }
 }
@@ -191,7 +232,14 @@ fn run_prepare(args: &Args) -> Result<(), Box<dyn Error>> {
     let out = args.out.as_deref().ok_or("prepare needs --out DIR")?;
     let database = load_database(args)?;
     database.write(Path::new(out))?;
-    eprintln!("vdj-assign: wrote {out}/V.fasta, J.fasta{}, annotation.tsv", if database.d.is_some() { ", D.fasta" } else { "" });
+    eprintln!(
+        "vdj-assign: wrote {out}/V.fasta, J.fasta{}, annotation.tsv",
+        if database.d.is_some() {
+            ", D.fasta"
+        } else {
+            ""
+        }
+    );
     Ok(())
 }
 
@@ -199,13 +247,20 @@ fn run_assign(args: &Args) -> Result<(), Box<dyn Error>> {
     if cfg!(debug_assertions) {
         eprintln!("vdj-assign: warning: debug build, typically 10-50x slower; build with `cargo build --release`");
     }
-    let reads = args.reads.as_deref().ok_or("a reads file (FASTA, FASTQ or '-') is required")?;
+    let reads = args
+        .reads
+        .as_deref()
+        .ok_or("a reads file (FASTA, FASTQ or '-') is required")?;
     let profile = match args.profile.as_deref() {
-        Some(name) => CallingProfile::from_name(name).ok_or_else(|| format!("unknown profile '{name}'"))?,
-        None => CallingProfile::TruthOptimized,
+        Some(name) => {
+            CallingProfile::from_name(name).ok_or_else(|| format!("unknown profile '{name}'"))?
+        }
+        None => CallingProfile::ROptimized,
     };
     let threads = match args.threads.as_deref() {
-        Some(n) => n.parse().map_err(|_| format!("--threads expects a number, got '{n}'"))?,
+        Some(n) => n
+            .parse()
+            .map_err(|_| format!("--threads expects a number, got '{n}'"))?,
         None => 0,
     };
     let mut config = profile.config();
@@ -226,8 +281,16 @@ fn run_assign(args: &Args) -> Result<(), Box<dyn Error>> {
 
     let started = Instant::now();
     let (total, with_path) = if args.residual {
-        let residual = ResidualAdjudicator { min_retained: config.min_retained, ..ResidualAdjudicator::default() };
-        stream_input(reads, &assigner.with_adjudicator(residual), threads, &support)?
+        let residual = ResidualAdjudicator {
+            min_retained: config.min_retained,
+            ..ResidualAdjudicator::default()
+        };
+        stream_input(
+            reads,
+            &assigner.with_adjudicator(residual),
+            threads,
+            &support,
+        )?
     } else {
         stream_input(reads, &assigner, threads, &support)?
     };
@@ -246,7 +309,11 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Some(args)) => {
-            let result = if args.prepare { run_prepare(&args) } else { run_assign(&args) };
+            let result = if args.prepare {
+                run_prepare(&args)
+            } else {
+                run_assign(&args)
+            };
             match result {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {

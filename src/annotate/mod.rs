@@ -141,12 +141,16 @@ fn mode_with_share(values: impl Iterator<Item = u32>) -> (Option<u32>, f64) {
     counts
         .into_iter()
         .max_by_key(|&(value, count)| (count, std::cmp::Reverse(value)))
-        .map_or((None, 0.0), |(value, count)| (Some(value), count as f64 / total as f64))
+        .map_or((None, 0.0), |(value, count)| {
+            (Some(value), count as f64 / total as f64)
+        })
 }
 
 fn residue_at(codes: &[u8], anchor: u32) -> u8 {
     let a = anchor as usize;
-    codes.get(a..a + 3).map_or(b'?', |c| codon(c[0], c[1], c[2]))
+    codes
+        .get(a..a + 3)
+        .map_or(b'?', |c| codon(c[0], c[1], c[2]))
 }
 
 /// Region starts implied by a V hit (IMGT definitions, see module docs).
@@ -162,7 +166,13 @@ fn regions_from_hit(hit: &VHit, chain: Option<ChainType>) -> RegionStarts {
 
 /// Header values win; derived values fill the gaps. Derived values that break
 /// the ordering are dropped, latest first, with a note.
-fn merge_regions(header: RegionStarts, derived: RegionStarts, anchor: u32, len: usize, notes: &mut Vec<String>) -> RegionStarts {
+fn merge_regions(
+    header: RegionStarts,
+    derived: RegionStarts,
+    anchor: u32,
+    len: usize,
+    notes: &mut Vec<String>,
+) -> RegionStarts {
     let header_values = header.values();
     let mut values = header_values;
     for (slot, value) in values.iter_mut().zip(derived.values()) {
@@ -172,11 +182,17 @@ fn merge_regions(header: RegionStarts, derived: RegionStarts, anchor: u32, len: 
     }
     let mut merged = RegionStarts::from_values(values);
     while let Err(reason) = merged.check(Some(anchor), len) {
-        let Some(index) = (0..5).rev().find(|&i| merged.values()[i].is_some() && header_values[i].is_none()) else {
+        let Some(index) = (0..5)
+            .rev()
+            .find(|&i| merged.values()[i].is_some() && header_values[i].is_none())
+        else {
             notes.push(format!("header regions inconsistent: {reason}"));
             break;
         };
-        notes.push(format!("dropped derived {}: {reason}", RegionStarts::KEYS[index]));
+        notes.push(format!(
+            "dropped derived {}: {reason}",
+            RegionStarts::KEYS[index]
+        ));
         let mut values = merged.values();
         values[index] = None;
         merged = RegionStarts::from_values(values);
@@ -202,16 +218,27 @@ fn from_relative(
 ) -> Option<(usize, Vec<Option<u32>>)> {
     let donor = index.nearest(target, eligible)?;
     let alleles = set.alleles();
-    let mapped = transfer(&alleles[target].codes, &alleles[donor].codes, &positions_of(donor), workspace)?;
+    let mapped = transfer(
+        &alleles[target].codes,
+        &alleles[donor].codes,
+        &positions_of(donor),
+        workspace,
+    )?;
     Some((donor, mapped))
 }
 
 /// The relative index of `set`, built on first use.
 fn relatives<'a>(index: &'a mut Option<RelativeIndex>, set: &GermlineSet) -> &'a mut RelativeIndex {
-    index.get_or_insert_with(|| RelativeIndex::build(set.alleles().iter().map(|a| a.codes.as_slice())))
+    index.get_or_insert_with(|| {
+        RelativeIndex::build(set.alleles().iter().map(|a| a.codes.as_slice()))
+    })
 }
 
-fn annotate_j(j: &mut GermlineSet, frames: &mut [Vec<u8>; 3], workspace: &mut GotohWorkspace) -> (Vec<AlleleAnnotation>, Option<u32>, i32) {
+fn annotate_j(
+    j: &mut GermlineSet,
+    frames: &mut [Vec<u8>; 3],
+    workspace: &mut GotohWorkspace,
+) -> (Vec<AlleleAnnotation>, Option<u32>, i32) {
     let mut result: Vec<AlleleAnnotation> = Vec::with_capacity(j.len());
     let mut anchors: Vec<Option<u32>> = Vec::with_capacity(j.len());
     let mut weak: Vec<Option<JHit>> = Vec::with_capacity(j.len());
@@ -223,7 +250,10 @@ fn annotate_j(j: &mut GermlineSet, frames: &mut [Vec<u8>; 3], workspace: &mut Go
             if !matches!(residue, b'W' | b'F') {
                 notes.push(format!("header anchor codon is {}", char::from(residue)));
             }
-            result.push(AlleleAnnotation { source: AnchorSource::Header, notes });
+            result.push(AlleleAnnotation {
+                source: AnchorSource::Header,
+                notes,
+            });
             anchors.push(Some(anchor));
             weak.push(None);
             continue;
@@ -232,18 +262,29 @@ fn annotate_j(j: &mut GermlineSet, frames: &mut [Vec<u8>; 3], workspace: &mut Go
         match hit.filter(|h| h.confident) {
             Some(h) => {
                 vote += 2 * i32::from(h.chain_vote());
-                result.push(AlleleAnnotation { source: AnchorSource::Motif, notes });
+                result.push(AlleleAnnotation {
+                    source: AnchorSource::Motif,
+                    notes,
+                });
                 anchors.push(Some(h.anchor()));
                 weak.push(None);
             }
             None => {
-                result.push(AlleleAnnotation { source: AnchorSource::Missing, notes });
+                result.push(AlleleAnnotation {
+                    source: AnchorSource::Missing,
+                    notes,
+                });
                 anchors.push(None);
                 weak.push(hit);
             }
         }
     }
-    let tail = mode(j.alleles().iter().zip(&anchors).filter_map(|(a, &x)| x.map(|x| a.codes.len() as u32 - x)));
+    let tail = mode(
+        j.alleles()
+            .iter()
+            .zip(&anchors)
+            .filter_map(|(a, &x)| x.map(|x| a.codes.len() as u32 - x)),
+    );
     // Consensus prior for weak alleles.
     for (index, allele) in j.alleles().iter().enumerate() {
         if anchors[index].is_some() || tail.is_none() {
@@ -266,24 +307,41 @@ fn annotate_j(j: &mut GermlineSet, frames: &mut [Vec<u8>; 3], workspace: &mut Go
         }
         let donor = if any_donor {
             let relatives = relatives(&mut relative_index, j);
-            from_relative(j, index, &trusted, relatives, |d| vec![anchors[d]], workspace)
+            from_relative(
+                j,
+                index,
+                &trusted,
+                relatives,
+                |d| vec![anchors[d]],
+                workspace,
+            )
         } else {
             None
         };
         let codes_len = j.alleles()[index].codes.len();
-        match donor.and_then(|(d, mapped)| mapped[0].filter(|&a| a as usize + 3 <= codes_len).map(|a| (d, a))) {
+        match donor.and_then(|(d, mapped)| {
+            mapped[0]
+                .filter(|&a| a as usize + 3 <= codes_len)
+                .map(|a| (d, a))
+        }) {
             Some((donor, anchor)) => {
                 let residue = residue_at(&j.alleles()[index].codes, anchor);
                 if !matches!(residue, b'W' | b'F') {
-                    result[index].notes.push(format!("conserved residue is {}", char::from(residue)));
+                    result[index]
+                        .notes
+                        .push(format!("conserved residue is {}", char::from(residue)));
                 }
-                result[index].source = AnchorSource::Transfer { from: j.alleles()[donor].name.clone() };
+                result[index].source = AnchorSource::Transfer {
+                    from: j.alleles()[donor].name.clone(),
+                };
                 anchors[index] = Some(anchor);
             }
             None => {
                 if let Some(h) = weak[index] {
                     result[index].source = AnchorSource::LowConfidence;
-                    result[index].notes.push(format!("weak motif {}G.G", char::from(h.residue)));
+                    result[index]
+                        .notes
+                        .push(format!("weak motif {}G.G", char::from(h.residue)));
                     anchors[index] = Some(h.anchor());
                 }
             }
@@ -296,7 +354,11 @@ fn annotate_j(j: &mut GermlineSet, frames: &mut [Vec<u8>; 3], workspace: &mut Go
 }
 
 /// Annotate `v` (anchors and region starts) and `j` (anchors) in place.
-pub fn annotate(v: &mut GermlineSet, j: Option<&mut GermlineSet>, options: AnnotateOptions) -> DatabaseAnnotation {
+pub fn annotate(
+    v: &mut GermlineSet,
+    j: Option<&mut GermlineSet>,
+    options: AnnotateOptions,
+) -> DatabaseAnnotation {
     let mut frames = [Vec::new(), Vec::new(), Vec::new()];
     let mut workspace = GotohWorkspace::default();
     let (j_annotations, j_tail, mut vote) = match j {
@@ -308,7 +370,10 @@ pub fn annotate(v: &mut GermlineSet, j: Option<&mut GermlineSet>, options: Annot
     let mut hits: Vec<Option<VHit>> = Vec::with_capacity(v.len());
     let mut result: Vec<AlleleAnnotation> = Vec::with_capacity(v.len());
     for allele in v.alleles() {
-        let search = VSearch { fixed_anchor: allele.anchor, ..VSearch::default() };
+        let search = VSearch {
+            fixed_anchor: allele.anchor,
+            ..VSearch::default()
+        };
         let hit = find_v(&allele.codes, search, &mut frames);
         let source = match (allele.anchor, hit) {
             (Some(_), _) => AnchorSource::Header,
@@ -336,17 +401,31 @@ pub fn annotate(v: &mut GermlineSet, j: Option<&mut GermlineSet>, options: Annot
 
     // Database consensus from pass 1: the 3′ tail after Cys104, the frame of
     // full-length alleles and the codon index of their Cys23.
-    let trusted: Vec<VHit> = (0..v.len()).filter(|&i| result[i].source.trusted()).filter_map(|i| hits[i]).collect();
+    let trusted: Vec<VHit> = (0..v.len())
+        .filter(|&i| result[i].source.trusted())
+        .filter_map(|i| hits[i])
+        .collect();
     let (tail, tail_share) = mode_with_share(
         (0..v.len())
             .filter(|&i| result[i].source.trusted())
-            .filter_map(|i| v.alleles()[i].anchor.or(hits[i].map(|h| h.anchor())).map(|x| v.alleles()[i].codes.len() as u32 - x)),
+            .filter_map(|i| {
+                v.alleles()[i]
+                    .anchor
+                    .or(hits[i].map(|h| h.anchor()))
+                    .map(|x| v.alleles()[i].codes.len() as u32 - x)
+            }),
     );
     let (frame_mode, _) = mode_with_share(trusted.iter().map(|h| h.frame as u32));
     let (cys23_mode, _) = mode_with_share(
-        trusted.iter().filter(|h| Some(h.frame as u32) == frame_mode).filter_map(|h| h.cys23).map(|c| c as u32),
+        trusted
+            .iter()
+            .filter(|h| Some(h.frame as u32) == frame_mode)
+            .filter_map(|h| h.cys23)
+            .map(|c| c as u32),
     );
-    let cys23_prior = cys23_mode.zip(frame_mode).map(|(c, f)| (f as usize, c as usize));
+    let cys23_prior = cys23_mode
+        .zip(frame_mode)
+        .map(|(c, f)| (f as usize, c as usize));
     let v_tail = tail;
 
     // V pass 2: every allele again with the database priors. The tail prior
@@ -369,7 +448,9 @@ pub fn annotate(v: &mut GermlineSet, j: Option<&mut GermlineSet>, options: Annot
             }
             (AnchorSource::Motif, _) => {
                 result[index].source = AnchorSource::Missing;
-                result[index].notes.push("motifs inconsistent with the database consensus".into());
+                result[index]
+                    .notes
+                    .push("motifs inconsistent with the database consensus".into());
             }
             _ => {}
         }
@@ -389,7 +470,13 @@ pub fn annotate(v: &mut GermlineSet, j: Option<&mut GermlineSet>, options: Annot
                         hit.cys23_alternatives
                     ));
                 }
-                merge_regions(allele.regions, regions_from_hit(&hit, chain), anchor, len_of(v, index), &mut result[index].notes)
+                merge_regions(
+                    allele.regions,
+                    regions_from_hit(&hit, chain),
+                    anchor,
+                    len_of(v, index),
+                    &mut result[index].notes,
+                )
             }
             _ => allele.regions,
         };
@@ -402,41 +489,64 @@ pub fn annotate(v: &mut GermlineSet, j: Option<&mut GermlineSet>, options: Annot
     // unambiguous allele, if it lands on a Cys codon in this allele's frame.
     let mut relative_index = None;
     let unambiguous: Vec<bool> = (0..v.len())
-        .map(|i| result[i].source.trusted() && regions[i].cdr1.is_some() && hits[i].is_some_and(|h| h.cys23_alternatives == 0))
+        .map(|i| {
+            result[i].source.trusted()
+                && regions[i].cdr1.is_some()
+                && hits[i].is_some_and(|h| h.cys23_alternatives == 0)
+        })
         .collect();
     let any_unambiguous = unambiguous.iter().any(|&u| u);
     for index in 0..v.len() {
         if !any_unambiguous {
             break;
         }
-        let Some(hit) = hits[index].filter(|h| h.cys23_alternatives > 0 && result[index].source.trusted()) else {
+        let Some(hit) =
+            hits[index].filter(|h| h.cys23_alternatives > 0 && result[index].source.trusted())
+        else {
             continue;
         };
         if Some(hit.frame as u32) == frame_mode || v.alleles()[index].regions.cdr1.is_some() {
             continue;
         }
         let relatives = relatives(&mut relative_index, v);
-        let Some((donor, mapped)) =
-            from_relative(v, index, &unambiguous, relatives, |d| vec![regions[d].cdr1], &mut workspace)
-        else {
+        let Some((donor, mapped)) = from_relative(
+            v,
+            index,
+            &unambiguous,
+            relatives,
+            |d| vec![regions[d].cdr1],
+            &mut workspace,
+        ) else {
             continue;
         };
         let codes = &v.alleles()[index].codes;
-        let lands_on_cys = mapped[0].filter(|&p| p >= 12 && p % 3 == hit.frame as u32).filter(|&p| residue_at(codes, p - 12) == b'C');
+        let lands_on_cys = mapped[0]
+            .filter(|&p| p >= 12 && p % 3 == hit.frame as u32)
+            .filter(|&p| residue_at(codes, p - 12) == b'C');
         if let Some(cdr1) = lands_on_cys {
             let mut values = regions[index].values();
             values[1] = Some(cdr1);
-            if RegionStarts::from_values(values).check(anchors[index], codes.len()).is_ok() {
+            if RegionStarts::from_values(values)
+                .check(anchors[index], codes.len())
+                .is_ok()
+            {
                 regions[index] = RegionStarts::from_values(values);
                 let notes = &mut result[index].notes;
                 notes.retain(|n| !n.starts_with("Cys23 ambiguous"));
-                notes.push(format!("ambiguous Cys23 resolved from {}", v.alleles()[donor].name));
+                notes.push(format!(
+                    "ambiguous Cys23 resolved from {}",
+                    v.alleles()[donor].name
+                ));
             }
         }
     }
 
     // V pass 4: sibling transfer of anchor and all region starts.
-    let trusted: Vec<bool> = result.iter().zip(&anchors).map(|(r, a)| r.source.trusted() && a.is_some()).collect();
+    let trusted: Vec<bool> = result
+        .iter()
+        .zip(&anchors)
+        .map(|(r, a)| r.source.trusted() && a.is_some())
+        .collect();
     let any_donor = trusted.iter().any(|&t| t);
     for index in 0..v.len() {
         if anchors[index].is_some() {
@@ -457,32 +567,51 @@ pub fn annotate(v: &mut GermlineSet, j: Option<&mut GermlineSet>, options: Annot
         match donor.filter(|(_, mapped)| mapped[0].is_some_and(|a| a as usize + 3 <= len)) {
             Some((donor, mapped)) => {
                 let anchor = mapped[0].expect("filtered above");
-                let derived = RegionStarts::from_values([mapped[1], mapped[2], mapped[3], mapped[4], mapped[5]]);
+                let derived = RegionStarts::from_values([
+                    mapped[1], mapped[2], mapped[3], mapped[4], mapped[5],
+                ]);
                 let notes = &mut result[index].notes;
                 let residue = residue_at(&v.alleles()[index].codes, anchor);
                 if residue != b'C' {
                     notes.push(format!("conserved residue is {}", char::from(residue)));
                 }
-                regions[index] = merge_regions(v.alleles()[index].regions, derived, anchor, len, notes);
-                result[index].source = AnchorSource::Transfer { from: v.alleles()[donor].name.clone() };
+                regions[index] =
+                    merge_regions(v.alleles()[index].regions, derived, anchor, len, notes);
+                result[index].source = AnchorSource::Transfer {
+                    from: v.alleles()[donor].name.clone(),
+                };
                 anchors[index] = Some(anchor);
             }
             None => {
                 if let Some(hit) = hits[index] {
                     let notes = &mut result[index].notes;
                     notes.push("weak motifs; no similar annotated allele".into());
-                    regions[index] = merge_regions(v.alleles()[index].regions, regions_from_hit(&hit, chain), hit.anchor(), len, notes);
+                    regions[index] = merge_regions(
+                        v.alleles()[index].regions,
+                        regions_from_hit(&hit, chain),
+                        hit.anchor(),
+                        len,
+                        notes,
+                    );
                     result[index].source = AnchorSource::LowConfidence;
                     anchors[index] = Some(hit.anchor());
                 }
             }
         }
     }
-    for ((_, anchor, slot), (found, merged)) in v.annotate_mut().zip(anchors.into_iter().zip(regions)) {
+    for ((_, anchor, slot), (found, merged)) in
+        v.annotate_mut().zip(anchors.into_iter().zip(regions))
+    {
         *anchor = anchor.or(found);
         *slot = merged;
     }
-    DatabaseAnnotation { chain, v_tail, j_tail, v: result, j: j_annotations }
+    DatabaseAnnotation {
+        chain,
+        v_tail,
+        j_tail,
+        v: result,
+        j: j_annotations,
+    }
 }
 
 impl DatabaseAnnotation {
@@ -498,7 +627,11 @@ impl DatabaseAnnotation {
                 None => counts.push((label, 1)),
             }
         }
-        counts.iter().map(|(l, c)| format!("{c} {l}")).collect::<Vec<_>>().join(", ")
+        counts
+            .iter()
+            .map(|(l, c)| format!("{c} {l}"))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     /// One line per segment for logs.
@@ -513,11 +646,20 @@ impl DatabaseAnnotation {
 
     /// Alleles whose anchor is not from a header, motif or consensus.
     pub fn uncertain(&self) -> usize {
-        self.v.iter().chain(&self.j).filter(|a| !a.source.trusted()).count()
+        self.v
+            .iter()
+            .chain(&self.j)
+            .filter(|a| !a.source.trusted())
+            .count()
     }
 
     /// Per-allele report (TSV).
-    pub fn write_tsv<W: Write>(&self, out: &mut W, v: &GermlineSet, j: Option<&GermlineSet>) -> io::Result<()> {
+    pub fn write_tsv<W: Write>(
+        &self,
+        out: &mut W,
+        v: &GermlineSet,
+        j: Option<&GermlineSet>,
+    ) -> io::Result<()> {
         writeln!(
             out,
             "segment\tallele\taliases\tlength\tframe\tanchor\tresidue\tfr1\tcdr1\tfr2\tcdr2\tfr3\tcdr1_codons\tcdr2_codons\tsource\tnotes"
@@ -527,8 +669,13 @@ impl DatabaseAnnotation {
         for (set, annotations, segment) in rows {
             for (allele, annotation) in set.alleles().iter().zip(annotations) {
                 let r = &allele.regions;
-                let span = |a: Option<u32>, b: Option<u32>| a.zip(b).map_or(String::new(), |(a, b)| ((b - a) / 3).to_string());
-                let residue = allele.anchor.map_or(String::new(), |a| char::from(residue_at(&allele.codes, a)).to_string());
+                let span = |a: Option<u32>, b: Option<u32>| {
+                    a.zip(b)
+                        .map_or(String::new(), |(a, b)| ((b - a) / 3).to_string())
+                };
+                let residue = allele.anchor.map_or(String::new(), |a| {
+                    char::from(residue_at(&allele.codes, a)).to_string()
+                });
                 writeln!(
                     out,
                     "{segment}\t{}\t{}\t{}\t{}\t{}\t{residue}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
