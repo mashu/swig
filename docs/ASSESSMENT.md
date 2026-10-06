@@ -164,8 +164,10 @@ work.
 1. **V gene at extreme SHM: −0.2 pp on the hard preset** against the start.
    Gene-frame votes are unions over alleles, and at 15–25 % SHM the gene budget
    sometimes ranks a sibling gene above the true one. Search errors went from
-   0.1 % to 0.4 % of reads. Possible remedies: a wider budget when the top
-   genes are close, or votes normalised by frame size.
+   0.1 % to 0.4 % of reads. A base budget of 5 genes instead of 3 recovers
+   it (98.44 %) at about 10 % of throughput, so the default stays at 3 and the
+   budget is the knob. Votes normalised by frame size are the alternative to
+   try.
 2. **D presence on D-free junctions.** 12–24 % of reads with no D receive one,
    because a 9-nt chance match is indistinguishable from a 9-nt D remnant.
    `P_D` sets the trade-off, and the prior odds are the single knob.
@@ -204,8 +206,10 @@ In order of expected value:
 3. **Sensitivity analysis** of the inherited constants on the simulator,
    across presets and both databases, with each constant either derived or
    shown to be flat.
-4. **`vdj-assign simulate` / `evaluate`** subcommands, so other tools are
-   scored on identical reads with the same metrics.
+4. **Cross-tool benchmark.** Run IgBLAST, partis and Swig through
+   `vdj-assign simulate` / `evaluate` (implemented: any AIRR TSV is scored with
+   the same metrics on identical reads) at several SHM levels, and report
+   precision/recall curves for D.
 5. **AVX-512BW (32 lanes) and NEON (8 lanes)** kernels of the same design.
 6. **Allele rescoring along the gene frame.** Trace one representative per
    frame, rescore siblings along its path, and run DP only where bounds

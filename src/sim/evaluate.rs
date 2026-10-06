@@ -1,7 +1,8 @@
-//! Scoring AIRR calls against simulated truth.
+//! Scoring calls against simulated truth.
 //!
 //! The metrics are defined so they can be reported in a paper and compared
-//! across tools (anything that yields an [`AirrRecord`]-like call):
+//! across tools: a call is an [`Assignment`], built from this crate's
+//! [`AirrRecord`] or from any AIRR Rearrangement TSV row.
 //!
 //! * **Exact** — the primary (first) called allele is the simulated allele.
 //! * **Equivalent** — the primary allele is *germline-equivalent* on this
@@ -14,28 +15,100 @@
 //!   labelled read positions (only for correctly oriented reads).
 //! * **D presence**, stratified by the length of the simulated D remnant:
 //!   a 2-nt remnant is not identifiable, a 20-nt one must be found.
-//! * **Junction** — the called junction interval equals the true one
+//! * **Junction** — the called junction sequence equals the true one
 //!   (Cys104 … Trp/Phe118 inclusive), when both anchor codons are templated
 //!   in the read.
 
 use std::fmt;
+use std::ops::Range;
 
-use super::simulate::{Region, SimulatedRead, Simulator};
-use crate::germline::{GermlineSet, SegmentKind};
+use super::truth::{Slot, Truth};
+use crate::germline::GermlineSet;
 use crate::report::{AirrRecord, SegmentReport};
-
-/// Names of alleles whose sequence contains `body` (germline-equivalent).
-fn equivalent_names<'s>(set: &'s GermlineSet, body: &[u8]) -> Vec<&'s str> {
-    let codes = crate::alphabet::encode(body);
-    set.alleles()
-        .iter()
-        .filter(|a| codes.is_empty() || a.codes.windows(codes.len()).any(|w| w == codes.as_slice()))
-        .flat_map(|a| a.names())
-        .collect()
-}
 
 fn gene(name: &str) -> &str {
     GermlineSet::gene_of_name(name)
+}
+
+/// One called segment: reported allele names (primary first) and its read
+/// interval, 0-based half-open on the oriented read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SegmentCall {
+    pub names: Vec<String>,
+    pub span: Option<Range<usize>>,
+}
+
+/// A caller's answer for one read, from any tool.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Assignment {
+    pub rev_comp: bool,
+    /// Indexed by [`Slot::index`].
+    pub segments: [Option<SegmentCall>; 4],
+    pub junction: Option<String>,
+}
+
+impl Assignment {
+    pub fn from_record(record: &AirrRecord) -> Self {
+        let segment = |report: &Option<SegmentReport>| {
+            report.as_ref().map(|r| SegmentCall {
+                names: r.call.split(',').map(str::to_string).collect(),
+                span: Some(r.sequence_start.saturating_sub(1) as usize..r.sequence_end as usize),
+            })
+        };
+        Self {
+            rev_comp: record.rev_comp,
+            segments: [
+                segment(&record.v),
+                segment(&record.d),
+                segment(&record.d2),
+                segment(&record.j),
+            ],
+            junction: record.junction_sequence().map(str::to_string),
+        }
+    }
+
+    /// Parse one AIRR Rearrangement TSV row; returns `(sequence_id, assignment)`.
+    /// Only `sequence_id` is required. `{v,d,d2,j}_call` may list several
+    /// comma-separated names (primary first); coordinates are AIRR 1-based closed.
+    pub fn from_airr(header: &[&str], line: &str) -> Result<(String, Self), String> {
+        let fields: Vec<&str> = line.split('\t').collect();
+        let get = |name: &str| {
+            header
+                .iter()
+                .position(|h| *h == name)
+                .and_then(|i| fields.get(i).copied())
+                .filter(|v| !v.is_empty())
+        };
+        let id = get("sequence_id").ok_or("AIRR row without sequence_id")?;
+        let mut assignment = Self {
+            rev_comp: matches!(get("rev_comp"), Some("T" | "TRUE" | "true" | "True")),
+            junction: get("junction").map(|j| j.to_ascii_uppercase()),
+            ..Self::default()
+        };
+        for slot in Slot::ALL {
+            let p = slot.label();
+            let Some(call) = get(&format!("{p}_call")) else {
+                continue;
+            };
+            let coordinate = |key: &str| get(&format!("{p}_sequence_{key}"))?.parse::<usize>().ok();
+            assignment.segments[slot.index()] = Some(SegmentCall {
+                names: call.split(',').map(|n| n.trim().to_string()).collect(),
+                span: coordinate("start")
+                    .zip(coordinate("end"))
+                    .map(|(start, end)| start.saturating_sub(1)..end),
+            });
+        }
+        Ok((id.to_string(), assignment))
+    }
+
+    pub fn segment(&self, slot: Slot) -> Option<&SegmentCall> {
+        self.segments[slot.index()].as_ref()
+    }
+
+    /// Any V or J call (a read without one is unassigned).
+    pub fn assigned(&self) -> bool {
+        self.segment(Slot::V).is_some() || self.segment(Slot::J).is_some()
+    }
 }
 
 /// Per-segment tallies.
@@ -89,34 +162,35 @@ impl SegmentStats {
 
     fn add(
         &mut self,
-        truth: Option<(&str, Vec<&str>, std::ops::Range<usize>)>,
-        call: Option<&SegmentReport>,
+        truth: Option<&super::truth::TrueSegment>,
+        call: Option<&SegmentCall>,
         oriented: bool,
     ) {
-        let Some((truth_name, equivalent, span)) = truth else {
+        let Some(truth) = truth else {
             self.spurious += usize::from(call.is_some());
             return;
         };
         self.reads += 1;
         let Some(call) = call else { return };
         self.called += 1;
-        let names: Vec<&str> = call.call.split(',').collect();
-        self.names += names.len();
-        let primary = names[0];
+        self.names += call.names.len();
+        let Some(primary) = call.names.first() else {
+            return;
+        };
         if !oriented {
             return;
         }
-        self.exact += usize::from(primary == truth_name);
-        self.equivalent += usize::from(equivalent.contains(&primary));
-        self.truth_listed += usize::from(names.contains(&truth_name));
-        self.gene += usize::from(equivalent.iter().any(|&e| gene(e) == gene(primary)));
-        let start = (call.sequence_start as usize).saturating_sub(1);
-        let end = call.sequence_end as usize;
-        self.boundary_reads += 1;
-        self.start_error += start.abs_diff(span.start);
-        self.end_error += end.abs_diff(span.end);
-        self.start_exact += usize::from(start == span.start);
-        self.end_exact += usize::from(end == span.end);
+        self.exact += usize::from(*primary == truth.allele);
+        self.equivalent += usize::from(truth.equivalent.contains(primary));
+        self.truth_listed += usize::from(call.names.contains(&truth.allele));
+        self.gene += usize::from(truth.equivalent.iter().any(|e| gene(e) == gene(primary)));
+        if let Some(span) = &call.span {
+            self.boundary_reads += 1;
+            self.start_error += span.start.abs_diff(truth.span.start);
+            self.end_error += span.end.abs_diff(truth.span.end);
+            self.start_exact += usize::from(span.start == truth.span.start);
+            self.end_exact += usize::from(span.end == truth.span.end);
+        }
     }
 }
 
@@ -150,76 +224,38 @@ pub struct Evaluation {
 }
 
 impl Evaluation {
-    pub fn add(&mut self, sim: &Simulator<'_>, read: &SimulatedRead, record: &AirrRecord) {
+    pub fn add(&mut self, truth: &Truth, call: &Assignment) {
         self.reads += 1;
-        let oriented = record.rev_comp == read.reverse_complemented;
+        let oriented = call.rev_comp == truth.reverse_complemented;
         self.oriented += usize::from(oriented);
-        self.unassigned += usize::from(record.path_score.is_none());
+        self.unassigned += usize::from(!call.assigned());
+        for (slot, stats) in [
+            (Slot::V, &mut self.v),
+            (Slot::D, &mut self.d),
+            (Slot::D2, &mut self.d2),
+            (Slot::J, &mut self.j),
+        ] {
+            stats.add(truth.segment(slot), call.segment(slot), oriented);
+        }
 
-        let truth = |kind: SegmentKind, region: Region, allele: Option<usize>| {
-            let set = sim.set(kind)?;
-            let allele = allele?;
-            let body = sim.germline_body(read, region)?;
-            let span = read.span(region)?;
-            Some((
-                set.alleles()[allele].name.as_str(),
-                equivalent_names(set, body),
-                span,
-            ))
-        };
-        self.v.add(
-            truth(SegmentKind::V, Region::V, Some(read.v)),
-            record.v.as_ref(),
-            oriented,
-        );
-        self.d.add(
-            truth(SegmentKind::D, Region::D, read.d),
-            record.d.as_ref(),
-            oriented,
-        );
-        self.d2.add(
-            truth(SegmentKind::D, Region::D2, read.d2),
-            record.d2.as_ref(),
-            oriented,
-        );
-        self.j.add(
-            truth(SegmentKind::J, Region::J, Some(read.j)),
-            record.j.as_ref(),
-            oriented,
-        );
-
-        let d_length = read.span(Region::D).map_or(0, |s| s.len());
         let bin = D_LENGTH_BINS
             .iter()
-            .position(|&(lo, hi)| (lo..=hi).contains(&d_length))
+            .position(|&(lo, hi)| (lo..=hi).contains(&truth.d_length))
             .expect("bins cover every length");
         let presence = &mut self.d_presence[bin];
         presence.reads += 1;
-        presence.called += usize::from(record.d.is_some());
-        if let (Some(call), Some((_, equivalent, _))) =
-            (&record.d, truth(SegmentKind::D, Region::D, read.d))
-        {
-            let primary = call.call.split(',').next().unwrap_or_default();
-            presence.correct += usize::from(oriented && equivalent.contains(&primary));
+        let called_d = call.segment(Slot::D);
+        presence.called += usize::from(called_d.is_some());
+        if let (Some(called), Some(true_d)) = (called_d, truth.segment(Slot::D)) {
+            let primary = called.names.first();
+            presence.correct +=
+                usize::from(oriented && primary.is_some_and(|p| true_d.equivalent.contains(p)));
         }
 
-        let v_anchor = sim
-            .set(SegmentKind::V)
-            .and_then(|s| s.alleles()[read.v].anchor);
-        let j_anchor = sim
-            .set(SegmentKind::J)
-            .and_then(|s| s.alleles()[read.j].anchor);
-        if let (Some(va), Some(ja)) = (v_anchor, j_anchor) {
-            let start = read.locate(Region::V, va);
-            let end = read.locate(Region::J, ja + 2);
-            let intact = start.is_some_and(|s| read.locate(Region::V, va + 2) == Some(s + 2))
-                && end.is_some_and(|e| read.locate(Region::J, ja) == Some(e - 2));
-            if let (true, Some(start), Some(end)) = (intact, start, end) {
-                self.junction_reads += 1;
-                self.junction_exact += usize::from(
-                    oriented && record.regions.junction == Some(start as u32..end as u32 + 1),
-                );
-            }
+        if let Some(junction) = &truth.junction {
+            self.junction_reads += 1;
+            self.junction_exact +=
+                usize::from(oriented && call.junction.as_deref() == Some(junction.as_str()));
         }
     }
 

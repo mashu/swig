@@ -17,7 +17,9 @@ use std::time::Instant;
 use vdj_assign::annotate::AnnotateOptions;
 use vdj_assign::prelude::*;
 use vdj_assign::prepare::prepare;
-use vdj_assign::sim::{Evaluation, SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
+use vdj_assign::sim::{
+    Assignment, Evaluation, SimParams, Simulator, SyntheticDatabase, SyntheticSpec, Truth,
+};
 
 fn load(kind: SegmentKind, path: &str) -> Result<GermlineSet, Box<dyn Error>> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
@@ -63,6 +65,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         });
         config.v.evalue = gates;
         config.j.evalue = gates;
+    }
+    if let Some(base) = value("--budget-base") {
+        config.v.budget.base = base.parse()?;
     }
     if let Some(limit) = value("--max-alleles") {
         config.v.seeds.max_alleles = limit.parse()?;
@@ -117,7 +122,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     for (read, call) in simulated.iter().zip(&calls) {
         let sequence = String::from_utf8_lossy(&read.sequence);
         let record = AirrRecord::from_call("r", &sequence, call, &assigner, &[None, None, None]);
-        evaluation.add(&sim, read, &record);
+        let truth = Truth::from_read(&sim, read, "r");
+        evaluation.add(&truth, &Assignment::from_record(&record));
     }
     println!(
         "preset {preset}  profile {}  {} reads  {:.0} reads/s on {threads} thread(s)",

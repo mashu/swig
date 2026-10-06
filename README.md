@@ -19,7 +19,7 @@ Zero dependencies, Rust ≥ 1.75, edition 2021.
 
 ```sh
 cargo build --release                          # always run the release build
-cargo test                                     # 62 unit, 7 annotation, 10 synthetic, 5 simulated-accuracy tests
+cargo test                                     # 63 unit, 7 annotation, 10 synthetic, 6 simulated-accuracy tests
 
 target/release/vdj-assign --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta \
     [--profile r|truth|igblast|sensitive-d] [--threads N] [--tandem-d] \
@@ -29,6 +29,12 @@ zcat reads.fastq.gz | target/release/vdj-assign --v V.fasta --d D.fasta --j J.fa
 
 # optional: write the annotated database for review or curation
 target/release/vdj-assign prepare --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta --out prepared/
+
+# simulate reads with known truth (IgSim model), then score any tool's AIRR TSV against it
+target/release/vdj-assign simulate --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta \
+    --preset hard --reads 10000 --seed 1 --out sim          # sim.fasta + sim.truth.tsv
+target/release/vdj-assign --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta sim.fasta > calls.tsv
+target/release/vdj-assign evaluate --truth sim.truth.tsv calls.tsv   # works for IgBLAST etc. too
 
 # accuracy and throughput on simulated reads (synthetic database unless --v/--d/--j are given)
 cargo run --release --example benchmark -- [--v V.fasta --d D.fasta --j J.fasta] \
@@ -429,7 +435,11 @@ It extends IgSim in three ways:
   similarity hierarchy and conserved anchors, for tests that cannot ship
   IMGT-derived data.
 
-`sim::Evaluation` scores AIRR records against the truth:
+`sim::Truth` holds one read's ground truth and reads and writes it as TSV.
+`sim::Assignment` is a call, built from an `AirrRecord` or from any tool's
+AIRR Rearrangement TSV row. `vdj-assign simulate` and `vdj-assign evaluate`
+expose both, so other callers can be scored on identical reads.
+`sim::Evaluation` scores calls against the truth:
 - an allele call is *equivalent* when the primary allele contains the
   trimmed, pre-mutation germline body (no read can separate such alleles);
 - *gene*, *listed* (truth among the reported names) and *exact*;
@@ -595,8 +605,6 @@ In order of expected value; reasons and measurements are in
    the same design.
 4. **Allele rescoring along the gene frame.** Score siblings along their
    representative's traceback and run DP only where bounds straddle the cutoff.
-5. **Simulation CLI.** `vdj-assign simulate` and `evaluate` over any tool's
-   AIRR TSV, for cross-tool benchmarks on identical reads.
-6. **Annotation.** A per-database FR3 length learned from header-annotated
+5. **Annotation.** A per-database FR3 length learned from header-annotated
    alleles (TR loci). A consensus position prior for Cys23.
-7. **C-segment assignment.**
+6. **C-segment assignment.**

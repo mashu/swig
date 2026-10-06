@@ -265,6 +265,12 @@ impl AirrRecord {
         record
     }
 
+    /// The junction (V Cys104 … J Trp/Phe118) as nucleotides of the oriented read.
+    pub fn junction_sequence(&self) -> Option<&str> {
+        let range = self.regions.junction.as_ref()?;
+        self.oriented.get(range.start as usize..range.end as usize)
+    }
+
     pub fn tsv_header() -> String {
         let mut columns = vec![
             "sequence_id".to_string(),

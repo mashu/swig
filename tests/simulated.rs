@@ -8,7 +8,9 @@
 //! (see `vdj_assign::sim::evaluate`).
 
 use vdj_assign::prelude::*;
-use vdj_assign::sim::{Evaluation, Rng, SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
+use vdj_assign::sim::{
+    Assignment, Evaluation, Rng, SimParams, Simulator, SyntheticDatabase, SyntheticSpec, Truth,
+};
 
 struct Setup {
     db: SyntheticDatabase,
@@ -36,7 +38,8 @@ impl Setup {
         let mut evaluation = Evaluation::default();
         for (read, call) in simulated.iter().zip(&calls) {
             let record = AirrRecord::from_call("r", "", call, &assigner, &[None, None, None]);
-            evaluation.add(&sim, read, &record);
+            let truth = Truth::from_read(&sim, read, "r");
+            evaluation.add(&truth, &Assignment::from_record(&record));
         }
         println!("{evaluation}");
         evaluation
@@ -106,4 +109,28 @@ fn random_reads_receive_no_call() {
         .filter(|call| call.path.is_some())
         .count();
     assert!(with_path <= 1, "{with_path}/300 random reads were assigned");
+}
+
+#[test]
+fn airr_tsv_rows_score_like_the_records_they_were_written_from() {
+    let setup = Setup::new();
+    let sim = Simulator::new(&setup.db.v, Some(&setup.db.d), &setup.db.j, SimParams::mid().with_reverse_complement(0.5))
+        .expect("simulator");
+    let assigner = setup.assigner(&EngineConfig::default());
+    let header = AirrRecord::tsv_header();
+    let columns: Vec<&str> = header.split('\t').collect();
+    let mut ws = assigner.workspace();
+    for (i, read) in sim.reads(100, 6).expect("reads").iter().enumerate() {
+        let call = assigner.assign(&encode(&read.sequence), &mut ws);
+        let sequence = String::from_utf8_lossy(&read.sequence);
+        let id = format!("r{i}");
+        let record = AirrRecord::from_call(&id, &sequence, &call, &assigner, &[None, None, None]);
+        let (parsed_id, parsed) = Assignment::from_airr(&columns, &record.to_tsv()).expect("AIRR row");
+        assert_eq!(parsed_id, id);
+        assert_eq!(parsed, Assignment::from_record(&record));
+        let truth = Truth::from_read(&sim, read, &id);
+        let header = Truth::tsv_header();
+        let truth_columns: Vec<&str> = header.split('\t').collect();
+        assert_eq!(Truth::from_tsv(&truth_columns, &truth.to_tsv()).expect("truth row"), truth);
+    }
 }
