@@ -26,6 +26,7 @@ pub use dag::{DagScratch, PlacementDag};
 pub use model::{EngineeringObjective, Grammar, PathModel, VdjGrammar};
 pub use posterior::{
     divergence, EvidenceScale, Marginals, PosteriorModel, PosteriorScratch, MAX_SPREAD,
+    OVERLAP_SPREAD,
 };
 pub use residual::{ResidualAdjudicator, ResidualScratch};
 

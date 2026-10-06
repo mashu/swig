@@ -19,7 +19,7 @@ Zero dependencies, Rust ≥ 1.75, edition 2021.
 
 ```sh
 cargo build --release                          # always run the release build
-cargo test                                     # 71 unit, 8 annotation, 11 synthetic, 7 simulated-accuracy tests
+cargo test                                     # 74 unit, 9 annotation, 11 synthetic, 7 simulated-accuracy tests
 
 target/release/vdj-assign --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta \
     [--profile r|truth|igblast|sensitive-d] [--threads N] [--tandem-d] \
@@ -69,7 +69,7 @@ columns. `np1`–`np3` hold the junctional N/P regions, and `*_support` holds
 Karlin–Altschul E-values. `*_posterior` is the posterior probability that
 the call is germline-equivalent to the read's allele, and
 `d_presence_posterior` the probability that the read has a D at all (see
-*Posterior probabilities* below; `--no-posterior` skips them, ~15 % faster).
+*Posterior probabilities* below; `--no-posterior` skips them, ~30 % faster).
 Region columns follow: `fwr1`–`fwr4`, `cdr1`–`cdr3`
 (sequence, `_start`, `_end`), `cdr3_aa`, `junction`, `junction_length`,
 `junction_aa`, `vj_in_frame`, `stop_codon` and `productive`. A read without a
@@ -328,8 +328,10 @@ chosen the same way in the germline index and in the read. The choice depends
 only on the k-mer, so a shared seed survives any mutation outside it, and any
 5 consecutive k-mers hold a seed, so every unmutated 13-base stretch yields one.
 On human IGH they matched every-k-mer seeding within ±0.08 pp at the IgSim
-presets, at 15–30 % SHM and on reads covering only 30–80 V bases, with 60 %
-fewer votes to sort (`SeedSampling`; minimisers and open syncmers are options).
+presets and within ±0.4 pp on reads covering only 30–80 V bases, and lost
+nothing at 15–30 % SHM (+0.0 to +0.6 pp V, +0.35 to +1.45 pp V gene), with
+60 % fewer votes to sort (`SeedSampling`; minimisers and open syncmers are
+options).
 
 **Strand from a k-mer bitset.** A presence bitset over all 4¹¹ k-mers of the V
 and J germline (512 KiB). One pass computes forward and reverse-complement
@@ -445,6 +447,8 @@ accounting at the new edges.
 **One lattice, two semirings.** Viterbi (max-plus) and forward–backward
 (sum-product) run the same recursion over the same lattice: one slot per
 placement, D count and first segment, with a value per canonical entry cut.
+Placements are visited by segment kind, then read start, so a D can precede
+a J whose alignment starts before it; only the cuts order them.
 Clip scores are separable in (entry, exit), the N/P score is linear in the
 gap, and the support tie-break is separable too, so the inner maximum (or
 sum) over entries is a running one along the placement and the one over
@@ -454,8 +458,12 @@ is added once to a running maximum (or difference array): an edge costs
 O(overlap). Every pair of cuts is evaluated, and both passes equal
 exhaustive enumeration (tested). The posterior keeps linear values with one
 log-scale per slot, carries N/P weights relative to each cut so they never
-exceed 1, walks cut weights as running products along the alignment, and
-evaluates no transcendental function per cut.
+exceed 1 (a gap between non-overlapping neighbours joins the log-scale),
+walks cut weights as running products along the alignment, and evaluates no
+transcendental function per cut. A read whose evidence would leave the
+`f64` range (a placement spanning > 1 200 nats on one side, or an overlap
+> 600 nats, far beyond any junction) gets no posteriors rather than wrong
+ones.
 
 ### Parallelism and allocation
 
@@ -498,8 +506,12 @@ preset, germline-equivalent accuracy in %, before → after the redesign:
 | Preset (IgSim) | Orientation | V | V gene | D | J | Junction | Random reads called |
 |---|---|---|---|---|---|---|---|
 | easy (no SHM) | 99.94 → **100** | 99.54 → **99.84** | 99.92 → **99.98** | 98.78 → **99.29** | 99.90 → **99.94** | 99.94 → **100** | 30.5 → **0** |
-| mid (IgM-like) | 100 → 100 | 97.76 → **97.92** | 99.84 → 99.82 | 91.96 → **93.00** | 98.84 → 98.80 | 99.93 → 99.93 | 30.2 → **0** |
-| hard (IgG-like) | 99.98 → **100** | 89.74 → **89.86** | 98.44 → 98.36 | 81.72 → **83.58** | 92.70 → **93.32** | 98.39 → **98.47** | 31.2 → **0** |
+| mid (IgM-like) | 100 → 100 | 97.76 → **97.92** | 99.84 → 99.82 | 91.96 → **93.00** | 98.84 → 98.80 | 99.93 → **99.97** | 30.2 → **0** |
+| hard (IgG-like) | 99.98 → **100** | 89.74 → **89.86** | 98.44 → 98.36 | 81.72 → **83.58** | 92.70 → **93.32** | 98.39 → **99.50** | 31.2 → **0** |
+
+Junctions "after" use the corrected anchors of 3′-partial V alleles, which
+leave those alleles' reads without a templated junction (hard: 2416 → 2214
+scored reads); with the old annotation the same calls scored 98.47 %.
 
 The synthetic database (`SyntheticSpec::default()`, seed 1) gives, after:
 easy V/D/J 99.98/99.82/99.98, mid 99.54/87.88/98.92, hard 97.06/79.67/94.06,
@@ -511,11 +523,11 @@ strand, 5000 per preset, scored by `vdj-assign evaluate`):
 
 | Preset | Tool | V | V gene | D | J | Junction | D-free reads given a D | Throughput, 4 threads |
 |---|---|---|---|---|---|---|---|---|
-| easy | vdj_assign | **99.88** | **100.00** | **99.29** | 99.84 | **100.00** | 0 % | **4800 reads/s** |
+| easy | vdj_assign | **99.88** | **100.00** | **99.29** | 99.84 | **100.00** | 0 % | **5200 reads/s** |
 | easy | IgBLAST | 99.12 | 99.78 | 98.86 | **99.86** | 99.77 | 0 % | 67 reads/s |
-| mid | vdj_assign | **97.88** | **99.72** | 93.35 | **98.74** | **99.97** | **23 %** | **4800 reads/s** |
+| mid | vdj_assign | **97.88** | **99.72** | 93.35 | **98.74** | **99.97** | **23 %** | **5100 reads/s** |
 | mid | IgBLAST | 97.18 | 99.62 | **93.73** | 98.60 | 99.72 | 43 % | 66 reads/s |
-| hard | vdj_assign | **89.26** | 98.58 | **83.00** | **92.80** | **99.69** | **16 %** | **4800 reads/s** |
+| hard | vdj_assign | **89.26** | 98.58 | **83.00** | **92.80** | **99.69** | **16 %** | **5200 reads/s** |
 | hard | IgBLAST | 89.16 | **98.90** | 81.75 | 91.84 | 98.07 | 30 % | 71 reads/s |
 
 IgBLAST's higher mid-preset D accuracy comes with twice the D calls on D-free
@@ -547,18 +559,19 @@ has a simulated D" for D presence:
 
 | Preset | V | D | J | D presence |
 |---|---|---|---|---|
-| easy | 0.04 / 0.0008 | 0.49 / 0.0015 | 0.07 / 0.0000 | 0.21 / 0.0029 |
-| mid | 0.31 / 0.0090 | 1.45 / 0.041 | 0.30 / 0.0059 | 1.97 / 0.026 |
-| hard | 1.31 / 0.045 | 1.48 / 0.072 | 0.68 / 0.031 | 1.27 / 0.024 |
+| easy | 0.04 / 0.0008 | 0.49 / 0.0015 | 0.07 / 0.0000 | 0.20 / 0.0029 |
+| mid | 0.31 / 0.0090 | 1.29 / 0.040 | 0.30 / 0.0059 | 1.98 / 0.026 |
+| hard | 1.31 / 0.045 | 1.16 / 0.072 | 0.69 / 0.031 | 1.24 / 0.024 |
 
 With one fixed λ instead of each read's divergence, and only co-optimal
 placements pooled, mid-preset ECEs were 4.6 / 7.7 / 3.9 / 2.1.
 
 **Where D errors arise** (`examples/d_errors`, D remnants ≥ 8 nt): on the hard
-preset 87.5 % of D calls are right; 9.9 % pick another allele although the
-right one was a candidate (similar D genes under SHM), 2.0 % never had the
-right candidate, and 0.07 % lose the D to a J alignment that covers it. No
-true D lay outside the D windows, with or without the anchor window.
+preset 87.5 % of reads get the right D; 10.2 % get another allele although
+the right one was a candidate (similar D genes under SHM), 1.8 % never had
+the right candidate, and none lose the D to a J alignment that covers it
+(0.00 %). No true D lay outside the D windows, with or without the anchor
+window; searching J over the whole read lets 0.05 % fall outside.
 
 ## Validation
 
@@ -567,17 +580,20 @@ true D lay outside the D windows, with or without the anchor window.
   summation over paths and canonical cuts (VJ, VDJ, VDDJ, a per-base N/P cost,
   a per-column evidence term, an N column, an insertion), and checks that the
   Viterbi score is the best path score; `strong_junction_costs_stay_in_range`
-  does the same with N/P costs of −4 and −8 per base across a 300-base V;
-  `posteriors_are_calibrated` bounds V/J calibration error on IgM- and
-  IgG-like reads.
+  does the same with N/P costs of −4 and −8 per base across a 300-base V,
+  `long_costly_gaps_keep_their_mass` across a 300-base gap that every path
+  crosses, and `overlaps_beyond_the_f64_range_are_refused` checks that a
+  540-base overlap gets no posteriors; `posteriors_are_calibrated` bounds V/J
+  calibration error on IgM- and IgG-like reads.
 - **DAG optimality:** `dag_equals_brute_force_over_all_paths_and_cuts` and
   `dag_equals_brute_force_on_hypermutated_igsim_reads` enumerate every
   VJ/VDJ/VDDJ path and every pair of canonical exit and entry cuts, with and
   without a per-base insertion cost and with the lexicographic support
   tie-break, and require the same optimum; the IgSim case fails on a DAG that
-  tries entries only inside the overlap. Two constructed reads need two cuts
-  (`two_cuts_leave_a_shared_mismatch_stretch_to_n`) and an entry beyond the
-  overlap (`entries_beyond_the_overlap_are_tried`).
+  tries entries only inside the overlap. Constructed reads need two cuts
+  (`two_cuts_leave_a_shared_mismatch_stretch_to_n`), an entry beyond the
+  overlap (`entries_beyond_the_overlap_are_tried`), and a D before a J whose
+  alignment starts earlier (`a_d_can_precede_a_j_that_starts_earlier`).
 - **Kernel exactness:**
   - The scalar kernel equals a textbook Gotoh across three gap regimes.
   - Every traceback rescores to its reported score.

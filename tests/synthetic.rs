@@ -244,7 +244,8 @@ fn tandem_d_is_a_first_class_path() {
 #[test]
 fn residual_adjudicator_is_a_drop_in_replacement() {
     let db = Db::new();
-    let residual = db.assigner(&EngineConfig::default()).with_adjudicator(ResidualAdjudicator::default());
+    let config = EngineConfig { posterior: false, ..EngineConfig::default() };
+    let residual = db.assigner(&config).with_adjudicator(ResidualAdjudicator::default());
     let mut rng = Rng(11);
     for _ in 0..20 {
         let d = rng.below(8);
@@ -343,7 +344,10 @@ impl Brute<'_> {
         }
         for e in 0..self.placements.len() {
             let pe = &self.placements[e];
-            if pe.q_start() <= pb.q_start() || !grammar.can_follow(pb.kind, pe.kind, d_used) {
+            // Kinds in grammar order wherever they start; one kind (tandem D)
+            // in order of start.
+            let same_kind_before = pe.kind == pb.kind && pe.q_start() <= pb.q_start();
+            if same_kind_before || !grammar.can_follow(pb.kind, pe.kind, d_used) {
                 continue;
             }
             let d_next = d_used + u8::from(pe.kind == SegmentKind::D);

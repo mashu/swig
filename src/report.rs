@@ -169,11 +169,13 @@ fn segment_report<C: AlleleCatalog>(
 
     // Posterior that the reported names include the read's allele up to
     // germline equivalence: the mass of every placement of this kind that is
-    // tied with the call, or that lies in the region the call's neighbours
-    // leave to this segment with germline bases there that the primary
-    // allele contains. If the read came from such a placement, the call still
-    // carries its germline bases. Placements outside the region (a tandem
-    // D's partner) are other events on the same path, so they never count.
+    // tied with the call, or that explains most of the read bases the call
+    // explains (more than half of the called span, within the region the
+    // call's neighbours leave to this segment) with germline bases there that
+    // the primary allele contains. If the read came from such a placement,
+    // the call still carries its germline bases. A placement that only
+    // reaches into the region by a few bases (a D inside the called J, a
+    // tandem D's partner) is another hypothesis, so it does not count.
     let region = call
         .path
         .as_ref()
@@ -187,10 +189,18 @@ fn segment_report<C: AlleleCatalog>(
                 .map(|s| s.span.q_lo);
             before.unwrap_or(0)..after.unwrap_or(call.query.len() as u32)
         });
+    let called_bases = called.span.q_lo..called.span.q_hi;
     let carried = |p: &Placement| {
         let Some(own) = p.clip.span(region.start, region.end) else {
             return false;
         };
+        let shared = own
+            .q_hi
+            .min(called_bases.end)
+            .saturating_sub(own.q_lo.max(called_bases.start));
+        if 2 * shared <= called_bases.len() as u32 {
+            return false;
+        }
         let codes = &set.allele(p.primary_allele()).codes;
         let bases = &codes[own.r_lo as usize..own.r_hi as usize];
         bases.is_empty() || reference.windows(bases.len()).any(|w| w == bases)
@@ -203,7 +213,9 @@ fn segment_report<C: AlleleCatalog>(
             })
             .filter_map(|i| m.placement.get(i))
             .sum::<f64>()
-            .min(1.0) // rounding only: the placements are exclusive on a path
+            // Rounding; and under a tandem grammar, a path holding two such
+            // D placements, so the sum is then an upper bound.
+            .min(1.0)
     });
     let mut names: Vec<&str> = Vec::new();
     for p in &tied {

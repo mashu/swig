@@ -12,6 +12,9 @@ use crate::germline::SegmentKind;
 use crate::placement::Placement;
 use crate::scoring::Score;
 
+/// Which segment sequences form a path. Transitions between kinds must go
+/// forward in [`SegmentKind::ALL`] order (V, D, J): the DAG visits kinds in
+/// that order ([`super::PlacementDag`]).
 pub trait Grammar: Send + Sync {
     fn can_start(&self, kind: SegmentKind) -> bool;
     /// `d_used` counts D segments up to and including `prev`.

@@ -159,14 +159,25 @@ pub fn transfer(
     positions: &[Option<u32>],
     workspace: &mut GotohWorkspace,
 ) -> Option<Vec<Option<u32>>> {
+    transfer_aligned(query, reference, positions, workspace).map(|(mapped, _)| mapped)
+}
+
+/// [`transfer`], also returning the local alignment the positions went
+/// through (to tell a query that ends while still aligned from one whose
+/// alignment stopped short).
+pub fn transfer_aligned(
+    query: &[u8],
+    reference: &[u8],
+    positions: &[Option<u32>],
+    workspace: &mut GotohWorkspace,
+) -> Option<(Vec<Option<u32>>, Alignment)> {
     let profile = SubstitutionProfile::build(&SCORING, reference);
     let alignment = BandedGotoh.align(query, &profile, SCORING.gaps, Band::Full, workspace)?;
-    Some(
-        positions
-            .iter()
-            .map(|p| p.and_then(|r| map_position(&alignment, r, query.len())))
-            .collect(),
-    )
+    let mapped = positions
+        .iter()
+        .map(|p| p.and_then(|r| map_position(&alignment, r, query.len())))
+        .collect();
+    Some((mapped, alignment))
 }
 
 #[cfg(test)]

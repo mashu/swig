@@ -1,7 +1,12 @@
 //! Placement DAG: bounded-topology semi-Markov Viterbi over clipped placements.
 //!
-//! Nodes are placements sorted by query start. A path visits placements in
-//! query order. Each placement on the path is clipped independently: the
+//! Nodes are placements sorted by segment kind (V, D, J), then query start.
+//! A path visits placements in read order of their retained bases: a
+//! transition between kinds needs only an exit cut `x` and an entry cut
+//! `y ≥ x`, wherever the two alignments start, so a D can precede a J whose
+//! alignment reaches back over it. Two segments of one kind (tandem D) also
+//! follow the order of their alignment starts. Each placement on the path is
+//! clipped independently: the
 //! earlier of two consecutive placements keeps query bases before its **exit
 //! cut** `x`, the later one keeps bases from its **entry cut** `y ≥ x` on,
 //! and the bases in between are N/P. This is the full segmentation model:
@@ -37,8 +42,10 @@
 //!
 //! Ties: final paths compare by [`PathScore`] (score, then fewer D, then
 //! germline support), so a with-D path must strictly beat the best no-D path.
-//! Among equal keys the later exit is kept (it retains more of the
-//! placement), then the first predecessor.
+//! Among equal keys: a node keeps its earliest entry, so a junction base that
+//! scores the same on either side goes to the later segment; for that entry,
+//! the predecessor's latest exit; and across predecessors, a path start, then
+//! the first predecessor in DAG order.
 
 use super::model::{Grammar, PathModel, VdjGrammar};
 use super::posterior::{divergence, Marginals, PosteriorModel, PosteriorScratch};
@@ -113,7 +120,35 @@ fn improve(best: &mut Option<Cell>, candidate: Cell, ties: bool) {
     }
 }
 
-/// One placement in DAG order (query start, then end).
+/// Keep `candidate` if its key is better, or equal and its predecessor comes
+/// first (a path start, then predecessors in node order). Candidates for one
+/// entry may be folded in any order: the result does not depend on it.
+#[inline]
+fn prefer(best: &mut Option<Cell>, candidate: Cell) {
+    // START (u32::MAX) wraps to 0, slot u to u + 1; slots follow node order.
+    let rank = |cell: &Cell| cell.slot.wrapping_add(1);
+    let better = match best {
+        None => true,
+        Some(current) => {
+            candidate.key > current.key
+                || (candidate.key == current.key && rank(&candidate) < rank(current))
+        }
+    };
+    if better {
+        *best = Some(candidate);
+    }
+}
+
+/// DAG order: segment kind (V, D, J), then query start and end. Every
+/// transition between kinds goes forward in this order whatever the
+/// alignments' starts, so a D can precede a J whose alignment starts earlier
+/// (the cuts decide whether the path is feasible); two segments of one kind
+/// (tandem D) follow the order of their starts.
+pub(super) fn order_key(p: &Placement, i: usize) -> (usize, u32, u32, usize) {
+    (p.kind.index(), p.q_start(), p.q_end(), i)
+}
+
+/// One placement in DAG order (kind, then query start and end).
 #[derive(Clone, Copy, Debug)]
 struct Node {
     placement: usize,
@@ -132,6 +167,12 @@ struct Node {
 impl Node {
     fn q_end(&self) -> u32 {
         self.q_start + self.len
+    }
+
+    /// Whether `self` comes before `other` in DAG order and may precede it
+    /// on a path: an earlier kind, or the same kind starting earlier.
+    fn precedes(&self, other: &Node) -> bool {
+        (self.kind.index(), self.q_start) < (other.kind.index(), other.q_start)
     }
 
     fn width(&self) -> usize {
@@ -229,8 +270,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
     fn layout(&self, placements: &[Placement], s: &mut DagScratch) {
         s.order.clear();
         s.order.extend(0..placements.len());
-        s.order
-            .sort_by_key(|&i| (placements[i].q_start(), placements[i].q_end(), i));
+        s.order.sort_by_key(|&i| order_key(&placements[i], i));
         s.nodes.clear();
         s.entry.clear();
         s.exit.clear();
@@ -266,7 +306,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         let grammar = &self.grammar;
         let node = s.nodes[e];
         let width = node.width();
-        let predecessors = s.nodes.partition_point(|b| b.q_start < node.q_start);
+        let predecessors = s.nodes.partition_point(|b| b.precedes(&node));
         let start = grammar
             .can_start(node.kind)
             .then_some((u8::from(node.kind == SegmentKind::D), node.kind))
@@ -314,14 +354,13 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
             } = s.slots[t];
             let forward = &mut s.forward[values..values + width];
             if start == Some((d_used, first)) {
-                improve(
+                prefer(
                     &mut forward[0],
                     Cell {
                         key: (0, 0),
                         slot: START,
                         at: 0,
                     },
-                    false,
                 );
             }
             s.tails.clear();
@@ -336,20 +375,24 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
             ) {
                 let iota = self.model.junction_per_base(b.kind, node.kind);
                 let running = &s.running[s.slots[u].per_kind(node.kind, b.width())];
-                // Entries inside b: the best exit at or before the entry.
+                // Entries inside b: the best exit at or before the entry. A
+                // predecessor of another kind may start after this node
+                // (its entries before b's start have no exit to follow).
                 for &o in entries {
                     let y = node.q_start + o;
                     if y >= b.q_end() {
                         break;
                     }
-                    let z = y - b.q_start;
+                    let Some(z) = y.checked_sub(b.q_start) else {
+                        continue;
+                    };
                     if let Some(cell) = running[z as usize] {
                         let candidate = Cell {
                             key: (cell.key.0 + iota * z as Score, cell.key.1),
                             slot: u as u32,
                             at: cell.at,
                         };
-                        improve(&mut forward[o as usize], candidate, false);
+                        prefer(&mut forward[o as usize], candidate);
                     }
                 }
                 // Entries at or beyond b's end: b's best exit overall, once.
@@ -357,17 +400,13 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
                 if let (true, Some(cell)) = (beyond < width, running[b.len as usize]) {
                     let candidate = Cell {
                         key: (
-                            cell.key.0 + iota * (node.q_start - b.q_start) as Score,
+                            cell.key.0 + iota * (node.q_start as Score - b.q_start as Score),
                             cell.key.1,
                         ),
                         slot: u as u32,
                         at: cell.at,
                     };
-                    improve(
-                        &mut s.tails[b.kind.index() * width + beyond],
-                        candidate,
-                        false,
-                    );
+                    prefer(&mut s.tails[b.kind.index() * width + beyond], candidate);
                 }
             }
             for kind in SegmentKind::ALL {
@@ -379,10 +418,10 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
                 let mut best: Option<Cell> = None;
                 for (o, cell) in tail.iter().enumerate() {
                     if let Some(cell) = *cell {
-                        improve(&mut best, cell, false);
+                        prefer(&mut best, cell);
                     }
                     if let (Some(cell), true) = (best, s.entry[node.cuts + o].is_some()) {
-                        improve(&mut forward[o], cell.shift(iota * o as Score), false);
+                        prefer(&mut forward[o], cell.shift(iota * o as Score));
                     }
                 }
             }
@@ -618,6 +657,44 @@ mod tests {
         assert_eq!(path.score.score, 44);
         let (v_seg, j_seg) = (path.segments[0], path.segments[1]);
         assert_eq!((v_seg.span.q_hi, j_seg.span.q_lo), (11, 15));
+    }
+
+    /// The J alignment starts one base before the D, its first 13 bases
+    /// mismatching the D region. V → D → J, with J entered after the D,
+    /// beats V → J: the D follows a J that starts earlier.
+    #[test]
+    fn a_d_can_precede_a_j_that_starts_earlier() {
+        let ascii = b"TTTTTTTTTTTTTTTTTTTTACGACTTGCAGTCAAAAAAAAAAAAAAAAAAAAAAAA";
+        let query = encode(ascii);
+        let other = |b: &u8| match b {
+            b'A' => b'C',
+            b'C' => b'A',
+            b'G' => b'T',
+            _ => b'G',
+        };
+        let mut j: Vec<u8> = ascii[21..34].iter().map(other).collect();
+        j.extend_from_slice(&ascii[34..]);
+        let placements = [
+            placement(SegmentKind::V, &query, &encode(&ascii[..20]), 0),
+            placement(SegmentKind::D, &query, &encode(&ascii[22..34]), 22),
+            placement(SegmentKind::J, &query, &encode(&j), 21),
+        ];
+        assert_eq!(
+            placements.iter().map(Placement::score).collect::<Vec<_>>(),
+            [40, 24, 7]
+        );
+        let dag = PlacementDag::new(VdjGrammar::VDJ, EngineeringObjective::default(), [1, 1, 1]);
+        let path = dag
+            .adjudicate(query.len(), &placements, &mut DagScratch::default())
+            .expect("a path");
+        // V 40 + D (24 − 11) + J from base 34 (46) = 99; V → J alone is 86.
+        assert_eq!(path.score.score, 99);
+        let spans: Vec<(u32, u32)> = path
+            .segments
+            .iter()
+            .map(|s| (s.span.q_lo, s.span.q_hi))
+            .collect();
+        assert_eq!(spans, vec![(0, 20), (22, 34), (34, 57)]);
     }
 
     /// J starts inside V, and its alignment has two mismatches right after

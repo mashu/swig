@@ -60,10 +60,14 @@
 //! and exit weights are centred separately, each on the midpoint of the
 //! evidence range over the cuts a path can use on that side, and the
 //! difference is carried as a per-node `shift`. Junction recursions keep only
-//! relative factors (`≤ 1`) and renormalise before multiplying weights. A
-//! placement whose range on one side exceeds [`MAX_SPREAD`] nats would leave
-//! the `f64` range, and the read then gets no marginals.
+//! relative factors (`≤ 1`) and renormalise before multiplying weights; the
+//! N/P cost of a gap between non-overlapping neighbours joins the slot's
+//! log-scale. A placement whose range on one side exceeds [`MAX_SPREAD`]
+//! nats, or an overlap across which both neighbours gain more than
+//! [`OVERLAP_SPREAD`], would leave the `f64` range, and the read then gets no
+//! marginals.
 
+use super::dag::order_key;
 use super::model::{Grammar, PathModel};
 use super::{CallPath, PlacementDag};
 use crate::germline::SegmentKind;
@@ -73,6 +77,13 @@ use crate::scoring::Score;
 /// Largest range of evidence, in nats, over a placement's usable entry cuts
 /// or over its usable exit cuts. Each weight then stays within `e^{±600}`.
 pub const MAX_SPREAD: f64 = 1200.0;
+
+/// Largest evidence a predecessor's exits and a successor's entries may
+/// both gain across their overlap. A junction product `F(y) · B(y)` there
+/// is about `e^{−min of the two}` relative to its factors' maxima, so this
+/// keeps it inside the `f64` range. Real overlaps (a junction's length) gain
+/// a few dozen nats.
+pub const OVERLAP_SPREAD: f64 = 600.0;
 
 /// D counts the grammar is asked about when deciding which cuts are usable.
 const MAX_D: u8 = 3;
@@ -266,6 +277,11 @@ impl Node {
         self.q_start + self.len
     }
 
+    /// As in the Viterbi DAG: an earlier kind, or the same kind starting earlier.
+    fn precedes(&self, other: &Node) -> bool {
+        (self.kind.index(), self.q_start) < (other.kind.index(), other.q_start)
+    }
+
     fn width(&self) -> usize {
         self.len as usize + 1
     }
@@ -318,6 +334,9 @@ pub struct PosteriorScratch {
     /// Per Match column: query position, entry and exit prefix scores, and
     /// the evidence (nats) before and through it.
     columns: Vec<(u32, Score, Score, f64, f64)>,
+    /// Uncentred evidence at each usable entry / exit offset (NaN elsewhere).
+    entry_nats: Vec<f64>,
+    exit_nats: Vec<f64>,
 }
 
 /// `ln(e^a + e^b)`.
@@ -391,8 +410,9 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
     /// with each segment's alignment evidence on `evidence[kind]` and the
     /// model's prior terms at `lambda` nats per unit.
     ///
-    /// `None` when no grammatical path exists, or a placement's evidence
-    /// range is too wide for linear arithmetic ([`MAX_SPREAD`]).
+    /// `None` when no grammatical path exists, or when linear arithmetic
+    /// cannot hold the read: a placement's evidence range ([`MAX_SPREAD`]) or
+    /// an overlap's ([`OVERLAP_SPREAD`]) is too wide.
     pub fn posterior(
         &self,
         placements: &[Placement],
@@ -463,18 +483,20 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
     }
 
     /// Nodes in DAG order with dense canonical-cut weights. `false` when a
-    /// placement's usable entries or exits span more than [`MAX_SPREAD`] nats.
+    /// placement's usable entries or exits span more than [`MAX_SPREAD`] nats,
+    /// or an overlap more than [`OVERLAP_SPREAD`].
     fn layout(&self, s: &mut PosteriorScratch) -> bool {
         let placements = self.placements;
         let grammar = &self.dag.grammar;
         let lambda0 = self.w.lambda;
         s.order.clear();
         s.order.extend(0..placements.len());
-        s.order
-            .sort_by_key(|&i| (placements[i].q_start(), placements[i].q_end(), i));
+        s.order.sort_by_key(|&i| order_key(&placements[i], i));
         s.nodes.clear();
         s.entry_w.clear();
         s.exit_w.clear();
+        s.entry_nats.clear();
+        s.exit_nats.clear();
         s.entries.clear();
         let any_d = |f: &dyn Fn(u8) -> bool| (0..=MAX_D).any(f);
         for &i in &s.order {
@@ -532,6 +554,8 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
             let cuts = s.entry_w.len();
             s.entry_w.resize(cuts + len as usize + 1, 0.0);
             s.exit_w.resize(cuts + len as usize + 1, 0.0);
+            s.entry_nats.resize(cuts + len as usize + 1, f64::NAN);
+            s.exit_nats.resize(cuts + len as usize + 1, f64::NAN);
             let first_entry = s.entries.len();
             // Running products along the alignment, `before` = e^{c_in − entry
             // nats} and `inv` = e^{entry nats − c_out}, reseeded exactly
@@ -543,7 +567,7 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
             };
             let (mut before, mut inv) = (f64::NAN, f64::NAN);
             let mut last: Option<(Score, Score)> = None;
-            for &(q, entry, exit, nats, _) in &s.columns {
+            for &(q, entry, exit, nats, through) in &s.columns {
                 if let Some((last_entry, last_exit)) = last {
                     let (column, gap) = (last_exit - last_entry, entry - last_exit);
                     before *= substitution(column, false) * self.w.of(-gap);
@@ -557,12 +581,14 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
                         before = (c_in - nats).exp();
                     }
                     s.entry_w[cuts + o as usize] = before;
+                    s.entry_nats[cuts + o as usize] = nats;
                 }
                 if exit_used(o + 1) {
                     if !usable(inv) {
                         inv = (nats - c_out).exp();
                     }
                     s.exit_w[cuts + o as usize + 1] = inv * substitution(exit - entry, true);
+                    s.exit_nats[cuts + o as usize + 1] = through;
                 }
                 s.entries.push(o);
             }
@@ -577,6 +603,37 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
                 shift: c_out - c_in,
             });
         }
+        self.overlaps_in_range(s)
+    }
+
+    /// Whether every overlap between a node and a possible successor keeps
+    /// its junction products in range ([`OVERLAP_SPREAD`]).
+    fn overlaps_in_range(&self, s: &PosteriorScratch) -> bool {
+        let grammar = &self.dag.grammar;
+        // Range of the finite values of `nats` at query positions `lo..=hi`.
+        let range = |nats: &[f64], node: &Node, lo: u32, hi: u32| {
+            let at = |q: u32| nats[node.cuts + (q - node.q_start) as usize];
+            let (min, max) = (lo..=hi)
+                .map(at)
+                .filter(|v| v.is_finite())
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| {
+                    (a.min(v), b.max(v))
+                });
+            (max - min).max(0.0)
+        };
+        for (k, e) in s.nodes.iter().enumerate() {
+            for b in &s.nodes[..k] {
+                let follows = (0..=MAX_D).any(|d| grammar.can_follow(b.kind, e.kind, d));
+                if !(b.precedes(e) && follows && b.q_end() > e.q_start && e.q_end() > b.q_start) {
+                    continue;
+                }
+                let (lo, hi) = (b.q_start.max(e.q_start), b.q_end().min(e.q_end()));
+                let gained = range(&s.exit_nats, b, lo, hi).min(range(&s.entry_nats, e, lo, hi));
+                if gained > OVERLAP_SPREAD {
+                    return false;
+                }
+            }
+        }
         true
     }
 
@@ -586,7 +643,7 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
         let grammar = &self.dag.grammar;
         let node = s.nodes[e];
         let width = node.width();
-        let predecessors = s.nodes.partition_point(|b| b.q_start < node.q_start);
+        let predecessors = s.nodes.partition_point(|b| b.precedes(&node));
         let start = grammar
             .can_start(node.kind)
             .then_some((u8::from(node.kind == SegmentKind::D), node.kind))
@@ -631,6 +688,13 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
                 ..
             } = s.slots[t];
             let starts_here = start == Some((d_used, first));
+            // A predecessor ending before this node reaches it across an N/P
+            // gap; its weight joins the log scale, so a long, costly gap
+            // cannot underflow when every path crosses it.
+            let gap = |b: &Node| {
+                let iota = self.dag.model.junction_per_base(b.kind, node.kind);
+                self.w.lambda * f64::from(iota * node.q_start.saturating_sub(b.q_end()) as Score)
+            };
             let reference = incoming(
                 s,
                 grammar,
@@ -639,7 +703,7 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
                 d_used,
                 first,
             )
-            .map(|(_, u)| u.exit_scale)
+            .map(|(b, u)| u.exit_scale + gap(&b))
             .fold(if starts_here { 0.0 } else { f64::NEG_INFINITY }, f64::max);
 
             let mut tails = std::mem::take(&mut s.tails);
@@ -660,25 +724,26 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
                 d_used,
                 first,
             ) {
-                let factor = (u.exit_scale - reference).exp();
-                let iota = self.dag.model.junction_per_base(b.kind, node.kind);
+                // `gap(b)` is 0 for a predecessor that overlaps this node.
+                let factor = (u.exit_scale + gap(&b) - reference).exp();
                 let r = &s.running[u.per_kind(node.kind, b.width())];
-                // Entries inside b: exits up to the entry.
+                // Entries inside b: exits up to the entry (none before b's
+                // start, which a predecessor of another kind may have).
                 for &o in entries {
                     let y = node.q_start + o;
                     if y >= b.q_end() {
                         break;
                     }
+                    let Some(z) = y.checked_sub(b.q_start) else {
+                        continue;
+                    };
                     // r[z] already carries e^{λι(z − x)} for each exit x.
-                    f[o as usize] += factor * r[(y - b.q_start) as usize];
+                    f[o as usize] += factor * r[z as usize];
                 }
                 // Entries at or beyond b's end: all exits, added once.
                 let beyond = b.q_end().saturating_sub(node.q_start) as usize;
                 if beyond < width {
-                    let gap = self
-                        .w
-                        .of(iota * node.q_start.saturating_sub(b.q_end()) as Score);
-                    tails[b.kind.index() * width + beyond] += factor * r[b.len as usize] * gap;
+                    tails[b.kind.index() * width + beyond] += factor * r[b.len as usize];
                 }
             }
             for kind in SegmentKind::ALL {
@@ -789,13 +854,19 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
             return;
         }
         let width = node.width();
-        let successors = s.nodes.partition_point(|e| e.q_start <= node.q_start);
+        let successors = s.nodes.partition_point(|e| !node.precedes(e));
         let can_end = grammar.can_end(slot.first, node.kind);
         let follows = |kind: SegmentKind| grammar.can_follow(node.kind, kind, slot.d_used);
+        // As in the forward pass, an N/P gap to a successor that starts after
+        // this node's end joins the log scale.
+        let gap = |e: &Node| {
+            let iota = model.junction_per_base(node.kind, e.kind);
+            self.w.lambda * f64::from(iota * e.q_start.saturating_sub(node.q_end()) as Score)
+        };
         let mut reference = if can_end { 0.0 } else { f64::NEG_INFINITY };
         for kind in SegmentKind::ALL.into_iter().filter(|&k| follows(k)) {
-            for (_, u) in outgoing(s, &s.nodes[successors..], kind, &slot) {
-                reference = reference.max(u.backward_scale);
+            for (e, u) in outgoing(s, &s.nodes[successors..], kind, &slot) {
+                reference = reference.max(u.backward_scale + gap(&e));
             }
         }
         if reference == f64::NEG_INFINITY {
@@ -816,22 +887,22 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
             tails.clear();
             tails.resize(width, 0.0);
             for (e, u) in outgoing(s, &s.nodes[successors..], kind, &slot) {
-                let factor = (u.backward_scale - reference).exp();
+                let factor = (u.backward_scale + gap(&e) - reference).exp();
                 let backward = &s.backward[u.values..u.values + e.width()];
                 for &o in &s.entries[e.entries.0..e.entries.1] {
                     let y = e.q_start + o;
                     if y >= node.q_end() {
                         break;
                     }
-                    tails[(y - node.q_start) as usize] += factor * backward[o as usize];
+                    let Some(z) = y.checked_sub(node.q_start) else {
+                        continue;
+                    };
+                    tails[z as usize] += factor * backward[o as usize];
                 }
                 let beyond = node.q_end().saturating_sub(e.q_start) as usize;
                 if beyond < e.width() {
-                    let gap = self
-                        .w
-                        .of(iota * e.q_start.saturating_sub(node.q_end()) as Score);
                     let suffix = &s.suffix[u.per_kind(node.kind, e.width())];
-                    tails[width - 1] += factor * gap * suffix[beyond];
+                    tails[width - 1] += factor * suffix[beyond];
                 }
             }
             // inner(o) += Σ_{z ≥ o} tails(z) · e^{λι(z − o)}.
@@ -1029,8 +1100,10 @@ mod tests {
                     self.d_count[usize::from(d_used)] += weight;
                 }
                 for (j, e) in placements.iter().enumerate() {
-                    if e.q_start() <= b.q_start() || !dag.grammar.can_follow(b.kind, e.kind, d_used)
-                    {
+                    // Kinds in grammar order wherever they start; one kind
+                    // (tandem D) in order of start.
+                    let same_kind_before = e.kind == b.kind && e.q_start() <= b.q_start();
+                    if same_kind_before || !dag.grammar.can_follow(b.kind, e.kind, d_used) {
                         continue;
                     }
                     let iota = dag.model.junction_per_base(b.kind, e.kind);
@@ -1175,6 +1248,27 @@ mod tests {
         (query, placements)
     }
 
+    /// A J alignment that starts before the D it follows on the best path
+    /// (its first bases mismatch the D region).
+    fn j_reaching_over_d() -> (Vec<u8>, Vec<Placement>) {
+        let ascii = b"TTTTTTTTTTTTTTTTTTTTACGACTTGCAGTCAAAAAAAAAAAAAAAAAAAAAAAA";
+        let query = encode(ascii);
+        let other = |b: &u8| match b {
+            b'A' => b'C',
+            b'C' => b'A',
+            b'G' => b'T',
+            _ => b'G',
+        };
+        let mut j: Vec<u8> = ascii[21..34].iter().map(other).collect();
+        j.extend_from_slice(&ascii[34..]);
+        let placements = vec![
+            placement(SegmentKind::V, &query, &encode(&ascii[..20]), 0),
+            placement(SegmentKind::D, &query, &encode(&ascii[22..34]), 22),
+            placement(SegmentKind::J, &query, &encode(&j), 21),
+        ];
+        (query, placements)
+    }
+
     #[test]
     fn marginals_equal_exhaustive_summation() {
         let (_, placements) = junction();
@@ -1198,6 +1292,11 @@ mod tests {
         check(&dag, &placements, fixed);
         // Evidence at a read's own divergence: a per-column term μ ≠ 0.
         check(&dag, &placements, EvidenceScale::at_divergence(0.02, 2, -3));
+        // A D before a J whose alignment starts earlier.
+        let (_, over) = j_reaching_over_d();
+        for grammar in [VdjGrammar::VDJ, VdjGrammar::TANDEM_D] {
+            check(&PlacementDag::new(grammar, model, [4, 3, 4]), &over, fixed);
+        }
         // An N column and an insertion, at the read's divergence and fixed.
         let (_, gapped) = gapped_junction();
         for evidence in [fixed, EvidenceScale::at_divergence(0.005, 2, -3)] {
@@ -1252,6 +1351,74 @@ mod tests {
                 EvidenceScale::at_divergence(0.001, 2, -3),
             );
         }
+    }
+
+    /// Every path crosses a 300-base N/P gap at ι = −4 (−760 nats), which
+    /// is below the `f64` range as a factor; it must go into the log scale.
+    #[test]
+    fn long_costly_gaps_keep_their_mass() {
+        let mut x = 11u64;
+        let query: Vec<u8> = (0..360)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((x >> 33) & 3) as u8
+            })
+            .collect();
+        let placements = vec![
+            placement(SegmentKind::V, &query, &query[..30], 0),
+            placement(SegmentKind::J, &query, &query[330..], 330),
+        ];
+        let model = EngineeringObjective {
+            insertion_per_base: -4,
+            ..EngineeringObjective::default()
+        };
+        let grammar = VdjGrammar {
+            require_v: true,
+            require_j: true,
+            ..VdjGrammar::VDJ
+        };
+        check(
+            &PlacementDag::new(grammar, model, [4, 3, 4]),
+            &placements,
+            EvidenceScale::fixed(LAMBDA),
+        );
+    }
+
+    /// V and J overlap on 540 matched bases: a junction product would fall
+    /// out of the `f64` range, so the read gets no marginals rather than
+    /// wrong ones.
+    #[test]
+    fn overlaps_beyond_the_f64_range_are_refused() {
+        let mut x = 5u64;
+        let query: Vec<u8> = (0..700)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((x >> 33) & 3) as u8
+            })
+            .collect();
+        let placements = vec![
+            placement(SegmentKind::V, &query, &query[..600], 0),
+            placement(SegmentKind::J, &query, &query[60..], 60),
+        ];
+        let dag = PlacementDag::new(VdjGrammar::VDJ, EngineeringObjective::default(), [4, 3, 4]);
+        let evidence = EvidenceScale::at_divergence(0.01, 2, -3);
+        let m = dag.posterior(
+            &placements,
+            LAMBDA,
+            &[evidence; 3],
+            &mut PosteriorScratch::default(),
+        );
+        assert!(m.is_none(), "{m:?}");
+        // A junction-sized overlap is fine.
+        let short = vec![
+            placement(SegmentKind::V, &query, &query[..300], 0),
+            placement(SegmentKind::J, &query, &query[260..360], 260),
+        ];
+        check(&dag, &short, evidence);
     }
 
     #[test]

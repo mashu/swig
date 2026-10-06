@@ -223,6 +223,11 @@ impl<A, RV, RJ, RD, W, Adm, Adj, Rf> Assigner<A, RV, RJ, RD, W, Adm, Adj, Rf> {
         }
     }
 
+    /// Swap the adjudicator. The D stage keeps the D placements the original
+    /// one needed: built with posteriors, it keeps those below the DAG's D
+    /// floor, so pair an adjudicator without its own D significance floor
+    /// (such as [`crate::adjudicate::ResidualAdjudicator`]) with
+    /// `posterior: false`.
     pub fn with_adjudicator<Adj2>(
         self,
         adjudicator: Adj2,

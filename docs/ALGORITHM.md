@@ -48,7 +48,8 @@ the extension, mismatches included, count towards the ranking.
 ### 2.2 Paths
 
 A *placement* is an aligned segment hypothesis. A *path* is a sequence of
-placements in read order that the grammar allows (`adjudicate/model.rs`):
+placements that the grammar allows (`adjudicate/model.rs`), with their
+retained bases in read order:
 
 ```text
 V → D{0..max_d} → J,     partial paths allowed (V…, …J, V…J);  max_d = 1 (VDJ) or 2 (VDDJ)
@@ -59,6 +60,10 @@ read bases before its *exit* `x`, the second keeps bases from its *entry*
 `y ≥ x` on, and the `y − x` bases between them are N/P. Each placement is
 then *clipped* to the alignment columns it keeps. Overlapping placements may
 therefore split the overlap at any point, or leave part of it to neither.
+Only the cuts order two segments of different kinds: a D may precede a J
+whose alignment starts before the D's, as long as the J is entered after the
+D's exit. Two segments of one kind (tandem D) follow the order of their
+alignment starts.
 
 ### 2.3 Objective
 
@@ -132,8 +137,12 @@ one term per cut. The support key is cut-independent.
 
 ## 4. Adjudication: exact semi-Markov Viterbi (`adjudicate/dag.rs`)
 
-Placements are nodes, sorted by read start. The paths through a node with a
-given D count and first segment kind form a **slot**. A slot holds one value
+Placements are nodes, sorted by segment kind (V, D, J), then read start.
+Every transition between kinds goes forward in this order wherever the two
+alignments start, and the cuts alone decide whether it is feasible
+(`x ≤ y`); two segments of one kind (tandem D) follow the order of their
+starts. The paths through a node with a given D count and first segment kind
+form a **slot**. A slot holds one value
 per canonical entry cut `y` of the node: the best key (score, then germline
 support) of a path prefix that enters there. With a linear N/P score
 `ι·(y − x)` the recursion is
@@ -166,12 +175,19 @@ alignment's own start, but the bases between `b`'s end and a later entry are
 a middle stretch of `e`'s alignment and can score below zero (two mismatches
 right after V's end, as a mutated read has). Entering after them and leaving
 them to N/P then wins. Adversarial review found the gap, and a hypermutated
-IgSim oracle (below) confirms that real reads hit it.
+IgSim oracle (below) confirms that real reads hit it. A second review found
+that nodes sorted by read start alone let a D precede only a J that starts
+after it, so a J alignment reaching back over the D (the "J eats D"
+configuration) excluded the path V → D → J with that J. The brute-force
+oracles had the same restriction; sorting by kind removes it.
 
 Ties: complete paths compare by `PathScore` (score, then fewer D, then
 germline support), so a path with a D must strictly beat the best path
-without one. Among equal keys the later exit is kept (it retains more of the
-placement), then the first predecessor.
+without one. Among equal keys: a node keeps its earliest entry, so a junction
+base that scores the same on either side goes to the later segment; for that
+entry, the predecessor's latest exit; across predecessors, a path start, then
+the first predecessor in node order (compared explicitly, so the result does
+not depend on the order candidates are folded in).
 
 **Theorem 1.** The DAG returns the optimum of §2.3 over all grammatical
 paths, placements and pairs of canonical cuts. Checks:
@@ -184,9 +200,16 @@ paths, placements and pairs of canonical cuts. Checks:
   reads (`dag_equals_brute_force_on_hypermutated_igsim_reads`, top 3 V,
   6 D, 3 J, `ι ∈ {0, −1}`). The test asserts that some optimum enters a
   placement beyond the overlap, and it fails on the earlier restricted search;
-- two constructed cases in `adjudicate/dag.rs`: leaving a shared mismatch
-  stretch to N beats every single cut, and an entry in the middle of J's
-  alignment, past V's end, beats every entry inside the overlap.
+- three constructed cases in `adjudicate/dag.rs`: leaving a shared mismatch
+  stretch to N beats every single cut; an entry in the middle of J's
+  alignment, past V's end, beats every entry inside the overlap; and
+  V → D → J beats V → J when the J's alignment starts one base before the D
+  (it fails when nodes are sorted by read start alone).
+
+The exhaustive test on synthetic reads alone separates neither restricted
+search from the exact one: its reads never put mismatches right after a
+neighbour's end, nor a J alignment over a D. The hypermutated-read test and
+the constructed cases are the ones that do.
 
 ## 4a. Posterior decoding (`adjudicate/posterior.rs`)
 
@@ -255,14 +278,28 @@ slot, as in scaled HMM recursions.
 - *Junctions.* The N/P factor `e^{ι(y' − x)}` is accumulated as a relative
   recursion (`acc ← acc·e^{ι} + v`), whose factors are ≤ 1, and every prefix
   sum is normalised before it multiplies a cut weight. A strong per-base cost
-  across a long V therefore cannot overflow.
+  across a long V therefore cannot overflow. The cost of a gap between
+  neighbours that do not overlap joins the slot's log-scale instead of being
+  a factor, so a long, costly gap that every path crosses cannot underflow.
+- *Overlaps.* Inside an overlap, the forward mass rises with the
+  predecessor's exit evidence and the backward mass falls with the
+  successor's entry evidence, so their product is about `e^{−g}` relative to
+  its factors' maxima, with `g` the smaller of the two gains across the
+  overlap. A read with `g > 600` nats (`OVERLAP_SPREAD`; about 430 matched
+  bases, against a few dozen nats for a junction) gets no posteriors rather
+  than wrong ones.
 
 **Reported probabilities.** A segment's `posterior` is the mass of every
-placement of its kind, overlapping the call's region, that is tied with the
-call on the called interval, or whose germline bases between the call's
-neighbours the primary allele contains. The event is "the reported names
-include the read's allele, up to germline equivalence"; §7 scores exactly
-this event. `d_presence_posterior = 1 − P(no D)`.
+placement of its kind that is tied with the call on the called interval, or
+that explains most of the read bases the call explains (more than half of
+the called span, within the region between the call's neighbours) with
+germline bases there that the primary allele contains. A placement that only
+reaches into the region by a few bases (a D inside the called J) is another
+hypothesis: a few bases occur in almost any allele. The event is "the
+reported names include the read's allele, up to germline equivalence"; §7
+scores exactly this event. Under the tandem grammar a path can hold two such
+D placements, so the sum is clamped to 1 and is then an upper bound.
+`d_presence_posterior = 1 − P(no D)`.
 
 **Theorem 2.** The marginals equal exhaustive summation over all grammatical
 paths and canonical cut pairs (unit tests in `adjudicate/posterior.rs`):
@@ -274,9 +311,15 @@ paths and canonical cut pairs (unit tests in `adjudicate/posterior.rs`):
   the test fails if `N` columns are scored as `μ`);
 - a 300-base V with every 7th base mutated and a strong N/P cost
   (`ι ∈ {−4, −8}`), which overflowed before the junction recursion was made
-  relative.
+  relative;
+- a 300-base N/P gap at `ι = −4` that every path crosses
+  (`require_v`, `require_j`), which underflowed to no posteriors when the gap
+  was a linear factor;
+- a D before a J whose alignment starts one base earlier, under VDJ and
+  VDDJ grammars.
 
-The same tests check that the Viterbi score is the best path score.
+The same tests check that the Viterbi score is the best path score, and a
+540-base V/J overlap is refused (`None`) instead of giving marginals above 1.
 
 ## 5. Search
 
@@ -291,10 +334,10 @@ step can lose.
 | V band | `retrieve/seed_vote.rs` | bounded | Cluster's diagonal range, shifted by the allele's frame offset, ± 8 diagonals: holds unless an indel longer than 8 escapes the seeds. |
 | V scoring | `segment.rs`, `family_bound.rs` | lossless | Score-only DP; a same-length sibling is skipped when `S(rep) + Δ(rep, sibling)` cannot reach the current top-3 cutoff (sound upper bound). |
 | V/J keep | `segment.rs` | defined | Trace back until the top 3 alignments with E ≤ 1, plus ties. No length or identity floor: a positive `(2, −3)` local alignment has identity > 3/5 and the E-value implies a length. |
-| J | `retrieve/exhaustive.rs`, `window.rs` | bounded | Every J allele, unbanded, in `[min V end − 12, read end)`: a J can reach back into V only through chance edge matches. Whole-read J search changes no V or D call and is 15–28 % slower. The J is not placed jointly with the D, yet in measurement it does not "eat" it: the D windows reach 12 bases into J and include the conserved-anchor window, and the DAG's independent cuts give any J/D overlap to whichever explains it better. With a D remnant ≥ 8 nt (`examples/d_errors.rs`, human IGH), a missing D whose bases the called J covers is 0.00 % (mid) / 0.09 % (hard) of reads, and a true D outside the windows 0 %; only whole-read J without the anchor window lets 0.05 % fall outside. |
+| J | `retrieve/exhaustive.rs`, `window.rs` | bounded | Every J allele, unbanded, in `[min V end − 12, read end)`: a J can reach back into V only through chance edge matches. Whole-read J search is 18 % slower and changes a few hard-preset calls (D −0.04 pp, J −0.02 pp), none on mid. The J is not placed jointly with the D, yet it does not "eat" it: the D windows reach 12 bases into J and include the conserved-anchor window, and the DAG orders segments by kind, so a D can precede a J whose alignment reaches back over it and the cuts give any J/D overlap to whichever explains it better. With a D remnant ≥ 8 nt (`examples/d_errors.rs`, human IGH), a missing D whose bases the called J covers is 0.00 % of reads on mid and hard, and a true D outside the windows 0 %; whole-read J lets 0.05 % fall outside. |
 | D windows | `window.rs` | bounded | `[best V end − 12, best J start + 12)` plus the conserved-anchor window `[V Cys104 + 3, J Trp/Phe118)`. |
 | D prefilter | `retrieve/lmer_mask.rs` | lossless w.r.t. gates | Shares ≥ 1 L-mer, with `L` derived from the gates (`min_d_match`; 4 with the optional distributed-D gate, by pigeonhole). |
-| D floor | `config.rs`, `adjudicate/model.rs` | lossless for the call | Viterbi only (`--no-posterior`): score ≥ max(gate floor, `P_D + 1`). By Lemma 1 a D at or below `P_D` adds ≤ 0, and dropping it leaves its neighbours' cuts valid (exit ≤ entry), so the no-D path is at least as good (requires `ι = 0`, the default). With posteriors every admissible D is kept: a D below the floor cannot be called but carries mass `e^{s − P_D}`, and dropping it would bias `d_presence_posterior` down. |
+| D floor | `config.rs`, `adjudicate/model.rs` | lossless for the call | Only when the DAG computes no posteriors (`--no-posterior`; `--residual` turns posteriors off): score ≥ max(gate floor, `P_D + 1`). By Lemma 1 a D at or below `P_D` adds ≤ 0, and dropping it leaves its neighbours' cuts valid (exit ≤ entry), so the no-D path is at least as good (requires `ι = 0`, the default). With posteriors every admissible D is kept: a D below the floor cannot be called but carries mass `e^{s − P_D}`, and dropping it would bias `d_presence_posterior` down. |
 | D admission | `admission.rs` | defined | Exact run ≥ `min_d_match` = 4 (3, 5 and 6 are all worse). The note's distributed-evidence alternative is optional and off: it admitted no D that changed a call. |
 
 *Gene frames.* The alleles of a gene are placed in one coordinate system,
@@ -364,8 +407,13 @@ window (`--no-anchor-window`).
 
 **Cross-tool comparison.** IgBLAST 1.22 (Bioconda) on the same IgSim reads
 and germline database (`-organism human -ig_seqtype Ig -outfmt 19`, custom
-V/D/J databases from the same FASTA, auxiliary data from the package),
-scored by the same evaluator after mapping IgBLAST's names back.
+V/D/J databases from the same FASTA), scored by the same evaluator after
+mapping IgBLAST's names back. IgBLAST takes J frames and CDR3 ends from its
+auxiliary file, which must list every J allele of the database: three were
+missing (IGHJ4\*02_g23-, IGHJ5\*02_c33t, IGHJ5\*04) and were added from
+`vdj-assign prepare`'s anchors (CDR3 end = anchor − 1, frame = anchor mod 3;
+these agree with the file on all 13 shared alleles). Without them IgBLAST
+reports no junction for 18 % of reads.
 
 **Search error vs model error** (`examples/diagnose.rs`). Each read is also
 aligned to every allele, unbanded, under the same objective. If that

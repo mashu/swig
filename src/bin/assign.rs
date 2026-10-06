@@ -55,7 +55,7 @@ options:
   --tandem-d           allow VDDJ paths (second D as a first-class node)
   --forward-only       do not try the reverse complement
   --no-anchor-window   do not add the conserved-anchor D window
-  --no-posterior       skip posterior probabilities (*_posterior columns; ~15 % faster)
+  --no-posterior       skip posterior probabilities (*_posterior columns; ~30 % faster)
   --residual           ordinary commit-V/J-then-D adjudication instead of the DAG
   -h, --help           this message";
 
@@ -330,7 +330,8 @@ fn run_assign(args: &Args) -> Result<(), Box<dyn Error>> {
         config.options.orientation = OrientationPolicy::FORWARD_ONLY;
     }
     config.anchor_window = !args.no_anchor_window;
-    config.posterior = !args.no_posterior;
+    // The residual adjudicator computes no posteriors.
+    config.posterior = !args.no_posterior && !args.residual;
     let support: SupportModels = [
         KarlinAltschul::ungapped(&config.v.scoring),
         KarlinAltschul::ungapped(&config.d.scoring),

@@ -189,7 +189,10 @@ pub struct EngineConfig {
     pub min_retained: [u32; 3],
     /// Report posterior probabilities (forward–backward over the placement
     /// DAG, priors at the V scoring's λ, alignment evidence at each read's
-    /// divergence): per called segment and for D presence.
+    /// divergence): per called segment and for D presence. With posteriors,
+    /// D placements below the objective's floor (`P_D + 1`) are kept, since
+    /// they carry probability; without, they are pruned, which never changes
+    /// the DAG's call.
     pub posterior: bool,
     pub options: AssignerOptions,
 }
@@ -454,7 +457,9 @@ impl Assigner {
         Ok(Assigner {
             v: v_stage(v, &config.v)?,
             j: j_stage(j, &config.j),
-            d: d.map(|set| d_stage(set, &config.d, &objective, config.posterior)),
+            // Only an adjudicator that computes posteriors needs the Ds below
+            // the objective's floor.
+            d: d.map(|set| d_stage(set, &config.d, &objective, adjudicator.posterior.is_some())),
             strand,
             j_window: config.j.window,
             aligner: InterSequenceGotoh::new(),

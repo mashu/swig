@@ -146,8 +146,11 @@ Each change was measured on the same reads before it was kept.
     alignment", which scores ≥ 0. Adversarial review showed the argument
     wrong: the clipped bases are a middle stretch of the next alignment, not
     a prefix, and can score below zero (mismatches right after V's end).
-    The brute-force oracle of the time searched the same restricted range and
-    could not see it. Item 13 fixes both.
+    The brute-force oracle of the time searched 12 bases past the overlap,
+    wide enough to see it, but its synthetic reads never put mismatches
+    right after a neighbour's end, so it never fired. Item 13 fixes the DAG
+    and adds an oracle test on hypermutated IgSim reads, which fails on the
+    restricted DAG.
 12. **Posterior decoding** (`adjudicate/posterior.rs`). Forward–backward
     over the same DAG gives the marginal probability of every placement and
     D count under `P(path, cuts) ∝ exp(nats)`; it equals exhaustive
@@ -206,9 +209,9 @@ Each change was measured on the same reads before it was kept.
     - *D floor.* Dropping Ds below `P_D + 1` is lossless for the maximum but
       not for the sum; posteriors now keep every admissible D.
     - *Reported event.* A tandem D could be counted twice, once for each
-      region; a placement now counts only if it overlaps the call's region.
-      The event is "the reported names include the read's allele, up to
-      germline equivalence", which is what §4 scores.
+      region; a placement now counts only if it overlaps the call's region
+      (tightened in item 17). The event is "the reported names include the
+      read's allele, up to germline equivalence", which is what §4 scores.
 15. **Closed-syncmer seeds** (`seed.rs`). See §8.
 16. **3′-partial V alleles got a wrong anchor** (`annotate/mod.rs`). Found
     through the IgBLAST comparison (§8), whose junctions disagreed with the
@@ -221,7 +224,50 @@ Each change was measured on the same reads before it was kept.
     trusted relative's anchor maps at or past the 3′ end, the allele gets no
     anchor and a `3′-partial` note (22 V alleles of the human IGH set). The
     J pass follows the same rule. A test builds a partial allele with a TGT
-    decoy; it fails on the old code.
+    decoy; it fails on the old code. Item 17 refines the rule.
+17. **Second adversarial review** (of items 13–16; each finding reproduced
+    by an independent verifier, or by me where the verifier failed):
+    - *A D could not precede a J that starts earlier.* Nodes were sorted by
+      read start, and an edge `b → e` needed `e` to start after `b`. A J
+      alignment reaching back over the D, the "J eats D" configuration, so
+      excluded V → D → J with that J. Both brute-force oracles had the same
+      restriction. Nodes are now sorted by kind, then start: transitions
+      between kinds depend only on the cuts. A constructed test fails on the
+      old order. Measured: missing Ds covered by the called J fall to 0.00 %
+      on mid and hard (`d_errors`), and reads whose called J covers ≥ 3
+      bases of the true D from 0.44 / 0.95 % when first measured (before
+      item 13) to 0.21 / 0.42 %; D calls move by ≤ 0.03 pp.
+    - *Ties across predecessors depended on evaluation order* (a predecessor
+      overlapping the entry beat an earlier one ending before it). They are
+      now compared explicitly: path start, then node order. The documented
+      rule was also wrong about junction bases that score the same on either
+      side: the later segment gets them (ALGORITHM §4 now says so).
+    - *Posterior range.* A gap between non-overlapping neighbours was a
+      linear factor and underflowed for long costly gaps; it now joins the
+      log-scale. An overlap of 540+ matched bases gave marginals above 1;
+      such reads are now refused (`OVERLAP_SPREAD`). Neither occurs on
+      immunoglobulin reads; both have tests that fail on the old code.
+    - *D floor keyed on the setting, not the adjudicator.* With `--residual`
+      (posteriors on by default) the floor was dropped although the residual
+      adjudicator has no floor of its own, so it could call sub-floor Ds. The
+      floor now follows whether the DAG computes posteriors, and
+      `--residual` turns them off.
+    - *Reported event.* A placement reaching 1–3 bases into the call's
+      region counted in full, since a few bases occur in almost any allele.
+      A placement now counts only if it covers more than half of the called
+      span. D-allele ECE fell on every SHM preset (real mid 1.45 → 1.29 %,
+      hard 1.47 → 1.16 %; synthetic 2.63 → 2.44 %, 2.94 → 2.43 %).
+    - *3′-partial rule.* An allele was declared partial whenever its
+      relative's anchor mapped past its end, which also happens when a
+      deletion stops the sibling alignment short. It is now partial only if
+      it ends while still aligned to the relative (within a codon); otherwise
+      the weak motif hit stands, flagged. Partial alleles also keep the
+      relative's FR1–FR3 starts, so their reads still get FR1–CDR2 columns
+      (26 human IGH alleles). Anchors on the human set are unchanged.
+    - *Docs.* D-error numbers had been measured on the previous commit;
+      "whole-read J changes no call" no longer held; the item 11 account of
+      the old oracle was wrong. All are corrected below with measurements of
+      this code.
 
 ## 4. Results
 
@@ -231,7 +277,7 @@ Human IGH, 5000 reads per preset, germline-equivalent accuracy in %:
 |---|---|---|---|---|---|---|---|
 | easy | 99.94 → 100 | 99.54 → 99.84 | 99.92 → 99.98 | 98.78 → 99.29 | 99.90 → 99.94 | 99.94 → 100 | 30.5 → 0 |
 | mid | 100 → 100 | 97.76 → 97.92 | 99.84 → 99.82 | 91.96 → 93.00 | 98.84 → 98.80 | 99.93 → 99.97 | 30.2 → 0 |
-| hard | 99.98 → 99.98 | 89.74 → 89.86 | 98.44 → 98.36 | 81.72 → 83.55 | 92.70 → 93.32 | 98.39 → 99.50 | 31.2 → 0 |
+| hard | 99.98 → 99.98 | 89.74 → 89.86 | 98.44 → 98.36 | 81.72 → 83.58 | 92.70 → 93.32 | 98.39 → 99.50 | 31.2 → 0 |
 
 Junctions "after" are scored with the corrected anchors (item 16), which
 remove the reads of 3′-partial alleles from the denominator (hard: 2416 →
@@ -242,19 +288,20 @@ with them, and ~3600 → ~7300 / ~5400 reads/s on 4 threads (a busier
 container than the earlier ~2200 / ~9000; in instructions the exact DAG
 costs 3 % and posteriors 18 %).
 
-Calibration on real IGH (ECE %, easy / mid / hard), with the event of item 14:
+Calibration on real IGH (ECE %, easy / mid / hard), with the event of items
+14 and 17:
 
 | | V | D | J | D presence |
 |---|---|---|---|---|
-| ECE | 0.04 / 0.31 / 1.31 | 0.49 / 1.45 / 1.47 | 0.07 / 0.30 / 0.68 | 0.21 / 1.97 / 1.27 |
-| Brier | 0.001 / 0.009 / 0.045 | 0.002 / 0.041 / 0.072 | 0.000 / 0.006 / 0.031 | 0.003 / 0.026 / 0.024 |
+| ECE | 0.04 / 0.31 / 1.31 | 0.49 / 1.29 / 1.16 | 0.07 / 0.30 / 0.69 | 0.20 / 1.98 / 1.24 |
+| Brier | 0.001 / 0.009 / 0.045 | 0.002 / 0.040 / 0.072 | 0.000 / 0.006 / 0.031 | 0.003 / 0.026 / 0.024 |
 
-On the synthetic database, V and J ECE stay ≤ 1 % and D ≤ 2.9 %; D presence
-is the weakest (4.9 % mid, 3.0 % hard), because the synthetic D genes are
+On the synthetic database, V and J ECE stay ≤ 1 % and D ≤ 2.5 %; D presence
+is the weakest (5.0 % mid, 3.2 % hard), because the synthetic D genes are
 shorter and more alike than human ones, which the derived `P_D` does not
-model (§5.2). Items 13–14 improved D-allele ECE on every preset with SHM
-(real 1.68 → 1.45 and 1.80 → 1.47 %, synthetic 3.45 → 2.63 and 4.21 →
-2.94 %).
+model (§5.2). Items 13, 14 and 17 together improved D-allele ECE on every
+preset with SHM (real 1.68 → 1.29 and 1.80 → 1.16 %, synthetic 3.45 → 2.44
+and 4.21 → 2.43 %).
 
 Error decomposition after the changes (2000 reads):
 
@@ -322,9 +369,9 @@ work.
 8. **SIMD portability.** AVX2 only; AVX-512 hardware runs at half width, and
    ARM falls back to scalar.
 9. **D errors are mostly the wrong allele, not a missing D.** With a remnant
-   of ≥ 8 nt (§8), 2.6 % (mid) and 9.9 % (hard) of reads get a wrong D
+   of ≥ 8 nt (§8), 2.7 % (mid) and 10.2 % (hard) of reads get a wrong D
    allele although a placement of the right one was found; the search loses
-   0.3 % and 2.0 %. These are model errors: short, mutated D remnants that
+   0.2 % and 1.8 %. These are model errors: short, mutated D remnants that
    another allele explains as well or better.
 10. **Posterior cost.** The forward–backward pass is 18 % of instructions
     but ~30 % of single-thread wall clock (dependent floating-point
@@ -433,7 +480,8 @@ taking its bases:
    depends on where the J's conserved codon lands, not on how far its
    alignment reaches to the left;
 2. adjudication is joint: the DAG gives each placement its own exit and
-   entry cut, so any overlap between the J alignment and a D placement goes
+   entry cut and orders segments by kind, so a D can precede a J whose
+   alignment reaches back over it (item 17), any overlap between them goes
    to whichever explains it better, and bases neither explains go to N/P;
 3. the J is still an alignment, not a call: the top three J alignments
    (E ≤ 1, plus ties) are kept, and the path chooses among them, with or
@@ -445,22 +493,26 @@ IGH, 5000 reads, D remnant ≥ 8 nt:
 | | mid | hard |
 |---|---|---|
 | D correct | 97.08 % | 87.50 % |
-| wrong D, a correct placement existed (adjudication) | 2.61 % | 9.92 % |
-| wrong D, not found | 0.28 % | 1.98 % |
+| wrong D, a correct placement existed (adjudication) | 2.66 % | 10.22 % |
+| wrong D, not found | 0.23 % | 1.77 % |
 | true D outside the D windows | 0.00 % | 0.00 % |
-| missing D, the called J covers its bases | 0.00 % | 0.09 % |
+| missing D, the called J covers its bases | 0.00 % | 0.00 % |
 | missing D, the called V covers its bases | 0.00 % | 0.02 % |
+| called J covers ≥ 3 bases of the true D (any call) | 0.21 % | 0.42 % |
 
-Counterfactuals on the hard preset: without the anchor window nothing
-changes (0 % outside); with J searched over the whole read *and* no anchor
-window, 0.05 % of true Ds fall outside the windows. Searching J over the
-whole read changes no V or D call and is 15–28 % slower. The failure mode
+Counterfactuals on the hard preset: without the anchor window no true D
+falls outside the windows (D correct 87.43 %); with J searched over the
+whole read, 0.05 % do, with or without the anchor window. Whole-read J
+search is 18 % slower; it changes no call on mid and a few on hard (D called
+−0.04 pp, J −0.02 pp, one more D-free read given a D). The failure mode
 seen before is not reproduced. Since the starting commit, J moved from seed
 retrieval plus every allele over the whole read to an exhaustive search
-right of V, and the single shared cut became two independent cuts; the
-anchor window was already there. Whole-read J without the anchor window is
-the only configuration measured that lets a true D fall outside the
-windows. The D errors that remain are wrong alleles (§5.9).
+right of V, the single shared cut became two independent cuts, and a D can
+now precede a J that starts earlier (item 17); the anchor window was already
+there. Whole-read J is the only configuration measured that lets a true D
+fall outside the windows. So the joint search is kept where it matters, in
+adjudication, and J retrieval right of V costs nothing measurable. The D
+errors that remain are wrong alleles (§5.9).
 
 **Against IgBLAST 1.22.** Same reads (5000 per preset, forward strand), same
 germline as BLAST databases, `-organism human -ig_seqtype Ig -outfmt 19`,
@@ -468,11 +520,11 @@ scored by `vdj-assign evaluate`:
 
 | Preset | Tool | V | V gene | D | J | Junction | D called on D-free reads | Reads/s, 4 threads |
 |---|---|---|---|---|---|---|---|---|
-| easy | vdj_assign | 99.88 | 100.00 | 99.29 | 99.84 | 100.00 | 0 % | 4800 |
+| easy | vdj_assign | 99.88 | 100.00 | 99.29 | 99.84 | 100.00 | 0 % | 5200 |
 | easy | IgBLAST | 99.12 | 99.78 | 98.86 | 99.86 | 99.77 | 0 % | 67 |
-| mid | vdj_assign | 97.88 | 99.72 | 93.35 | 98.74 | 99.97 | 23 % | 4800 |
+| mid | vdj_assign | 97.88 | 99.72 | 93.35 | 98.74 | 99.97 | 23 % | 5100 |
 | mid | IgBLAST | 97.18 | 99.62 | 93.73 | 98.60 | 99.72 | 43 % | 66 |
-| hard | vdj_assign | 89.26 | 98.58 | 83.00 | 92.80 | 99.69 | 16 % | 4800 |
+| hard | vdj_assign | 89.26 | 98.58 | 83.00 | 92.80 | 99.69 | 16 % | 5200 |
 | hard | IgBLAST | 89.16 | 98.90 | 81.75 | 91.84 | 98.07 | 30 % | 71 |
 
 IgBLAST's higher mid D accuracy comes with twice the D calls on D-free
