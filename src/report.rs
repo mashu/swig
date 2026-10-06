@@ -12,8 +12,8 @@
 //! probability is the `posterior` column ([`crate::adjudicate::Marginals`]):
 //! the posterior mass of every placement of that kind that is tied on the
 //! interval, or whose germline bases between the call's neighbours the
-//! primary allele contains: the probability that the call is
-//! germline-equivalent to the read's allele. `d_presence_posterior` is the probability that the read has a D.
+//! primary allele contains: the probability that the reported names include
+//! the read's allele up to germline equivalence. `d_presence_posterior` is the probability that the read has a D.
 
 use std::fmt::Write as _;
 
@@ -37,8 +37,8 @@ pub struct SegmentReport {
     pub identity: f64,
     /// Karlin–Altschul E-value, when a model is supplied for the segment kind.
     pub support: Option<f64>,
-    /// Posterior probability that the call is germline-equivalent to the
-    /// read's allele (see the module documentation).
+    /// Posterior probability that the reported names include the read's
+    /// allele up to germline equivalence (see the module documentation).
     pub posterior: Option<f64>,
     pub cigar: String,
     pub sequence_start: u32,
@@ -167,12 +167,13 @@ fn segment_report<C: AlleleCatalog>(
         .expect("primary tied placement clips to the called interval");
     let reference = &set.allele(placement.primary_allele()).codes;
 
-    // Posterior that the call is germline-equivalent to the read's allele:
-    // the mass of every placement of this kind whose germline bases in the
-    // region the call's neighbours leave to this segment (its whole
-    // alignment if it misses the region) the primary allele contains. If the
-    // read came from such a placement, the call still carries its germline
-    // bases, as the evaluation's germline equivalence counts it.
+    // Posterior that the reported names include the read's allele up to
+    // germline equivalence: the mass of every placement of this kind that is
+    // tied with the call, or that lies in the region the call's neighbours
+    // leave to this segment with germline bases there that the primary
+    // allele contains. If the read came from such a placement, the call still
+    // carries its germline bases. Placements outside the region (a tandem
+    // D's partner) are other events on the same path, so they never count.
     let region = call
         .path
         .as_ref()
@@ -187,10 +188,9 @@ fn segment_report<C: AlleleCatalog>(
             before.unwrap_or(0)..after.unwrap_or(call.query.len() as u32)
         });
     let carried = |p: &Placement| {
-        let own = p
-            .clip
-            .span(region.start, region.end)
-            .unwrap_or_else(|| p.clip.full());
+        let Some(own) = p.clip.span(region.start, region.end) else {
+            return false;
+        };
         let codes = &set.allele(p.primary_allele()).codes;
         let bases = &codes[own.r_lo as usize..own.r_hi as usize];
         bases.is_empty() || reference.windows(bases.len()).any(|w| w == bases)
@@ -203,7 +203,7 @@ fn segment_report<C: AlleleCatalog>(
             })
             .filter_map(|i| m.placement.get(i))
             .sum::<f64>()
-            .min(1.0)
+            .min(1.0) // rounding only: the placements are exclusive on a path
     });
     let mut names: Vec<&str> = Vec::new();
     for p in &tied {

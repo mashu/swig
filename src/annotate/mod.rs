@@ -19,7 +19,9 @@
 //!    distance from the 3′ end, for alleles whose motifs were weak.
 //! 4. Transfer from the most similar confidently annotated allele by
 //!    alignment ([`RelativeIndex`], [`transfer()`]) — rescues pseudogenes and
-//!    mutated motifs.
+//!    mutated motifs. When the relative's anchor codon maps at or past the
+//!    allele's 3′ end (an IMGT 3′-partial sequence), the allele holds no
+//!    anchor and none is reported: a weak motif hit there is another codon.
 //!
 //! The chain type (which fixes the FR3 length) is voted by J residues
 //! (`W` heavy, `F` light) and Trp41 contexts (`W.R` heavy, `W.Q` light).
@@ -319,12 +321,9 @@ fn annotate_j(
             None
         };
         let codes_len = j.alleles()[index].codes.len();
-        match donor.and_then(|(d, mapped)| {
-            mapped[0]
-                .filter(|&a| a as usize + 3 <= codes_len)
-                .map(|a| (d, a))
-        }) {
-            Some((donor, anchor)) => {
+        match donor {
+            Some((donor, mapped)) if mapped[0].is_some_and(|a| a as usize + 3 <= codes_len) => {
+                let anchor = mapped[0].expect("checked above");
                 let residue = residue_at(&j.alleles()[index].codes, anchor);
                 if !matches!(residue, b'W' | b'F') {
                     result[index]
@@ -335,6 +334,13 @@ fn annotate_j(
                     from: j.alleles()[donor].name.clone(),
                 };
                 anchors[index] = Some(anchor);
+            }
+            // A partial allele: the relative's anchor codon maps outside it.
+            Some((donor, _)) => {
+                result[index].notes.push(format!(
+                    "partial: the anchor codon of {} maps outside the sequence",
+                    j.alleles()[donor].name
+                ));
             }
             None => {
                 if let Some(h) = weak[index] {
@@ -564,9 +570,9 @@ pub fn annotate(
             None
         };
         let len = len_of(v, index);
-        match donor.filter(|(_, mapped)| mapped[0].is_some_and(|a| a as usize + 3 <= len)) {
-            Some((donor, mapped)) => {
-                let anchor = mapped[0].expect("filtered above");
+        match donor {
+            Some((donor, mapped)) if mapped[0].is_some_and(|a| a as usize + 3 <= len) => {
+                let anchor = mapped[0].expect("checked above");
                 let derived = RegionStarts::from_values([
                     mapped[1], mapped[2], mapped[3], mapped[4], mapped[5],
                 ]);
@@ -581,6 +587,15 @@ pub fn annotate(
                     from: v.alleles()[donor].name.clone(),
                 };
                 anchors[index] = Some(anchor);
+            }
+            // The closest relative's anchor codon maps at or past the 3′ end:
+            // a 3′-partial allele, which holds no Cys104. A weak motif hit
+            // would be some other codon, so the anchor stays missing.
+            Some((donor, _)) => {
+                result[index].notes.push(format!(
+                    "3′-partial: the anchor codon of {} maps past the 3′ end",
+                    v.alleles()[donor].name
+                ));
             }
             None => {
                 if let Some(hit) = hits[index] {

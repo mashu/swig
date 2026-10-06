@@ -19,7 +19,7 @@ Zero dependencies, Rust ≥ 1.75, edition 2021.
 
 ```sh
 cargo build --release                          # always run the release build
-cargo test                                     # 67 unit, 7 annotation, 10 synthetic, 7 simulated-accuracy tests
+cargo test                                     # 71 unit, 8 annotation, 11 synthetic, 7 simulated-accuracy tests
 
 target/release/vdj-assign --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta \
     [--profile r|truth|igblast|sensitive-d] [--threads N] [--tandem-d] \
@@ -42,6 +42,8 @@ cargo run --release --example benchmark -- [--v V.fasta --d D.fasta --j J.fasta]
     [--preset easy|mid|hard] [--reads N] [--threads N] [--random N]
 # search errors vs model errors against an exhaustive oracle
 cargo run --release --example diagnose -- --v V.fasta --d D.fasta --j J.fasta --preset hard
+# where D errors arise: adjudication, not found, outside the D windows, eaten by J or V
+cargo run --release --example d_errors -- --v V.fasta --d D.fasta --j J.fasta --preset hard
 ```
 
 Reads may be FASTA or FASTQ. The format is detected from the first
@@ -137,7 +139,13 @@ A header value is never overridden.
      trusted allele.
    - A relative must share ≥ 50 % of the target's distinct 8-mers, so a chance
      match can never donate.
-5. **Low-confidence motif hit, or missing.** Both are reported.
+   - When the relative's anchor codon maps at or past the allele's 3′ end
+     (an IMGT 3′-partial sequence), the allele holds no Cys104 and gets no
+     anchor. Its weak motif hit would be another codon: on human IGH, 22
+     partial V alleles (IGHV4-31\*06–\*09, IGHV2-70\*02, …) had been given an
+     out-of-frame TGT ~30 nt upstream, which shifted every junction they
+     produced.
+5. **Low-confidence motif hit (no relative), or missing.** Both are reported.
 
 ### Speed
 
@@ -175,6 +183,7 @@ Synthetic genes are built from heavy and light framework templates:
 | 12,000 alleles over 40 databases | 0 anchor, FR2, CDR2 or FR3 errors |
 | CDR1 starts in the same 12,000 | 5 wrong, all flagged `Cys23 ambiguous` (truncated alleles without a sibling); 0 silent errors |
 | Pseudogene with Cys104 and Trp41 destroyed | anchor and all regions transferred exactly from its sibling |
+| 3′-partial allele ending inside Cys104, with an out-of-frame TGT decoy | no anchor, flagged `3′-partial` |
 | 200 simulated reads, half reverse-complemented | FR1–FR4, CDR1–CDR3, junction, frame, stop codon and productive flag exact |
 
 ### `prepare`
@@ -298,15 +307,29 @@ reverse-complemented, 450–650 nt) against a human IGH germline set of
 | + D floor `P_D + 1`, junction windows reclaim 12 instead of 24 | ~1830 |
 | + uniform-profile fast path in the SIMD kernel | ~2020 |
 | + clip index in three allocations instead of seven | **~2200** |
+| + exact DAG over every entry cut (+3 % instructions) | ~1900 |
+| + posterior decoding, on by default (`--no-posterior` skips it) | ~1300 |
 
-Four threads give ~9000 reads/s. Calls are identical across the
-pure-speed steps; the steps that changed calls are listed in
-[docs/ASSESSMENT.md](docs/ASSESSMENT.md) with their accuracy effect.
+Rows after the first seven were measured later in a busier container
+(±10 %); in instructions the exact DAG costs 3 % and the posterior pass 18 %
+of a hard-preset run. Four threads give ~7300 reads/s without posteriors and
+~5400 with them. Calls are identical across the pure-speed steps; the steps
+that changed calls are listed in [docs/ASSESSMENT.md](docs/ASSESSMENT.md)
+with their accuracy effect.
 
 ### Data and retrieval
 
 **Nucleotides and k-mers as integers.** Rolling 2-bit k-mer keys in `u64`, with
 N resetting the window. Spaced seeds are data (a mask), not code.
+
+**Closed-syncmer seeds.** A k-mer is a seed when the smallest of its s-mers
+(`s = k − 4`, ordered by a hash) is its first or last one: 40 % of k-mers,
+chosen the same way in the germline index and in the read. The choice depends
+only on the k-mer, so a shared seed survives any mutation outside it, and any
+5 consecutive k-mers hold a seed, so every unmutated 13-base stretch yields one.
+On human IGH they matched every-k-mer seeding within ±0.08 pp at the IgSim
+presets, at 15–30 % SHM and on reads covering only 30–80 V bases, with 60 %
+fewer votes to sort (`SeedSampling`; minimisers and open syncmers are options).
 
 **Strand from a k-mer bitset.** A presence bitset over all 4¹¹ k-mers of the V
 and J germline (512 KiB). One pass computes forward and reverse-complement
@@ -407,9 +430,11 @@ exact run ≥ 4, by pigeonhole).
 
 **Score floor from the objective.** A clipped span of an optimal local
 alignment never outscores the whole alignment. So a D scoring at most `P_D`
-can only add ≤ 0 to a path, and the strict with-D-beats-no-D rule rejects it.
-The D stage therefore keeps only scores ≥ `P_D + 1` (and ≥ the gates' own
-floor). Dropping a D leaves its neighbours' cuts valid, so this is exact.
+can only add ≤ 0 to a path, and the strict with-D-beats-no-D rule rejects it;
+dropping a D leaves its neighbours' cuts valid. The floor `P_D + 1` is
+therefore exact for the call. A D below it still carries posterior mass, so
+the floor applies only with `--no-posterior`; posteriors keep every
+admissible D (+1 % of instructions).
 
 ### Adjudication
 
@@ -417,21 +442,20 @@ floor). Dropping a D leaves its neighbours' cuts valid, so this is exact.
 of any sub-alignment between two query cuts in O(1), with exact affine gap
 accounting at the new edges.
 
-**DAG with running maxima.** Clip scores are separable in (entry, exit), the
-N/P score is linear in the gap, and the support tie-break is separable too.
-For every exit cut, the best predecessor state is a lexicographic prefix
-maximum found by one binary search; for every entry cut of the next
-placement, the best exit before it is a running maximum read in O(1). Every
-pair of cuts is evaluated, and the result provably equals exhaustive
-enumeration (tested).
-
-**Forward–backward with the same sums.** The posterior pass replaces every
-running maximum by a running sum. On an edge, all entries beyond the
-predecessor's end see the same exit mass, which forward adds once to a
-difference array and backward reads from a suffix sum, so an edge costs
-O(overlap). Values are linear with one log-scale per slot; cut weights are
-running products along the alignment and prior weights a table lookup, so
-no transcendental function is evaluated per cut.
+**One lattice, two semirings.** Viterbi (max-plus) and forward–backward
+(sum-product) run the same recursion over the same lattice: one slot per
+placement, D count and first segment, with a value per canonical entry cut.
+Clip scores are separable in (entry, exit), the N/P score is linear in the
+gap, and the support tie-break is separable too, so the inner maximum (or
+sum) over entries is a running one along the placement and the one over
+exits `x ≤ y` another, read in O(1) per entry. On an edge, every entry
+beyond the predecessor's end sees the same best exit (or exit mass), which
+is added once to a running maximum (or difference array): an edge costs
+O(overlap). Every pair of cuts is evaluated, and both passes equal
+exhaustive enumeration (tested). The posterior keeps linear values with one
+log-scale per slot, carries N/P weights relative to each cut so they never
+exceed 1, walks cut weights as running products along the alignment, and
+evaluates no transcendental function per cut.
 
 ### Parallelism and allocation
 
@@ -473,13 +497,33 @@ preset, germline-equivalent accuracy in %, before → after the redesign:
 
 | Preset (IgSim) | Orientation | V | V gene | D | J | Junction | Random reads called |
 |---|---|---|---|---|---|---|---|
-| easy (no SHM) | 99.94 → **100** | 99.54 → **99.84** | 99.92 → **99.98** | 98.78 → **99.27** | 99.90 → **99.94** | 99.94 → **100** | 30.5 → **0** |
-| mid (IgM-like) | 100 → 100 | 97.76 → **97.94** | 99.84 → 99.84 | 91.96 → **93.00** | 98.84 → 98.80 | 99.93 → 99.93 | 30.2 → **0** |
-| hard (IgG-like) | 99.98 → 99.98 | 89.74 → **89.82** | 98.44 → 98.24 | 81.72 → **83.53** | 92.70 → **93.32** | 98.39 → **98.51** | 31.2 → **0** |
+| easy (no SHM) | 99.94 → **100** | 99.54 → **99.84** | 99.92 → **99.98** | 98.78 → **99.29** | 99.90 → **99.94** | 99.94 → **100** | 30.5 → **0** |
+| mid (IgM-like) | 100 → 100 | 97.76 → **97.92** | 99.84 → 99.82 | 91.96 → **93.00** | 98.84 → 98.80 | 99.93 → 99.93 | 30.2 → **0** |
+| hard (IgG-like) | 99.98 → **100** | 89.74 → **89.86** | 98.44 → 98.36 | 81.72 → **83.58** | 92.70 → **93.32** | 98.39 → **98.47** | 31.2 → **0** |
 
 The synthetic database (`SyntheticSpec::default()`, seed 1) gives, after:
-easy V/D/J 99.98/99.82/99.98, mid 99.52/87.81/98.92, hard 97.10/79.36/94.00,
+easy V/D/J 99.98/99.82/99.98, mid 99.54/87.88/98.92, hard 97.06/79.67/94.06,
 and junctions ≥ 99.8 %.
+
+**Against IgBLAST 1.22** (Bioconda build, defaults, `-organism human` with
+the same germline as BLAST databases; the same simulated reads, all forward
+strand, 5000 per preset, scored by `vdj-assign evaluate`):
+
+| Preset | Tool | V | V gene | D | J | Junction | D-free reads given a D | Throughput, 4 threads |
+|---|---|---|---|---|---|---|---|---|
+| easy | vdj_assign | **99.88** | **100.00** | **99.29** | 99.84 | **100.00** | 0 % | **4800 reads/s** |
+| easy | IgBLAST | 99.12 | 99.78 | 98.86 | **99.86** | 99.77 | 0 % | 67 reads/s |
+| mid | vdj_assign | **97.88** | **99.72** | 93.35 | **98.74** | **99.97** | **23 %** | **4800 reads/s** |
+| mid | IgBLAST | 97.18 | 99.62 | **93.73** | 98.60 | 99.72 | 43 % | 66 reads/s |
+| hard | vdj_assign | **89.26** | 98.58 | **83.00** | **92.80** | **99.69** | **16 %** | **4800 reads/s** |
+| hard | IgBLAST | 89.16 | **98.90** | 81.75 | 91.84 | 98.07 | 30 % | 71 reads/s |
+
+IgBLAST's higher mid-preset D accuracy comes with twice the D calls on D-free
+junctions. Throughput is wall clock for the whole command, posteriors on.
+IgBLAST takes J anchors from its auxiliary file, which lacks three of this
+database's J alleles; the comparison adds them (frame and CDR3 end from
+`vdj-assign prepare`, which agrees with the file on all 13 shared alleles).
+Without them IgBLAST reports no junction for 18 % of reads.
 
 `examples/diagnose` separates errors by aligning every allele unbanded under
 the same objective. If that exhaustive optimum is right but the pipeline is
@@ -497,30 +541,43 @@ Nearly all remaining errors are where SHM mimics an allele's distinguishing
 SNPs, so no score-based caller can do better.
 
 **Posterior calibration** (same reads; expected calibration error in %, then
-Brier score). The event is "the call is germline-equivalent to the truth"
-for V, D and J, and "the read has a simulated D" for D presence:
+Brier score). The event is "some reported name is germline-equivalent to the
+truth" for V, D and J (the call lists all co-optimal alleles), and "the read
+has a simulated D" for D presence:
 
 | Preset | V | D | J | D presence |
 |---|---|---|---|---|
-| easy | 0.04 / 0.0008 | 0.46 / 0.0015 | 0.07 / 0.0000 | 0.25 / 0.0032 |
-| mid | 0.28 / 0.0088 | 1.68 / 0.041 | 0.25 / 0.0060 | 2.17 / 0.028 |
-| hard | 1.34 / 0.045 | 1.80 / 0.073 | 0.73 / 0.031 | 1.46 / 0.027 |
+| easy | 0.04 / 0.0008 | 0.49 / 0.0015 | 0.07 / 0.0000 | 0.21 / 0.0029 |
+| mid | 0.31 / 0.0090 | 1.45 / 0.041 | 0.30 / 0.0059 | 1.97 / 0.026 |
+| hard | 1.31 / 0.045 | 1.48 / 0.072 | 0.68 / 0.031 | 1.27 / 0.024 |
 
 With one fixed λ instead of each read's divergence, and only co-optimal
 placements pooled, mid-preset ECEs were 4.6 / 7.7 / 3.9 / 2.1.
+
+**Where D errors arise** (`examples/d_errors`, D remnants ≥ 8 nt): on the hard
+preset 87.5 % of D calls are right; 9.9 % pick another allele although the
+right one was a candidate (similar D genes under SHM), 2.0 % never had the
+right candidate, and 0.07 % lose the D to a J alignment that covers it. No
+true D lay outside the D windows, with or without the anchor window.
 
 ## Validation
 
 - **Posterior exactness:** `marginals_equal_exhaustive_summation` compares
   ln Z, every placement marginal and the D-count distribution with exhaustive
   summation over paths and canonical cuts (VJ, VDJ, VDDJ, a per-base N/P cost,
-  a per-column evidence term); `posteriors_are_calibrated` bounds V/J
-  calibration error on IgM- and IgG-like reads.
-- **DAG optimality:** `dag_equals_brute_force_over_all_paths_and_cuts`
-  enumerates every VJ/VDJ/VDDJ path and every pair of exit and entry cuts,
-  with a per-base insertion cost and the lexicographic support tie-break, and
-  requires the same optimum. `two_cuts_leave_a_shared_mismatch_stretch_to_n`
-  checks a constructed read where no single cut is optimal.
+  a per-column evidence term, an N column, an insertion), and checks that the
+  Viterbi score is the best path score; `strong_junction_costs_stay_in_range`
+  does the same with N/P costs of −4 and −8 per base across a 300-base V;
+  `posteriors_are_calibrated` bounds V/J calibration error on IgM- and
+  IgG-like reads.
+- **DAG optimality:** `dag_equals_brute_force_over_all_paths_and_cuts` and
+  `dag_equals_brute_force_on_hypermutated_igsim_reads` enumerate every
+  VJ/VDJ/VDDJ path and every pair of canonical exit and entry cuts, with and
+  without a per-base insertion cost and with the lexicographic support
+  tie-break, and require the same optimum; the IgSim case fails on a DAG that
+  tries entries only inside the overlap. Two constructed reads need two cuts
+  (`two_cuts_leave_a_shared_mismatch_stretch_to_n`) and an entry beyond the
+  overlap (`entries_beyond_the_overlap_are_tried`).
 - **Kernel exactness:**
   - The scalar kernel equals a textbook Gotoh across three gap regimes.
   - Every traceback rescores to its reported score.
@@ -609,7 +666,7 @@ Each is a named field you can change.
 - **Posteriors are conditional on the candidates.** An allele that retrieval
   or the keep policy dropped gets no mass, and the call and the posterior use
   different evidence scales (fixed vs per-read), so a reported posterior can
-  fall below 0.5. D-presence calibration is the weakest (ECE up to 2.2 %),
+  fall below 0.5. D-presence calibration is the weakest (ECE up to 2 %),
   because the D prior counts genes × positions (see ALGORITHM.md §8).
 - **E-values** use exact *ungapped* λ and K and the total database length.
   Gapped scores are slightly higher (anti-conservative); near-identical alleles

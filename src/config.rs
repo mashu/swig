@@ -380,12 +380,20 @@ fn d_stage(
     set: GermlineSet,
     config: &DSegmentConfig,
     objective: &EngineeringObjective,
+    posterior: bool,
 ) -> SegmentStage<LmerMaskRetriever> {
     let lmer = config.lmer.unwrap_or_else(|| config.lossless_lmer());
     let retriever = LmerMaskRetriever::build(&set, lmer, 1);
     let segment = PreparedSegment::new(set, &config.scoring, config.scoring.gaps);
     let keep = KeepPolicy {
-        min_score: config.lossless_min_score().max(objective.d_floor()),
+        // The objective's D floor prunes only what cannot win the Viterbi
+        // call; a D below it still carries posterior mass, so posteriors keep
+        // every admissible D.
+        min_score: if posterior {
+            config.lossless_min_score()
+        } else {
+            config.lossless_min_score().max(objective.d_floor())
+        },
         ..config.keep
     };
     let mut stage = SegmentStage::new(Arc::new(segment), retriever, keep);
@@ -446,7 +454,7 @@ impl Assigner {
         Ok(Assigner {
             v: v_stage(v, &config.v)?,
             j: j_stage(j, &config.j),
-            d: d.map(|set| d_stage(set, &config.d, &objective)),
+            d: d.map(|set| d_stage(set, &config.d, &objective, config.posterior)),
             strand,
             j_window: config.j.window,
             aligner: InterSequenceGotoh::new(),

@@ -132,44 +132,61 @@ one term per cut. The support key is cut-independent.
 
 ## 4. Adjudication: exact semi-Markov Viterbi (`adjudicate/dag.rs`)
 
-Placements are nodes, sorted by read start. A state is
-`(node, entry cut, D count, first segment kind)`. Its value is the best path
-score before the node's own segment, with support as a second key. With a
-linear N/P score `ι·(y − x)`, a transition `b → e` that exits `b` at `x`
-and enters `e` at `y ≥ x` has the value
+Placements are nodes, sorted by read start. The paths through a node with a
+given D count and first segment kind form a **slot**. A slot holds one value
+per canonical entry cut `y` of the node: the best key (score, then germline
+support) of a path prefix that enters there. With a linear N/P score
+`ι·(y − x)` the recursion is
 
 ```text
-max over x ≤ y, and states s of b with q_lo(s) ≤ exit_b(x).q − min_retained(b):
-    [score(s) − entry_prefix(s), support(s)]
-  + exit_b(x).prefix − ι·exit_b(x).q
-  + bonus(b) + ι·entry_e(y).q
+X(b, x)  = exit_b(x) + bonus(b) + max_{y ≤ x − min(b)} [F(b, y) − entry_b(y)]
+F(e, y') = max_b max_{x ≤ y'} [X(b, x) + ι·(y' − x)]          (0 at a path start)
+best     = max_b X(b, end of b) + end(g, b)
 ```
 
-Every term is a function of `s`, of `x`, or of `y` alone. So:
+over every exit cut `x` of `b` and every entry cut `y' ≥ x` of `e`. Each term
+depends on one cut only (separability, §3), so:
 
-1. *Best state for an exit.* The maximand depends on `s` only through
-   `(score − entry_prefix, support)`, and the constraint is a threshold on
-   `q_lo(s)`. Sorting a node's states by `q_lo` once and keeping running
-   lexicographic maxima answers each exit with one binary search.
-2. *Best exit for an entry.* The best `x ≤ y` is a running maximum over the
-   node's exits, built once per node and successor kind and read in O(1)
-   per entry.
+1. *Best entry for an exit.* `max_{y ≤ x − min} [F(b, y) − entry_b(y)]` is a
+   running maximum along the node, read at `x − min`.
+2. *Best exit for an entry.* `max_{x ≤ y'} [X(b, x) − ι·x]` is a second running
+   maximum along `b`, one per successor kind, read at `y'`.
+3. *Entries beyond the overlap.* Every entry `y' ≥ end(b)` sees the same best
+   exit of `b`, so the edge `b → e` adds it once at `e`'s first entry at or
+   after `end(b)`, and a prefix maximum over `e`'s entries (shifted by `ι`
+   per base) carries it to the rest.
 
-Entries are tried only inside the overlap, or at `e`'s first base when the
-placements do not overlap. Moving an entry further right clips a prefix of an
-optimal local alignment, which scores ≥ 0 (Lemma 1), and lengthens the N/P
-run, which scores ≤ 0 (`ι ≤ 0`: a per-base N/P score is a length cost, never
-a reward), so it never helps.
+An edge costs `O(overlap + 1)` and a read
+`O(Σ_slots len + Σ_edges (overlap + 1))`. The search runs over **every**
+canonical entry of `e`, not only those inside the overlap. An earlier version
+tried entries only inside the overlap, arguing that moving an entry further
+right "clips a prefix of an optimal local alignment, which scores ≥ 0"
+(Lemma 1). That is wrong: Lemma 1 bounds prefixes that start at the
+alignment's own start, but the bases between `b`'s end and a later entry are
+a middle stretch of `e`'s alignment and can score below zero (two mismatches
+right after V's end, as a mutated read has). Entering after them and leaving
+them to N/P then wins. Adversarial review found the gap, and a hypermutated
+IgSim oracle (below) confirms that real reads hit it.
 
-Complexity is `O(S log S + L log S + T·C)` per node, with `S` states, `L`
-exit cuts, `T` successors and `C` entry cuts, instead of `O(S·T·L·C)`.
+Ties: complete paths compare by `PathScore` (score, then fewer D, then
+germline support), so a path with a D must strictly beat the best path
+without one. Among equal keys the later exit is kept (it retains more of the
+placement), then the first predecessor.
 
 **Theorem 1.** The DAG returns the optimum of §2.3 over all grammatical
-paths, placements and pairs of cuts. This is checked by an exhaustive,
-memoised enumeration in `tests/synthetic.rs` that tries every exit and every
-entry `y ≥ x` within 12 bases of the meeting point (wider than the DAG's own
-entry range), and by a constructed case in `adjudicate/dag.rs` where leaving
-a shared mismatch stretch to N beats every single cut.
+paths, placements and pairs of canonical cuts. Checks:
+
+- an exhaustive, memoised enumeration in `tests/synthetic.rs` over every
+  grammatical path, every canonical exit `x` and every canonical entry
+  `y ≥ x` (no window), on 40 reads with 0–2 D segments under the tandem-D
+  grammar at `ι = −1` (VJ, VDJ and VDDJ optima all occur);
+- the same oracle on the pipeline's own placements for 40 hypermutated IgSim
+  reads (`dag_equals_brute_force_on_hypermutated_igsim_reads`, top 3 V,
+  6 D, 3 J, `ι ∈ {0, −1}`). The test asserts that some optimum enters a
+  placement beyond the overlap, and it fails on the earlier restricted search;
+- two constructed cases in `adjudicate/dag.rs`: leaving a shared mismatch
+  stretch to N beats every single cut, and an entry in the middle of J's
+  alignment, past V's end, beats every entry inside the overlap.
 
 ## 4a. Posterior decoding (`adjudicate/posterior.rs`)
 
@@ -179,30 +196,32 @@ The objective is a log-likelihood ratio, so it also defines a distribution:
 P(path, cuts | read) = exp(nats(path, cuts)) / Z,     Z = Σ_{path, cuts} exp(nats)
 ```
 
-over every grammatical path and every pair of cuts between neighbours. The
-Viterbi path of §4 is its mode when the evidence is read at the fixed λ.
-Forward–backward over the same DAG gives the marginal probability of every
-placement and of every D count.
+over every grammatical path and every pair of canonical cuts between
+neighbours: the domain §4 maximises over. Read at the fixed λ, the Viterbi
+path of §4 is its mode. Forward–backward over the same DAG gives the marginal
+probability of every placement and of every D count.
 
 **Evidence at the read's divergence.** `(2, −3)` is log-odds only at 11.2 %
 divergence: a fixed λ makes unmutated reads underconfident (a SNP between
 alleles is worth `ln(3(1−p)/p) = 8.0` nats at `p = 0.1 %`, not 3.2) and
 heavily mutated ones overconfident. Let `p̂` be the fraction of mismatched
-`Match` columns in the called V and J (with half a pseudo-mismatch, clamped
-to `[10⁻⁴, 0.5]`). A `Match` column scoring `s` is worth `λ_r·s + μ_r` nats,
-with `(λ_r, μ_r)` chosen so that a match is worth `ln 4(1 − p̂)` and a
-mismatch `ln(4p̂/3)`, the log-odds of "templated at divergence `p̂`" against
-"uniform random"; gaps are worth `λ_r·g`. Each segment kind uses its own
-match/mismatch scores. The priors (`P_D`, pair bonus, tandem, `ι`) stay at the
-λ they were derived with. At `p̂ = 11.2 %`, `λ_r = λ` and `μ_r = 0`. Because
-the map is affine per column, clip scores stay separable in their cuts.
+substitution columns in the called V and J, `N` columns excluded (with half a
+pseudo-mismatch, clamped to `[10⁻⁴, 0.5]`). A substitution column scoring
+`s ≠ 0` is worth `λ_r·s + μ_r` nats, with `(λ_r, μ_r)` chosen so that a match
+is worth `ln 4(1 − p̂)` and a mismatch `ln(4p̂/3)`: the log-odds of
+"templated at divergence `p̂`" against "uniform random". An `N` column
+(`s = 0`) is worth 0, as it is to the scoring: it supports neither
+hypothesis. Gaps stay at the prior λ, because `p̂` measures substitutions, not
+indels. Each segment kind uses its own match/mismatch scores. The priors
+(`P_D`, pair bonus, tandem, `ι`) stay at the λ they were derived with. At
+`p̂ = 11.2 %`, `λ_r = λ` and `μ_r = 0`. The map is affine per column, so clip
+scores stay separable in their cuts.
 
 **Domain.** The first segment keeps its start and the last its end, as in §4
 (V and J are extended to the read's ends on purpose). Between neighbours every
-pair of cuts `x ≤ y` is summed, including entries beyond the overlap that the
-Viterbi search skips because they cannot win. Each segmentation is counted
-once by taking *canonical* cuts: an entry on the first retained base and an
-exit right after the last (one pair per distinct retained sub-alignment).
+pair of canonical cuts `x ≤ y` is summed. A canonical entry lies on the first
+retained base and a canonical exit right after the last, so each distinct
+retained sub-alignment is one pair and each segmentation is counted once.
 
 **Recursions.** For node `b` in group `g` with forward mass `F(b, y)` per
 entry,
@@ -213,29 +232,51 @@ F(e, y') = Σ_b Σ_{x ≤ y'} X(b, x) · e^{ι(y' − x)}          (+ 1 at a pat
 Z        = Σ_b X(b, end of b) · e^{end(g, b)}
 ```
 
-(all terms in nats), and the backward pass mirrors them. Every inner sum is a
-prefix or suffix sum, as every maximum of §4 is a running maximum. On an edge
-`b → e`, every entry of `e` beyond `b`'s end sees the same exit mass, so
-forward adds it once to a difference array and backward reads it from a
-suffix sum: an edge costs `O(overlap + 1)`.
+(all terms in nats), the sum-product twin of §4, and the backward pass mirrors
+them. Every inner sum is a prefix or suffix sum where §4 has a running
+maximum, and entries beyond `b`'s end share one exit mass, so an edge costs
+`O(overlap + 1)` here too.
 
-**Arithmetic.** Values are linear with one log-scale per `(node, group)`
-slot, as in scaled HMM recursions. Cut weights are running products along the
-alignment (steps `e^{±(λ_r d + μ_r)}` tabulated for small `d`), and prior
-weights come from an `e^{λk}` table, so no transcendental function is
-evaluated per cut.
+**Arithmetic.** Values are linear, with one log-scale per `(node, group)`
+slot, as in scaled HMM recursions.
+
+- *Cut weights* are running products along the alignment (steps
+  `e^{±(λ_r d + μ_r)}` tabulated for small `d`; prior weights from an
+  `e^{λk}` table), so no transcendental function is evaluated per cut. A
+  product that leaves the `f64` range is reseeded exactly at the next cut.
+- *Centring.* Entry and exit weights are centred separately, each on the
+  midpoint of the evidence range over the cuts a path can actually use on
+  that side (entries past the start only if some kind can precede the
+  placement, exits before the end only if some kind can follow it). The
+  difference of the two centres is carried as a per-node shift. A placement
+  whose range on one side exceeds 1 200 nats (`MAX_SPREAD`; weights within
+  `e^{±600}`) would leave the `f64` range, and the read then reports no
+  posteriors.
+- *Junctions.* The N/P factor `e^{ι(y' − x)}` is accumulated as a relative
+  recursion (`acc ← acc·e^{ι} + v`), whose factors are ≤ 1, and every prefix
+  sum is normalised before it multiplies a cut weight. A strong per-base cost
+  across a long V therefore cannot overflow.
 
 **Reported probabilities.** A segment's `posterior` is the mass of every
-placement of its kind that is tied with the call on the called interval, or
-whose germline bases between the call's neighbours the primary allele
-contains: the probability that the call is germline-equivalent to the read's
-allele, the event §7 scores. `d_presence_posterior = 1 − P(no D)`.
+placement of its kind, overlapping the call's region, that is tied with the
+call on the called interval, or whose germline bases between the call's
+neighbours the primary allele contains. The event is "the reported names
+include the read's allele, up to germline equivalence"; §7 scores exactly
+this event. `d_presence_posterior = 1 − P(no D)`.
 
 **Theorem 2.** The marginals equal exhaustive summation over all grammatical
-paths and canonical cut pairs, for VJ, VDJ and VDDJ grammars, a per-base N/P
-cost and a per-column evidence term `μ ≠ 0` (unit test in
-`adjudicate/posterior.rs`, which also checks that the Viterbi score is the
-best path score).
+paths and canonical cut pairs (unit tests in `adjudicate/posterior.rs`):
+
+- VJ, VDJ and VDDJ grammars, with and without a per-base N/P cost;
+- evidence at a read's divergence (`μ ≠ 0`);
+- a junction with an `N` column and a J with an insertion, at fixed λ and at
+  `p̂ = 0.5 %` (the oracle reads `N` columns as 0 and gaps at the prior λ;
+  the test fails if `N` columns are scored as `μ`);
+- a 300-base V with every 7th base mutated and a strong N/P cost
+  (`ι ∈ {−4, −8}`), which overflowed before the junction recursion was made
+  relative.
+
+The same tests check that the Viterbi score is the best path score.
 
 ## 5. Search
 
@@ -245,14 +286,15 @@ step can lose.
 | Step | Where | Guarantee | Parameter and justification |
 |---|---|---|---|
 | Strand | `orient.rs` | heuristic + fallback | Count read positions whose 11-mer occurs in the V/J germline, per strand. Trusted when the winner exceeds its Poisson null `λ₀ + 3√λ₀` (`λ₀` = k-mers × germline k-mer density); otherwise compare V seed votes on both strands. |
+| V seeds | `seed.rs` | bounded | Closed syncmers of the 9-mers (7-mer fallback): a k-mer is a seed when its smallest 5-mer (3-mer), in a fixed hash order, is first or last. 40 % of the k-mers; context-free, so a seed shared by read and germline is sampled in both; any 13 (11) unmutated bases yield one. Same V calls as every k-mer: within 0.1 point on the presets, none lost at 15–30 % SHM, within 0.4 points (both signs) on reads covering only 30–80 V bases; about 2.5 % fewer instructions (V retrieval is 5.5 % of the run; alignment and adjudication dominate). Minimisers and open syncmers match it on accuracy, but a minimiser depends on its neighbours, so a mutation can unselect a shared k-mer on one side only. |
 | V retrieval | `retrieve/seed_vote.rs`, `retrieve/frames.rs` | heuristic | Seed votes per gene frame, best diagonal cluster per frame. Keep 3 genes, and up to 16 while votes are within `max(8, 5 %)` of the leader. Every allele of a kept gene becomes a candidate. |
 | V band | `retrieve/seed_vote.rs` | bounded | Cluster's diagonal range, shifted by the allele's frame offset, ± 8 diagonals: holds unless an indel longer than 8 escapes the seeds. |
 | V scoring | `segment.rs`, `family_bound.rs` | lossless | Score-only DP; a same-length sibling is skipped when `S(rep) + Δ(rep, sibling)` cannot reach the current top-3 cutoff (sound upper bound). |
 | V/J keep | `segment.rs` | defined | Trace back until the top 3 alignments with E ≤ 1, plus ties. No length or identity floor: a positive `(2, −3)` local alignment has identity > 3/5 and the E-value implies a length. |
-| J | `retrieve/exhaustive.rs`, `window.rs` | bounded | Every J allele, unbanded, in `[min V end − 12, read end)`: a J can reach back into V only through chance edge matches. |
+| J | `retrieve/exhaustive.rs`, `window.rs` | bounded | Every J allele, unbanded, in `[min V end − 12, read end)`: a J can reach back into V only through chance edge matches. Whole-read J search changes no V or D call and is 15–28 % slower. The J is not placed jointly with the D, yet in measurement it does not "eat" it: the D windows reach 12 bases into J and include the conserved-anchor window, and the DAG's independent cuts give any J/D overlap to whichever explains it better. With a D remnant ≥ 8 nt (`examples/d_errors.rs`, human IGH), a missing D whose bases the called J covers is 0.00 % (mid) / 0.09 % (hard) of reads, and a true D outside the windows 0 %; only whole-read J without the anchor window lets 0.05 % fall outside. |
 | D windows | `window.rs` | bounded | `[best V end − 12, best J start + 12)` plus the conserved-anchor window `[V Cys104 + 3, J Trp/Phe118)`. |
 | D prefilter | `retrieve/lmer_mask.rs` | lossless w.r.t. gates | Shares ≥ 1 L-mer, with `L` derived from the gates (`min_d_match`; 4 with the optional distributed-D gate, by pigeonhole). |
-| D floor | `config.rs`, `adjudicate/model.rs` | lossless | Score ≥ max(gate floor, `P_D + 1`): by Lemma 1, a D at or below `P_D` adds ≤ 0, and dropping it leaves its neighbours' cuts valid (exit ≤ entry), so the no-D path is at least as good (requires `ι ≥ 0`). |
+| D floor | `config.rs`, `adjudicate/model.rs` | lossless for the call | Viterbi only (`--no-posterior`): score ≥ max(gate floor, `P_D + 1`). By Lemma 1 a D at or below `P_D` adds ≤ 0, and dropping it leaves its neighbours' cuts valid (exit ≤ entry), so the no-D path is at least as good (requires `ι = 0`, the default). With posteriors every admissible D is kept: a D below the floor cannot be called but carries mass `e^{s − P_D}`, and dropping it would bias `d_presence_posterior` down. |
 | D admission | `admission.rs` | defined | Exact run ≥ `min_d_match` = 4 (3, 5 and 6 are all worse). The note's distributed-evidence alternative is optional and off: it admitted no D that changed a call. |
 
 *Gene frames.* The alleles of a gene are placed in one coordinate system,
@@ -306,8 +348,24 @@ Metrics (`sim/evaluate.rs`):
 - **calibration** of any reported posterior: reads binned by posterior, the
   observed frequency of the event per bin, the expected calibration error
   (ECE, `Σ_bins n_b·|mean posterior − frequency| / n`) and the Brier score.
-  A segment's event is "the primary call is germline-equivalent to the
-  truth"; D presence's is "the read has a simulated D", however short.
+  A segment's event is "the reported names include the read's allele, up to
+  germline equivalence" (§4a); D presence's is "the read has a simulated D",
+  however short.
+
+**D error attribution** (`examples/d_errors.rs`). Every wrong or missing D
+call is attributed to where it arose: the true D lies outside the D windows
+(recomputed from the call's own V and J placements); inside them, but no
+placement of an equivalent allele overlaps it; or such a placement exists and
+the path took another D or none. Missing D calls are further split by which
+called segment covers the true D's bases (J, V or neither). A J-covered miss
+is the failure mode of a J alignment "eating" the D. Counterfactual flags
+search J over the whole read (`--j-reclaim 100000`) or drop the anchor
+window (`--no-anchor-window`).
+
+**Cross-tool comparison.** IgBLAST 1.22 (Bioconda) on the same IgSim reads
+and germline database (`-organism human -ig_seqtype Ig -outfmt 19`, custom
+V/D/J databases from the same FASTA, auxiliary data from the package),
+scored by the same evaluator after mapping IgBLAST's names back.
 
 **Search error vs model error** (`examples/diagnose.rs`). Each read is also
 aligned to every allele, unbanded, under the same objective. If that

@@ -6,37 +6,39 @@
 //! cut** `x`, the later one keeps bases from its **entry cut** `y ≥ x` on,
 //! and the bases in between are N/P. This is the full segmentation model:
 //! when two placements overlap, AER-R's candidate A (D wins the overlap),
-//! candidate B (V/J win it), every allocation in between, and leaving part of
-//! the overlap to neither are all evaluated exactly.
+//! candidate B (V/J win it), every allocation in between, and leaving any part
+//! of the overlap or of either alignment to N/P are all evaluated exactly.
+//! The first segment keeps its start and the last its end (V and J are
+//! extended to the read's ends on purpose, see [`crate::refine::extend_outer`]).
 //!
-//! State: `(node, entry cut, D count, first kind)`. The score of a node's own
-//! segment depends on its entry *and* exit cut, which is what makes this
-//! semi-Markov. Naively each transition costs `#states × #exits × #entries`
-//! clip evaluations.
+//! Cuts are *canonical* ([`crate::clip::ClipIndex::matches`]): an entry on
+//! the first retained base, an exit right after the last, so every distinct
+//! clipped span is one `(entry, exit)` pair.
+//!
+//! **Slots.** The paths through a node with a given D count and first kind
+//! form a slot, with one value per entry cut: the best key (score, then
+//! germline support) of a path prefix entering there. The recursion is the
+//! max-plus twin of the posterior's sum-product ([`super::posterior`]):
+//!
+//! ```text
+//! X(b, x)  = exit(x) + bonus + max_{y ≤ x − min} [F(b, y) − entry(y)]
+//! F(e, y') = max_b max_{x ≤ y'} [X(b, x) + ι·(y' − x)]          (0 at a path start)
+//! best     = max_b X(b, end of b) + end(g, b)
+//! ```
 //!
 //! **Trick — separable scores → running maxima.** A clipped span scores
-//! `exit(x).prefix − entry(e).prefix` (see [`crate::clip`]), the model adds a
+//! `exit(x).prefix − entry(y).prefix` (see [`crate::clip`]), the model adds a
 //! cut-independent bonus, and the N/P score is linear in the inserted length.
-//! So:
-//!
-//! 1. For a fixed exit `x`, the best predecessor state maximises
-//!    `score_before − entry.prefix` among states whose entry leaves at least
-//!    `min_retained` bases — a threshold on the entry position, answered by a
-//!    binary search in the node's states sorted by entry with running maxima.
-//! 2. The best exit for an entry `y` of the next placement is the maximum of
-//!    those values over `x ≤ y` — a running maximum over the node's exits,
-//!    built once per node and state group, then read in O(1) per entry.
-//!
-//! Entries are only tried inside the overlap (or at the next placement's start
-//! when there is none): moving an entry further right clips a prefix of an
-//! optimal local alignment, which never scores below zero, and lengthens the
-//! N/P run, which never scores above zero (a per-base N/P score is a cost,
-//! `ι ≤ 0`), so it never helps.
-//! Cost: `O(S log S + L log S + T·C)` per node, for `S` states, `L` exit cuts,
-//! `T` successors and `C` entries — instead of `O(S·T·L·C)`.
+//! So the inner maximum over entries is a running maximum along the node, and
+//! the maximum over exits `x ≤ y'` another, read in O(1) per entry. On an edge
+//! `b → e`, every entry of `e` at or beyond `b`'s end sees the same best exit,
+//! so it is added once to a running maximum over `e`'s entries: an edge costs
+//! `O(overlap + 1)`, a read `O(Σ_nodes len + Σ_edges (overlap + 1))`.
 //!
 //! Ties: final paths compare by [`PathScore`] (score, then fewer D, then
 //! germline support), so a with-D path must strictly beat the best no-D path.
+//! Among equal keys the later exit is kept (it retains more of the
+//! placement), then the first predecessor.
 
 use super::model::{Grammar, PathModel, VdjGrammar};
 use super::posterior::{divergence, Marginals, PosteriorModel, PosteriorScratch};
@@ -44,6 +46,12 @@ use super::{Adjudicator, CallPath, CalledSegment, EngineeringObjective, PathScor
 use crate::germline::SegmentKind;
 use crate::placement::Placement;
 use crate::scoring::Score;
+
+/// Segment kinds: one running-maximum array per kind and slot.
+const KINDS: usize = SegmentKind::ALL.len();
+
+/// No back pointer: a path start.
+const START: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PlacementDag<G = VdjGrammar, M = EngineeringObjective> {
@@ -67,173 +75,133 @@ impl Default for PlacementDag {
     }
 }
 
+/// Score, then germline support (the summed unclipped scores of the path's
+/// placements), compared lexicographically.
+type Key = (Score, Score);
+
+/// A best value with where it came from.
 #[derive(Clone, Copy, Debug)]
-struct Back {
-    node: u32,
-    state: u32,
-    exit: u32,
+struct Cell {
+    key: Key,
+    /// Entry cells: the predecessor slot ([`START`] at a path start).
+    /// Exit cells: unused. Running cells: unused.
+    slot: u32,
+    /// Entry cells: the predecessor's exit offset. Exit cells: this slot's
+    /// entry offset. Running cells: this slot's exit offset.
+    at: u32,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct State {
-    /// Query cut this node's placement is clipped to on the left.
-    entry: u32,
-    /// First retained query base for that cut, and the prefix score there.
-    q_lo: u32,
-    entry_prefix: Score,
-    d_used: u8,
-    first: SegmentKind,
-    /// Path score accumulated *before* this node's own segment.
-    score: Score,
-    /// Unclipped placement scores accumulated before this node (tie-break).
-    support: Score,
-    back: Option<Back>,
-}
-
-impl State {
-    /// `(score − entry prefix, support)`: lexicographic, and both parts are
-    /// separable from the exit cut, so prefix maxima stay exact.
+impl Cell {
     #[inline]
-    fn key(&self) -> (Score, Score) {
-        (self.score - self.entry_prefix, self.support)
+    fn shift(self, by: Score) -> Self {
+        Self {
+            key: (self.key.0 + by, self.key.1),
+            ..self
+        }
     }
 }
 
-/// Running maximum of `State::key` over states sorted by `q_lo`.
-#[derive(Clone, Copy, Debug)]
-struct Ranked {
-    q_lo: u32,
-    best_key: (Score, Score),
-    state: u32,
+/// Keep `candidate` if it is better (strictly, or also when equal with `ties`).
+#[inline]
+fn improve(best: &mut Option<Cell>, candidate: Cell, ties: bool) {
+    let better = match best {
+        None => true,
+        Some(current) => candidate.key > current.key || (ties && candidate.key == current.key),
+    };
+    if better {
+        *best = Some(candidate);
+    }
 }
 
+/// One placement in DAG order (query start, then end).
 #[derive(Clone, Copy, Debug)]
-struct Group {
+struct Node {
+    placement: usize,
+    kind: SegmentKind,
+    q_start: u32,
+    /// `q_end − q_start`; cut offsets run over `0..=len`.
+    len: u32,
+    /// Start of the node's dense cut prefixes in `entry` / `exit`.
+    cuts: usize,
+    /// The node's canonical entry offsets (ascending) in `entries`.
+    entries: (usize, usize),
+    /// The node's slots in `slots`.
+    slots: (usize, usize),
+}
+
+impl Node {
+    fn q_end(&self) -> u32 {
+        self.q_start + self.len
+    }
+
+    fn width(&self) -> usize {
+        self.len as usize + 1
+    }
+}
+
+/// The paths through one node with one `(D count, first kind)`.
+#[derive(Clone, Copy, Debug)]
+struct Slot {
+    node: u32,
     d_used: u8,
     first: SegmentKind,
-    start: usize,
-    end: usize,
+    /// Start of the slot's `width` cells in `forward` / `exits`;
+    /// `KINDS · values` starts its per-successor-kind arrays in `running`.
+    values: usize,
+    /// Whether any path leaves the slot.
+    open: bool,
 }
 
-/// Best exit cut `≤ x` of a node for one state group: the predecessor state
-/// and exit maximising `(score before − entry prefix + exit prefix − per_base ·
-/// exit position, support)`.
-#[derive(Clone, Copy, Debug)]
-struct ExitBest {
-    key: (Score, Score),
-    exit: u32,
-    state: u32,
+impl Slot {
+    fn per_kind(&self, kind: SegmentKind, width: usize) -> std::ops::Range<usize> {
+        let start = KINDS * self.values + kind.index() * width;
+        start..start + width
+    }
 }
 
 /// Per-thread buffers for [`PlacementDag`].
 #[derive(Debug, Default)]
 pub struct DagScratch {
-    order: Vec<u32>,
-    states: Vec<Vec<State>>,
-    perm: Vec<u32>,
-    ranked: Vec<Ranked>,
-    groups: Vec<Group>,
-    /// Running best exits of the current node and group, `exits[kind][x − q_start]`
-    /// per successor kind (the junction score may depend on it).
-    exits: [Vec<Option<ExitBest>>; 3],
+    order: Vec<usize>,
+    nodes: Vec<Node>,
+    /// Prefix score at each canonical entry / exit offset (`None` elsewhere).
+    entry: Vec<Option<Score>>,
+    exit: Vec<Option<Score>>,
+    entries: Vec<u32>,
+    slots: Vec<Slot>,
+    /// Best path prefix entering at each offset.
+    forward: Vec<Option<Cell>>,
+    /// Best path prefix through each exit offset (segment included).
+    exits: Vec<Option<Cell>>,
+    /// Per slot and successor kind: best `X(x) − ι·x` over exits `≤ z`.
+    running: Vec<Option<Cell>>,
+    groups: Vec<(u8, SegmentKind)>,
+    tails: Vec<Option<Cell>>,
     posterior: PosteriorScratch,
 }
 
-/// Fill `out[x − b.q_start]` with the best exit cut `≤ x` of `b` for states
-/// `group`, folding in the linear junction score `per_base`.
-fn exit_table(
-    b: &Placement,
-    group: &[Ranked],
-    min_b: i64,
-    per_base: Score,
-    out: &mut Vec<Option<ExitBest>>,
-) {
-    out.clear();
-    let mut running: Option<ExitBest> = None;
-    for x in b.q_start()..=b.q_end() {
-        if let Some(exit) = b.clip.exit(x) {
-            if let Some(r) = best_up_to(group, i64::from(exit.q) - min_b) {
-                let key = (
-                    r.best_key.0 + exit.prefix - per_base * exit.q as Score,
-                    r.best_key.1,
-                );
-                // `>=`: on ties keep the later exit, which retains more of `b`.
-                if running.map_or(true, |best| key >= best.key) {
-                    running = Some(ExitBest {
-                        key,
-                        exit: x,
-                        state: r.state,
-                    });
-                }
-            }
-        }
-        out.push(running);
-    }
-}
-
-fn upsert(states: &mut Vec<State>, candidate: State) {
-    match states.iter_mut().find(|s| {
-        s.entry == candidate.entry && s.d_used == candidate.d_used && s.first == candidate.first
-    }) {
-        Some(existing)
-            if (candidate.score, candidate.support) > (existing.score, existing.support) =>
-        {
-            *existing = candidate
-        }
-        Some(_) => {}
-        None => states.push(candidate),
-    }
-}
-
-/// Group a node's states by `(d_used, first)` and build prefix maxima by entry position.
-fn rank_states(
-    states: &[State],
-    perm: &mut Vec<u32>,
-    ranked: &mut Vec<Ranked>,
-    groups: &mut Vec<Group>,
-) {
-    perm.clear();
-    perm.extend(0..states.len() as u32);
-    perm.sort_by_key(|&i| {
-        let s = &states[i as usize];
-        (s.d_used, s.first, s.q_lo)
-    });
-    ranked.clear();
-    groups.clear();
-    for &i in perm.iter() {
-        let s = &states[i as usize];
-        let new_group = groups
-            .last()
-            .map_or(true, |g| g.d_used != s.d_used || g.first != s.first);
-        if new_group {
-            groups.push(Group {
-                d_used: s.d_used,
-                first: s.first,
-                start: ranked.len(),
-                end: ranked.len(),
-            });
-        }
-        let running = match ranked.last() {
-            Some(prev) if !new_group && prev.best_key >= s.key() => *prev,
-            _ => Ranked {
-                q_lo: s.q_lo,
-                best_key: s.key(),
-                state: i,
-            },
-        };
-        ranked.push(Ranked {
-            q_lo: s.q_lo,
-            ..running
-        });
-        groups.last_mut().expect("pushed above").end = ranked.len();
-    }
-}
-
-/// Best ranked state whose first retained base is `≤ threshold`.
-#[inline]
-fn best_up_to(ranked: &[Ranked], threshold: i64) -> Option<Ranked> {
-    let k = ranked.partition_point(|r| i64::from(r.q_lo) <= threshold);
-    k.checked_sub(1).map(|i| ranked[i])
+/// Slots of `predecessors` whose paths continue into the group
+/// `(d_used, first)` of a node of kind `kind`.
+fn incoming<'s, G: Grammar>(
+    slots: &'s [Slot],
+    grammar: &'s G,
+    predecessors: &'s [Node],
+    kind: SegmentKind,
+    d_used: u8,
+    first: SegmentKind,
+) -> impl Iterator<Item = (Node, usize)> + 's {
+    let d_before = d_used.checked_sub(u8::from(kind == SegmentKind::D));
+    predecessors.iter().flat_map(move |b| {
+        (b.slots.0..b.slots.1)
+            .filter(move |&u| {
+                let slot = &slots[u];
+                slot.open
+                    && slot.first == first
+                    && Some(slot.d_used) == d_before
+                    && grammar.can_follow(b.kind, kind, slot.d_used)
+            })
+            .map(move |u| (*b, u))
+    })
 }
 
 impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
@@ -256,6 +224,297 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
     pub(super) fn min_bases(&self, kind: SegmentKind) -> u32 {
         self.min_retained[kind.index()].max(1)
     }
+
+    /// Nodes in DAG order with dense canonical-cut prefixes.
+    fn layout(&self, placements: &[Placement], s: &mut DagScratch) {
+        s.order.clear();
+        s.order.extend(0..placements.len());
+        s.order
+            .sort_by_key(|&i| (placements[i].q_start(), placements[i].q_end(), i));
+        s.nodes.clear();
+        s.entry.clear();
+        s.exit.clear();
+        s.entries.clear();
+        for &i in &s.order {
+            let p = &placements[i];
+            let (q_start, len) = (p.q_start(), p.q_end() - p.q_start());
+            let cuts = s.entry.len();
+            s.entry.resize(cuts + len as usize + 1, None);
+            s.exit.resize(cuts + len as usize + 1, None);
+            let first_entry = s.entries.len();
+            for (q, entry, exit) in p.clip.matches() {
+                let o = q - q_start;
+                s.entry[cuts + o as usize] = Some(entry);
+                s.exit[cuts + o as usize + 1] = Some(exit);
+                s.entries.push(o);
+            }
+            s.nodes.push(Node {
+                placement: i,
+                kind: p.kind,
+                q_start,
+                len,
+                cuts,
+                entries: (first_entry, s.entries.len()),
+                slots: (0, 0),
+            });
+        }
+    }
+
+    /// Create node `e`'s slots and their entry values from path starts and
+    /// from every predecessor's running exit maxima.
+    fn gather(&self, s: &mut DagScratch, e: usize) {
+        let grammar = &self.grammar;
+        let node = s.nodes[e];
+        let width = node.width();
+        let predecessors = s.nodes.partition_point(|b| b.q_start < node.q_start);
+        let start = grammar
+            .can_start(node.kind)
+            .then_some((u8::from(node.kind == SegmentKind::D), node.kind))
+            .filter(|_| s.entry[node.cuts].is_some());
+
+        s.groups.clear();
+        s.groups.extend(start);
+        for b in &s.nodes[..predecessors] {
+            for slot in &s.slots[b.slots.0..b.slots.1] {
+                let group = (
+                    slot.d_used + u8::from(node.kind == SegmentKind::D),
+                    slot.first,
+                );
+                if slot.open
+                    && grammar.can_follow(b.kind, node.kind, slot.d_used)
+                    && !s.groups.contains(&group)
+                {
+                    s.groups.push(group);
+                }
+            }
+        }
+        let first_slot = s.slots.len();
+        for &(d_used, first) in &s.groups {
+            let values = s.forward.len();
+            s.forward.resize(values + width, None);
+            s.exits.resize(values + width, None);
+            s.running.resize(KINDS * (values + width), None);
+            s.slots.push(Slot {
+                node: e as u32,
+                d_used,
+                first,
+                values,
+                open: false,
+            });
+        }
+        s.nodes[e].slots = (first_slot, s.slots.len());
+
+        let entries = &s.entries[node.entries.0..node.entries.1];
+        for t in first_slot..s.slots.len() {
+            let Slot {
+                d_used,
+                first,
+                values,
+                ..
+            } = s.slots[t];
+            let forward = &mut s.forward[values..values + width];
+            if start == Some((d_used, first)) {
+                improve(
+                    &mut forward[0],
+                    Cell {
+                        key: (0, 0),
+                        slot: START,
+                        at: 0,
+                    },
+                    false,
+                );
+            }
+            s.tails.clear();
+            s.tails.resize(KINDS * width, None);
+            for (b, u) in incoming(
+                &s.slots,
+                grammar,
+                &s.nodes[..predecessors],
+                node.kind,
+                d_used,
+                first,
+            ) {
+                let iota = self.model.junction_per_base(b.kind, node.kind);
+                let running = &s.running[s.slots[u].per_kind(node.kind, b.width())];
+                // Entries inside b: the best exit at or before the entry.
+                for &o in entries {
+                    let y = node.q_start + o;
+                    if y >= b.q_end() {
+                        break;
+                    }
+                    let z = y - b.q_start;
+                    if let Some(cell) = running[z as usize] {
+                        let candidate = Cell {
+                            key: (cell.key.0 + iota * z as Score, cell.key.1),
+                            slot: u as u32,
+                            at: cell.at,
+                        };
+                        improve(&mut forward[o as usize], candidate, false);
+                    }
+                }
+                // Entries at or beyond b's end: b's best exit overall, once.
+                let beyond = b.q_end().saturating_sub(node.q_start) as usize;
+                if let (true, Some(cell)) = (beyond < width, running[b.len as usize]) {
+                    let candidate = Cell {
+                        key: (
+                            cell.key.0 + iota * (node.q_start - b.q_start) as Score,
+                            cell.key.1,
+                        ),
+                        slot: u as u32,
+                        at: cell.at,
+                    };
+                    improve(
+                        &mut s.tails[b.kind.index() * width + beyond],
+                        candidate,
+                        false,
+                    );
+                }
+            }
+            for kind in SegmentKind::ALL {
+                let tail = &s.tails[kind.index() * width..(kind.index() + 1) * width];
+                if tail.iter().all(Option::is_none) {
+                    continue;
+                }
+                let iota = self.model.junction_per_base(kind, node.kind);
+                let mut best: Option<Cell> = None;
+                for (o, cell) in tail.iter().enumerate() {
+                    if let Some(cell) = *cell {
+                        improve(&mut best, cell, false);
+                    }
+                    if let (Some(cell), true) = (best, s.entry[node.cuts + o].is_some()) {
+                        improve(&mut forward[o], cell.shift(iota * o as Score), false);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Exit values `X(e, ·)` of slot `t`, their running maxima per successor
+    /// kind, and the path ending here if the grammar allows one.
+    fn emit(
+        &self,
+        placements: &[Placement],
+        s: &mut DagScratch,
+        t: usize,
+    ) -> Option<(PathScore, Cell)> {
+        let slot = s.slots[t];
+        let node = s.nodes[slot.node as usize];
+        let width = node.width();
+        let placement = &placements[node.placement];
+        let min = self.min_bases(node.kind) as usize;
+        let bonus = self.model.segment_bonus(placement, slot.d_used);
+        let support = placement.score();
+
+        // Running best of F(y) − entry(y) over entries, read min bases later.
+        let mut inner: Option<Cell> = None;
+        let mut open = false;
+        for o in 0..width {
+            if o >= min {
+                let entered = o - min;
+                if let (Some(cell), Some(prefix)) = (
+                    s.forward[slot.values + entered],
+                    s.entry[node.cuts + entered],
+                ) {
+                    improve(
+                        &mut inner,
+                        Cell {
+                            key: (cell.key.0 - prefix, cell.key.1),
+                            slot: 0,
+                            at: entered as u32,
+                        },
+                        false,
+                    );
+                }
+            }
+            let exit = match (inner, s.exit[node.cuts + o]) {
+                (Some(cell), Some(prefix)) => {
+                    open = true;
+                    Some(Cell {
+                        key: (cell.key.0 + prefix + bonus, cell.key.1 + support),
+                        slot: 0,
+                        at: cell.at,
+                    })
+                }
+                _ => None,
+            };
+            s.exits[slot.values + o] = exit;
+        }
+        s.slots[t].open = open;
+        if !open {
+            return None;
+        }
+        for kind in SegmentKind::ALL {
+            if !self.grammar.can_follow(node.kind, kind, slot.d_used) {
+                continue;
+            }
+            let iota = self.model.junction_per_base(node.kind, kind);
+            let range = slot.per_kind(kind, width);
+            let mut best: Option<Cell> = None;
+            for o in 0..width {
+                if let Some(cell) = s.exits[slot.values + o] {
+                    // `ties`: the later exit retains more of the placement.
+                    improve(
+                        &mut best,
+                        Cell {
+                            key: (cell.key.0 - iota * o as Score, cell.key.1),
+                            slot: 0,
+                            at: o as u32,
+                        },
+                        true,
+                    );
+                }
+                s.running[range.start + o] = best;
+            }
+        }
+        let end = s.exits[slot.values + width - 1]?;
+        self.grammar.can_end(slot.first, node.kind).then(|| {
+            let score = PathScore {
+                score: end.key.0 + self.model.end(slot.first, node.kind, slot.d_used),
+                d_count: slot.d_used,
+                support: end.key.1,
+            };
+            (
+                score,
+                Cell {
+                    key: end.key,
+                    slot: t as u32,
+                    at: (width - 1) as u32,
+                },
+            )
+        })
+    }
+
+    /// Walk back from the best path end.
+    fn trace(&self, placements: &[Placement], s: &DagScratch, end: Cell) -> Vec<CalledSegment> {
+        let mut segments = Vec::with_capacity(4);
+        let (mut t, mut exit) = (end.slot as usize, end.at);
+        loop {
+            let slot = s.slots[t];
+            let node = s.nodes[slot.node as usize];
+            let entry = s.exits[slot.values + exit as usize]
+                .expect("traced exits are reachable")
+                .at;
+            let placement = node.placement;
+            let (y, x) = (node.q_start + entry, node.q_start + exit);
+            segments.push(CalledSegment {
+                placement,
+                entry: y,
+                exit: x,
+                span: placements[placement]
+                    .clip
+                    .span(y, x)
+                    .expect("canonical cuts keep at least min_retained bases"),
+            });
+            let back =
+                s.forward[slot.values + entry as usize].expect("traced entries are reachable");
+            if back.slot == START {
+                break;
+            }
+            (t, exit) = (back.slot as usize, back.at);
+        }
+        segments.reverse();
+        segments
+    }
 }
 
 impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
@@ -267,169 +526,29 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
         placements: &[Placement],
         scratch: &mut DagScratch,
     ) -> Option<CallPath> {
-        let n = placements.len();
-        let DagScratch {
-            order,
-            states,
-            perm,
-            ranked,
-            groups,
-            exits,
-            ..
-        } = scratch;
-        order.clear();
-        order.extend(0..n as u32);
-        order.sort_by_key(|&i| {
-            let p = &placements[i as usize];
-            (p.q_start(), p.q_end(), i)
-        });
-        if states.len() < n {
-            states.resize_with(n, Vec::new);
-        }
-        for node in states.iter_mut().take(n) {
-            node.clear();
-        }
-
-        for (pos, &idx) in order.iter().enumerate() {
-            let p = &placements[idx as usize];
-            if !self.grammar.can_start(p.kind) {
-                continue;
-            }
-            if let Some(entry) = p.clip.entry(p.q_start()) {
-                states[pos].push(State {
-                    entry: p.q_start(),
-                    q_lo: entry.q,
-                    entry_prefix: entry.prefix,
-                    d_used: u8::from(p.kind == SegmentKind::D),
-                    first: p.kind,
-                    score: 0,
-                    support: 0,
-                    back: None,
-                });
-            }
-        }
-
-        let mut best: Option<(PathScore, Back)> = None;
-        for pos in 0..n {
-            if states[pos].is_empty() {
-                continue;
-            }
-            let b = &placements[order[pos] as usize];
-            let min_b = i64::from(self.min_bases(b.kind));
-            rank_states(&states[pos], perm, ranked, groups);
-
-            // Paths ending at b (b unclipped on the right).
-            if let Some(exit) = b.clip.exit(b.q_end()) {
-                for g in groups
-                    .iter()
-                    .filter(|g| self.grammar.can_end(g.first, b.kind))
-                {
-                    let Some(r) = best_up_to(&ranked[g.start..g.end], i64::from(exit.q) - min_b)
-                    else {
-                        continue;
-                    };
-                    let total = r.best_key.0
-                        + exit.prefix
-                        + self.model.segment_bonus(b, g.d_used)
-                        + self.model.end(g.first, b.kind, g.d_used);
-                    let candidate = PathScore {
-                        score: total,
-                        d_count: g.d_used,
-                        support: r.best_key.1 + b.score(),
-                    };
-                    if best.map_or(true, |(current, _)| candidate > current) {
-                        best = Some((
-                            candidate,
-                            Back {
-                                node: pos as u32,
-                                state: r.state,
-                                exit: b.q_end(),
-                            },
-                        ));
-                    }
-                }
-            }
-
-            // Transitions b → e, one state group and successor kind at a time.
-            for g in groups.iter() {
-                let group = &ranked[g.start..g.end];
-                let bonus = self.model.segment_bonus(b, g.d_used);
-                let mut built = [false; 3];
-                for epos in pos + 1..n {
-                    let e = &placements[order[epos] as usize];
-                    if e.q_start() <= b.q_start()
-                        || !self.grammar.can_follow(b.kind, e.kind, g.d_used)
-                    {
-                        continue;
-                    }
-                    let per_base = self.model.junction_per_base(b.kind, e.kind);
-                    let table = &mut exits[e.kind.index()];
-                    if !built[e.kind.index()] {
-                        exit_table(b, group, min_b, per_base, table);
-                        built[e.kind.index()] = true;
-                    }
-                    let min_e = self.min_bases(e.kind);
-                    let d_next = g.d_used + u8::from(e.kind == SegmentKind::D);
-                    let last_entry = if e.q_start() < b.q_end() {
-                        b.q_end().min(e.q_end().saturating_sub(1))
-                    } else {
-                        e.q_start()
-                    };
-                    for y in e.q_start()..=last_entry {
-                        let Some(en) = e.clip.entry(y) else {
-                            continue;
-                        };
-                        if e.q_end() < en.q + min_e {
-                            continue;
-                        }
-                        let Some(best_exit) = table[(y.min(b.q_end()) - b.q_start()) as usize]
-                        else {
-                            continue;
-                        };
-                        upsert(
-                            &mut states[epos],
-                            State {
-                                entry: y,
-                                q_lo: en.q,
-                                entry_prefix: en.prefix,
-                                d_used: d_next,
-                                first: g.first,
-                                score: best_exit.key.0 + bonus + per_base * en.q as Score,
-                                support: best_exit.key.1 + b.score(),
-                                back: Some(Back {
-                                    node: pos as u32,
-                                    state: best_exit.state,
-                                    exit: best_exit.exit,
-                                }),
-                            },
-                        );
+        let s = scratch;
+        self.layout(placements, s);
+        s.slots.clear();
+        s.forward.clear();
+        s.exits.clear();
+        s.running.clear();
+        let mut best: Option<(PathScore, Cell)> = None;
+        for e in 0..s.nodes.len() {
+            self.gather(s, e);
+            let (first, end) = s.nodes[e].slots;
+            for t in first..end {
+                if let Some((score, cell)) = self.emit(placements, s, t) {
+                    if best.map_or(true, |(current, _)| score > current) {
+                        best = Some((score, cell));
                     }
                 }
             }
         }
-
-        let (score, mut at) = best?;
-        let mut segments = Vec::with_capacity(4);
-        loop {
-            let state = states[at.node as usize][at.state as usize];
-            let placement = order[at.node as usize] as usize;
-            let span = placements[placement]
-                .clip
-                .span(state.entry, at.exit)
-                .expect("DAG only records spans that keep min_retained bases");
-            segments.push(CalledSegment {
-                placement,
-                entry: state.entry,
-                exit: at.exit,
-                span,
-            });
-            match state.back {
-                Some(back) => at = back,
-                None => break,
-            }
-        }
-        segments.reverse();
-        Some(CallPath { segments, score })
+        let (score, end) = best?;
+        Some(CallPath {
+            segments: self.trace(placements, s, end),
+            score,
+        })
     }
 
     fn marginals(
@@ -499,5 +618,33 @@ mod tests {
         assert_eq!(path.score.score, 44);
         let (v_seg, j_seg) = (path.segments[0], path.segments[1]);
         assert_eq!((v_seg.span.q_hi, j_seg.span.q_lo), (11, 15));
+    }
+
+    /// J starts inside V, and its alignment has two mismatches right after
+    /// V's end. Keeping V whole and entering J after the mismatches (N/P
+    /// between) beats every cut inside the overlap: the entry lies beyond
+    /// the overlap, in the middle of J's alignment.
+    #[test]
+    fn entries_beyond_the_overlap_are_tried() {
+        let query = encode(b"TTTTTTTTTTTTTTTTACGTCCAAAAAAAAAAAAAAAAAA");
+        let v = encode(b"TTTTTTTTTTTTTTTTACGT");
+        let j = encode(b"ACGTGGAAAAAAAAAAAAAAAAAA");
+        let placements = [
+            placement(SegmentKind::V, &query, &v, 0),
+            placement(SegmentKind::J, &query, &j, 16),
+        ];
+        assert_eq!((placements[0].score(), placements[1].score()), (40, 38));
+        let dag = PlacementDag::new(VdjGrammar::VJ, EngineeringObjective::default(), [1, 1, 1]);
+        let path = dag
+            .adjudicate(query.len(), &placements, &mut DagScratch::default())
+            .expect("a VJ path");
+        // Inside the overlap the best is V[0,16) + J whole = 32 + 38 = 70.
+        assert_eq!(path.score.score, 76);
+        let spans: Vec<(u32, u32)> = path
+            .segments
+            .iter()
+            .map(|s| (s.span.q_lo, s.span.q_hi))
+            .collect();
+        assert_eq!(spans, vec![(0, 20), (22, 40)]);
     }
 }

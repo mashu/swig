@@ -193,6 +193,25 @@ fn pseudogene_anchor_is_transferred_from_its_closest_sibling() {
     assert!(annotation.notes.iter().any(|n| n.contains("conserved residue is S")));
 }
 
+/// A 3′-partial allele (IMGT "partial in 3′") ends inside its Cys104 codon.
+/// Its closest sibling places the anchor past the end, so it gets no anchor,
+/// even when an out-of-frame TGT near the end looks like a weak Cys104.
+#[test]
+fn three_prime_partial_allele_gets_no_anchor() {
+    let mut rng = Rng(5);
+    let (mut v, truth, mut j, _) = database(ChainType::Heavy, 40, &mut rng);
+    let anchor = truth[0].anchor as usize;
+    let mut partial = truth[0].sequence[..anchor + 2].to_vec();
+    let decoy = anchor - 31;
+    partial[decoy..decoy + 3].copy_from_slice(b"TGT");
+    v.push("V0*02", &partial, None).unwrap();
+    let report = annotate(&mut v, Some(&mut j), AnnotateOptions::default());
+    assert_eq!(v.alleles().last().unwrap().anchor, None);
+    let annotation = report.v.last().unwrap();
+    assert_eq!(annotation.source, AnchorSource::Missing);
+    assert!(annotation.notes.iter().any(|n| n.contains("past the 3′ end")), "{:?}", annotation.notes);
+}
+
 #[test]
 fn header_values_are_never_overridden() {
     let mut rng = Rng(4);

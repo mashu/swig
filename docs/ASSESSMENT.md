@@ -117,7 +117,10 @@ Each change was measured on the same reads before it was kept.
 6. **Seed-span bands** (± 8 diagonals) halve V DP time with identical calls.
 7. **D floor from the objective** (Lemma 1 in ALGORITHM.md) and a **12-base
    reclaim**. D on the hard preset rose 83.1 → 83.5 % (mid: 92.5 → 93.2 %),
-   and D time fell ~20 %.
+   and D time fell ~20 %. The floor is now applied only without posteriors
+   (item 14): it never changes a call (verified: identical D calls with and
+   without it on 5000 mid and hard reads), but a D below it still carries
+   probability.
 8. **E-value gates with anchoring** (`segment::EvalueGates`). Hits are kept at
    E ≤ 1, and a call needs a V or J hit at E ≤ 10⁻³. Random reads called fell
    from 30 % to 0 %. A flat 10⁻³ floor had cost 0.3 pp of junctions on the
@@ -134,11 +137,17 @@ Each change was measured on the same reads before it was kept.
     approximation of the segmentation model that also made the D floor exact
     only when D's neighbours did not overlap. Each placement now has its own
     exit and entry cut (`x ≤ y`, N/P between). A running maximum over exits
-    keeps the cost per entry O(1). The DAG is exact for the model, and the D
-    floor is exact unconditionally. On 3000-read benchmarks, accuracy moved by
+    keeps the cost per entry O(1). On 3000-read benchmarks, accuracy moved by
     at most ±0.2 pp (real hard junction 98.28 → 98.35 %, synthetic hard D
-    79.02 → 79.24 %) and throughput is unchanged within noise. It is a
-    correctness fix for the paper's model statement, not an accuracy lever.
+    79.02 → 79.24 %) and throughput was unchanged within noise.
+
+    *This version was not yet exact.* It tried entries only inside the
+    overlap, arguing that a later entry "clips a prefix of an optimal local
+    alignment", which scores ≥ 0. Adversarial review showed the argument
+    wrong: the clipped bases are a middle stretch of the next alignment, not
+    a prefix, and can score below zero (mismatches right after V's end).
+    The brute-force oracle of the time searched the same restricted range and
+    could not see it. Item 13 fixes both.
 12. **Posterior decoding** (`adjudicate/posterior.rs`). Forward–backward
     over the same DAG gives the marginal probability of every placement and
     D count under `P(path, cuts) ∝ exp(nats)`; it equals exhaustive
@@ -157,9 +166,62 @@ Each change was measured on the same reads before it was kept.
       bases, between the call's neighbours, the called allele contains.
       Clipping the competitor to the called interval instead was too lenient
       (four bases occur in any D) and made D overconfident.
-    Final ECE on real IGH: V 0.04 / 0.28 / 1.34 %, D 0.46 / 1.68 / 1.80 %,
-    J 0.07 / 0.25 / 0.73 %, D presence 0.25 / 2.17 / 1.46 % (easy / mid /
-    hard). The pass costs about 15 % of throughput (`--no-posterior`).
+    The pass costs 18 % of instructions and about 30 % of single-thread wall
+    clock (`--no-posterior` skips it). Final calibration after item 14 is in
+    §4.
+13. **Exact Viterbi over every entry cut** (`adjudicate/dag.rs`, rewritten).
+    A node's slot (D count, first kind) now holds one value per canonical
+    entry cut, and the recursion is the max-plus twin of the posterior's:
+    a running maximum over entries for each exit, a running maximum over
+    exits per successor kind for each entry, and, for entries beyond the
+    predecessor's end, one value added at the first such entry and carried
+    by a prefix maximum. An edge still costs `O(overlap + 1)`. The oracle in
+    `tests/synthetic.rs` now enumerates every canonical exit and every
+    canonical entry with no window. A new oracle test runs it on the
+    pipeline's own placements for 40 hypermutated IgSim reads; it asserts
+    that some optimum enters beyond the overlap, and it fails on the
+    restricted DAG. Viterbi is now exactly the mode of the posterior at the
+    fixed λ.
+
+    Effect on identical 5000-read samples: V and J calls unchanged; D
+    accuracy +0.00 to +0.07 pp; D calls on D-free junctions +0.4 to
+    +0.8 pp (real mid 24.7 → 25.4 %, hard 12.2 → 12.9 %). The exact
+    optimum finds a few with-D paths the restricted search could not reach:
+    the objective, through `P_D`, decides them now. Cost: +3 % instructions
+    over a whole run.
+14. **Posterior numerics and evidence, from adversarial review.** Each
+    finding was confirmed by an independent verifier before it was fixed.
+    The numerical ones are now covered by exhaustive-summation tests (a
+    junction with an `N` column and an insertion; a strong N/P cost across a
+    300-base V); the reporting ones only by the calibration tests:
+    - *`N` columns* scored 0 under the substitution scores but were given
+      `μ_r` under per-read evidence; they now carry 0 nats. *Gaps* were
+      rescaled by `λ_r`, although `p̂` measures substitutions; they stay at
+      the prior λ.
+    - *Range.* One centre per placement put a long V's far cuts outside the
+      `f64` range, and one such placement voided the whole read's
+      posteriors. Entry and exit weights are now centred separately over the
+      cuts a path can use, and junction recursions keep only factors ≤ 1
+      (a strong per-base N/P cost across a 300-base V had overflowed).
+    - *D floor.* Dropping Ds below `P_D + 1` is lossless for the maximum but
+      not for the sum; posteriors now keep every admissible D.
+    - *Reported event.* A tandem D could be counted twice, once for each
+      region; a placement now counts only if it overlaps the call's region.
+      The event is "the reported names include the read's allele, up to
+      germline equivalence", which is what §4 scores.
+15. **Closed-syncmer seeds** (`seed.rs`). See §8.
+16. **3′-partial V alleles got a wrong anchor** (`annotate/mod.rs`). Found
+    through the IgBLAST comparison (§8), whose junctions disagreed with the
+    truth on 4.5 % of reads. IMGT 3′-partial alleles end inside or before
+    their Cys104 codon (IGHV4-31\*09 ends `…AVYY`). The sibling transfer
+    rejected the anchor because the codon did not fit, and the annotation
+    fell back to the weak motif hit, an out-of-frame TGT about 30 nt
+    upstream. Because the simulator's truth uses the same annotation, the
+    harness had scored those junctions as correct. Now, when the closest
+    trusted relative's anchor maps at or past the 3′ end, the allele gets no
+    anchor and a `3′-partial` note (22 V alleles of the human IGH set). The
+    J pass follows the same rule. A test builds a partial allele with a TGT
+    decoy; it fails on the old code.
 
 ## 4. Results
 
@@ -167,12 +229,32 @@ Human IGH, 5000 reads per preset, germline-equivalent accuracy in %:
 
 | Preset | Orientation | V | V gene | D | J | Junction | Random reads called |
 |---|---|---|---|---|---|---|---|
-| easy | 99.94 → 100 | 99.54 → 99.84 | 99.92 → 99.98 | 98.78 → 99.27 | 99.90 → 99.94 | 99.94 → 100 | 30.5 → 0 |
-| mid | 100 → 100 | 97.76 → 97.94 | 99.84 → 99.84 | 91.96 → 93.00 | 98.84 → 98.80 | 99.93 → 99.93 | 30.2 → 0 |
-| hard | 99.98 → 99.98 | 89.74 → 89.82 | 98.44 → 98.24 | 81.72 → 83.53 | 92.70 → 93.32 | 98.39 → 98.51 | 31.2 → 0 |
+| easy | 99.94 → 100 | 99.54 → 99.84 | 99.92 → 99.98 | 98.78 → 99.29 | 99.90 → 99.94 | 99.94 → 100 | 30.5 → 0 |
+| mid | 100 → 100 | 97.76 → 97.92 | 99.84 → 99.82 | 91.96 → 93.00 | 98.84 → 98.80 | 99.93 → 99.97 | 30.2 → 0 |
+| hard | 99.98 → 99.98 | 89.74 → 89.86 | 98.44 → 98.36 | 81.72 → 83.55 | 92.70 → 93.32 | 98.39 → 99.50 | 31.2 → 0 |
 
-Throughput is 849 → ~2200 reads/s per thread, and ~3600 → ~9000 reads/s on 4
-threads.
+Junctions "after" are scored with the corrected anchors (item 16), which
+remove the reads of 3′-partial alleles from the denominator (hard: 2416 →
+2214 reads); with the old annotation the same calls scored 98.47 %.
+
+Throughput is 849 → ~1900 reads/s per thread without posteriors and ~1300
+with them, and ~3600 → ~7300 / ~5400 reads/s on 4 threads (a busier
+container than the earlier ~2200 / ~9000; in instructions the exact DAG
+costs 3 % and posteriors 18 %).
+
+Calibration on real IGH (ECE %, easy / mid / hard), with the event of item 14:
+
+| | V | D | J | D presence |
+|---|---|---|---|---|
+| ECE | 0.04 / 0.31 / 1.31 | 0.49 / 1.45 / 1.47 | 0.07 / 0.30 / 0.68 | 0.21 / 1.97 / 1.27 |
+| Brier | 0.001 / 0.009 / 0.045 | 0.002 / 0.041 / 0.072 | 0.000 / 0.006 / 0.031 | 0.003 / 0.026 / 0.024 |
+
+On the synthetic database, V and J ECE stay ≤ 1 % and D ≤ 2.9 %; D presence
+is the weakest (4.9 % mid, 3.0 % hard), because the synthetic D genes are
+shorter and more alike than human ones, which the derived `P_D` does not
+model (§5.2). Items 13–14 improved D-allele ECE on every preset with SHM
+(real 1.68 → 1.45 and 1.80 → 1.47 %, synthetic 3.45 → 2.63 and 4.21 →
+2.94 %).
 
 Error decomposition after the changes (2000 reads):
 
@@ -239,6 +321,21 @@ work.
    (IgBLAST, partis) is still needed.
 8. **SIMD portability.** AVX2 only; AVX-512 hardware runs at half width, and
    ARM falls back to scalar.
+9. **D errors are mostly the wrong allele, not a missing D.** With a remnant
+   of ≥ 8 nt (§8), 2.6 % (mid) and 9.9 % (hard) of reads get a wrong D
+   allele although a placement of the right one was found; the search loses
+   0.3 % and 2.0 %. These are model errors: short, mutated D remnants that
+   another allele explains as well or better.
+10. **Posterior cost.** The forward–backward pass is 18 % of instructions
+    but ~30 % of single-thread wall clock (dependent floating-point
+    multiply–adds and per-slot normalisation). A single-precision pass
+    with the same scaling, or skipping slots whose mass is negligible,
+    would cut it.
+11. **Anchors without a relative.** Seven V alleles of the human IGH set
+    (pseudogenes and ORFs) keep a low-confidence motif anchor. One of them,
+    IGHV1-38-4\*01 (Cys104 → Tyr), is placed on a TGT in another frame;
+    without a relative there is no evidence to place it better, so it is
+    reported as low-confidence rather than silently trusted.
 
 ## 6. Plan
 
@@ -249,10 +346,8 @@ In order of expected value:
    search's own statistics (limitation 2).
 2. ~~**Two cuts per overlap with N/P between**~~ — done (§3, item 11).
 3. ~~**Sensitivity analysis**~~ — done (§7).
-4. **Cross-tool benchmark.** Run IgBLAST, partis and Swig through
-   `vdj-assign simulate` / `evaluate` (implemented: any AIRR TSV is scored with
-   the same metrics on identical reads) at several SHM levels, and report
-   precision/recall curves for D.
+4. **Cross-tool benchmark.** IgBLAST done (§8). partis and Swig remain, at
+   several SHM levels, with precision/recall curves for D.
 5. **AVX-512BW (32 lanes) and NEON (8 lanes)** kernels of the same design.
 6. **Allele rescoring along the gene frame.** Trace one representative per
    frame, rescore siblings along its path, and run DP only where bounds
@@ -299,3 +394,92 @@ Two results matter for the paper:
   and 2.59 % at 9, 3.36 % and 5.37 % at 13), so the posterior independently
   supports the value the derivation gives. Accuracy alone cannot choose it:
   D accuracy and D-free false positives trade monotonically.
+
+## 8. Seed sampling, the J/D interplay, and IgBLAST
+
+**Would minimisers or syncmers lose sensitivity?** Seeds are sampled alike in
+the gene-frame index and in the read (`seed::SeedSampling`). Closed syncmers
+(a k-mer is kept when its smallest `s`-mer, `s = k − 4`, is first or last)
+depend on the k-mer alone. A seed shared by read and germline is therefore
+kept in both or neither, and any `k + 4` unmutated bases contain one (13 for
+the 9-mer index, 11 for the 7-mer fallback). Minimisers lack this property:
+whether a k-mer is kept depends on its neighbours, so a mutation can unselect
+a shared seed on one side only. Measured against every k-mer on human IGH:
+
+| Condition | every k-mer | closed syncmers (40 %) |
+|---|---|---|
+| presets, three 5000-read hard samples, synthetic database | — | V and V gene within ±0.08 pp |
+| fixed SHM 15 % (V / gene) | 100.00 / 96.25 | 100.00 / 96.60 |
+| fixed SHM 20 % | 99.95 / 94.50 | 99.95 / 95.10 |
+| fixed SHM 25 % | 98.70 / 87.00 | 98.85 / 87.40 |
+| fixed SHM 30 % | 93.05 / 74.90 | 93.45 / 76.35 |
+| 3′ fragments covering 30–80 V bases | — | within ±0.4 pp, both signs |
+| instructions, 1000 hard reads | 6.09 × 10⁹ | 5.95 × 10⁹ (−2.4 %) |
+
+So no sensitivity is lost; at high SHM the sparser seeds are marginally
+better, because fewer chance seeds dilute the true gene's votes. Minimisers
+(w = 4) and open syncmers gave the same accuracy within noise, so closed
+syncmers were chosen for their guarantee, not for a measured gain. The gain
+is small because V retrieval is 5.5 % of a run (voting, sorting and
+clustering became about 60 % cheaper); alignment and adjudication dominate.
+
+**Does searching J downstream of V let a misplaced J eat the D?** The J is
+searched in `[min V end − 12, read end)`, every allele unbanded, before the D.
+The D is not placed jointly with the J, but three mechanisms keep the J from
+taking its bases:
+
+1. the D windows reach 12 bases back into the J (`reclaim`), and the
+   conserved-anchor window `[V Cys104 + 3, J Trp/Phe118)` is added, which
+   depends on where the J's conserved codon lands, not on how far its
+   alignment reaches to the left;
+2. adjudication is joint: the DAG gives each placement its own exit and
+   entry cut, so any overlap between the J alignment and a D placement goes
+   to whichever explains it better, and bases neither explains go to N/P;
+3. the J is still an alignment, not a call: the top three J alignments
+   (E ≤ 1, plus ties) are kept, and the path chooses among them, with or
+   without a D.
+
+`examples/d_errors.rs` attributes every D error on simulated reads. Human
+IGH, 5000 reads, D remnant ≥ 8 nt:
+
+| | mid | hard |
+|---|---|---|
+| D correct | 97.08 % | 87.50 % |
+| wrong D, a correct placement existed (adjudication) | 2.61 % | 9.92 % |
+| wrong D, not found | 0.28 % | 1.98 % |
+| true D outside the D windows | 0.00 % | 0.00 % |
+| missing D, the called J covers its bases | 0.00 % | 0.09 % |
+| missing D, the called V covers its bases | 0.00 % | 0.02 % |
+
+Counterfactuals on the hard preset: without the anchor window nothing
+changes (0 % outside); with J searched over the whole read *and* no anchor
+window, 0.05 % of true Ds fall outside the windows. Searching J over the
+whole read changes no V or D call and is 15–28 % slower. The failure mode
+seen before is not reproduced. Since the starting commit, J moved from seed
+retrieval plus every allele over the whole read to an exhaustive search
+right of V, and the single shared cut became two independent cuts; the
+anchor window was already there. Whole-read J without the anchor window is
+the only configuration measured that lets a true D fall outside the
+windows. The D errors that remain are wrong alleles (§5.9).
+
+**Against IgBLAST 1.22.** Same reads (5000 per preset, forward strand), same
+germline as BLAST databases, `-organism human -ig_seqtype Ig -outfmt 19`,
+scored by `vdj-assign evaluate`:
+
+| Preset | Tool | V | V gene | D | J | Junction | D called on D-free reads | Reads/s, 4 threads |
+|---|---|---|---|---|---|---|---|---|
+| easy | vdj_assign | 99.88 | 100.00 | 99.29 | 99.84 | 100.00 | 0 % | 4800 |
+| easy | IgBLAST | 99.12 | 99.78 | 98.86 | 99.86 | 99.77 | 0 % | 67 |
+| mid | vdj_assign | 97.88 | 99.72 | 93.35 | 98.74 | 99.97 | 23 % | 4800 |
+| mid | IgBLAST | 97.18 | 99.62 | 93.73 | 98.60 | 99.72 | 43 % | 66 |
+| hard | vdj_assign | 89.26 | 98.58 | 83.00 | 92.80 | 99.69 | 16 % | 4800 |
+| hard | IgBLAST | 89.16 | 98.90 | 81.75 | 91.84 | 98.07 | 30 % | 71 |
+
+IgBLAST's higher mid D accuracy comes with twice the D calls on D-free
+junctions, and its V gene is 0.3 pp better on the hard preset. Two setup
+issues had to be fixed for a fair junction comparison. IgBLAST takes J
+anchors from its auxiliary file, which lacks three of this database's J
+alleles, so it reported no junction for 18 % of reads; the entries were
+added, with frames and CDR3 ends from `vdj-assign prepare`, which agrees
+with the file on all 13 shared alleles. The remaining disagreements exposed
+item 16 on our side.

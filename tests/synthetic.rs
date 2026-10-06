@@ -301,17 +301,19 @@ fn batch_matches_sequential() {
 // ---------------------------------------------------------------------------
 
 /// Exhaustive search of the segmentation model: every grammatical path, and
-/// for every transition every exit cut `x` and entry cut `y ≥ x` within
-/// `MARGIN` bases of the placements' meeting point — wider than the DAG's own
-/// search (entries only inside the overlap), so it also checks that the DAG's
-/// restriction loses nothing. Memoised on `(placement, entry, D count, first)`.
+/// for every transition every canonical exit cut `x` and every canonical
+/// entry cut `y ≥ x` of the next placement, with no shortcut. Memoised on
+/// `(placement, entry, D count, first)`.
 struct Brute<'a> {
     dag: &'a PlacementDag,
     placements: &'a [Placement],
     memo: std::collections::HashMap<(usize, u32, u8, SegmentKind), Option<PathScore>>,
 }
 
-const MARGIN: u32 = 12;
+/// Canonical entry and exit cuts of a placement (one per Match column).
+fn cuts(p: &Placement) -> (Vec<u32>, Vec<u32>) {
+    p.clip.matches().map(|(q, ..)| (q, q + 1)).unzip()
+}
 
 impl Brute<'_> {
     fn min(&self, kind: SegmentKind) -> u32 {
@@ -344,15 +346,14 @@ impl Brute<'_> {
             if pe.q_start() <= pb.q_start() || !grammar.can_follow(pb.kind, pe.kind, d_used) {
                 continue;
             }
-            let meet = pb.q_end().min(pe.q_start());
-            let exits = meet.saturating_sub(MARGIN).max(entry + 1)..=pb.q_end();
-            let last_entry = (pb.q_end().max(pe.q_start()) + MARGIN).min(pe.q_end() - 1);
             let d_next = d_used + u8::from(pe.kind == SegmentKind::D);
-            for x in exits {
+            let (_, exits) = cuts(pb);
+            let (entries, _) = cuts(pe);
+            for x in exits.into_iter().filter(|&x| x > entry) {
                 let Some(span) = pb.clip.span(entry, x).filter(|s| s.q_len() >= self.min(pb.kind)) else {
                     continue;
                 };
-                for y in pe.q_start().max(x)..=last_entry {
+                for &y in entries.iter().filter(|&&y| y >= x) {
                     let Some(next) = pe.clip.entry(y) else {
                         continue;
                     };
@@ -371,6 +372,57 @@ impl Brute<'_> {
         self.memo.insert(key, best);
         best
     }
+}
+
+/// The DAG's best path score and the exhaustive one on `placements`.
+fn dag_and_brute(dag: &PlacementDag, placements: &[Placement], scratch: &mut DagScratch) -> (Option<PathScore>, Option<PathScore>) {
+    let fast = dag.adjudicate(0, placements, scratch).map(|path| path.score);
+    let mut brute = Brute { dag, placements, memo: Default::default() };
+    let exhaustive = (0..placements.len())
+        .filter(|&s| dag.grammar.can_start(placements[s].kind))
+        .filter_map(|s| {
+            let p = &placements[s];
+            brute.best_from(s, p.q_start(), u8::from(p.kind == SegmentKind::D), p.kind)
+        })
+        .max();
+    (fast, exhaustive)
+}
+
+/// IgSim reads mutate V, D and J, so an alignment can carry mismatches right
+/// after its neighbour's end, where entering later and leaving them to N/P
+/// wins (an entry beyond the overlap). The pipeline's own placements, with and
+/// without a per-base N/P cost.
+#[test]
+fn dag_equals_brute_force_on_hypermutated_igsim_reads() {
+    use vdj_assign::sim::{SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
+    let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 11);
+    let config = EngineConfig::default();
+    let assigner = DefaultAssigner::from_config(&config, db.v.clone(), Some(db.d.clone()), db.j.clone()).unwrap();
+    let base = config.objective.resolve(Some(&db.d), &config.d.scoring);
+    let sim = Simulator::new(&db.v, Some(&db.d), &db.j, SimParams::hard()).unwrap();
+    let mut ws = assigner.workspace();
+    let mut scratch = DagScratch::default();
+    let mut beyond = 0;
+    for read in sim.reads(40, 5).unwrap() {
+        let call = assigner.assign(&encode(&read.sequence), &mut ws);
+        let mut placements = top_by_kind(&call.placements, SegmentKind::V, 3);
+        placements.extend(top_by_kind(&call.placements, SegmentKind::D, 6));
+        placements.extend(top_by_kind(&call.placements, SegmentKind::J, 3));
+        for iota in [0, -1] {
+            let model = EngineeringObjective { insertion_per_base: iota, ..base };
+            let dag = PlacementDag::new(VdjGrammar::VDJ, model, config.min_retained);
+            let (fast, exhaustive) = dag_and_brute(&dag, &placements, &mut scratch);
+            assert_eq!(fast, exhaustive, "read {} at iota {iota}", read.sequence.len());
+            // Count reads whose optimum enters some placement beyond the overlap.
+            if let Some(path) = dag.adjudicate(0, &placements, &mut scratch) {
+                beyond += usize::from(path.segments.windows(2).any(|w| {
+                    let (b, e) = (&placements[w[0].placement], &placements[w[1].placement]);
+                    e.q_start() < b.q_end() && w[1].entry > b.q_end()
+                }));
+            }
+        }
+    }
+    assert!(beyond > 0, "the reads should exercise entries beyond the overlap");
 }
 
 fn top_by_kind(placements: &[Placement], kind: SegmentKind, n: usize) -> Vec<Placement> {
