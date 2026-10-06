@@ -23,6 +23,9 @@ pub struct Placement {
     pub clip: ClipIndex,
     /// Evidence of the unclipped alignment.
     pub evidence: Evidence,
+    /// Significant enough on its own to call the read (see
+    /// [`crate::segment::EvalueGates`]).
+    pub anchor: bool,
 }
 
 impl Placement {
@@ -43,6 +46,7 @@ impl Placement {
             alignment,
             clip,
             evidence,
+            anchor: false,
         }
     }
 

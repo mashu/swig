@@ -437,7 +437,13 @@ where
         }
     }
 
-    /// Stage 5, per read: adjudication and refinement into calls.
+    /// Whether calls need an anchor: some V or J hit significant on its own.
+    fn requires_anchor(&self) -> bool {
+        self.v.significance.is_some() || self.j.significance.is_some()
+    }
+
+    /// Stage 5, per read: adjudication and refinement into calls. A path
+    /// without an anchor ([`Placement::anchor`]) is not a call.
     fn stage_adjudicate(
         &self,
         reads: &[ReadState],
@@ -449,7 +455,11 @@ where
         for (state, placed) in reads.iter().zip(placements.iter_mut()) {
             let mut path = self
                 .adjudicator
-                .adjudicate(state.query.len(), placed, adjudication);
+                .adjudicate(state.query.len(), placed, adjudication)
+                .filter(|path| {
+                    !self.requires_anchor()
+                        || path.segments.iter().any(|s| placed[s.placement].anchor)
+                });
             if let Some(path) = path.as_mut() {
                 self.refiner.refine(&state.query, placed, path);
             }

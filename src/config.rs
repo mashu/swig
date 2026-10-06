@@ -23,7 +23,9 @@ use crate::retrieve::{
 };
 use crate::scoring::{AffineScoring, Score};
 use crate::seed::SeedShape;
-use crate::segment::{HitAcceptance, KeepPolicy, PreparedSegment, SegmentStage, Significance};
+use crate::segment::{
+    EvalueGates, HitAcceptance, KeepPolicy, PreparedSegment, SegmentStage, Significance,
+};
 use crate::stats::KarlinAltschul;
 use crate::window::{DownstreamWindow, ExpandedResidual, WithAnchorWindow};
 
@@ -41,8 +43,8 @@ pub struct VSegmentConfig {
     pub keep: KeepPolicy,
     /// Minimum substitution columns and identity of an accepted local hit.
     pub accept: HitAcceptance,
-    /// Largest E-value of an accepted hit (`None` = no significance floor).
-    pub max_evalue: Option<f64>,
+    /// E-value gates (`None` = no significance floor and no anchoring).
+    pub evalue: Option<EvalueGates>,
     /// Skip score-only DP for same-gene siblings that cannot enter the top-N,
     /// using a sound upper bound from the gene's representative.
     pub family_delta: bool,
@@ -54,8 +56,8 @@ pub struct JSegmentConfig {
     pub scoring: AffineScoring,
     pub keep: KeepPolicy,
     pub accept: HitAcceptance,
-    /// Largest E-value of an accepted hit (`None` = no significance floor).
-    pub max_evalue: Option<f64>,
+    /// E-value gates (`None` = no significance floor and no anchoring).
+    pub evalue: Option<EvalueGates>,
     pub window: DownstreamWindow,
 }
 
@@ -209,7 +211,7 @@ impl Default for VSegmentConfig {
                 min_subst: 24,
                 min_identity: 0.60,
             },
-            max_evalue: Some(1e-3),
+            evalue: Some(EvalueGates::default()),
             family_delta: true,
         }
     }
@@ -229,7 +231,7 @@ impl Default for JSegmentConfig {
                 min_subst: 10,
                 min_identity: 0.60,
             },
-            max_evalue: Some(1e-3),
+            evalue: Some(EvalueGates::default()),
             window: DownstreamWindow::default(),
         }
     }
@@ -340,8 +342,8 @@ fn v_stage(
     )
     .map_err(|source| BuildError::Index { kind, source })?;
     let significance = config
-        .max_evalue
-        .and_then(|e| Significance::new(&set, &config.scoring, e));
+        .evalue
+        .and_then(|gates| Significance::new(&set, &config.scoring, gates));
     let segment = Arc::new(PreparedSegment::new(
         set,
         &config.scoring,
@@ -362,8 +364,8 @@ fn v_stage(
 fn j_stage(set: GermlineSet, config: &JSegmentConfig) -> SegmentStage<ExhaustiveRetriever> {
     let retriever = ExhaustiveRetriever { alleles: set.len() };
     let significance = config
-        .max_evalue
-        .and_then(|e| Significance::new(&set, &config.scoring, e));
+        .evalue
+        .and_then(|gates| Significance::new(&set, &config.scoring, gates));
     let segment = PreparedSegment::new(set, &config.scoring, config.scoring.gaps);
     let mut stage = SegmentStage::new(Arc::new(segment), retriever, config.keep);
     stage.accept = config.accept;

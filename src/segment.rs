@@ -187,38 +187,60 @@ impl BatchScratch {
     }
 }
 
-/// Karlin–Altschul significance floor: an accepted hit must have an E-value
-/// of at most `max_evalue` against the whole database, for the query window
-/// that was searched, i.e. a local score of at least
-/// `⌈(ln(K·m·n) − ln E_max) / λ⌉` (`m` window length, `n` database length).
+/// E-value thresholds of a stage's hits (Karlin–Altschul, against the whole
+/// database for the query window searched).
 ///
-/// It separates calls from chance: without it every read, random sequence
-/// included, has some 10-column J alignment at 60 % identity.
+/// * `accept`: the largest E-value of a hit kept at all — at most one chance
+///   hit of that score is expected in the window.
+/// * `anchor`: the largest E-value of a hit that can *anchor* a call. A read
+///   is called only when its path contains an anchor ([`Placement::anchor`]),
+///   so a random read — whose best V or J is never that significant — gets
+///   no call, while a J downstream of a significant V needs only `accept`:
+///   given the V, a J is expected there.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EvalueGates {
+    pub accept: f64,
+    pub anchor: f64,
+}
+
+impl Default for EvalueGates {
+    fn default() -> Self {
+        Self {
+            accept: 1.0,
+            anchor: 1e-3,
+        }
+    }
+}
+
+/// Karlin–Altschul score thresholds for [`EvalueGates`]: a hit has E-value
+/// at most `E` when its local score is at least `⌈(ln(K·m·n) − ln E) / λ⌉`
+/// (`m` window length, `n` database length).
+///
+/// Without such a floor every read, random sequence included, has some
+/// 10-column J alignment at 60 % identity.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Significance {
     pub statistics: KarlinAltschul,
     /// Total length of the database (all alleles; conservative for
     /// near-identical alleles).
     pub database_len: usize,
-    pub max_evalue: f64,
+    pub gates: EvalueGates,
 }
 
 impl Significance {
-    pub fn new(set: &GermlineSet, scoring: &AffineScoring, max_evalue: f64) -> Option<Self> {
+    pub fn new(set: &GermlineSet, scoring: &AffineScoring, gates: EvalueGates) -> Option<Self> {
         Some(Self {
             statistics: KarlinAltschul::ungapped(scoring)?,
             database_len: set.alleles().iter().map(|a| a.codes.len()).sum(),
-            max_evalue,
+            gates,
         })
     }
 
-    /// Smallest local score with E-value ≤ `max_evalue` for a window of `query_len`.
-    pub fn min_score(&self, query_len: usize) -> Score {
+    /// Smallest local score with E-value ≤ `evalue` for a window of `query_len`.
+    pub fn min_score(&self, query_len: usize, evalue: f64) -> Score {
         let KarlinAltschul { lambda, k, .. } = self.statistics;
         let space = k * query_len.max(1) as f64 * self.database_len.max(1) as f64;
-        ((space.ln() - self.max_evalue.ln()) / lambda)
-            .ceil()
-            .max(0.0) as Score
+        ((space.ln() - evalue.ln()) / lambda).ceil().max(0.0) as Score
     }
 }
 
@@ -227,7 +249,7 @@ pub struct SegmentStage<R> {
     pub retriever: R,
     pub keep: KeepPolicy,
     pub accept: HitAcceptance,
-    /// `None` accepts hits of any significance.
+    /// `None` accepts hits of any significance, and none anchors a call.
     pub significance: Option<Significance>,
     /// Stitch the co-linear V prefix or J suffix back on after traceback, then re-rank.
     pub outer: OuterExtend,
@@ -267,9 +289,9 @@ impl<R: Retriever> SegmentStage<R> {
     /// Lowest local score worth keeping for `request`: the keep floor, raised
     /// to the significance floor of its window.
     fn floor(&self, request: &SegmentRequest<'_>) -> Score {
-        let significant = self
-            .significance
-            .map_or(Score::MIN, |s| s.min_score(request.window.len()));
+        let significant = self.significance.map_or(Score::MIN, |s| {
+            s.min_score(request.window.len(), s.gates.accept)
+        });
         self.keep.min_score.max(significant)
     }
 
@@ -545,13 +567,16 @@ impl<R: Retriever> SegmentStage<R> {
                 }
                 alignment.shift_query(request.window.start as u32);
                 let local = alignment.score;
-                let placement = Placement::new(
+                let mut placement = Placement::new(
                     self.kind(),
                     candidate.allele,
                     alignment,
                     request.query,
                     &self.segment,
                 );
+                placement.anchor = self
+                    .significance
+                    .is_some_and(|s| local >= s.min_score(request.window.len(), s.gates.anchor));
                 if self.accept.allows(&placement.evidence) {
                     let accepted = &mut batch.accepted[index];
                     let at = accepted.partition_point(|&s| s >= local);
@@ -696,16 +721,14 @@ mod tests {
     fn significance_floor_follows_the_search_space() {
         let (stage, _, _) = v_stage(false);
         let scoring = AffineScoring::new(2, -3, -9, -1);
-        let strict = Significance::new(stage.segment.set(), &scoring, 1e-3).unwrap();
-        let loose = Significance {
-            max_evalue: 1.0,
-            ..strict
-        };
+        let significance =
+            Significance::new(stage.segment.set(), &scoring, EvalueGates::default()).unwrap();
         // E = K·m·n·e^{−λS}: S grows with ln(m) and with −ln(E) / λ.
-        assert!(strict.min_score(600) > strict.min_score(60));
-        let gap = strict.min_score(300) - loose.min_score(300);
-        assert!((gap - (1e3f64.ln() / strict.statistics.lambda) as Score).abs() <= 1);
-        let floor = strict.min_score(300);
+        assert!(significance.min_score(600, 1e-3) > significance.min_score(60, 1e-3));
+        let gap = significance.min_score(300, 1e-3) - significance.min_score(300, 1.0);
+        assert!((gap - (1e3f64.ln() / significance.statistics.lambda) as Score).abs() <= 1);
+        let strict = significance;
+        let floor = strict.min_score(300, 1e-3);
         let evalue = |s: Score| {
             strict.statistics.k
                 * 300.0

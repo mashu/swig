@@ -55,11 +55,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Some(penalty) = value("--p-d") {
         config.objective.d_prior = vdj_assign::config::DPrior::Fixed(penalty.parse()?);
     }
-    if let Some(e) = value("--evalue") {
+    if let Some(e) = value("--anchor-evalue") {
         let e: f64 = e.parse()?;
-        let e = (e > 0.0).then_some(e);
-        config.v.max_evalue = e;
-        config.j.max_evalue = e;
+        let gates = (e > 0.0).then_some(vdj_assign::segment::EvalueGates {
+            anchor: e,
+            ..Default::default()
+        });
+        config.v.evalue = gates;
+        config.j.evalue = gates;
     }
     if let Some(limit) = value("--max-alleles") {
         config.v.seeds.max_alleles = limit.parse()?;
