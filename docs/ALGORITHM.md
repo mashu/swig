@@ -156,8 +156,9 @@ Every term is a function of `s`, of `x`, or of `y` alone. So:
 
 Entries are tried only inside the overlap, or at `e`'s first base when the
 placements do not overlap. Moving an entry further right clips a prefix of an
-optimal local alignment, which scores ≥ 0 (Lemma 1), and only lengthens the
-N/P run, so it never helps when `ι ≥ 0`.
+optimal local alignment, which scores ≥ 0 (Lemma 1), and lengthens the N/P
+run, which scores ≤ 0 (`ι ≤ 0`: a per-base N/P score is a length cost, never
+a reward), so it never helps.
 
 Complexity is `O(S log S + L log S + T·C)` per node, with `S` states, `L`
 exit cuts, `T` successors and `C` entry cuts, instead of `O(S·T·L·C)`.

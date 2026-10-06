@@ -125,9 +125,20 @@ fn airr_tsv_rows_score_like_the_records_they_were_written_from() {
         let sequence = String::from_utf8_lossy(&read.sequence);
         let id = format!("r{i}");
         let record = AirrRecord::from_call(&id, &sequence, &call, &assigner, &[None, None, None]);
-        let (parsed_id, parsed) = Assignment::from_airr(&columns, &record.to_tsv()).expect("AIRR row");
+        let (parsed_id, mut parsed) = Assignment::from_airr(&columns, &record.to_tsv()).expect("AIRR row");
         assert_eq!(parsed_id, id);
-        assert_eq!(parsed, Assignment::from_record(&record));
+        let mut direct = Assignment::from_record(&record);
+        assert_eq!(record.d_presence_posterior.is_some(), record.path_score.is_some(), "posteriors by default");
+        // Posteriors are written with six decimals (more near 0 and 1).
+        let probabilities = |a: &mut Assignment| {
+            let mut out = vec![a.d_presence.take()];
+            out.extend(a.segments.iter_mut().flatten().map(|s| s.posterior.take()));
+            out
+        };
+        for (p, q) in probabilities(&mut parsed).into_iter().zip(probabilities(&mut direct)) {
+            assert!(p.zip(q).map_or(p == q, |(p, q)| (p - q).abs() <= 5e-7), "{p:?} vs {q:?}");
+        }
+        assert_eq!(parsed, direct);
         let truth = Truth::from_read(&sim, read, &id);
         let header = Truth::tsv_header();
         let truth_columns: Vec<&str> = header.split('\t').collect();

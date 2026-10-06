@@ -30,7 +30,7 @@
 
 use std::ops::Range;
 
-use crate::adjudicate::{Adjudicator, CallPath, DagScratch, PlacementDag};
+use crate::adjudicate::{Adjudicator, CallPath, DagScratch, Marginals, PlacementDag};
 use crate::admission::{Admission, DefaultAdmission};
 use crate::align::{Aligner, InterSequenceGotoh, InterSequenceWorkspace};
 use crate::alphabet::reverse_complement_into;
@@ -57,6 +57,9 @@ pub struct Call {
     pub placements: Vec<Placement>,
     /// The adjudicated path, if any segment could be placed.
     pub path: Option<CallPath>,
+    /// Posterior marginals of `placements` (indexed alike), when the
+    /// adjudicator computes them and the read has a call.
+    pub marginals: Option<Marginals>,
 }
 
 /// Anything that assigns V(D)J to encoded queries with a reusable workspace.
@@ -460,6 +463,9 @@ where
                     !self.requires_anchor()
                         || path.segments.iter().any(|s| placed[s.placement].anchor)
                 });
+            let marginals = path
+                .as_ref()
+                .and_then(|_| self.adjudicator.marginals(placed, adjudication));
             if let Some(path) = path.as_mut() {
                 self.refiner.refine(&state.query, placed, path);
             }
@@ -468,6 +474,7 @@ where
                 query: state.query.clone(),
                 placements: std::mem::take(placed),
                 path,
+                marginals,
             });
         }
     }

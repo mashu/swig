@@ -142,6 +142,18 @@ impl ClipIndex {
         }
     }
 
+    /// Canonical cuts, one per `Match` column in query order: its query
+    /// position `q`, the prefix score of an entry cut at `q` (the column is
+    /// kept first) and of an exit cut at `q + 1` (kept last). Every distinct
+    /// clipped span has exactly one such pair of cuts.
+    pub fn matches(&self) -> impl Iterator<Item = (u32, Score, Score)> + '_ {
+        self.columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.op == Op::Match)
+            .map(|(k, c)| (c.q, self.prefix[k], self.prefix[k + 1]))
+    }
+
     #[inline]
     fn first_match_from(&self, offset: u32) -> u32 {
         self.lookup[offset as usize]

@@ -29,7 +29,9 @@
 //!
 //! Entries are only tried inside the overlap (or at the next placement's start
 //! when there is none): moving an entry further right clips a prefix of an
-//! optimal local alignment, which never scores below zero, so it never helps.
+//! optimal local alignment, which never scores below zero, and lengthens the
+//! N/P run, which never scores above zero (a per-base N/P score is a cost,
+//! `ι ≤ 0`), so it never helps.
 //! Cost: `O(S log S + L log S + T·C)` per node, for `S` states, `L` exit cuts,
 //! `T` successors and `C` entries — instead of `O(S·T·L·C)`.
 //!
@@ -37,17 +39,21 @@
 //! germline support), so a with-D path must strictly beat the best no-D path.
 
 use super::model::{Grammar, PathModel, VdjGrammar};
+use super::posterior::{Marginals, PosteriorScratch};
 use super::{Adjudicator, CallPath, CalledSegment, EngineeringObjective, PathScore};
 use crate::germline::SegmentKind;
 use crate::placement::Placement;
 use crate::scoring::Score;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PlacementDag<G = VdjGrammar, M = EngineeringObjective> {
     pub grammar: G,
     pub model: M,
     /// Minimum query bases a clipped segment must keep, indexed by [`SegmentKind::index`].
     pub min_retained: [u32; 3],
+    /// Nats per score unit. When set, [`Adjudicator::marginals`] returns the
+    /// posterior marginals under `P(path, cuts) ∝ exp(λ·score)`.
+    pub lambda: Option<f64>,
 }
 
 impl Default for PlacementDag {
@@ -56,6 +62,7 @@ impl Default for PlacementDag {
             grammar: VdjGrammar::VDJ,
             model: EngineeringObjective::default(),
             min_retained: [10, 3, 6],
+            lambda: None,
         }
     }
 }
@@ -129,6 +136,7 @@ pub struct DagScratch {
     /// Running best exits of the current node and group, `exits[kind][x − q_start]`
     /// per successor kind (the junction score may depend on it).
     exits: [Vec<Option<ExitBest>>; 3],
+    posterior: PosteriorScratch,
 }
 
 /// Fill `out[x − b.q_start]` with the best exit cut `≤ x` of `b` for states
@@ -234,11 +242,18 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
             grammar,
             model,
             min_retained,
+            lambda: None,
         }
     }
 
+    /// Also compute posterior marginals at `lambda` nats per score unit.
+    pub fn with_posterior(mut self, lambda: f64) -> Self {
+        self.lambda = Some(lambda);
+        self
+    }
+
     #[inline]
-    fn min_bases(&self, kind: SegmentKind) -> u32 {
+    pub(super) fn min_bases(&self, kind: SegmentKind) -> u32 {
         self.min_retained[kind.index()].max(1)
     }
 }
@@ -260,6 +275,7 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
             ranked,
             groups,
             exits,
+            ..
         } = scratch;
         order.clear();
         order.extend(0..n as u32);
@@ -414,6 +430,11 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
         }
         segments.reverse();
         Some(CallPath { segments, score })
+    }
+
+    fn marginals(&self, placements: &[Placement], scratch: &mut DagScratch) -> Option<Marginals> {
+        let lambda = self.lambda?;
+        self.posterior(placements, lambda, &mut scratch.posterior)
     }
 }
 

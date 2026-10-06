@@ -92,6 +92,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "family-delta" => config.v.family_delta = false,
             "anchor-window" => config.anchor_window = false,
             "distributed-d" => config.d.distributed = None,
+            "posterior" => config.posterior = false,
             other => return Err(format!("unknown ablation '{other}'").into()),
         }
     }

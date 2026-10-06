@@ -8,7 +8,11 @@
 //! Co-optimal labels are recomputed on the called cut interval: every
 //! placement of the same kind whose clip to `[entry, exit)` scores exactly the
 //! called score contributes its alleles. As the note says, this means "equal
-//! score under this caller", not equal biological probability.
+//! score under this caller", not equal biological probability. The
+//! probability is the `posterior` column: the posterior mass of those
+//! co-optimal placements under `P(path, cuts) ∝ exp(λ·score)`
+//! ([`crate::adjudicate::Marginals`]); `d_presence_posterior` is the
+//! probability that the read has a D at all.
 
 use std::fmt::Write as _;
 
@@ -31,6 +35,8 @@ pub struct SegmentReport {
     pub identity: f64,
     /// Karlin–Altschul E-value, when a model is supplied for the segment kind.
     pub support: Option<f64>,
+    /// Posterior probability that the segment is one of the called alleles.
+    pub posterior: Option<f64>,
     pub cigar: String,
     pub sequence_start: u32,
     pub sequence_end: u32,
@@ -53,6 +59,8 @@ pub struct AirrRecord {
     pub np2: Option<String>,
     pub np3: Option<String>,
     pub path_score: Option<Score>,
+    /// Posterior probability that the read contains a D segment.
+    pub d_presence_posterior: Option<f64>,
     /// FR/CDR/CDR3/junction coordinates and productivity.
     pub regions: ReadRegions,
     /// Oriented query as ASCII (region sequences are slices of it).
@@ -73,11 +81,12 @@ const REGION_COLUMNS: [(&str, fn(&ReadRegions) -> &Option<std::ops::Range<u32>>)
 /// Per-kind statistics for support values (indexed by [`SegmentKind::index`]).
 pub type SupportModels = [Option<KarlinAltschul>; 3];
 
-const SEGMENT_FIELDS: [&str; 11] = [
+const SEGMENT_FIELDS: [&str; 12] = [
     "call",
     "score",
     "identity",
     "support",
+    "posterior",
     "cigar",
     "sequence_start",
     "sequence_end",
@@ -86,6 +95,17 @@ const SEGMENT_FIELDS: [&str; 11] = [
     "sequence_alignment",
     "germline_alignment",
 ];
+
+/// A probability with six significant digits of its distance from 0 or 1,
+/// so `0.999999` and `0.9999999` stay distinguishable.
+fn probability(p: f64) -> String {
+    let tail = p.min(1.0 - p);
+    if tail > 0.0 && tail < 1e-4 {
+        format!("{p:.10}")
+    } else {
+        format!("{p:.6}")
+    }
+}
 
 fn push_run(cigar: &mut String, symbol: char, length: u32) {
     if length > 0 {
@@ -108,17 +128,24 @@ fn segment_report<C: AlleleCatalog>(
     // Co-optimal alleles on the called interval. The primary name is the one
     // with the most germline support (unclipped score, the DAG's own tie-break),
     // then the longest exact run and most matches on the interval.
+    let tied_indices: Vec<usize> = (0..call.placements.len())
+        .filter(|&i| {
+            let p = &call.placements[i];
+            p.kind == kind
+                && p.clip
+                    .span(called.entry, called.exit)
+                    .is_some_and(|s| s.score == called_score)
+        })
+        .collect();
+    let posterior = call.marginals.as_ref().map(|m| {
+        tied_indices
+            .iter()
+            .filter_map(|&i| m.placement.get(i))
+            .sum::<f64>()
+            .min(1.0)
+    });
     let mut tied: Vec<_> = std::iter::once(dag_placement)
-        .chain(
-            call.placements
-                .iter()
-                .filter(|p| p.kind == kind)
-                .filter(|p| {
-                    p.clip
-                        .span(called.entry, called.exit)
-                        .is_some_and(|s| s.score == called_score)
-                }),
-        )
+        .chain(tied_indices.iter().map(|&i| &call.placements[i]))
         .collect();
     tied.sort_by_key(|p| {
         let own = p
@@ -201,6 +228,7 @@ fn segment_report<C: AlleleCatalog>(
         score: span.score,
         identity: evidence.identity(),
         support: evalue,
+        posterior,
         cigar,
         sequence_start: span.q_lo + 1,
         sequence_end: span.q_hi,
@@ -231,6 +259,7 @@ impl AirrRecord {
             np2: None,
             np3: None,
             path_score: None,
+            d_presence_posterior: None,
             regions: ReadRegions::from_call(call, catalog),
             oriented: decode(&call.query),
         };
@@ -238,6 +267,7 @@ impl AirrRecord {
             return record;
         };
         record.path_score = Some(path.score.score);
+        record.d_presence_posterior = call.marginals.as_ref().map(|m| m.d_present());
 
         let mut junctions = Vec::with_capacity(3);
         for (i, called) in path.segments.iter().enumerate() {
@@ -285,6 +315,7 @@ impl AirrRecord {
             columns.push(format!("{np}_length"));
         }
         columns.push("path_score".to_string());
+        columns.push("d_presence_posterior".to_string());
         for (name, _) in REGION_COLUMNS {
             columns.extend([
                 name.to_string(),
@@ -320,6 +351,7 @@ impl AirrRecord {
                     s.score.to_string(),
                     format!("{:.4}", s.identity),
                     s.support.map_or_else(String::new, |e| format!("{e:.3e}")),
+                    s.posterior.map_or_else(String::new, probability),
                     s.cigar.clone(),
                     s.sequence_start.to_string(),
                     s.sequence_end.to_string(),
@@ -338,6 +370,10 @@ impl AirrRecord {
             }
         }
         fields.push(self.path_score.map_or_else(String::new, |s| s.to_string()));
+        fields.push(
+            self.d_presence_posterior
+                .map_or_else(String::new, probability),
+        );
         let slice =
             |range: &std::ops::Range<u32>| &self.oriented[range.start as usize..range.end as usize];
         for (_, get) in REGION_COLUMNS {

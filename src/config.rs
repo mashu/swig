@@ -187,6 +187,9 @@ pub struct EngineConfig {
     pub objective: ObjectiveConfig,
     /// Minimum retained query bases after clipping, per [`SegmentKind::index`].
     pub min_retained: [u32; 3],
+    /// Report posterior probabilities (forward–backward over the placement
+    /// DAG at the V scoring's λ): per called segment and for D presence.
+    pub posterior: bool,
     pub options: AssignerOptions,
 }
 
@@ -268,6 +271,7 @@ impl Default for EngineConfig {
             // V ≥ 24 aligned bases, J ≥ 10, D ≥ min_d_match. Query bases
             // retained after a clip use the same floors.
             min_retained: [24, 4, 10],
+            posterior: true,
             options: AssignerOptions::default(),
         }
     }
@@ -427,6 +431,14 @@ impl Assigner {
         };
         let strand = StrandIndex::build([&v, &j], StrandIndex::K);
         let objective = config.objective.resolve(d.as_ref(), &config.d.scoring);
+        let mut adjudicator = PlacementDag::new(grammar, objective, config.min_retained);
+        if config.posterior {
+            // Scores are summed across V, D and J; the default stages share
+            // one substitution scoring and so one λ.
+            if let Some(ka) = KarlinAltschul::ungapped(&config.v.scoring) {
+                adjudicator = adjudicator.with_posterior(ka.lambda);
+            }
+        }
         Ok(Assigner {
             v: v_stage(v, &config.v)?,
             j: j_stage(j, &config.j),
@@ -441,7 +453,7 @@ impl Assigner {
                 },
                 config.d.distributed,
             ),
-            adjudicator: PlacementDag::new(grammar, objective, config.min_retained),
+            adjudicator,
             refiner: NoRefine,
             options: config.options,
         })
