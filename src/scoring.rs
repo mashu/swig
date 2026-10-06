@@ -13,9 +13,72 @@
 //! polymorphic positions, codon-aware scores) plugs in without touching any
 //! aligner, clipper or adjudicator — they all read the same profile.
 
-use crate::alphabet::{ALPHABET_SIZE, N};
+use crate::alphabet::{A, ALPHABET_SIZE, C, G, N, T};
 
 pub type Score = i32;
+
+#[inline]
+fn is_w(c: u8) -> bool {
+    c == A || c == T
+}
+#[inline]
+fn is_r(c: u8) -> bool {
+    c == A || c == G
+}
+#[inline]
+fn is_y(c: u8) -> bool {
+    c == C || c == T
+}
+#[inline]
+fn is_s(c: u8) -> bool {
+    c == C || c == G
+}
+
+/// Classic AID hotspot target at `position` of `reference` (WRCY / RGYW).
+#[inline]
+pub fn is_hotspot_target(reference: &[u8], position: usize) -> bool {
+    let n = reference.len();
+    let b = reference[position];
+    // WRCY — mutable C
+    if b == C && position >= 2 && position + 1 < n {
+        if is_w(reference[position - 2])
+            && is_r(reference[position - 1])
+            && is_y(reference[position + 1])
+        {
+            return true;
+        }
+    }
+    // RGYW — mutable G
+    if b == G && position >= 1 && position + 2 < n {
+        if is_r(reference[position - 1])
+            && is_y(reference[position + 1])
+            && is_w(reference[position + 2])
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Coldspot target at `position` (SYC / GRS).
+#[inline]
+pub fn is_coldspot_target(reference: &[u8], position: usize) -> bool {
+    let n = reference.len();
+    let b = reference[position];
+    // SYC — mutable C
+    if b == C && position >= 2 {
+        if is_s(reference[position - 2]) && is_y(reference[position - 1]) {
+            return true;
+        }
+    }
+    // GRS — mutable G
+    if b == G && position + 2 < n {
+        if is_r(reference[position + 1]) && is_s(reference[position + 2]) {
+            return true;
+        }
+    }
+    false
+}
 
 /// "Minus infinity" with headroom so that adding a few penalties never overflows.
 pub const NEG_INF: Score = i32::MIN / 4;
@@ -91,6 +154,59 @@ impl SubstitutionModel for AffineScoring {
     #[inline]
     fn score(&self, query_code: u8, reference: &[u8], position: usize) -> Score {
         self.substitution(query_code, reference[position])
+    }
+}
+
+/// SHM hotspot-aware substitution model.
+///
+/// Matches and gaps follow [`AffineScoring`]. Mismatches at germline AID
+/// hotspot positions (WRCY / RGYW) cost `hotspot_mismatch`; coldspot positions
+/// (SYC / GRS) cost `coldspot_mismatch`; everything else uses `base.mismatch`.
+/// Ambiguous bases still score 0.
+///
+/// Built into J profiles by default: under heavy SHM the true allele's hotspot
+/// mismatches are discounted relative to decoys whose disagreements sit on
+/// cold or neutral positions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HotspotScoring {
+    pub base: AffineScoring,
+    pub hotspot_mismatch: Score,
+    pub coldspot_mismatch: Score,
+}
+
+impl HotspotScoring {
+    /// Soft hotspot (−2); coldspot stays at `base.mismatch` (no extra harden).
+    /// A −1 hotspot / −4 coldspot pair over-shrunk high-SHM J scores and let
+    /// decoys win; this milder discount is enough to tip close gene ties.
+    pub const fn for_shm(base: AffineScoring) -> Self {
+        Self {
+            base,
+            hotspot_mismatch: -2,
+            coldspot_mismatch: base.mismatch,
+        }
+    }
+
+    #[inline]
+    pub fn substitution(&self, query_code: u8, reference: &[u8], position: usize) -> Score {
+        let r = reference[position];
+        if query_code >= N || r >= N {
+            0
+        } else if query_code == r {
+            self.base.matched
+        } else if is_hotspot_target(reference, position) {
+            self.hotspot_mismatch
+        } else if is_coldspot_target(reference, position) {
+            self.coldspot_mismatch
+        } else {
+            self.base.mismatch
+        }
+    }
+}
+
+impl SubstitutionModel for HotspotScoring {
+    #[inline]
+    fn score(&self, query_code: u8, reference: &[u8], position: usize) -> Score {
+        self.substitution(query_code, reference, position)
     }
 }
 
@@ -175,5 +291,20 @@ mod tests {
             }
         }
         assert_eq!(scoring.gaps.cost(3), -7);
+    }
+
+    #[test]
+    fn hotspot_softens_wrcy_and_hardens_syc() {
+        // AGCT = WRCY (mutable C at 2); GTC = SYC (mutable C at 6).
+        let reference = encode(b"AGCTGTC");
+        let model = HotspotScoring::for_shm(AffineScoring::new(2, -3, -17, -2));
+        assert!(is_hotspot_target(&reference, 2));
+        assert_eq!(model.substitution(T, &reference, 2), -2);
+        assert_eq!(model.substitution(A, &reference, 2), -2);
+        assert_eq!(model.substitution(C, &reference, 0), -3);
+        assert!(is_coldspot_target(&reference, 6));
+        // coldspot penalty equals base mismatch in for_shm
+        assert_eq!(model.substitution(T, &reference, 6), -3);
+        assert_eq!(model.substitution(C, &reference, 6), 2);
     }
 }

@@ -41,6 +41,17 @@ pub struct VjSegmentConfig {
     pub outer: OuterExtend,
     /// Minimum substitution columns and identity of an accepted local hit.
     pub accept: HitAcceptance,
+    /// Softer acceptance used while placing, then discarded when the best V
+    /// identity is above [`crate::refine::JUNCTION_TIE_IDENTITY`]. `None` =
+    /// always use [`Self::accept`]. For J under SHM: retrieve/score soft, keep
+    /// strict gates on clean (high-identity) V reads.
+    pub accept_shm: Option<HitAcceptance>,
+    /// Skip score-only DP for same-gene siblings that cannot enter the top-N
+    /// local scores, using a sound upper bound from the gene's representative.
+    pub family_delta: bool,
+    /// Build substitution profiles with [`crate::scoring::HotspotScoring`]
+    /// (AID hotspot / coldspot mismatch costs). Intended for J under SHM.
+    pub hotspot: bool,
 }
 
 /// D: L-mer prefilter, unbanded DP inside junction windows, admission gates.
@@ -127,25 +138,34 @@ impl VjSegmentConfig {
                 min_subst: 24,
                 min_identity: 0.60,
             },
+            accept_shm: None,
+            family_delta: true,
+            hotspot: false,
         }
     }
 
-    /// Swig J: `(2, −3, −17, −2)`, three candidates (`max(top_j, 3)`), identity ≥ 0.60.
+    /// J: `(2, −3, −17, −2)`. Primary is a 5-mer (not 7): the locus is ~50 bp
+    /// with few alleles, and under SHM a 7-mer primary can lock onto decoys and
+    /// skip the short-seed fallback. No shorter fallback — 4-mers are too shared
+    /// across the tiny J set and drown the true allele. V keeps longer seeds.
+    /// Profiles use SHM hotspot mismatch costs so the true J can win under
+    /// heavy mutation when decoys disagree on cold/neutral positions.
+    /// Clean reads keep Swig-like acceptance; high-SHM V reads keep the soft gate.
     pub fn j_default() -> Self {
         Self {
             scoring: AffineScoring::new(2, -3, -17, -2),
-            primary: SeedShape::contiguous(7),
-            fallback: Some(SeedShape::contiguous(5)),
+            primary: SeedShape::contiguous(5),
+            fallback: None,
             seeds: SeedVoteParams::default(),
             budget: AmbiguityBudget {
                 base: 3,
-                max: 3,
+                max: 5,
                 ..AmbiguityBudget::default()
             },
             ungapped: None,
-            // Score-screen to Swig's top_j of 2, plus the exact-score tie group.
+            // Score-screen a few more J candidates under SHM ambiguity.
             keep: KeepPolicy {
-                top: 2,
+                top: 3,
                 slack: 0,
                 min_score: 1,
                 cap: 64,
@@ -157,6 +177,13 @@ impl VjSegmentConfig {
                 min_subst: 10,
                 min_identity: 0.60,
             },
+            accept_shm: Some(HitAcceptance {
+                min_subst: 8,
+                min_identity: 0.50,
+            }),
+            // J genes rarely have enough alleles for the bound to pay off.
+            family_delta: false,
+            hotspot: true,
         }
     }
 }
@@ -194,6 +221,10 @@ impl Default for EngineConfig {
                 d_presence: DPresencePenalty::R_OPTIMIZED,
                 tandem_d_penalty: 12,
                 insertion_per_base: 0,
+                d_short_run_penalty: 1,
+                d_short_run_floor: 6,
+                d_long_span_soft_max: 0,
+                d_long_span_penalty: 0,
             },
             // Swig: V ≥ 24 aligned bases, J ≥ 10, D ≥ min_d_match. Query bases
             // retained after a clip use the same floors.
@@ -274,15 +305,26 @@ fn vj_stage(
         config.budget,
     )
     .map_err(|source| BuildError::Index { kind, source })?;
-    let segment = Arc::new(PreparedSegment::new(
-        set,
-        &config.scoring,
-        config.scoring.gaps,
-    ));
+    let segment = Arc::new(if config.hotspot {
+        PreparedSegment::new(
+            set,
+            &crate::scoring::HotspotScoring::for_shm(config.scoring),
+            config.scoring.gaps,
+        )
+    } else {
+        PreparedSegment::new(set, &config.scoring, config.scoring.gaps)
+    });
     let retriever = UngappedPrefilter::new(seeds, Arc::clone(&segment), config.ungapped);
+    let family_delta = config
+        .family_delta
+        .then(|| crate::family_bound::FamilyBoundTable::build(segment.set()));
     let mut stage = SegmentStage::new(segment, retriever, config.keep);
-    stage.accept = config.accept;
+    // Place with the soft SHM gate when configured; clean-V filtering restores
+    // `accept` after placement (see pipeline).
+    stage.accept = config.accept_shm.unwrap_or(config.accept);
+    stage.accept_clean = config.accept_shm.map(|_| config.accept);
     stage.outer = config.outer;
+    stage.family_delta = family_delta;
     Ok(stage)
 }
 

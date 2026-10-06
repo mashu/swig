@@ -39,6 +39,7 @@ pub mod batch;
 pub mod clip;
 pub mod config;
 pub mod evidence;
+pub mod family_bound;
 pub mod fasta;
 pub mod germline;
 pub mod index;
@@ -83,7 +84,7 @@ pub mod prelude {
     pub use crate::refine::{NoRefine, Refiner};
     pub use crate::report::{AirrRecord, SupportModels};
     pub use crate::retrieve::{Candidate, Retriever};
-    pub use crate::scoring::AffineScoring;
+    pub use crate::scoring::{AffineScoring, HotspotScoring};
     pub use crate::stats::KarlinAltschul;
     pub use crate::window::{DWindowPolicy, ExpandedResidual, ResidualWindow, WithAnchorWindow};
 }

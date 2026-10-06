@@ -99,24 +99,46 @@ fn segment_report<C: AlleleCatalog>(
     catalog: &C,
     support: &SupportModels,
 ) -> Option<SegmentReport> {
-    let placement = &call.placements[called.placement];
-    let kind = placement.kind;
+    let dag_placement = &call.placements[called.placement];
+    let kind = dag_placement.kind;
     let segment = catalog.segment(kind)?;
     let set = segment.set();
-    let reference = &set.allele(placement.primary_allele()).codes;
-    let span = &called.span;
+    let called_score = called.span.score;
 
-    // Co-optimal alleles on the called interval.
+    // Co-optimal alleles on the called interval, ranked by exact-run then
+    // matches on that interval so the primary name is the strongest gene
+    // hypothesis (1/n allele scoring cares about order).
+    let mut tied: Vec<_> = std::iter::once(dag_placement)
+        .chain(call.placements.iter().filter(|p| p.kind == kind).filter(|p| {
+            p.clip
+                .span(called.entry, called.exit)
+                .is_some_and(|s| s.score == called_score)
+        }))
+        .collect();
+    tied.sort_by_key(|p| {
+        let own = p
+            .clip
+            .span(called.entry, called.exit)
+            .expect("tied placement clips to the called interval");
+        let e = Evidence::from_columns(
+            p.clip.columns(&own),
+            &call.query,
+            &set.allele(p.primary_allele()).codes,
+        );
+        (
+            std::cmp::Reverse(e.longest_exact_run),
+            std::cmp::Reverse(e.matches),
+            p.primary_allele(),
+        )
+    });
+    let placement = tied[0];
+    let span = placement
+        .clip
+        .span(called.entry, called.exit)
+        .expect("primary tied placement clips to the called interval");
+    let reference = &set.allele(placement.primary_allele()).codes;
     let mut names: Vec<&str> = Vec::new();
-    let tied =
-        std::iter::once(placement).chain(call.placements.iter().filter(|p| p.kind == kind).filter(
-            |p| {
-                p.clip
-                    .span(called.entry, called.exit)
-                    .is_some_and(|s| s.score == span.score)
-            },
-        ));
-    for p in tied {
+    for p in &tied {
         for &allele in &p.alleles {
             for name in set.allele(allele).names() {
                 if !names.contains(&name) {
@@ -133,7 +155,7 @@ fn segment_report<C: AlleleCatalog>(
     let mut sequence_alignment = String::with_capacity(span.q_len() as usize + 8);
     let mut germline_alignment = String::with_capacity(span.r_len() as usize + 8);
     let mut run: Option<(char, u32)> = None;
-    for (op, q, r) in placement.clip.columns(span) {
+    for (op, q, r) in placement.clip.columns(&span) {
         let (symbol, qs, rs) = match op {
             Op::Match => {
                 let (a, b) = (call.query[q as usize], reference[r as usize]);
@@ -163,7 +185,7 @@ fn segment_report<C: AlleleCatalog>(
     }
     push_run(&mut cigar, 'S', call.query.len() as u32 - span.q_hi);
 
-    let evidence = Evidence::from_columns(placement.clip.columns(span), &call.query, reference);
+    let evidence = Evidence::from_columns(placement.clip.columns(&span), &call.query, reference);
     let db_len: usize = set.alleles().iter().map(|a| a.codes.len()).sum();
     let evalue =
         support[kind.index()].map(|ka| ka.evalue(span.score, call.query.len(), db_len, set.len()));

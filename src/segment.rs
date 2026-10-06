@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use crate::align::{AlignJob, Aligner, Alignment, ScoreHit};
 use crate::evidence::Evidence;
+use crate::family_bound::FamilyBoundTable;
 use crate::germline::{AlleleId, GermlineSet, SegmentKind};
 use crate::placement::{merge_identical, Placement};
 use crate::refine::{extend_outer, OuterExtend};
@@ -213,8 +214,15 @@ pub struct SegmentStage<R> {
     pub retriever: R,
     pub keep: KeepPolicy,
     pub accept: HitAcceptance,
+    /// When set, placements that only pass the soft [`Self::accept`] gate are
+    /// dropped on reads whose V identity is above the SHM threshold (see
+    /// pipeline). `None` means every placement that passed `accept` is kept.
+    pub accept_clean: Option<HitAcceptance>,
     /// Stitch the co-linear V prefix or J suffix back on after traceback, then re-rank.
     pub outer: OuterExtend,
+    /// When set, score one allele per gene first and skip siblings whose upper
+    /// bound cannot enter the score-screen top-N.
+    pub family_delta: Option<FamilyBoundTable>,
 }
 
 impl<R: Retriever> SegmentStage<R> {
@@ -224,7 +232,9 @@ impl<R: Retriever> SegmentStage<R> {
             retriever,
             keep,
             accept: HitAcceptance::PERMISSIVE,
+            accept_clean: None,
             outer: OuterExtend::None,
+            family_delta: None,
         }
     }
 
@@ -403,15 +413,228 @@ impl<R: Retriever> SegmentStage<R> {
                     out.push(placement);
                 }
             }
-            out[first_new..].sort_by_key(|p| std::cmp::Reverse(p.score()));
+            out[first_new..].sort_by_key(|p| {
+                std::cmp::Reverse((p.score(), p.evidence.longest_exact_run))
+            });
             merge_identical(out, first_new);
         }
     }
 
-    /// Score every candidate, then traceback only the prefix that can enter the
-    /// top `keep.top` accepted alignments. One wave is enough when those
-    /// alignments pass the length and identity floors; a rejected high score
-    /// opens another wave.
+    /// Score-only pass for the screen: every candidate, or representatives
+    /// plus only those siblings that can still enter the top-N.
+    fn score_for_screen<'a, A: Aligner>(
+        &'a self,
+        aligner: &A,
+        requests: &[SegmentRequest<'a>],
+        dp: &mut A::Workspace,
+        hits: &mut Vec<Option<ScoreHit>>,
+    ) -> Vec<Vec<(Candidate, Score)>> {
+        let mut grouped: Vec<Vec<(Candidate, Score)>> = vec![Vec::new(); requests.len()];
+        for (request_index, request) in requests.iter().enumerate() {
+            if request.candidates.len() <= self.keep.top.saturating_add(1) {
+                grouped[request_index] = request
+                    .candidates
+                    .iter()
+                    .copied()
+                    .map(|candidate| (candidate, Score::MAX))
+                    .collect();
+            }
+        }
+
+        let Some(table) = self.family_delta.as_ref() else {
+            self.score_all_candidates(aligner, requests, dp, hits, &mut grouped);
+            for group in &mut grouped {
+                group.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
+            }
+            return grouped;
+        };
+
+        // Per request: pick the highest-vote allele of each gene as representative.
+        let mut reps: Vec<Vec<Candidate>> = vec![Vec::new(); requests.len()];
+        let mut siblings: Vec<Vec<(Candidate, AlleleId)>> = vec![Vec::new(); requests.len()];
+        for (request_index, request) in requests.iter().enumerate() {
+            if request.candidates.len() <= self.keep.top.saturating_add(1) {
+                continue;
+            }
+            let mut best_for_gene: Vec<Option<Candidate>> = Vec::new();
+            for &candidate in request.candidates {
+                let gene = table.gene(candidate.allele) as usize;
+                if best_for_gene.len() <= gene {
+                    best_for_gene.resize(gene + 1, None);
+                }
+                match &mut best_for_gene[gene] {
+                    slot @ None => *slot = Some(candidate),
+                    Some(best) => {
+                        if candidate.votes > best.votes
+                            || (candidate.votes == best.votes && candidate.allele < best.allele)
+                        {
+                            *best = candidate;
+                        }
+                    }
+                }
+            }
+            for &candidate in request.candidates {
+                let gene = table.gene(candidate.allele) as usize;
+                let rep = best_for_gene[gene].expect("gene seen above");
+                if candidate.allele == rep.allele {
+                    reps[request_index].push(candidate);
+                } else {
+                    siblings[request_index].push((candidate, rep.allele));
+                }
+            }
+        }
+
+        // Representative scores are kept even below `min_score` so a weak rep
+        // can still upper-bound a sibling that clears the floor.
+        let mut rep_scores: Vec<Vec<(AlleleId, Score)>> = vec![Vec::new(); requests.len()];
+        self.score_candidate_lists_raw(
+            aligner,
+            requests,
+            &reps,
+            dp,
+            hits,
+            &mut |request_index, candidate, score| {
+                rep_scores[request_index].push((candidate.allele, score));
+                if score >= self.keep.min_score {
+                    grouped[request_index].push((candidate, score));
+                }
+            },
+        );
+
+        // Score siblings whose upper bound can still reach the top-N cutoff.
+        // Recompute the cutoff after each wave so newly scored high hits raise it.
+        let mut pending = siblings;
+        loop {
+            let mut wave: Vec<Vec<Candidate>> = vec![Vec::new(); requests.len()];
+            let mut any = false;
+            for (request_index, request_pending) in pending.iter_mut().enumerate() {
+                if request_pending.is_empty() {
+                    continue;
+                }
+                let cutoff = screen_score_cutoff(&grouped[request_index], self.keep.top);
+                request_pending.retain(|(candidate, rep)| {
+                    let Some(&(_, rep_score)) = rep_scores[request_index]
+                        .iter()
+                        .find(|(allele, _)| *allele == *rep)
+                    else {
+                        // Representative failed to produce a score; must DP.
+                        wave[request_index].push(*candidate);
+                        any = true;
+                        return false;
+                    };
+                    match table.upper_bound(&self.segment, *rep, candidate.allele, rep_score) {
+                        None => {
+                            wave[request_index].push(*candidate);
+                            any = true;
+                            false
+                        }
+                        Some(bound) if bound < self.keep.min_score => false,
+                        Some(bound) => {
+                            if bound_can_enter(
+                                bound,
+                                cutoff,
+                                self.keep.top,
+                                grouped[request_index].len(),
+                            ) {
+                                wave[request_index].push(*candidate);
+                                any = true;
+                                false
+                            } else {
+                                false
+                            }
+                        }
+                    }
+                });
+            }
+            if !any {
+                break;
+            }
+            self.score_candidate_lists(aligner, requests, &wave, dp, hits, &mut grouped);
+        }
+
+        for group in &mut grouped {
+            group.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
+        }
+        grouped
+    }
+
+    fn score_all_candidates<'a, A: Aligner>(
+        &'a self,
+        aligner: &A,
+        requests: &[SegmentRequest<'a>],
+        dp: &mut A::Workspace,
+        hits: &mut Vec<Option<ScoreHit>>,
+        grouped: &mut [Vec<(Candidate, Score)>],
+    ) {
+        let lists: Vec<Vec<Candidate>> = requests
+            .iter()
+            .map(|request| {
+                if request.candidates.len() > self.keep.top.saturating_add(1) {
+                    request.candidates.to_vec()
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
+        self.score_candidate_lists(aligner, requests, &lists, dp, hits, grouped);
+    }
+
+    fn score_candidate_lists<'a, A: Aligner>(
+        &'a self,
+        aligner: &A,
+        requests: &[SegmentRequest<'a>],
+        lists: &[Vec<Candidate>],
+        dp: &mut A::Workspace,
+        hits: &mut Vec<Option<ScoreHit>>,
+        grouped: &mut [Vec<(Candidate, Score)>],
+    ) {
+        self.score_candidate_lists_raw(
+            aligner,
+            requests,
+            lists,
+            dp,
+            hits,
+            &mut |request_index, candidate, score| {
+                if score >= self.keep.min_score {
+                    grouped[request_index].push((candidate, score));
+                }
+            },
+        );
+    }
+
+    fn score_candidate_lists_raw<'a, A: Aligner>(
+        &'a self,
+        aligner: &A,
+        requests: &[SegmentRequest<'a>],
+        lists: &[Vec<Candidate>],
+        dp: &mut A::Workspace,
+        hits: &mut Vec<Option<ScoreHit>>,
+        emit: &mut dyn FnMut(usize, Candidate, Score),
+    ) {
+        let mut jobs = Vec::new();
+        let mut owner = Vec::new();
+        for (request_index, list) in lists.iter().enumerate() {
+            for candidate in list {
+                jobs.push(self.job(&requests[request_index], candidate));
+                owner.push((request_index, *candidate));
+            }
+        }
+        hits.clear();
+        if jobs.is_empty() {
+            return;
+        }
+        aligner.score_batch(&jobs, dp, hits);
+        for ((request_index, candidate), hit) in owner.iter().zip(hits.iter()) {
+            if let Some(hit) = hit {
+                emit(*request_index, *candidate, hit.score);
+            }
+        }
+    }
+
+    /// Score candidates (optionally with family-delta pruning), then traceback
+    /// only the prefix that can enter the top `keep.top` accepted alignments.
+    /// One wave is enough when those alignments pass the length and identity
+    /// floors; a rejected high score opens another wave.
     fn place_screened<'a, A: Aligner>(
         &'a self,
         aligner: &A,
@@ -423,42 +646,7 @@ impl<R: Retriever> SegmentStage<R> {
         let BatchScratch {
             hits, alignments, ..
         } = batch;
-        let mut score_jobs: Vec<AlignJob<'a>> = Vec::new();
-        let mut score_owner: Vec<(usize, usize)> = Vec::new();
-        for (request_index, request) in requests.iter().enumerate() {
-            if request.candidates.len() > self.keep.top.saturating_add(1) {
-                for (candidate_index, candidate) in request.candidates.iter().enumerate() {
-                    score_jobs.push(self.job(request, candidate));
-                    score_owner.push((request_index, candidate_index));
-                }
-            }
-        }
-        hits.clear();
-        if !score_jobs.is_empty() {
-            aligner.score_batch(&score_jobs, dp, hits);
-        }
-
-        let mut grouped: Vec<Vec<(Candidate, Score)>> = vec![Vec::new(); requests.len()];
-        for ((request_index, candidate_index), hit) in score_owner.iter().zip(hits.iter()) {
-            if let Some(hit) = hit {
-                if hit.score >= self.keep.min_score {
-                    let candidate = requests[*request_index].candidates[*candidate_index];
-                    grouped[*request_index].push((candidate, hit.score));
-                }
-            }
-        }
-        for (request_index, request) in requests.iter().enumerate() {
-            if request.candidates.len() > self.keep.top.saturating_add(1) {
-                grouped[request_index].sort_by_key(|(_, score)| std::cmp::Reverse(*score));
-            } else {
-                grouped[request_index] = request
-                    .candidates
-                    .iter()
-                    .copied()
-                    .map(|candidate| (candidate, Score::MAX))
-                    .collect();
-            }
-        }
+        let grouped = self.score_for_screen(aligner, requests, dp, hits);
 
         let mut scored: Vec<(Candidate, Score)> = Vec::new();
         let mut bounds = Vec::with_capacity(requests.len() + 1);
@@ -538,7 +726,11 @@ impl<R: Retriever> SegmentStage<R> {
             for placement in &mut out[first_new..] {
                 self.extend_outer(placement, request.query);
             }
-            out[first_new..].sort_by_key(|placement| std::cmp::Reverse(placement.score()));
+            // Exact-run breaks score ties so compact, high-core D alleles rank
+            // ahead of long decoys that only match on total affine score.
+            out[first_new..].sort_by_key(|placement| {
+                std::cmp::Reverse((placement.score(), placement.evidence.longest_exact_run))
+            });
             merge_identical(out, first_new);
         }
     }
@@ -569,10 +761,39 @@ impl<R: Retriever> SegmentStage<R> {
     }
 }
 
+/// N-th best score among already-scored candidates, when at least `top` exist.
+fn screen_score_cutoff(scored: &[(Candidate, Score)], top: usize) -> Option<Score> {
+    if top == 0 || scored.len() < top {
+        return None;
+    }
+    let mut scores: Vec<Score> = scored.iter().map(|(_, score)| *score).collect();
+    scores.sort_unstable_by_key(|score| std::cmp::Reverse(*score));
+    Some(scores[top - 1])
+}
+
+/// Whether a sibling with this upper bound must still be score-DP'd.
+fn bound_can_enter(
+    bound: Score,
+    cutoff: Option<Score>,
+    top: usize,
+    scored_len: usize,
+) -> bool {
+    if top == 0 {
+        return false;
+    }
+    match cutoff {
+        // Fewer than `top` scored hits: every competitive sibling is needed.
+        None => scored_len < top,
+        Some(cutoff) => bound >= cutoff,
+    }
+}
+
 /// Keep the first `top` placements and every later one tied with the last of those.
 fn retain_top_ties(placements: &mut Vec<Placement>, from: usize, top: usize) {
     let slice = &mut placements[from..];
-    slice.sort_by_key(|placement| std::cmp::Reverse(placement.score()));
+    slice.sort_by_key(|placement| {
+        std::cmp::Reverse((placement.score(), placement.evidence.longest_exact_run))
+    });
     if top == 0 || slice.len() <= top {
         return;
     }
@@ -587,6 +808,109 @@ fn retain_top_ties(placements: &mut Vec<Placement>, from: usize, top: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::align::BandedGotoh;
+    use crate::alphabet::encode;
+    use crate::band::Band;
+    use crate::family_bound::FamilyBoundTable;
+    use crate::retrieve::Retriever;
+    use crate::scoring::AffineScoring;
+
+    struct EmptyRetriever;
+    impl Retriever for EmptyRetriever {
+        fn retrieve(
+            &self,
+            _: &[u8],
+            _: &mut RetrievalScratch,
+            out: &mut Vec<Candidate>,
+        ) {
+            out.clear();
+        }
+    }
+
+    fn v_stage(family_delta: bool) -> (SegmentStage<EmptyRetriever>, Vec<u8>, Vec<Candidate>) {
+        let scoring = AffineScoring::new(2, -3, -9, -1);
+        let mut set = GermlineSet::new(SegmentKind::V);
+        // Gene 1: two alleles, one SNP. Gene 2: distant decoy.
+        let a1 = b"CAGGTCACCTTGAAGGAGTCTGGTCCTGCCTGGTGAAACCCACACAGACC";
+        let mut a2 = a1.to_vec();
+        a2[10] = b'G'; // SNP
+        let decoy = b"GACATGCAGCTGGTGGAGTCTGGGGGAGGCTTGGTACAGCCTGGGGGGTCC";
+        set.push("IGHV1-1*01", a1, None).unwrap();
+        set.push("IGHV1-1*02", &a2, None).unwrap();
+        set.push("IGHV2-1*01", decoy, None).unwrap();
+        let segment = Arc::new(PreparedSegment::new(set, &scoring, scoring.gaps));
+        let keep = KeepPolicy {
+            top: 2,
+            slack: 0,
+            min_score: 1,
+            cap: 8,
+            prescore_above: 3,
+            screen: true,
+        };
+        let mut stage = SegmentStage::new(Arc::clone(&segment), EmptyRetriever, keep);
+        stage.accept = HitAcceptance {
+            min_subst: 10,
+            min_identity: 0.50,
+        };
+        if family_delta {
+            stage.family_delta = Some(FamilyBoundTable::build(segment.set()));
+        }
+        let query = encode(a1);
+        let candidates = vec![
+            Candidate {
+                allele: 0,
+                band: Band::Full,
+                votes: 40,
+            },
+            Candidate {
+                allele: 1,
+                band: Band::Full,
+                votes: 30,
+            },
+            Candidate {
+                allele: 2,
+                band: Band::Full,
+                votes: 5,
+            },
+        ];
+        (stage, query, candidates)
+    }
+
+    #[test]
+    fn family_delta_keeps_the_same_alleles_as_full_scoring() {
+        let aligner = BandedGotoh;
+        let (full, query, candidates) = v_stage(false);
+        let (delta, _, _) = v_stage(true);
+        let mut ws_full = StageScratch::default();
+        let mut ws_delta = StageScratch::default();
+        let mut out_full = Vec::new();
+        let mut out_delta = Vec::new();
+        full.place_candidates(
+            &aligner,
+            &candidates,
+            &query,
+            0..query.len(),
+            &mut ws_full.dp,
+            &mut ws_full.batch,
+            &mut out_full,
+        );
+        delta.place_candidates(
+            &aligner,
+            &candidates,
+            &query,
+            0..query.len(),
+            &mut ws_delta.dp,
+            &mut ws_delta.batch,
+            &mut out_delta,
+        );
+        let alleles = |placements: &[Placement]| {
+            let mut ids: Vec<_> = placements.iter().map(|p| p.primary_allele()).collect();
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(alleles(&out_full), alleles(&out_delta));
+        assert!(alleles(&out_full).contains(&0));
+    }
 
     #[test]
     fn keep_policy_combines_top_slack_floor_and_cap() {

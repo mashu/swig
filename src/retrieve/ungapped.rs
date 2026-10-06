@@ -59,6 +59,25 @@ impl<R> UngappedPrefilter<R> {
     }
 }
 
+/// Best ungapped local score for a J-like end alignment of `profile` into `query`.
+///
+/// Scans diagonals around `query.len() − |r|`, which is where a full-length J
+/// sits when it occupies the 3′ end of the read.
+pub fn end_anchored_ungapped(
+    query: &[u8],
+    profile: &SubstitutionProfile,
+    radius: i32,
+) -> Score {
+    if query.is_empty() || profile.is_empty() {
+        return 0;
+    }
+    let center = query.len() as i32 - profile.len() as i32;
+    (center - radius..=center + radius)
+        .map(|d| diagonal_score(query, profile, d))
+        .max()
+        .unwrap_or(0)
+}
+
 /// Best ungapped local segment score on diagonal `d = query_pos − ref_pos`.
 #[inline]
 fn diagonal_score(query: &[u8], profile: &SubstitutionProfile, d: i32) -> Score {

@@ -439,6 +439,7 @@ The note leaves several of these unspecified; each is a named field you can chan
    - V keeps 3 genes and walks up to 16 while votes stay within `max(8, 5%)`.
    - J keeps 3 genes.
    - Traceback keeps the top 3 V and top 2 J local scores, plus whatever is tied with the last of those. A hit that fails the length or identity floor does not occupy a slot.
+   - V family-delta: score one allele per gene first; skip same-length siblings whose profile upper bound cannot enter that top-N. J leaves this off.
    - `weak_votes` 16 triggers the fallback seed.
    - `max_occurrences` 256.
    - Minimum substitution columns: V 24, J 10, D `min_d_match`. Identity floor 0.60.
@@ -501,8 +502,6 @@ The note leaves several of these unspecified; each is a named field you can chan
 - Placement construction.
 
 **Retrieval.**
-- Allele-family delta scoring: bound sibling alleles from one representative
-  alignment and skip DP when they cannot reach the keep threshold.
 - Minimizers / syncmers.
 - BMI2 `pext` for spaced seeds.
 - Suffix automaton / matching statistics for D.

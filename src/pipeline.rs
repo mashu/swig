@@ -36,11 +36,15 @@ use crate::align::{Aligner, InterSequenceGotoh, InterSequenceWorkspace};
 use crate::alphabet::reverse_complement_into;
 use crate::config::DefaultVjRetriever;
 use crate::evidence::Evidence;
-use crate::germline::SegmentKind;
+use crate::band::Band;
+use crate::germline::{AlleleId, SegmentKind};
 use crate::orient::{Orientation, OrientationPolicy};
 use crate::placement::{mark_repeated_d_tracts, Placement};
 use crate::refine::{extend_junction_tie, NoRefine, Refiner, JUNCTION_TIE_IDENTITY};
-use crate::retrieve::{strongest, Candidate, LmerMaskRetriever, RetrievalScratch, Retriever};
+use crate::retrieve::{
+    end_anchored_ungapped, strongest, Candidate, LmerMaskRetriever, RetrievalScratch, Retriever,
+};
+use crate::scoring::Score;
 use crate::segment::{BatchScratch, PreparedSegment, SegmentRequest, SegmentStage};
 use crate::window::{merge_windows, DWindowPolicy, ExpandedResidual, WithAnchorWindow};
 
@@ -336,6 +340,81 @@ impl<A, RV, RJ, RD, W, Adm, Adj, Rf> Assigner<A, RV, RJ, RD, W, Adm, Adj, Rf> {
     }
 }
 
+/// Identity of the highest-scoring V placement, or 1.0 when none (treat as clean).
+fn best_v_identity(query: &[u8], v_placements: &[Placement], v: &PreparedSegment) -> f64 {
+    let Some(best) = v_placements
+        .iter()
+        .filter(|p| p.kind == SegmentKind::V)
+        .max_by_key(|p| p.score())
+    else {
+        return 1.0;
+    };
+    let reference = &v.set().allele(best.primary_allele()).codes;
+    Evidence::from_columns(best.alignment.columns(), query, reference).identity()
+}
+
+/// On high-SHM reads, add a mild path bonus to each J from ungapped support on
+/// the post-V suffix. Relative across J candidates; scaled so it tips close
+/// gene ties without overriding a clear DP winner.
+fn apply_j_shm_ungapped_adjust(
+    query: &[u8],
+    placed: &mut [Placement],
+    v_count: usize,
+    j: &PreparedSegment,
+) {
+    let v_end = placed[..v_count]
+        .iter()
+        .filter(|p| p.kind == SegmentKind::V)
+        .max_by_key(|p| p.score())
+        .map(|p| p.q_end() as usize)
+        .unwrap_or(0);
+    if v_end >= query.len() {
+        return;
+    }
+    let suffix = &query[v_end..];
+    let mut min_ug = Score::MAX;
+    let mut ugs = Vec::with_capacity(placed.len().saturating_sub(v_count));
+    for p in &placed[v_count..] {
+        if p.kind != SegmentKind::J {
+            ugs.push(0);
+            continue;
+        }
+        let ug = end_anchored_ungapped(suffix, j.profile(p.primary_allele()), 4);
+        min_ug = min_ug.min(ug);
+        ugs.push(ug);
+    }
+    if min_ug == Score::MAX {
+        return;
+    }
+    for (p, ug) in placed[v_count..].iter_mut().zip(ugs) {
+        if p.kind != SegmentKind::J {
+            continue;
+        }
+        // Quarter-weight relative ungapped margin (integer scores).
+        p.path_adjust = (ug - min_ug) / 4;
+    }
+}
+
+/// Add every allele missing from `out` as an unbanded candidate.
+fn supplement_all_alleles(n_alleles: usize, out: &mut Vec<Candidate>) {
+    let mut seen = vec![false; n_alleles];
+    for candidate in out.iter() {
+        let index = candidate.allele as usize;
+        if index < n_alleles {
+            seen[index] = true;
+        }
+    }
+    for (index, present) in seen.into_iter().enumerate() {
+        if !present {
+            out.push(Candidate {
+                allele: index as AlleleId,
+                band: Band::Full,
+                votes: 0,
+            });
+        }
+    }
+}
+
 impl<A, RV, RJ, RD, W, Adm, Adj, Rf> Assigner<A, RV, RJ, RD, W, Adm, Adj, Rf>
 where
     A: Aligner + Send + Sync,
@@ -464,6 +543,9 @@ where
             std::mem::swap(&mut state.v, chosen);
             self.j
                 .retrieve(&state.query, 0..state.query.len(), retrieval, &mut state.j);
+            // J sets are tiny (~10–20 alleles). Score every allele so SHM that
+            // destroys short seeds cannot drop the true J before DP.
+            supplement_all_alleles(self.j.segment.set().len(), &mut state.j);
         }
         placements.iter_mut().for_each(Vec::clear);
 
@@ -495,6 +577,27 @@ where
             .collect();
         self.j
             .place_many(&self.aligner, &requests, dp, batch, placements);
+        // Adaptive J: soft gate during place; on clean V reads drop soft-only
+        // hits. On high-SHM V reads, boost J path scores by end-anchored
+        // ungapped support on the post-V suffix (gene disambiguation).
+        for (k, placed) in placements.iter_mut().enumerate() {
+            let v_identity =
+                best_v_identity(&reads[k].query, &placed[..v_count[k]], &self.v.segment);
+            if v_identity > JUNCTION_TIE_IDENTITY {
+                if let Some(clean) = self.j.accept_clean {
+                    retain_from(placed, v_count[k], |p| {
+                        p.kind != SegmentKind::J || clean.allows(&p.evidence)
+                    });
+                }
+            } else {
+                apply_j_shm_ungapped_adjust(
+                    &reads[k].query,
+                    placed,
+                    v_count[k],
+                    &self.j.segment,
+                );
+            }
+        }
 
         // Stage 4: D windows per read, D over the whole chunk, admission per read.
         if let Some(d) = &self.d {

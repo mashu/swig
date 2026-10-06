@@ -13,7 +13,7 @@ mod ungapped;
 pub use budget::{AmbiguityBudget, CandidateBudget, FixedBudget};
 pub use lmer_mask::{LmerMaskRetriever, MAX_LMER};
 pub use seed_vote::{SeedVoteParams, SeedVoteRetriever};
-pub use ungapped::{UngappedParams, UngappedPrefilter};
+pub use ungapped::{end_anchored_ungapped, UngappedParams, UngappedPrefilter};
 
 use crate::band::Band;
 use crate::germline::{AlleleId, GeneId};
