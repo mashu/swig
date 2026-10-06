@@ -26,21 +26,30 @@ use crate::scoring::{GapCosts, Score, SubstitutionProfile};
 
 const NONE: u32 = u32::MAX;
 
+/// One alignment column: its operation and the query and reference
+/// positions before it consumes its bases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Column {
+    op: Op,
+    q: u32,
+    r: u32,
+}
+
 /// Column-indexed view of one alignment supporting O(1) clipping.
+///
+/// Three allocations per alignment: the columns, their prefix scores, and
+/// both query-offset lookup tables in one vector.
 #[derive(Clone, Debug)]
 pub struct ClipIndex {
     q_start: u32,
     q_end: u32,
-    col_op: Vec<Op>,
-    col_q: Vec<u32>,
-    col_r: Vec<u32>,
+    columns: Vec<Column>,
     /// `prefix[k]` = score of columns `0..k`.
     prefix: Vec<Score>,
-    /// For query offset `t` (relative to `q_start`), first `Match` column whose
-    /// query position is `≥ q_start + t`.
-    first_m_from: Vec<u32>,
-    /// For query offset `t`, last `Match` column whose query position is `< q_start + t`.
-    last_m_before: Vec<u32>,
+    /// `lookup[t]` for `t ≤ q_len`: first `Match` column whose query position
+    /// is `≥ q_start + t`. `lookup[q_len + 1 + t]`: last `Match` column whose
+    /// query position is `< q_start + t`.
+    lookup: Vec<u32>,
 }
 
 /// One side of a clipped span.
@@ -87,28 +96,24 @@ impl ClipIndex {
         profile: &SubstitutionProfile,
         gaps: GapCosts,
     ) -> Self {
-        let columns = alignment.ops.len();
         let q_len = (alignment.q_end - alignment.q_start) as usize;
-        let mut col_op = Vec::with_capacity(columns);
-        let mut col_q = Vec::with_capacity(columns);
-        let mut col_r = Vec::with_capacity(columns);
-        let mut prefix = Vec::with_capacity(columns + 1);
-        let mut match_col_of_q = vec![NONE; q_len];
+        let mut columns = Vec::with_capacity(alignment.ops.len());
+        let mut prefix = Vec::with_capacity(alignment.ops.len() + 1);
+        // First the Match column of each query offset, then the two scans.
+        let mut lookup = vec![NONE; 2 * (q_len + 1)];
         prefix.push(0);
         let mut previous: Option<Op> = None;
         let mut total: Score = 0;
         for (k, (op, q, r)) in alignment.columns().enumerate() {
             total += match op {
                 Op::Match => {
-                    match_col_of_q[(q - alignment.q_start) as usize] = k as u32;
+                    lookup[(q - alignment.q_start) as usize] = k as u32;
                     profile.at(query[q as usize], r as usize)
                 }
                 gap if previous == Some(gap) => gaps.extend,
                 _ => gaps.open,
             };
-            col_op.push(op);
-            col_q.push(q);
-            col_r.push(r);
+            columns.push(Column { op, q, r });
             prefix.push(total);
             previous = Some(op);
         }
@@ -116,31 +121,35 @@ impl ClipIndex {
             total, alignment.score,
             "column rescoring must reproduce the DP score"
         );
-
-        let mut first_m_from = vec![NONE; q_len + 1];
-        for t in (0..q_len).rev() {
-            first_m_from[t] = match match_col_of_q[t] {
-                NONE => first_m_from[t + 1],
+        let (first_from, last_before) = lookup.split_at_mut(q_len + 1);
+        for t in 0..q_len {
+            last_before[t + 1] = match first_from[t] {
+                NONE => last_before[t],
                 col => col,
             };
         }
-        let mut last_m_before = vec![NONE; q_len + 1];
-        for t in 0..q_len {
-            last_m_before[t + 1] = match match_col_of_q[t] {
-                NONE => last_m_before[t],
-                col => col,
-            };
+        for t in (0..q_len).rev() {
+            if first_from[t] == NONE {
+                first_from[t] = first_from[t + 1];
+            }
         }
         Self {
             q_start: alignment.q_start,
             q_end: alignment.q_end,
-            col_op,
-            col_q,
-            col_r,
+            columns,
             prefix,
-            first_m_from,
-            last_m_before,
+            lookup,
         }
+    }
+
+    #[inline]
+    fn first_match_from(&self, offset: u32) -> u32 {
+        self.lookup[offset as usize]
+    }
+
+    #[inline]
+    fn last_match_before(&self, offset: u32) -> u32 {
+        self.lookup[(self.q_len() + 1 + offset) as usize]
     }
 
     pub fn q_start(&self) -> u32 {
@@ -162,11 +171,11 @@ impl ClipIndex {
         if lo >= self.q_end {
             return None;
         }
-        match self.first_m_from[(lo - self.q_start) as usize] {
+        match self.first_match_from(lo - self.q_start) {
             NONE => None,
             col => Some(Boundary {
                 col,
-                q: self.col_q[col as usize],
+                q: self.columns[col as usize].q,
                 prefix: self.prefix[col as usize],
             }),
         }
@@ -179,11 +188,11 @@ impl ClipIndex {
         if hi <= self.q_start {
             return None;
         }
-        match self.last_m_before[(hi - self.q_start) as usize] {
+        match self.last_match_before(hi - self.q_start) {
             NONE => None,
             col => Some(Boundary {
                 col,
-                q: self.col_q[col as usize] + 1,
+                q: self.columns[col as usize].q + 1,
                 prefix: self.prefix[col as usize + 1],
             }),
         }
@@ -200,8 +209,8 @@ impl ClipIndex {
             last_col: exit.col,
             q_lo: entry.q,
             q_hi: exit.q,
-            r_lo: self.col_r[entry.col as usize],
-            r_hi: self.col_r[exit.col as usize] + 1,
+            r_lo: self.columns[entry.col as usize].r,
+            r_hi: self.columns[exit.col as usize].r + 1,
             score: exit.prefix - entry.prefix,
         })
     }
@@ -215,33 +224,43 @@ impl ClipIndex {
     /// `(op, query_pos, ref_pos)` of the columns of `span`.
     pub fn columns(&self, span: &ClipSpan) -> impl Iterator<Item = (Op, u32, u32)> + '_ {
         (span.first_col as usize..=span.last_col as usize)
-            .map(move |k| (self.col_op[k], self.col_q[k], self.col_r[k]))
+            .map(move |k| {
+                let Column { op, q, r } = self.columns[k];
+                (op, q, r)
+            })
     }
 
     /// Query position aligned to reference position `r`, extrapolated along the
     /// alignment's end diagonals when `r` lies outside the aligned reference range.
     /// Used to project conserved anchors (V Cys, J Trp/Phe) onto the query.
     pub fn project_reference(&self, r: u32) -> i64 {
-        let r_start = self.col_r.first().copied().unwrap_or(0);
-        let r_end = self.col_r.last().map_or(0, |&last| last + 1);
+        let r_start = self.columns.first().map_or(0, |c| c.r);
+        let r_end = self.columns.last().map_or(0, |c| c.r + 1);
         if r < r_start {
             return i64::from(self.q_start) - i64::from(r_start - r);
         }
         if r >= r_end {
             return i64::from(self.q_end) + i64::from(r - r_end);
         }
-        let mut k = self.col_r.partition_point(|&x| x < r);
-        while k < self.col_op.len() && self.col_op[k] == Op::Ins {
+        let mut k = self.columns.partition_point(|c| c.r < r);
+        while k < self.columns.len() && self.columns[k].op == Op::Ins {
             k += 1;
         }
-        i64::from(self.col_q[k.min(self.col_q.len() - 1)])
+        i64::from(self.columns[k.min(self.columns.len() - 1)].q)
     }
 
     /// `true` when both indices describe the same query columns with the same
     /// per-column scores, so every clip of one scores exactly like the other.
     /// Reference coordinates may differ (e.g. alleles with different 5' lengths).
     pub fn equivalent(&self, other: &Self) -> bool {
-        self.q_start == other.q_start && self.col_op == other.col_op && self.prefix == other.prefix
+        self.q_start == other.q_start
+            && self.prefix == other.prefix
+            && self.columns.len() == other.columns.len()
+            && self
+                .columns
+                .iter()
+                .zip(&other.columns)
+                .all(|(a, b)| a.op == b.op)
     }
 }
 
