@@ -55,6 +55,7 @@ options:
   --tandem-d           allow VDDJ paths (second D as a first-class node)
   --forward-only       do not try the reverse complement
   --no-anchor-window   do not add the conserved-anchor D window
+  --no-posterior       skip posterior probabilities (*_posterior columns; ~15 % faster)
   --residual           ordinary commit-V/J-then-D adjudication instead of the DAG
   -h, --help           this message";
 
@@ -95,6 +96,7 @@ struct Args {
     tandem_d: bool,
     forward_only: bool,
     no_anchor_window: bool,
+    no_posterior: bool,
     residual: bool,
     preset: Option<String>,
     count: Option<String>,
@@ -148,6 +150,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--tandem-d" if assign => args.tandem_d = true,
             "--forward-only" if assign => args.forward_only = true,
             "--no-anchor-window" if assign => args.no_anchor_window = true,
+            "--no-posterior" if assign => args.no_posterior = true,
             "--residual" if assign => args.residual = true,
             "--preset" if simulate => set_once(&mut args.preset, "--preset", value("--preset")?)?,
             "--reads" if simulate => set_once(&mut args.count, "--reads", value("--reads")?)?,
@@ -327,6 +330,7 @@ fn run_assign(args: &Args) -> Result<(), Box<dyn Error>> {
         config.options.orientation = OrientationPolicy::FORWARD_ONLY;
     }
     config.anchor_window = !args.no_anchor_window;
+    config.posterior = !args.no_posterior;
     let support: SupportModels = [
         KarlinAltschul::ungapped(&config.v.scoring),
         KarlinAltschul::ungapped(&config.d.scoring),

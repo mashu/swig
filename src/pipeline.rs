@@ -465,7 +465,7 @@ where
                 });
             let marginals = path
                 .as_ref()
-                .and_then(|_| self.adjudicator.marginals(placed, adjudication));
+                .and_then(|path| self.adjudicator.marginals(placed, path, adjudication));
             if let Some(path) = path.as_mut() {
                 self.refiner.refine(&state.query, placed, path);
             }

@@ -9,7 +9,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use crate::adjudicate::{EngineeringObjective, PlacementDag, VdjGrammar};
+use crate::adjudicate::{EngineeringObjective, PlacementDag, PosteriorModel, VdjGrammar};
 use crate::admission::{AnyOf, DistributedEvidence, ExactRunFloor};
 use crate::align::InterSequenceGotoh;
 use crate::germline::{GermlineSet, SegmentKind};
@@ -188,7 +188,8 @@ pub struct EngineConfig {
     /// Minimum retained query bases after clipping, per [`SegmentKind::index`].
     pub min_retained: [u32; 3],
     /// Report posterior probabilities (forward–backward over the placement
-    /// DAG at the V scoring's λ): per called segment and for D presence.
+    /// DAG, priors at the V scoring's λ, alignment evidence at each read's
+    /// divergence): per called segment and for D presence.
     pub posterior: bool,
     pub options: AssignerOptions,
 }
@@ -433,10 +434,16 @@ impl Assigner {
         let objective = config.objective.resolve(d.as_ref(), &config.d.scoring);
         let mut adjudicator = PlacementDag::new(grammar, objective, config.min_retained);
         if config.posterior {
-            // Scores are summed across V, D and J; the default stages share
-            // one substitution scoring and so one λ.
             if let Some(ka) = KarlinAltschul::ungapped(&config.v.scoring) {
-                adjudicator = adjudicator.with_posterior(ka.lambda);
+                let substitution = |s: &AffineScoring| (s.matched, s.mismatch);
+                adjudicator = adjudicator.with_posterior(PosteriorModel {
+                    lambda: ka.lambda,
+                    substitution: [
+                        substitution(&config.v.scoring),
+                        substitution(&config.d.scoring),
+                        substitution(&config.j.scoring),
+                    ],
+                });
             }
         }
         Ok(Assigner {

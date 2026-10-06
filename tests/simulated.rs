@@ -93,6 +93,24 @@ fn long_d_remnants_are_found() {
     assert!(percent(correct, reads) >= 98.0, "long D {correct}/{reads}");
 }
 
+/// Reported V and J posteriors match observed accuracy (expected calibration
+/// error and Brier score), on IgM-like and on IgG-like hypermutated reads.
+#[test]
+fn posteriors_are_calibrated() {
+    let setup = Setup::new();
+    for (params, seed) in [(SimParams::mid(), 11), (SimParams::hard(), 12)] {
+        let e = setup.evaluate(params, 500, seed, &EngineConfig::default());
+        for (label, c) in [("V", e.calibration.v), ("J", e.calibration.j)] {
+            eprintln!("{label}: n {} ECE {:.3} % Brier {:.4}", c.count(), 100.0 * c.ece(), c.brier());
+            assert!(c.count() >= 495, "{label}: {} posteriors", c.count());
+            assert!(c.ece() <= 0.03, "{label} ECE {:.3} %", 100.0 * c.ece());
+            assert!(c.brier() <= 0.04, "{label} Brier {:.4}", c.brier());
+        }
+        let d = e.calibration.d_presence;
+        assert!(d.ece() <= 0.08, "D presence ECE {:.3} %", 100.0 * d.ece());
+    }
+}
+
 #[test]
 fn random_reads_receive_no_call() {
     let setup = Setup::new();

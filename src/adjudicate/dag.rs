@@ -39,7 +39,7 @@
 //! germline support), so a with-D path must strictly beat the best no-D path.
 
 use super::model::{Grammar, PathModel, VdjGrammar};
-use super::posterior::{Marginals, PosteriorScratch};
+use super::posterior::{divergence, Marginals, PosteriorModel, PosteriorScratch};
 use super::{Adjudicator, CallPath, CalledSegment, EngineeringObjective, PathScore};
 use crate::germline::SegmentKind;
 use crate::placement::Placement;
@@ -51,9 +51,9 @@ pub struct PlacementDag<G = VdjGrammar, M = EngineeringObjective> {
     pub model: M,
     /// Minimum query bases a clipped segment must keep, indexed by [`SegmentKind::index`].
     pub min_retained: [u32; 3],
-    /// Nats per score unit. When set, [`Adjudicator::marginals`] returns the
-    /// posterior marginals under `P(path, cuts) ∝ exp(λ·score)`.
-    pub lambda: Option<f64>,
+    /// When set, [`Adjudicator::marginals`] returns posterior marginals
+    /// (see [`PlacementDag::posterior`]).
+    pub posterior: Option<PosteriorModel>,
 }
 
 impl Default for PlacementDag {
@@ -62,7 +62,7 @@ impl Default for PlacementDag {
             grammar: VdjGrammar::VDJ,
             model: EngineeringObjective::default(),
             min_retained: [10, 3, 6],
-            lambda: None,
+            posterior: None,
         }
     }
 }
@@ -242,13 +242,13 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
             grammar,
             model,
             min_retained,
-            lambda: None,
+            posterior: None,
         }
     }
 
-    /// Also compute posterior marginals at `lambda` nats per score unit.
-    pub fn with_posterior(mut self, lambda: f64) -> Self {
-        self.lambda = Some(lambda);
+    /// Also compute posterior marginals under `model`.
+    pub fn with_posterior(mut self, model: PosteriorModel) -> Self {
+        self.posterior = Some(model);
         self
     }
 
@@ -432,9 +432,15 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
         Some(CallPath { segments, score })
     }
 
-    fn marginals(&self, placements: &[Placement], scratch: &mut DagScratch) -> Option<Marginals> {
-        let lambda = self.lambda?;
-        self.posterior(placements, lambda, &mut scratch.posterior)
+    fn marginals(
+        &self,
+        placements: &[Placement],
+        path: &CallPath,
+        scratch: &mut DagScratch,
+    ) -> Option<Marginals> {
+        let model = self.posterior?;
+        let evidence = model.evidence(divergence(placements, path));
+        self.posterior(placements, model.lambda, &evidence, &mut scratch.posterior)
     }
 }
 

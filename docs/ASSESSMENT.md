@@ -139,6 +139,27 @@ Each change was measured on the same reads before it was kept.
     at most ±0.2 pp (real hard junction 98.28 → 98.35 %, synthetic hard D
     79.02 → 79.24 %) and throughput is unchanged within noise. It is a
     correctness fix for the paper's model statement, not an accuracy lever.
+12. **Posterior decoding** (`adjudicate/posterior.rs`). Forward–backward
+    over the same DAG gives the marginal probability of every placement and
+    D count under `P(path, cuts) ∝ exp(nats)`; it equals exhaustive
+    summation (tested). Two modelling decisions made the probabilities
+    calibrated, each found by inspecting miscalibrated reads:
+    - *Evidence at the read's divergence.* With one λ, `(2, −3)` scores are
+      log-odds at 11.2 % divergence only, so V/J posteriors on IgM-like reads
+      were underconfident (mid-preset ECE V 4.6 %, J 3.9 %). Rescoring each
+      `Match` column as `λ_r·s + μ_r`, the log-odds at the read's own
+      mismatch rate, brought them to 0.4 % and 0.8 %. Priors keep their λ.
+    - *The event users are scored on.* Pooling only co-optimal placements
+      left D underconfident (77 % predicted, 99.7 % observed on easy reads):
+      a runner-up allele that lacks one chance-matching flank base is
+      germline-equivalent to the call on the true remnant. The reported
+      posterior is therefore the mass of every placement whose germline
+      bases, between the call's neighbours, the called allele contains.
+      Clipping the competitor to the called interval instead was too lenient
+      (four bases occur in any D) and made D overconfident.
+    Final ECE on real IGH: V 0.04 / 0.28 / 1.34 %, D 0.46 / 1.68 / 1.80 %,
+    J 0.07 / 0.25 / 0.73 %, D presence 0.25 / 2.17 / 1.46 % (easy / mid /
+    hard). The pass costs about 15 % of throughput (`--no-posterior`).
 
 ## 4. Results
 
@@ -147,8 +168,8 @@ Human IGH, 5000 reads per preset, germline-equivalent accuracy in %:
 | Preset | Orientation | V | V gene | D | J | Junction | Random reads called |
 |---|---|---|---|---|---|---|---|
 | easy | 99.94 → 100 | 99.54 → 99.84 | 99.92 → 99.98 | 98.78 → 99.27 | 99.90 → 99.94 | 99.94 → 100 | 30.5 → 0 |
-| mid | 100 → 100 | 97.76 → 97.94 | 99.84 → 99.84 | 91.96 → 92.93 | 98.84 → 98.80 | 99.93 → 99.93 | 30.2 → 0 |
-| hard | 99.98 → 99.98 | 89.74 → 89.80 | 98.44 → 98.24 | 81.72 → 83.55 | 92.70 → 93.32 | 98.39 → 98.47 | 31.2 → 0 |
+| mid | 100 → 100 | 97.76 → 97.94 | 99.84 → 99.84 | 91.96 → 93.00 | 98.84 → 98.80 | 99.93 → 99.93 | 30.2 → 0 |
+| hard | 99.98 → 99.98 | 89.74 → 89.82 | 98.44 → 98.24 | 81.72 → 83.53 | 92.70 → 93.32 | 98.39 → 98.51 | 31.2 → 0 |
 
 Throughput is 849 → ~2200 reads/s per thread, and ~3600 → ~9000 reads/s on 4
 threads.
@@ -181,37 +202,48 @@ work.
 2. **D presence on D-free junctions.** 12–24 % of reads with no D receive one,
    because a 9-nt chance match is indistinguishable from a 9-nt D remnant.
    `P_D` sets the trade-off, and the prior odds are the single knob.
-   Precision/recall curves, not one number, belong in the paper.
-3. **One alignment per D allele and window.** A D's optimal local alignment
+   Precision/recall curves, not one number, belong in the paper; the
+   reported `d_presence_posterior` now carries this uncertainty per read.
+   The derivation itself undercounts the search: `ln(N·L)` counts genes ×
+   read positions, but a local alignment tries every allele, allele offset
+   and read position (Karlin–Altschul `K·m·n ≈ e^{10}` against `e^{6.7}` for
+   human IGH; ~0.26 expected chance 9-mer matches per junction, in line with
+   the 22 % false-positive rate on mid). Even prior odds understate IgSim's
+   99 % D inclusion, and the two errors roughly cancel there. Both terms
+   should be estimated, not assumed.
+3. **Calls and posteriors use different evidence scales.** The Viterbi call
+   reads scores at the fixed λ, the posterior at the read's divergence, so
+   the posterior's mode can disagree with the call (a short exact D against
+   a longer one with a mismatch on an unmutated read). Calling from the
+   per-read model is the next step.
+4. **One alignment per D allele and window.** A D's optimal local alignment
    in its window is not always its optimal clipped alignment at the chosen
    cuts; the 12-base reclaim keeps this rare. It is the one remaining
    approximation of the segmentation model.
-4. **Constants still inherited from the note.** These have not been derived
+5. **Constants still inherited from the note.** These have not been derived
    and should get a sensitivity analysis:
    - `pair_bonus` 24 and `tandem` 12;
    - acceptance at 60 % identity with 24/10 columns;
    - the budget (3–16 genes, 5 %/8 votes) and seed lengths 9/7;
    - `max_occurrences` 256;
    - distributed-D thresholds.
-5. **E-values are approximate.** They use ungapped λ/K (anti-conservative for
+6. **E-values are approximate.** They use ungapped λ/K (anti-conservative for
    gapped scores) and the total database length (conservative for
    near-identical alleles). They gate hits; they are not p-values.
-6. **Simulator realism.** IgSim has no AID hotspot targeting, no
+7. **Simulator realism.** IgSim has no AID hotspot targeting, no
    codon-length indels and no allele-frequency skew, so hotspot-aware scoring
    cannot be judged on it. Validation on real data with an independent caller
    (IgBLAST, partis) is still needed.
-7. **SIMD portability.** AVX2 only; AVX-512 hardware runs at half width, and
+8. **SIMD portability.** AVX2 only; AVX-512 hardware runs at half width, and
    ARM falls back to scalar.
 
 ## 6. Plan
 
 In order of expected value:
 
-1. **Posterior decoding** over the DAG (log-sum-exp prefix sums replace prefix
-   maxima, plus a backward pass). It gives calibrated per-allele and D-presence
-   probabilities and maximum-posterior-marginal calls. It turns limitation 2
-   into a reported confidence rather than a hard call, and generalises the
-   support tie-break.
+1. ~~**Posterior decoding**~~ — done (§3, item 12). Next on that line:
+   calls from the per-read model (limitation 3) and a D prior from the D
+   search's own statistics (limitation 2).
 2. ~~**Two cuts per overlap with N/P between**~~ — done (§3, item 11).
 3. **Sensitivity analysis** of the inherited constants on the simulator,
    across presets and both databases, with each constant either derived or

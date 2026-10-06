@@ -9,10 +9,11 @@
 //! placement of the same kind whose clip to `[entry, exit)` scores exactly the
 //! called score contributes its alleles. As the note says, this means "equal
 //! score under this caller", not equal biological probability. The
-//! probability is the `posterior` column: the posterior mass of those
-//! co-optimal placements under `P(path, cuts) ∝ exp(λ·score)`
-//! ([`crate::adjudicate::Marginals`]); `d_presence_posterior` is the
-//! probability that the read has a D at all.
+//! probability is the `posterior` column ([`crate::adjudicate::Marginals`]):
+//! the posterior mass of every placement of that kind that is tied on the
+//! interval, or whose germline bases between the call's neighbours the
+//! primary allele contains: the probability that the call is
+//! germline-equivalent to the read's allele. `d_presence_posterior` is the probability that the read has a D.
 
 use std::fmt::Write as _;
 
@@ -22,6 +23,7 @@ use crate::alphabet::{decode, decode_base, N};
 use crate::evidence::Evidence;
 use crate::germline::SegmentKind;
 use crate::pipeline::{AlleleCatalog, Call};
+use crate::placement::Placement;
 use crate::read_regions::ReadRegions;
 use crate::scoring::Score;
 use crate::stats::KarlinAltschul;
@@ -35,7 +37,8 @@ pub struct SegmentReport {
     pub identity: f64,
     /// Karlin–Altschul E-value, when a model is supplied for the segment kind.
     pub support: Option<f64>,
-    /// Posterior probability that the segment is one of the called alleles.
+    /// Posterior probability that the call is germline-equivalent to the
+    /// read's allele (see the module documentation).
     pub posterior: Option<f64>,
     pub cigar: String,
     pub sequence_start: u32,
@@ -137,13 +140,6 @@ fn segment_report<C: AlleleCatalog>(
                     .is_some_and(|s| s.score == called_score)
         })
         .collect();
-    let posterior = call.marginals.as_ref().map(|m| {
-        tied_indices
-            .iter()
-            .filter_map(|&i| m.placement.get(i))
-            .sum::<f64>()
-            .min(1.0)
-    });
     let mut tied: Vec<_> = std::iter::once(dag_placement)
         .chain(tied_indices.iter().map(|&i| &call.placements[i]))
         .collect();
@@ -170,6 +166,45 @@ fn segment_report<C: AlleleCatalog>(
         .span(called.entry, called.exit)
         .expect("primary tied placement clips to the called interval");
     let reference = &set.allele(placement.primary_allele()).codes;
+
+    // Posterior that the call is germline-equivalent to the read's allele:
+    // the mass of every placement of this kind whose germline bases in the
+    // region the call's neighbours leave to this segment (its whole
+    // alignment if it misses the region) the primary allele contains. If the
+    // read came from such a placement, the call still carries its germline
+    // bases, as the evaluation's germline equivalence counts it.
+    let region = call
+        .path
+        .as_ref()
+        .map_or(0..call.query.len() as u32, |path| {
+            let at = path.segments.iter().position(|s| s == called);
+            let before = at
+                .and_then(|i| i.checked_sub(1))
+                .map(|i| path.segments[i].span.q_hi);
+            let after = at
+                .and_then(|i| path.segments.get(i + 1))
+                .map(|s| s.span.q_lo);
+            before.unwrap_or(0)..after.unwrap_or(call.query.len() as u32)
+        });
+    let carried = |p: &Placement| {
+        let own = p
+            .clip
+            .span(region.start, region.end)
+            .unwrap_or_else(|| p.clip.full());
+        let codes = &set.allele(p.primary_allele()).codes;
+        let bases = &codes[own.r_lo as usize..own.r_hi as usize];
+        bases.is_empty() || reference.windows(bases.len()).any(|w| w == bases)
+    };
+    let posterior = call.marginals.as_ref().map(|m| {
+        (0..call.placements.len())
+            .filter(|&i| {
+                let p = &call.placements[i];
+                p.kind == kind && (tied_indices.contains(&i) || carried(p))
+            })
+            .filter_map(|i| m.placement.get(i))
+            .sum::<f64>()
+            .min(1.0)
+    });
     let mut names: Vec<&str> = Vec::new();
     for p in &tied {
         for &allele in &p.alleles {

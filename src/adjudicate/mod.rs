@@ -13,8 +13,9 @@
 //!   baseline and for regression comparisons.
 //!
 //! [`PlacementDag`] also reads the objective as a distribution over paths and
-//! cuts, `P ∝ exp(λ·score)`, and returns posterior [`Marginals`] of the
-//! placements and of the D count by forward–backward over the same DAG.
+//! cuts, `P ∝ exp(nats)`, and returns posterior [`Marginals`] of the
+//! placements and of the D count by forward–backward over the same DAG, with
+//! alignment evidence rescored at the read's own divergence.
 
 mod dag;
 mod model;
@@ -23,7 +24,9 @@ mod residual;
 
 pub use dag::{DagScratch, PlacementDag};
 pub use model::{EngineeringObjective, Grammar, PathModel, VdjGrammar};
-pub use posterior::{Marginals, PosteriorScratch, MAX_SPREAD};
+pub use posterior::{
+    divergence, EvidenceScale, Marginals, PosteriorModel, PosteriorScratch, MAX_SPREAD,
+};
 pub use residual::{ResidualAdjudicator, ResidualScratch};
 
 use std::cmp::Ordering;
@@ -94,11 +97,13 @@ pub trait Adjudicator: Send + Sync {
         scratch: &mut Self::Scratch,
     ) -> Option<CallPath>;
 
-    /// Posterior marginals of `placements`, for adjudicators with a
-    /// probabilistic reading that are configured to compute them.
+    /// Posterior marginals of `placements` given the adjudicated `path`, for
+    /// adjudicators with a probabilistic reading that are configured to
+    /// compute them.
     fn marginals(
         &self,
         _placements: &[Placement],
+        _path: &CallPath,
         _scratch: &mut Self::Scratch,
     ) -> Option<Marginals> {
         None

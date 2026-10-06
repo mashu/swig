@@ -19,11 +19,12 @@ Zero dependencies, Rust ≥ 1.75, edition 2021.
 
 ```sh
 cargo build --release                          # always run the release build
-cargo test                                     # 63 unit, 7 annotation, 10 synthetic, 6 simulated-accuracy tests
+cargo test                                     # 67 unit, 7 annotation, 10 synthetic, 7 simulated-accuracy tests
 
 target/release/vdj-assign --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta \
     [--profile r|truth|igblast|sensitive-d] [--threads N] [--tandem-d] \
-    [--chain heavy|light] [--forward-only] [--no-anchor-window] [--residual] reads.fastq > calls.tsv
+    [--chain heavy|light] [--forward-only] [--no-anchor-window] [--no-posterior] [--residual] \
+    reads.fastq > calls.tsv
 
 zcat reads.fastq.gz | target/release/vdj-assign --v V.fasta --d D.fasta --j J.fasta - > calls.tsv
 
@@ -63,7 +64,11 @@ also enable the anchor-bounded D window. Output is an AIRR Rearrangement TSV.
 Coordinates are 1-based closed intervals on the oriented query. CIGARs use
 `S`/`N` for unaligned query and germline bases and `=`/`X`/`I`/`D` for
 columns. `np1`–`np3` hold the junctional N/P regions, and `*_support` holds
-Karlin–Altschul E-values. Region columns follow: `fwr1`–`fwr4`, `cdr1`–`cdr3`
+Karlin–Altschul E-values. `*_posterior` is the posterior probability that
+the call is germline-equivalent to the read's allele, and
+`d_presence_posterior` the probability that the read has a D at all (see
+*Posterior probabilities* below; `--no-posterior` skips them, ~15 % faster).
+Region columns follow: `fwr1`–`fwr4`, `cdr1`–`cdr3`
 (sequence, `_start`, `_end`), `cdr3_aa`, `junction`, `junction_length`,
 `junction_aa`, `vj_in_frame`, `stop_codon` and `productive`. A read without a
 significant V or J (see *Significance* below) is written with empty calls.
@@ -245,6 +250,11 @@ The full description, with the guarantee of each search step, is in
 - **Significance.** A V or J hit is kept at E ≤ 1 against its database and
   window. A read is called only when its path contains an *anchor*, a V or J
   hit at E ≤ 10⁻³, so random sequence receives no call.
+- **Posterior probabilities.** Read as a distribution, `P(path, cuts) ∝
+  exp(nats)`, the objective gives calibrated probabilities by forward–backward
+  over the same DAG. Alignment evidence is read as log-odds at the read's own
+  divergence (a match is worth `ln 4(1−p̂)` nats, a mismatch `ln(4p̂/3)`); the
+  priors stay at their derivation λ.
 
 ## Extension points
 
@@ -414,6 +424,14 @@ placement, the best exit before it is a running maximum read in O(1). Every
 pair of cuts is evaluated, and the result provably equals exhaustive
 enumeration (tested).
 
+**Forward–backward with the same sums.** The posterior pass replaces every
+running maximum by a running sum. On an edge, all entries beyond the
+predecessor's end see the same exit mass, which forward adds once to a
+difference array and backward reads from a suffix sum, so an edge costs
+O(overlap). Values are linear with one log-scale per slot; cut weights are
+running products along the alignment and prior weights a table lookup, so
+no transcendental function is evaluated per cut.
+
 ### Parallelism and allocation
 
 One workspace per thread means no DP allocation after warm-up. Work is
@@ -455,8 +473,8 @@ preset, germline-equivalent accuracy in %, before → after the redesign:
 | Preset (IgSim) | Orientation | V | V gene | D | J | Junction | Random reads called |
 |---|---|---|---|---|---|---|---|
 | easy (no SHM) | 99.94 → **100** | 99.54 → **99.84** | 99.92 → **99.98** | 98.78 → **99.27** | 99.90 → **99.94** | 99.94 → **100** | 30.5 → **0** |
-| mid (IgM-like) | 100 → 100 | 97.76 → **97.94** | 99.84 → 99.84 | 91.96 → **92.93** | 98.84 → 98.80 | 99.93 → 99.93 | 30.2 → **0** |
-| hard (IgG-like) | 99.98 → 99.98 | 89.74 → **89.80** | 98.44 → 98.24 | 81.72 → **83.55** | 92.70 → **93.32** | 98.39 → **98.47** | 31.2 → **0** |
+| mid (IgM-like) | 100 → 100 | 97.76 → **97.94** | 99.84 → 99.84 | 91.96 → **93.00** | 98.84 → 98.80 | 99.93 → 99.93 | 30.2 → **0** |
+| hard (IgG-like) | 99.98 → 99.98 | 89.74 → **89.82** | 98.44 → 98.24 | 81.72 → **83.53** | 92.70 → **93.32** | 98.39 → **98.51** | 31.2 → **0** |
 
 The synthetic database (`SyntheticSpec::default()`, seed 1) gives, after:
 easy V/D/J 99.98/99.82/99.98, mid 99.52/87.81/98.92, hard 97.10/79.36/94.00,
@@ -477,8 +495,26 @@ a *model* error or tie.
 Nearly all remaining errors are where SHM mimics an allele's distinguishing
 SNPs, so no score-based caller can do better.
 
+**Posterior calibration** (same reads; expected calibration error in %, then
+Brier score). The event is "the call is germline-equivalent to the truth"
+for V, D and J, and "the read has a simulated D" for D presence:
+
+| Preset | V | D | J | D presence |
+|---|---|---|---|---|
+| easy | 0.04 / 0.0008 | 0.46 / 0.0015 | 0.07 / 0.0000 | 0.25 / 0.0032 |
+| mid | 0.28 / 0.0088 | 1.68 / 0.041 | 0.25 / 0.0060 | 2.17 / 0.028 |
+| hard | 1.34 / 0.045 | 1.80 / 0.073 | 0.73 / 0.031 | 1.46 / 0.027 |
+
+With one fixed λ instead of each read's divergence, and only co-optimal
+placements pooled, mid-preset ECEs were 4.6 / 7.7 / 3.9 / 2.1.
+
 ## Validation
 
+- **Posterior exactness:** `marginals_equal_exhaustive_summation` compares
+  ln Z, every placement marginal and the D-count distribution with exhaustive
+  summation over paths and canonical cuts (VJ, VDJ, VDDJ, a per-base N/P cost,
+  a per-column evidence term); `posteriors_are_calibrated` bounds V/J
+  calibration error on IgM- and IgG-like reads.
 - **DAG optimality:** `dag_equals_brute_force_over_all_paths_and_cuts`
   enumerates every VJ/VDJ/VDDJ path and every pair of exit and entry cuts,
   with a per-base insertion cost and the lexicographic support tie-break, and
@@ -566,6 +602,11 @@ Each is a named field you can change.
 - **One alignment per D allele per window.** A D's optimal local alignment in
   its window is not always its optimal *clipped* alignment at the chosen cut.
   The 12-base reclaim keeps this rare; see the assessment.
+- **Posteriors are conditional on the candidates.** An allele that retrieval
+  or the keep policy dropped gets no mass, and the call and the posterior use
+  different evidence scales (fixed vs per-read), so a reported posterior can
+  fall below 0.5. D-presence calibration is the weakest (ECE up to 2.2 %),
+  because the D prior counts genes × positions (see ALGORITHM.md §8).
 - **E-values** use exact *ungapped* λ and K and the total database length.
   Gapped scores are slightly higher (anti-conservative); near-identical alleles
   inflate the database length (conservative). They gate hits; they are not
@@ -596,14 +637,14 @@ Each is a named field you can change.
 In order of expected value; reasons and measurements are in
 [docs/ASSESSMENT.md](docs/ASSESSMENT.md).
 
-1. **Posterior decoding.** A forward–backward (sum-product) pass over the same
-   DAG gives calibrated posterior probabilities per allele and per D presence.
-   Every separability trick carries over: prefix log-sum-exp replaces prefix
-   maxima.
-2. **Wider SIMD.** An AVX-512BW kernel (32 lanes) and a NEON port (8 lanes) of
+1. **Calls from the per-read model.** Viterbi with per-read evidence weights,
+   or maximum-posterior-marginal calls, so the call and its posterior agree.
+2. **D prior from the D search's statistics** (Karlin–Altschul `K·m·n` and a
+   D-inclusion rate), checked by D-presence calibration.
+3. **Wider SIMD.** An AVX-512BW kernel (32 lanes) and a NEON port (8 lanes) of
    the same design.
-3. **Allele rescoring along the gene frame.** Score siblings along their
+4. **Allele rescoring along the gene frame.** Score siblings along their
    representative's traceback and run DP only where bounds straddle the cutoff.
-4. **Annotation.** A per-database FR3 length learned from header-annotated
+5. **Annotation.** A per-database FR3 length learned from header-annotated
    alleles (TR loci). A consensus position prior for Cys23.
-5. **C-segment assignment.**
+6. **C-segment assignment.**

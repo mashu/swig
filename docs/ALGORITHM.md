@@ -170,6 +170,72 @@ entry `y ≥ x` within 12 bases of the meeting point (wider than the DAG's own
 entry range), and by a constructed case in `adjudicate/dag.rs` where leaving
 a shared mismatch stretch to N beats every single cut.
 
+## 4a. Posterior decoding (`adjudicate/posterior.rs`)
+
+The objective is a log-likelihood ratio, so it also defines a distribution:
+
+```text
+P(path, cuts | read) = exp(nats(path, cuts)) / Z,     Z = Σ_{path, cuts} exp(nats)
+```
+
+over every grammatical path and every pair of cuts between neighbours. The
+Viterbi path of §4 is its mode when the evidence is read at the fixed λ.
+Forward–backward over the same DAG gives the marginal probability of every
+placement and of every D count.
+
+**Evidence at the read's divergence.** `(2, −3)` is log-odds only at 11.2 %
+divergence: a fixed λ makes unmutated reads underconfident (a SNP between
+alleles is worth `ln(3(1−p)/p) = 8.0` nats at `p = 0.1 %`, not 3.2) and
+heavily mutated ones overconfident. Let `p̂` be the fraction of mismatched
+`Match` columns in the called V and J (with half a pseudo-mismatch, clamped
+to `[10⁻⁴, 0.5]`). A `Match` column scoring `s` is worth `λ_r·s + μ_r` nats,
+with `(λ_r, μ_r)` chosen so that a match is worth `ln 4(1 − p̂)` and a
+mismatch `ln(4p̂/3)`, the log-odds of "templated at divergence `p̂`" against
+"uniform random"; gaps are worth `λ_r·g`. Each segment kind uses its own
+match/mismatch scores. The priors (`P_D`, pair bonus, tandem, `ι`) stay at the
+λ they were derived with. At `p̂ = 11.2 %`, `λ_r = λ` and `μ_r = 0`. Because
+the map is affine per column, clip scores stay separable in their cuts.
+
+**Domain.** The first segment keeps its start and the last its end, as in §4
+(V and J are extended to the read's ends on purpose). Between neighbours every
+pair of cuts `x ≤ y` is summed, including entries beyond the overlap that the
+Viterbi search skips because they cannot win. Each segmentation is counted
+once by taking *canonical* cuts: an entry on the first retained base and an
+exit right after the last (one pair per distinct retained sub-alignment).
+
+**Recursions.** For node `b` in group `g` with forward mass `F(b, y)` per
+entry,
+
+```text
+X(b, x)  = e^{exit(x) + bonus} · Σ_{y ≤ x − min} F(b, y) · e^{−entry(y)}
+F(e, y') = Σ_b Σ_{x ≤ y'} X(b, x) · e^{ι(y' − x)}          (+ 1 at a path start)
+Z        = Σ_b X(b, end of b) · e^{end(g, b)}
+```
+
+(all terms in nats), and the backward pass mirrors them. Every inner sum is a
+prefix or suffix sum, as every maximum of §4 is a running maximum. On an edge
+`b → e`, every entry of `e` beyond `b`'s end sees the same exit mass, so
+forward adds it once to a difference array and backward reads it from a
+suffix sum: an edge costs `O(overlap + 1)`.
+
+**Arithmetic.** Values are linear with one log-scale per `(node, group)`
+slot, as in scaled HMM recursions. Cut weights are running products along the
+alignment (steps `e^{±(λ_r d + μ_r)}` tabulated for small `d`), and prior
+weights come from an `e^{λk}` table, so no transcendental function is
+evaluated per cut.
+
+**Reported probabilities.** A segment's `posterior` is the mass of every
+placement of its kind that is tied with the call on the called interval, or
+whose germline bases between the call's neighbours the primary allele
+contains: the probability that the call is germline-equivalent to the read's
+allele, the event §7 scores. `d_presence_posterior = 1 − P(no D)`.
+
+**Theorem 2.** The marginals equal exhaustive summation over all grammatical
+paths and canonical cut pairs, for VJ, VDJ and VDDJ grammars, a per-base N/P
+cost and a per-column evidence term `μ ≠ 0` (unit test in
+`adjudicate/posterior.rs`, which also checks that the Viterbi score is the
+best path score).
+
 ## 5. Search
 
 Each stage narrows the hypotheses the DAG sees. The table states what each
@@ -235,7 +301,12 @@ Metrics (`sim/evaluate.rs`):
 - boundary error;
 - D presence by remnant length;
 - junction exactness;
-- a random-read negative control.
+- a random-read negative control;
+- **calibration** of any reported posterior: reads binned by posterior, the
+  observed frequency of the event per bin, the expected calibration error
+  (ECE, `Σ_bins n_b·|mean posterior − frequency| / n`) and the Brier score.
+  A segment's event is "the primary call is germline-equivalent to the
+  truth"; D presence's is "the read has a simulated D", however short.
 
 **Search error vs model error** (`examples/diagnose.rs`). Each read is also
 aligned to every allele, unbanded, under the same objective. If that
@@ -245,9 +316,17 @@ this objective can do better.
 
 ## 8. Open problems
 
-1. **Posterior decoding.** Replace max-plus by log-sum-exp in §4: prefix
-   log-sum-exp arrays replace prefix maxima, and a backward pass gives
-   per-placement posterior marginals. This yields calibrated allele and
-   D-presence probabilities and maximum-posterior-marginal calls.
-2. **Calibrated statistics.** Fit gapped λ and K, and an effective database
+1. **Calls from the per-read model.** The Viterbi call uses fixed scores and
+   the posterior uses evidence at the read's divergence, so the posterior's
+   mode can differ from the call (at low SHM a short exact D can beat a longer
+   one with a mismatch). Viterbi with real-valued per-read weights, or
+   maximum-posterior-marginal calls, would make them agree.
+2. **D prior from the D search's own statistics.** `P_D = ln(N·L) − ln odds`
+   counts genes × read positions. A local search actually tries every allele,
+   allele offset and read position, so the chance-match burden is closer to
+   the Karlin–Altschul `K·m·n` of the D window against the D database (about
+   `e^{10}` for human IGH, against `e^{6.7}`); even prior odds understate how
+   often IgSim includes a D (99 %). On IgSim the two errors roughly cancel
+   (D-presence ECE 0.2–2.2 %). Both should come from data.
+3. **Calibrated statistics.** Fit gapped λ and K, and an effective database
    size for near-identical alleles, by simulation.
