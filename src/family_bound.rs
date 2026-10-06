@@ -58,10 +58,7 @@ impl FamilyBoundTable {
         sibling: AlleleId,
         representative_score: Score,
     ) -> Option<Score> {
-        let delta = sibling_delta(
-            segment.profile(representative),
-            segment.profile(sibling),
-        )?;
+        let delta = sibling_delta(segment.profile(representative), segment.profile(sibling))?;
         Some(representative_score.saturating_add(delta))
     }
 }
@@ -80,8 +77,7 @@ pub fn sibling_delta(
     for j in 0..representative.len() {
         let mut best = 0;
         for code in 0..ALPHABET_SIZE {
-            let gain =
-                sibling.at(code as u8, j) - representative.at(code as u8, j);
+            let gain = sibling.at(code as u8, j) - representative.at(code as u8, j);
             if gain > best {
                 best = gain;
             }
@@ -113,13 +109,7 @@ mod tests {
         let profile = SubstitutionProfile::build(&scoring, reference);
         let mut ws = Default::default();
         BandedGotoh
-            .score(
-                query,
-                &profile,
-                GapCosts::new(-9, -1),
-                Band::Full,
-                &mut ws,
-            )
+            .score(query, &profile, GapCosts::new(-9, -1), Band::Full, &mut ws)
             .map(|hit| hit.score)
             .unwrap_or(0)
     }

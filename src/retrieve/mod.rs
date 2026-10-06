@@ -6,14 +6,16 @@
 //! aligner knows nothing about seeds — the [`Band`] is the whole contract.
 
 mod budget;
+mod exhaustive;
 mod lmer_mask;
 mod seed_vote;
 mod ungapped;
 
 pub use budget::{AmbiguityBudget, CandidateBudget, FixedBudget};
+pub use exhaustive::ExhaustiveRetriever;
 pub use lmer_mask::{LmerMaskRetriever, MAX_LMER};
 pub use seed_vote::{SeedVoteParams, SeedVoteRetriever};
-pub use ungapped::{end_anchored_ungapped, UngappedParams, UngappedPrefilter};
+pub use ungapped::{UngappedParams, UngappedPrefilter};
 
 use crate::band::Band;
 use crate::germline::{AlleleId, GeneId};
@@ -54,9 +56,4 @@ pub trait Retriever: Send + Sync {
     /// Fill `out` (cleared first) with candidates for `query`, strongest first.
     /// Band diagonals are relative to `query` (the window slice).
     fn retrieve(&self, query: &[u8], scratch: &mut RetrievalScratch, out: &mut Vec<Candidate>);
-}
-
-/// Strongest candidate's votes (orientation and weakness decisions).
-pub fn strongest(candidates: &[Candidate]) -> u32 {
-    candidates.iter().map(|c| c.votes).max().unwrap_or(0)
 }

@@ -57,7 +57,6 @@ impl CallingProfile {
                 config.d.distributed = None;
                 config.min_retained[SegmentKind::D.index()] = 6;
                 config.objective.d_presence = DPresencePenalty::NONE;
-                config.options.junction_tie = false;
             }
             Self::IgBlastAgreement => {
                 config.v.scoring = AffineScoring::new(2, -3, -5, -1);
@@ -67,7 +66,6 @@ impl CallingProfile {
                 config.d.distributed = None;
                 config.min_retained[SegmentKind::D.index()] = 5;
                 config.objective.d_presence = DPresencePenalty::NONE;
-                config.options.junction_tie = false;
             }
             Self::SensitiveD => {
                 config.objective.d_presence = DPresencePenalty::SENSITIVE_D;
@@ -102,7 +100,6 @@ mod tests {
         assert_eq!(r.v.scoring, AffineScoring::new(2, -3, -9, -1));
         assert_eq!(r.d.min_exact_run, 4);
         assert_eq!(r.objective.d_presence, DPresencePenalty::R_OPTIMIZED);
-        assert!(r.options.junction_tie);
         assert_eq!(EngineConfig::default().d.min_exact_run, 4);
         let sensitive = CallingProfile::SensitiveD.config();
         assert_eq!(sensitive.v.scoring, r.v.scoring);

@@ -311,14 +311,14 @@ impl Brute<'_> {
         self.dag.min_retained[kind.index()].max(1)
     }
 
-    fn visit(&mut self, b: usize, entry: u32, acc: i32, d_used: u8, first: SegmentKind) {
+    fn visit(&mut self, b: usize, entry: u32, acc: i32, support: i32, d_used: u8, first: SegmentKind) {
         let (grammar, model) = (&self.dag.grammar, &self.dag.model);
         let pb = &self.placements[b];
         let bonus = model.segment_bonus(pb, d_used);
         if grammar.can_end(first, pb.kind) {
             if let Some(span) = pb.clip.span(entry, pb.q_end()).filter(|s| s.q_len() >= self.min(pb.kind)) {
                 let total = acc + span.score + bonus + model.end(first, pb.kind, d_used);
-                let candidate = PathScore { score: total, d_count: d_used };
+                let candidate = PathScore { score: total, d_count: d_used, support: support + pb.score() };
                 if self.best.map_or(true, |best| candidate > best) {
                     self.best = Some(candidate);
                 }
@@ -341,7 +341,7 @@ impl Brute<'_> {
                 let Some(next) = pe.clip.entry(next_entry) else { continue };
                 let junction = model.junction(pb.kind, pe.kind, next.q.saturating_sub(span.q_hi));
                 let d_next = d_used + u8::from(pe.kind == SegmentKind::D);
-                self.visit(e, next_entry, acc + span.score + bonus + junction, d_next, first);
+                self.visit(e, next_entry, acc + span.score + bonus + junction, support + pb.score(), d_next, first);
             }
         }
     }
@@ -377,7 +377,7 @@ fn dag_equals_brute_force_over_all_paths_and_cuts() {
         for s in 0..placements.len() {
             let p = &placements[s];
             if dag.grammar.can_start(p.kind) {
-                brute.visit(s, p.q_start(), 0, u8::from(p.kind == SegmentKind::D), p.kind);
+                brute.visit(s, p.q_start(), 0, 0, u8::from(p.kind == SegmentKind::D), p.kind);
             }
         }
         assert_eq!(fast.as_ref().map(|path| path.score), brute.best);

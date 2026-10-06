@@ -26,8 +26,6 @@ pub struct Placement {
     /// The exact ungapped D tract occurs in at least two distinct D sequences.
     /// R-optimized uses this to relax the D-presence penalty. Other segments leave it false.
     pub relaxes_d_cost: bool,
-    /// Extra path-model term (e.g. high-SHM J ungapped suffix support). Default 0.
-    pub path_adjust: Score,
 }
 
 impl Placement {
@@ -49,7 +47,6 @@ impl Placement {
             clip,
             evidence,
             relaxes_d_cost: false,
-            path_adjust: 0,
         }
     }
 

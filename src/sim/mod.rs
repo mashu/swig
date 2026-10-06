@@ -1,0 +1,36 @@
+//! Read simulation with exact ground truth, and evaluation of calls against it.
+//!
+//! A dependency-free Rust port of [IgSim.jl](https://github.com/mashu/IgSim.jl)
+//! (same generative model and presets), extended with per-base germline
+//! origins and optional reverse complementation, plus:
+//!
+//! * [`synthetic`] — IGH-like germline databases with a family → gene →
+//!   allele similarity hierarchy, for regression tests that cannot ship
+//!   IMGT-derived data;
+//! * [`evaluate`] — allele, gene, boundary, D-presence and junction accuracy
+//!   of AIRR calls against the truth.
+//!
+//! ```ignore
+//! use vdj_assign::sim::{SimParams, Simulator, Evaluation};
+//! let sim = Simulator::new(&v, Some(&d), &j, SimParams::hard().with_reverse_complement(0.5))?;
+//! let reads = sim.reads(10_000, 1)?;
+//! let mut evaluation = Evaluation::default();
+//! for (read, record) in reads.iter().zip(&records) {
+//!     evaluation.add(&sim, read, record);
+//! }
+//! println!("{evaluation}");
+//! ```
+
+pub mod evaluate;
+pub mod params;
+pub mod random;
+pub mod simulate;
+pub mod synthetic;
+
+pub use evaluate::{DPresence, Evaluation, SegmentStats};
+pub use params::{IlluminaError, SimParams};
+pub use random::{Count, GatedRate, Rate, Rng};
+pub use simulate::{
+    reverse_complement, Region, SimError, SimulatedRead, Simulator, Trims, NO_ORIGIN,
+};
+pub use synthetic::{SyntheticDatabase, SyntheticSpec};

@@ -26,12 +26,22 @@ use crate::clip::ClipSpan;
 use crate::placement::Placement;
 use crate::scoring::Score;
 
-/// Path objective with the note's tie rule built in: at equal score the path
-/// with fewer D segments wins ("with-D must strictly beat no-D").
+/// Path objective with its tie rules built in, compared lexicographically:
+///
+/// 1. `score` — the objective;
+/// 2. fewer D segments ("with-D must strictly beat no-D");
+/// 3. `support` — the summed *unclipped* scores of the path's placements.
+///
+/// Rule 3 separates paths that explain the read equally well but differ in
+/// how much germline sequence supports them, typically alleles of different
+/// 3′ length at a junction where a base can belong to either side. The
+/// allele with more support admits more cuts that reach the same score, so
+/// it has the larger likelihood summed over cuts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PathScore {
     pub score: Score,
     pub d_count: u8,
+    pub support: Score,
 }
 
 impl Ord for PathScore {
@@ -39,6 +49,7 @@ impl Ord for PathScore {
         self.score
             .cmp(&other.score)
             .then(other.d_count.cmp(&self.d_count))
+            .then(self.support.cmp(&other.support))
     }
 }
 

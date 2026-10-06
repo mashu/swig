@@ -105,15 +105,20 @@ fn segment_report<C: AlleleCatalog>(
     let set = segment.set();
     let called_score = called.span.score;
 
-    // Co-optimal alleles on the called interval, ranked by exact-run then
-    // matches on that interval so the primary name is the strongest gene
-    // hypothesis (1/n allele scoring cares about order).
+    // Co-optimal alleles on the called interval. The primary name is the one
+    // with the most germline support (unclipped score, the DAG's own tie-break),
+    // then the longest exact run and most matches on the interval.
     let mut tied: Vec<_> = std::iter::once(dag_placement)
-        .chain(call.placements.iter().filter(|p| p.kind == kind).filter(|p| {
-            p.clip
-                .span(called.entry, called.exit)
-                .is_some_and(|s| s.score == called_score)
-        }))
+        .chain(
+            call.placements
+                .iter()
+                .filter(|p| p.kind == kind)
+                .filter(|p| {
+                    p.clip
+                        .span(called.entry, called.exit)
+                        .is_some_and(|s| s.score == called_score)
+                }),
+        )
         .collect();
     tied.sort_by_key(|p| {
         let own = p
@@ -126,6 +131,7 @@ fn segment_report<C: AlleleCatalog>(
             &set.allele(p.primary_allele()).codes,
         );
         (
+            std::cmp::Reverse(p.score()),
             std::cmp::Reverse(e.longest_exact_run),
             std::cmp::Reverse(e.matches),
             p.primary_allele(),

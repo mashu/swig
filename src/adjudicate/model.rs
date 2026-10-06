@@ -149,17 +149,6 @@ pub struct EngineeringObjective {
     /// Score per unassigned junction base (0 reproduces the note; negative
     /// values express an N/P length prior).
     pub insertion_per_base: Score,
-    /// Extra presence cost charged when a D's longest exact run is below
-    /// [`Self::d_short_run_floor`]. Suppresses distributed-D false positives
-    /// that admit on identity but lack a solid ungapped core.
-    pub d_short_run_penalty: Score,
-    /// Exact-run length at or above which no short-run surcharge applies.
-    pub d_short_run_floor: u32,
-    /// Per-base penalty for aligned reference span above
-    /// [`Self::d_long_span_soft_max`]. Prefers compact D alleles over ones that
-    /// eat into N-addition; zeroed when soft-max is 0.
-    pub d_long_span_soft_max: u32,
-    pub d_long_span_penalty: Score,
 }
 
 impl Default for EngineeringObjective {
@@ -169,13 +158,6 @@ impl Default for EngineeringObjective {
             d_presence: DPresencePenalty::R_OPTIMIZED,
             tandem_d_penalty: 12,
             insertion_per_base: 0,
-            // Mild surcharge: enough to cut short-core FPs, light enough that
-            // true short Ds on IgG still beat the no-D path.
-            d_short_run_penalty: 1,
-            d_short_run_floor: 6,
-            // Off by default: even mild over-long penalties cost D recall.
-            d_long_span_soft_max: 0,
-            d_long_span_penalty: 0,
         }
     }
 }
@@ -189,26 +171,9 @@ impl PathModel for EngineeringObjective {
                 } else {
                     0
                 };
-                let run = placement.evidence.longest_exact_run;
-                let short = if run < self.d_short_run_floor {
-                    self.d_short_run_penalty * (self.d_short_run_floor - run) as Score
-                } else {
-                    0
-                };
-                let span = placement
-                    .alignment
-                    .r_end
-                    .saturating_sub(placement.alignment.r_start);
-                let long = if self.d_long_span_soft_max > 0 && span > self.d_long_span_soft_max
-                {
-                    self.d_long_span_penalty * (span - self.d_long_span_soft_max) as Score
-                } else {
-                    0
-                };
-                -self.d_presence.penalty(placement) - tandem - short - long
+                -self.d_presence.penalty(placement) - tandem
             }
-            SegmentKind::V => 0,
-            SegmentKind::J => placement.path_adjust,
+            SegmentKind::V | SegmentKind::J => 0,
         }
     }
 

@@ -23,8 +23,8 @@
 //! running maximum turns every (transition, cut) into one binary search:
 //! `O(S log S + T·C·log S)` instead of `O(S·T·C)`.
 //!
-//! Ties: final paths compare by [`PathScore`] (score, then fewer D), so a
-//! with-D path must strictly beat the best no-D path.
+//! Ties: final paths compare by [`PathScore`] (score, then fewer D, then
+//! germline support), so a with-D path must strictly beat the best no-D path.
 
 use super::model::{Grammar, PathModel, VdjGrammar};
 use super::{Adjudicator, CallPath, CalledSegment, EngineeringObjective, PathScore};
@@ -68,13 +68,17 @@ struct State {
     first: SegmentKind,
     /// Path score accumulated *before* this node's own segment.
     score: Score,
+    /// Unclipped placement scores accumulated before this node (tie-break).
+    support: Score,
     back: Option<Back>,
 }
 
 impl State {
+    /// `(score − entry prefix, support)`: lexicographic, and both parts are
+    /// separable from the exit cut, so prefix maxima stay exact.
     #[inline]
-    fn key(&self) -> Score {
-        self.score - self.entry_prefix
+    fn key(&self) -> (Score, Score) {
+        (self.score - self.entry_prefix, self.support)
     }
 }
 
@@ -82,7 +86,7 @@ impl State {
 #[derive(Clone, Copy, Debug)]
 struct Ranked {
     q_lo: u32,
-    best_key: Score,
+    best_key: (Score, Score),
     state: u32,
 }
 
@@ -108,7 +112,11 @@ fn upsert(states: &mut Vec<State>, candidate: State) {
     match states.iter_mut().find(|s| {
         s.entry == candidate.entry && s.d_used == candidate.d_used && s.first == candidate.first
     }) {
-        Some(existing) if candidate.score > existing.score => *existing = candidate,
+        Some(existing)
+            if (candidate.score, candidate.support) > (existing.score, existing.support) =>
+        {
+            *existing = candidate
+        }
         Some(_) => {}
         None => states.push(candidate),
     }
@@ -223,6 +231,7 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
                     d_used: u8::from(p.kind == SegmentKind::D),
                     first: p.kind,
                     score: 0,
+                    support: 0,
                     back: None,
                 });
             }
@@ -247,13 +256,14 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
                     else {
                         continue;
                     };
-                    let total = r.best_key
+                    let total = r.best_key.0
                         + exit.prefix
                         + self.model.segment_bonus(b, g.d_used)
                         + self.model.end(g.first, b.kind, g.d_used);
                     let candidate = PathScore {
                         score: total,
                         d_count: g.d_used,
+                        support: r.best_key.1 + b.score(),
                     };
                     if best.map_or(true, |(current, _)| candidate > current) {
                         best = Some((
@@ -309,7 +319,7 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
                         let Some(r) = best_up_to(group, i64::from(xb.q) - min_b) else {
                             continue;
                         };
-                        let score = r.best_key
+                        let score = r.best_key.0
                             + xb.prefix
                             + bonus
                             + self
@@ -324,6 +334,7 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
                                 d_used: d_next,
                                 first: g.first,
                                 score,
+                                support: r.best_key.1 + b.score(),
                                 back: Some(Back {
                                     node: pos as u32,
                                     state: r.state,

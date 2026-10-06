@@ -154,6 +154,35 @@ impl<P: DWindowPolicy> DWindowPolicy for WithAnchorWindow<P> {
     }
 }
 
+/// Where J is searched: right of V, reaching `reclaim` bases back into it.
+///
+/// J follows V on every path, and a J alignment can only reach into V by
+/// chance matches at the junction edge, which [`ExpandedResidual`] bounds by
+/// the same margin. The window starts `reclaim` bases before the earliest V
+/// end, so it contains every J that a path through any V placement can use
+/// up to that overlap. Without V placements the whole read is searched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DownstreamWindow {
+    pub reclaim: u32,
+}
+
+impl Default for DownstreamWindow {
+    fn default() -> Self {
+        Self { reclaim: 24 }
+    }
+}
+
+impl DownstreamWindow {
+    pub fn window(&self, query_len: usize, upstream: &[Placement]) -> Range<usize> {
+        let start = upstream
+            .iter()
+            .map(|p| p.q_end().saturating_sub(self.reclaim) as usize)
+            .min()
+            .unwrap_or(0);
+        start.min(query_len)..query_len
+    }
+}
+
 /// Sort and merge overlapping or touching windows in place.
 pub fn merge_windows(windows: &mut Vec<Range<usize>>) {
     windows.sort_by_key(|w| (w.start, w.end));
