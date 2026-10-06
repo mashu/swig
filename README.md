@@ -1,17 +1,25 @@
 # vdj_assign
 
-Seeded, banded, affine V(D)J germline assignment with placement-DAG adjudication:
-a Rust implementation of the SwiftIG / Swig 0.38.x method note, built so that
-every heuristic is a replaceable, statically dispatched component.
+Seeded, banded, affine V(D)J germline assignment with placement-DAG
+adjudication. It started as a Rust implementation of the SwiftIG / Swig 0.38.x
+method note; its decision rules are now derived from one log-likelihood-ratio
+objective (see [docs/ALGORITHM.md](docs/ALGORITHM.md)) instead of tuned patches.
+Every component is a replaceable, statically dispatched trait, and every
+search shortcut is either lossless or measured on simulated repertoires.
 
 Zero dependencies, Rust ≥ 1.75, edition 2021.
+
+- [docs/ALGORITHM.md](docs/ALGORITHM.md): the model, the search and its
+  guarantees, structured for a methods section.
+- [docs/ASSESSMENT.md](docs/ASSESSMENT.md): the critical assessment behind
+  the current design. It covers what was ad hoc, what replaced it, the measurements, and
+  the remaining plan.
 
 ## Build and run
 
 ```sh
-cargo build --release                             # always benchmark/run the release build
-cargo test                                        # 45 unit + 7 annotation + 10 integration tests
-cargo run --release --example throughput 20000    # synthetic IGH-sized benchmark
+cargo build --release                          # always run the release build
+cargo test                                     # 62 unit, 7 annotation, 10 synthetic, 5 simulated-accuracy tests
 
 target/release/vdj-assign --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta \
     [--profile r|truth|igblast|sensitive-d] [--threads N] [--tandem-d] \
@@ -21,6 +29,12 @@ zcat reads.fastq.gz | target/release/vdj-assign --v V.fasta --d D.fasta --j J.fa
 
 # optional: write the annotated database for review or curation
 target/release/vdj-assign prepare --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta --out prepared/
+
+# accuracy and throughput on simulated reads (synthetic database unless --v/--d/--j are given)
+cargo run --release --example benchmark -- [--v V.fasta --d D.fasta --j J.fasta] \
+    [--preset easy|mid|hard] [--reads N] [--threads N] [--random N]
+# search errors vs model errors against an exhaustive oracle
+cargo run --release --example diagnose -- --v V.fasta --d D.fasta --j J.fasta --preset hard
 ```
 
 Reads may be FASTA or FASTQ. The format is detected from the first
@@ -39,13 +53,14 @@ Germline databases are FASTA. No IMGT reference is needed: anchors and V
 region boundaries are taken from the headers where present and detected
 otherwise, on every start, in milliseconds (see *Germline annotation* below).
 Identical sequences are merged and reported under all their names. Anchors
-also enable the anchor-bounded D window. Output is an AIRR Rearrangement TSV. Coordinates are 1-based closed
-intervals on the oriented query. CIGARs use `S`/`N` for unaligned query and
-germline bases and `=`/`X`/`I`/`D` for columns. `np1`–`np3` hold the
-junctional N/P regions, and `*_support` holds Karlin–Altschul E-values.
-Region columns follow: `fwr1`–`fwr4`, `cdr1`–`cdr3` (sequence, `_start`,
-`_end`), `cdr3_aa`, `junction`, `junction_length`, `junction_aa`,
-`vj_in_frame`, `stop_codon` and `productive`.
+also enable the anchor-bounded D window. Output is an AIRR Rearrangement TSV.
+Coordinates are 1-based closed intervals on the oriented query. CIGARs use
+`S`/`N` for unaligned query and germline bases and `=`/`X`/`I`/`D` for
+columns. `np1`–`np3` hold the junctional N/P regions, and `*_support` holds
+Karlin–Altschul E-values. Region columns follow: `fwr1`–`fwr4`, `cdr1`–`cdr3`
+(sequence, `_start`, `_end`), `cdr3_aa`, `junction`, `junction_length`,
+`junction_aa`, `vj_in_frame`, `stop_codon` and `productive`. A read without a
+significant V or J (see *Significance* below) is written with empty calls.
 
 As a library:
 
@@ -131,7 +146,7 @@ A header value is never overridden.
 
 Per read, regions are projected lazily when a call is reported, only through
 the called V and J alignments. Each boundary is one binary search in the
-clip index. This costs 0.72 µs per read, against ~326 µs for assignment and
+clip index. This costs under a microsecond per read, against ~450 µs for assignment and
 11.8 µs for the whole AIRR record, and nothing is added to assignment itself.
 
 ### Reliability (tests/annotation.rs)
@@ -169,44 +184,59 @@ transferred, low-confidence or missing.
 ## Architecture
 
 ```text
- chunk of reads ─► per read: orient (V votes, fwd vs rc; J breaks ties), retrieve V and J candidates
-                ─► V stage, whole chunk: one score batch + one traceback batch (16 jobs per AVX2 register)
-                ─► J stage, whole chunk
-                ─► per read: D windows from V/J geometry (+ anchor window), D candidates
+ chunk of reads ─► per read: strand from germline k-mer support; V candidates (gene frames)
+                ─► V stage, whole chunk: score batch, sibling bounds, traceback waves
+                ─► per read: J window right of V ─► J stage, whole chunk (every allele)
+                ─► per read: D windows from V/J geometry, D candidates (L-mer bitsets)
                 ─► D stage, whole chunk ─► per read: admission gates
-                ─► per read: placement DAG over VJ / VDJ / VDDJ ─► refiner ─► Call ─► AIRR
+                ─► per read: placement DAG over VJ / VDJ / VDDJ ─► anchor check ─► Call ─► AIRR
 ```
 
-Every per-read decision is still taken per read. Batch aligners must answer
+Every per-read decision is taken per read. Batch aligners must answer
 each job exactly as a single call would, so a read's result never depends on
-its chunk: `assign(q)` is literally a chunk of one, and this is tested.
+its chunk: `assign(q)` is literally a chunk of one, and this is tested. The
+stages are the methods `stage_orient`, `stage_v`, `stage_j`, `stage_d` and
+`stage_adjudicate` of `Assigner`.
 
-| Module | Responsibility | Method-note section |
-|---|---|---|
-| `alphabet`, `fasta`, `germline` | 2-bit codes (N = 4), germline FASTA, germline sets with anchors | Input |
-| `reads` | Streaming FASTA/FASTQ reads with format detection | Input |
-| `translate` | 64-entry codon table on 2-bit codon indices; one-pass three-frame translation | Annotation |
-| `annotate`, `annotate/{v_motif,j_motif,transfer}` | Anchors, frames, V region starts: header > motif > consensus > sibling transfer | Annotation |
-| `prepare` | Deduplicate + annotate; write annotated FASTA and `annotation.tsv` | Annotation |
-| `read_regions` | Lazy per-read FR/CDR/junction projection, frame, stop codon, productive | Reporting |
-| `scoring` | Affine tuples, substitution profiles; N scores 0 | Scoring tuples |
-| `seed`, `index` | Rolling k-mer integers, spaced seeds, CSR k-mer index | Seeding |
-| `retrieve/seed_vote` | Packed-vote diagonal clustering, per-gene budget | Candidate retrieval, votes |
-| `retrieve/budget` | Fixed / ambiguity-triggered candidate budget (4 → 16) | Budget |
-| `retrieve/ungapped` | Ungapped diagonal pre-ranking decorator | Acceleration (new) |
-| `retrieve/lmer_mask` | D prefilter: per-L-mer allele bitsets | D retrieval |
-| `band`, `align/gotoh` | Diagonal bands (bins of 4, w = clamp(span+8, 28, 256)); scalar banded Gotoh | Aligner, banding |
-| `align/inter_seq` | AVX2 inter-sequence Gotoh, 16 jobs per register, exact scalar semantics | Aligner (acceleration) |
-| `clip`, `evidence`, `placement` | O(1) clip-and-rescore at any cut; exact-run / identity evidence | Boundary scoring |
-| `segment` | Retrieve → pre-score → keep → traceback → merge identical, batched over many reads | Per-segment search |
-| `window` | Where D is searched: expanded residual, anchor window | Residual D search, rescue |
-| `admission` | Exact-run floor (`min_d_match`), distributed-D gate, combinators | D admission, AER-R |
-| `adjudicate/dag` | Semi-Markov Viterbi over placements with exact cut choice | Target architecture |
-| `adjudicate/model` | Grammar (VJ/VDJ/VDDJ), path model, D-presence penalty `P_D` | AER-R objective |
-| `adjudicate/residual` | Ordinary commit-V×J-then-D path | Ordinary path |
-| `refine` | Post-adjudication polishing of the winning path | Boundary refinement |
-| `pipeline`, `config`, `profiles` | Composition, configuration, calling profiles | Profiles |
-| `stats`, `report`, `batch` | E-values, AIRR output, parallel batches | Reporting |
+| Module | Responsibility |
+|---|---|
+| `alphabet`, `fasta`, `germline`, `reads` | 2-bit codes (N = 4), germline FASTA and sets with anchors, streaming FASTA/FASTQ |
+| `translate`, `annotate`, `prepare`, `read_regions` | Codon table, anchors and V regions (header > motif > consensus > sibling transfer), per-read FR/CDR/junction projection |
+| `scoring`, `stats` | Log-odds substitution profiles (uniform or position-specific), affine gaps, Karlin–Altschul λ/K/E-values |
+| `orient` | Strand from germline k-mer presence on both strands, with a significance test |
+| `seed`, `index`, `retrieve/frames` | Rolling k-mers, CSR k-mer index over gene frames (alleles of a gene in one coordinate system) |
+| `retrieve/seed_vote`, `retrieve/budget` | Radix-sorted diagonal votes per frame, gene budget, candidate bands |
+| `retrieve/exhaustive`, `retrieve/lmer_mask`, `retrieve/ungapped` | J: every allele; D: lossless L-mer bitsets; optional ungapped pre-ranking |
+| `band`, `align/gotoh`, `align/inter_seq` | Diagonal bands; scalar banded Gotoh; AVX2 inter-sequence Gotoh (16 jobs per register) |
+| `segment`, `family_bound` | One search stage: score → sibling upper bounds → traceback waves → acceptance and E-value gates → outer extension |
+| `clip`, `evidence`, `placement` | O(1) clip-and-rescore at any cut; exact-run / identity evidence |
+| `window`, `admission` | Where J and D are searched; D evidence gates |
+| `adjudicate/{dag,model,residual}` | Semi-Markov Viterbi over placements; grammar and log-odds path model; residual baseline |
+| `refine` | Outer-flank extension; `Refiner` extension point |
+| `pipeline`, `config`, `profiles` | Stage-wise composition, declarative configuration, calling profiles |
+| `report`, `batch` | AIRR output, parallel batches |
+| `sim/{random,params,simulate,synthetic,evaluate}` | IgSim port, synthetic germlines, accuracy evaluation |
+
+## The model in brief
+
+The full description, with the guarantee of each search step, is in
+[docs/ALGORITHM.md](docs/ALGORITHM.md).
+
+- **Scores are log-odds.** `(2, −3)` substitution scores are the
+  log-likelihood ratio, in units of 1/λ nats with λ = 0.634, of "templated by
+  this germline at 11.2 % divergence" against "random sequence". N and P bases
+  score 0 under both hypotheses. Affine gaps price indels.
+- **The path objective** is `Σ clipped segment scores − P_D·#D − tandem·[2nd D]
+  + pair_bonus·[V…J]`, maximised exactly over the topologies VJ / VDJ / VDDJ,
+  over the placements, and over every cut through overlaps. Ties go to fewer D,
+  then to more germline support (the summed unclipped scores).
+- **`P_D` is derived, not tuned.** A D is one of `N` genes at one of `L`
+  junction positions. Including it pays off when `λ·S_D > ln(N·L) − ln(prior
+  odds)`, which gives 11 for human IGH (32 genes, L = 25, even odds) and 6
+  for TRB.
+- **Significance.** A V or J hit is kept at E ≤ 1 against its database and
+  window. A read is called only when its path contains an *anchor*, a V or J
+  hit at E ≤ 10⁻³, so random sequence receives no call.
 
 ## Extension points
 
@@ -218,8 +248,9 @@ no runtime type checks.
 | Trait | Default | Alternatives shipped |
 |---|---|---|
 | `Aligner` (+ `score_batch`, `align_batch`) | `InterSequenceGotoh` (AVX2, scalar fallback) | `BandedGotoh`; batch methods default to single-job loops |
-| `Retriever` | `UngappedPrefilter<SeedVoteRetriever>` (V/J), `LmerMaskRetriever` (D) | `SeedVoteRetriever` alone, `params: None` |
-| `CandidateBudget` | `AmbiguityBudget{4, 16, 5 %, 8}` | `FixedBudget` |
+| `Retriever` | V: `UngappedPrefilter<SeedVoteRetriever>` (prefilter off); J: `ExhaustiveRetriever`; D: `LmerMaskRetriever` | `SeedVoteRetriever` alone |
+| `CandidateBudget` | `AmbiguityBudget{3, 16, 5 %, 8}` | `FixedBudget` |
+| `SubstitutionModel` | `AffineScoring` | `HotspotScoring` (position-specific; the kernel's profile path) |
 | `DWindowPolicy` | `WithAnchorWindow<ExpandedResidual>` | `ResidualWindow`, `ExpandedResidual` |
 | `Admission` | `AnyOf<ExactRunFloor, Option<DistributedEvidence>>` | `AdmitAll`, `AllOf`, any `Option<A>` |
 | `Adjudicator` | `PlacementDag<VdjGrammar, EngineeringObjective>` | `ResidualAdjudicator` |
@@ -236,62 +267,65 @@ let experiment = DefaultAssigner::from_config(&config, v, Some(d), j)?
 
 ## Acceleration tricks
 
-Measured single-threaded in a 1-core container, on a synthetic IGH-sized
-database. The database has 7 V families × 25 genes (~15 % within-family
-divergence) × 2 alleles = 350 V, 27 D and 12 J alleles. Reads carry 5 % SHM
-and half are reverse-complemented (`examples/throughput.rs`).
+Measured single-threaded on simulated reads (IgSim `mid` preset, half
+reverse-complemented, 450–650 nt) against a human IGH germline set of
+541 V, 90 D and 16 J alleles, in a shared 4-core container (±5 %):
 
 | Stage of optimisation | reads/s/thread |
 |---|---|
-| First complete pipeline | 508 |
-| + ungapped V/J pre-ranking, lossless D L-mer and score floor | 1162 |
-| + branch-free scalar kernel with shortened dependency chain | 1393 |
-| + pre-sized traceback, arithmetic trace codes, conditional pre-score pass | 1724 |
-| + AVX2 inter-sequence kernel, batched per read (~3 V jobs per register) | ~2000 |
-| + stage-wise batching across 64-read chunks (~190 V jobs per batch) | **3345** |
+| Starting point (method-note pipeline, AVX2, chunk batching) | 849 |
+| + k-mer orientation, V retrieved on one strand, J searched right of V only | ~1000 |
+| + band = seed cluster ± 8 diagonals (was ≥ 57 diagonals wide) | ~1230 |
+| + gene frames and radix-sorted votes (V retrieval 267 → 73 µs/read) | ~1620 |
+| + D floor `P_D + 1`, junction windows reclaim 12 instead of 24 | ~1830 |
+| + uniform-profile fast path in the SIMD kernel | ~2020 |
+| + clip index in three allocations instead of seven | **~2200** |
 
-In-situ DP time per read, scalar versus chunk-batched SIMD:
-
-| Segment | Scalar | SIMD, chunk-batched | Speedup |
-|---|---|---|---|
-| V | 188 µs | 38.5 µs | 4.9× |
-| J | 36 µs | 10.0 µs | 3.6× |
-| D | 132 µs | 16.9 µs | 7.8× |
-
-DP is now ~65 of ~280 µs per read. The rest is retrieval (V seed votes on
-both strands, ~80 µs), placement construction and adjudication; that is
-where the next speedups are.
-
-Kernel-level numbers are from 400 *distinct* V-like jobs; repeating one job
-lets the branch predictor memorise it and flatters scalar code:
-
-| Jobs per register | Score-only | Traceback |
-|---|---|---|
-| Scalar | 2.40 ns/cell | 3.91 ns/cell |
-| 16 (full) | 0.53 ns/cell (4.6×) | 0.84 ns/cell (4.7×) |
-| 8 | — | 1.39 ns/cell |
-| 4 | — | 2.72 ns/cell |
+Four threads give ~9000 reads/s. Calls are identical across the
+pure-speed steps; the steps that changed calls are listed in
+[docs/ASSESSMENT.md](docs/ASSESSMENT.md) with their accuracy effect.
 
 ### Data and retrieval
 
 **Nucleotides and k-mers as integers.** Rolling 2-bit k-mer keys in `u64`, with
 N resetting the window. Spaced seeds are data (a mask), not code.
 
-**CSR k-mer index.** Offsets and packed `u32` postings (allele, position).
+**Strand from a k-mer bitset.** A presence bitset over all 4¹¹ k-mers of the V
+and J germline (512 KiB). One pass computes forward and reverse-complement
+keys together, so each strand costs one bit test per base. Each read position
+counts at most once, so repeats cannot inflate the evidence. The count is
+trusted only when it exceeds its Poisson null (`λ₀ + 3√λ₀`); otherwise the
+read falls back to seed votes on both strands. Only the chosen strand is
+searched for V.
+
+**Gene frames.** The alleles of a gene share almost all seeds. A frame maps
+each allele into the gene's longest allele by the offset at which its shared
+seeds agree; an allele with an internal indel, or any divergent allele, gets
+its own frame. The k-mer index is built over frames with identical postings
+merged. A seed shared by 20 alleles is one posting and one vote, while
+allele-specific seeds still vote for their gene.
+
+**CSR k-mer index.** Offsets and packed `u32` postings (frame, position).
 Keys use a direct-address table up to 24 key bits, and a sorted key array with
-binary search beyond. Frequent seeds (> 256 occurrences) are skipped, as in the
-note.
+binary search beyond. Seeds with more than 256 postings are skipped.
 
-**Packed votes with sort-and-scan clustering.** Each seed hit is one `u64`
-(allele | diagonal bin | weight). A single `sort_unstable` followed by a linear
-scan yields diagonal clusters per allele: O(h log h), no hash maps.
+**Radix-sorted packed votes.** Each vote is one `u64`, `(frame · 2^b + diagonal
++ bias) << 8 | weight`, with `b` sized to the query. The sort key is ~21 bits,
+so two 11-bit LSD radix passes order the votes in linear time. One scan then
+yields the best diagonal cluster per frame. A seed repeated within a frame
+does not vote (it cannot locate the diagonal).
 
-**Ungapped before gapped (BLAST staging).**
-- Each V/J candidate is scored by Kadane's maximum segment sum along the
-  diagonals around its band centre, at about 1/50 of the banded DP cost.
-- Only candidates within `slack` of the best, and always the top `keep_top`,
-  reach DP.
-- This is a lossy speed knob (defaults: top 3, slack 30); `None` disables it.
+**Bands from the seeds.** A candidate's band is its frame cluster's diagonal
+range, shifted by the allele's frame offset and widened by 8 diagonals.
+Narrowing from ≥ 57 to ~17–25 diagonals changed no call on reads with indels.
+
+**Exhaustive J, small window.** The J set is tiny (10–20 alleles) and under
+heavy SHM keeps few intact seeds, so every J allele is aligned, unbanded, in
+the read right of V (from 12 bases before the earliest V end).
+
+**Ungapped pre-ranking** (`retrieve/ungapped`): Kadane's maximum segment sum
+along diagonals around the band centre ranks candidates before DP. It is
+lossy, so it is off by default.
 
 ### Dynamic programming
 
@@ -312,53 +346,52 @@ gap state satisfies `D' = max(t + g_o, D + max(g_o, g_e))`.
 - This is exact for any gap costs and is checked against a textbook
   three-matrix Gotoh oracle.
 - The serial path per cell drops from three maxima to one add and one max.
-- Together with the branch-free loop: 6.2 → 2.05 ns/cell on real D jobs.
 
-**Score first, traceback later — only when it can prune.**
-- Score-only DP ranks candidates, and only kept ones are traced.
-- When a stage has no more candidates than it keeps (`prescore_above`), it
-  aligns directly: the pre-pass could not prune.
+**Score first, traceback in waves.** Score-only DP ranks candidates. Traceback
+then runs in waves down the ranking until `top` alignments pass acceptance
+(plus ties), so a high score that fails the length/identity floor does not
+take a slot. With at most `top + 1` candidates the scoring pass is skipped.
+
+**Sibling upper bounds (`family_bound`).** After a gene's representative is
+scored, a same-length sibling satisfies `S*(A) ≤ S*(R) + Δ(R, A)`, where Δ
+sums the per-position maximum profile gain. Siblings whose bound cannot reach
+the current top-N cutoff are not scored.
 
 **Inter-sequence SIMD (`align/inter_seq`).**
 - Each 16-bit AVX2 lane holds the same cell of a *different* job. Every lane
   runs the ordinary recurrence, so traceback codes are the scalar ones and the
-  scalar traceback walk is reused verbatim. There is no striped lazy-F loop and
-  none of its traceback problems.
-- Diagonal bands use band-relative coordinates (row i, offset k = i − j − lo),
-  so all lanes walk the same grid even though their bands start on different
-  diagonals. The reference position of cell (i, k) depends only on i − k.
-  Profile columns are laid out once per batch, interleaved, and each cell's
-  substitution scores are then one contiguous load per base code.
-- Unbanded jobs (D windows) use a rectangular layout.
-- Scores come from the per-allele profiles, selected by per-row query-code
-  masks. This makes the kernel exact for any `SubstitutionModel`, not only
-  match/mismatch.
+  scalar traceback walk is reused verbatim.
+- Diagonal bands use band-relative coordinates, so all lanes walk the same
+  grid although their bands start on different diagonals. Unbanded jobs (J, D)
+  use a rectangular layout.
+- **Uniform fast path.** When every lane's profile depends on base identity
+  alone (every `AffineScoring` profile), the group stores reference codes,
+  and a cell's score is one load, one comparison and one blend. Otherwise the
+  five interleaved profile rows are selected by query-code masks, which is
+  exact for any `SubstitutionModel`.
 - Out-of-band and out-of-matrix cells read as H = 0, I = D = −∞, exactly like
-  the scalar kernel. Narrower bands are masked per lane. Cells past a lane's
-  query or reference get a −∞ substitution, so they can never feed back or
-  become a strict new maximum.
-- Saturating i16 arithmetic, with a per-job admission check on the attainable
-  score; jobs that could approach the sentinel fall back to the scalar kernel.
+  the scalar kernel. Saturating i16 arithmetic, with a per-job admission check;
+  jobs that could approach the sentinel fall back to the scalar kernel.
 - Runtime AVX2 detection, with a scalar fallback on other CPUs.
 
-**Stage-wise batching across reads.** After prefiltering, a read has ~3 V, ~3 J
-and ~9 D candidates, far too few to fill 16 lanes. So the pipeline runs every
-stage over a chunk of 64 reads (the batch scheduler's chunk) and hands the
-aligner one batch per stage. Jobs are sorted by shape into registers. Keep
-policies, D windows, admission and adjudication stay per read.
+**Stage-wise batching across reads.** A read has only a few V, J and D
+candidates, too few to fill 16 lanes. So every stage runs over a chunk of 64
+reads and hands the aligner one batch per wave. Keep policies, windows,
+admission and adjudication stay per read.
 
 ### D search
 
-**Lossless D prefilter.** The prefilter uses per-L-mer allele bitsets (one OR
-per query L-mer). L and the traceback score floor are derived from the
-admission gates, so they can never drop an admissible hit:
-- L = `min_d_match` when only the exact-run gate is on.
-- L = 4 when distributed-D is on: ≥ 80 % identity forces an exact run ≥ 4, by
-  pigeonhole.
-- Score floor = `m · min_d_match`, because an exact run of k scores ≥ k·m.
-- When L·m already meets that floor, every retrieved candidate passes it, so
-  the score-only pre-pass is skipped unless there are more candidates than
-  the keep policy's `top`.
+**Lossless D prefilter.** Per-L-mer allele bitsets (one OR per query L-mer).
+L is derived from the admission gates so it can never drop an admissible hit:
+`L = min_d_match` with only the exact-run gate, `L = 4` with distributed-D
+(≥ 80 % identity over ≥ 16 columns forces an exact run ≥ 4, by pigeonhole).
+
+**Score floor from the objective.** A clipped span of an optimal local
+alignment never outscores the whole alignment. So a D scoring at most `P_D`
+can only add ≤ 0 to a path, and the strict with-D-beats-no-D rule rejects it.
+The D stage therefore keeps only scores ≥ `P_D + 1` (and ≥ the gates' own
+floor). This is exact when the placements flanking the D do not overlap each
+other.
 
 ### Adjudication
 
@@ -366,118 +399,169 @@ admission gates, so they can never drop an admissible hit:
 of any sub-alignment between two query cuts in O(1), with exact affine gap
 accounting at the new edges.
 
-**DAG with prefix maxima.** Clip scores are separable in (entry, exit). So for
-every overlap cut, the best predecessor state is a prefix maximum found by one
-binary search. Every cut through every overlap is evaluated, and the result
-provably equals brute-force enumeration.
+**DAG with prefix maxima.** Clip scores are separable in (entry, exit), and so
+is the support tie-break. For every overlap cut, the best predecessor state
+is therefore a lexicographic prefix maximum found by one binary search. Every
+cut through every overlap is evaluated, and the result provably equals
+brute-force enumeration (tested).
 
 ### Parallelism and allocation
 
-**Workspaces and batching.** One workspace per thread means no DP allocation
-after warm-up. Work is self-scheduled in chunks of 64 from an atomic counter
-over scoped threads. Results come back in input order, and reporting is formatted
-on the workers (`assign_map`).
+One workspace per thread means no DP allocation after warm-up. Work is
+self-scheduled in chunks of 64 from an atomic counter over scoped threads.
+Results come back in input order, and reporting is formatted on the workers
+(`assign_map`).
+
+## Simulation and evaluation
+
+`vdj_assign::sim` is a dependency-free port of
+[IgSim.jl](https://github.com/mashu/IgSim.jl). It has the same generative
+model and the `easy`/`mid`/`hard` presets:
+- uniform allele sampling, exonuclease trims, N additions, random flanks;
+- gated SHM with single-base indels, and Illumina substitutions;
+- optional tandem DD.
+
+It extends IgSim in three ways:
+- **Per-base germline origins.** Boundaries, junctions and germline-equivalent
+  alleles are exact truth even across indels.
+- **Optional reverse complementation.**
+- **`SyntheticDatabase`.** An IGH-like germline with a family → gene → allele
+  similarity hierarchy and conserved anchors, for tests that cannot ship
+  IMGT-derived data.
+
+`sim::Evaluation` scores AIRR records against the truth:
+- an allele call is *equivalent* when the primary allele contains the
+  trimmed, pre-mutation germline body (no read can separate such alleles);
+- *gene*, *listed* (truth among the reported names) and *exact*;
+- boundary errors, D presence by remnant length, junction exactness;
+- a random-read negative control.
+
+Human IGH (541 V / 90 D / 16 J; a local copy, not shipped), 5000 reads per
+preset, germline-equivalent accuracy in %, before → after the redesign:
+
+| Preset (IgSim) | Orientation | V | V gene | D | J | Junction | Random reads called |
+|---|---|---|---|---|---|---|---|
+| easy (no SHM) | 99.94 → **100** | 99.54 → **99.84** | 99.92 → **99.98** | 98.78 → **99.27** | 99.90 → **99.94** | 99.94 → **100** | 30.5 → **0** |
+| mid (IgM-like) | 100 → 100 | 97.76 → **97.94** | 99.84 → 99.84 | 91.96 → **92.93** | 98.84 → 98.80 | 99.93 → 99.93 | 30.2 → **0** |
+| hard (IgG-like) | 99.98 → 99.98 | 89.74 → **89.80** | 98.44 → 98.24 | 81.72 → **83.55** | 92.70 → **93.32** | 98.39 → **98.47** | 31.2 → **0** |
+
+The synthetic database (`SyntheticSpec::default()`, seed 1) gives, after:
+easy V/D/J 99.98/99.82/99.98, mid 99.52/87.81/98.92, hard 97.10/79.36/94.00,
+and junctions ≥ 99.8 %.
+
+`examples/diagnose` separates errors by aligning every allele unbanded under
+the same objective. If that exhaustive optimum is right but the pipeline is
+wrong, it is a *search* error; if the optimum itself is wrong or tied, it is
+a *model* error or tie.
+
+| Human IGH, 2000 reads | correct | ties | search errors | model errors |
+|---|---|---|---|---|
+| V, mid | 97.4 % | 1.3 % | **0** | 1.3 % |
+| J, mid | 98.8 % | 0.6 % | **0** | 0.7 % |
+| V, hard | 88.9 % | 5.5 % | 0.4 % | 5.3 % |
+| J, hard | 93.4 % | 2.8 % | 0.1 % | 3.7 % |
+
+Nearly all remaining errors are where SHM mimics an allele's distinguishing
+SNPs, so no score-based caller can do better.
 
 ## Validation
 
 - **DAG optimality:** `dag_equals_brute_force_over_all_paths_and_cuts`
   enumerates every VJ/VDJ/VDDJ path and every cut, with a per-base insertion
-  cost, and requires the same optimum.
+  cost and the lexicographic support tie-break, and requires the same optimum.
 - **Kernel exactness:**
   - The scalar kernel equals a textbook Gotoh across three gap regimes.
   - Every traceback rescores to its reported score.
-  - Wide bands reproduce the full matrix.
-  - The AVX2 kernel equals the scalar kernel — scores, end cells and complete
-    tracebacks — on 120 random mixed batches of 1–40 jobs. These cover full
-    and banded layouts, band widths 7–66, N bases, indels and four scoring
-    schemes.
+  - The AVX2 kernel equals the scalar kernel on 160 random mixed batches. Its
+    scores, end cells and complete tracebacks are compared over full and
+    banded layouts, N bases, indels, four scoring schemes, and hotspot profiles
+    mixed into half of the batches. Both the uniform and the profile path are
+    covered.
   - The whole chunk-batched SIMD pipeline equals the per-read scalar pipeline
     on 400 simulated reads (paths, orientations and every placement).
+- **Simulated accuracy (`tests/simulated.rs`):** IgSim presets on the
+  synthetic database, half reverse-complemented. Accuracy floors sit ~1.5 points
+  below the measured values for orientation, V/D/J allele and gene, junctions
+  and long D remnants. Random reads must receive no call.
+- **Synthetic calling (`tests/synthetic.rs`):** D genes, D-free junctions,
+  tandem VDDJ, hypermutated V, reverse complements, residual adjudicator.
+- **Batch consistency:** chunk-batched parallel output equals per-read
+  sequential output.
 - **Input parsing:** multi-line FASTA/FASTQ, `@`/`+` at the start of quality
   lines, empty reads, CRLF, batch resumption, and every error case.
 - **Karlin–Altschul:** the series reproduces K = 1/3 for the ±1 walk and
   NCBI's ungapped blastn table (reward 1 / penalty −3 → λ 1.374, K 0.711, H 1.31).
-- **Synthetic calling accuracy:**
-
-| Test | Result |
-|---|---|
-| D gene | 60/60 correct |
-| D-free junctions | false D in 0/40 |
-| Tandem VDDJ, both D genes | 30/30 correct |
-| V gene at 8 % SHM | always correct |
-| Reverse-complemented reads | identical calls and CIGARs |
-
-- **Batch consistency:** chunk-batched parallel output equals per-read
-  sequential output.
 - **Germline annotation and read regions:** see *Reliability* under
   *Germline annotation and regions*.
 
 ## Calling profiles
 
-The default is Swig's default: AER-R adjudication with the R-optimized profile.
-`r_optimized` is accepted as an alias of `r`.
+The default is `r`. `r_optimized` is accepted as an alias.
 
-| Profile | V tuple | D tuple | J tuple | `min_d_match` | Distributed-D | `P_D` | Junction tie |
-|---|---|---|---|---|---|---|---|
-| `r` (default) | (2,−3,−9,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 4 | on | 12, or 10 if score ≥ 20 or the exact tract is in two D sequences | on |
-| `sensitive-d` | (2,−3,−9,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 4 | on | 10 fixed | on |
-| `truth` | (2,−3,−5,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 6 | off | 0 | off |
-| `igblast` | (2,−3,−5,−1) | (2,−4,−11,−1) | (2,−4,−13,−1) | 5 | off | 0 | off |
+| Profile | V tuple | D tuple | J tuple | `min_d_match` | Distributed-D | `P_D` (human IGH) |
+|---|---|---|---|---|---|---|
+| `r` (default) | (2,−3,−9,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 4 | on | derived, even odds: 11 |
+| `sensitive-d` | (2,−3,−9,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 4 | on | derived, odds 2: 9 |
+| `truth` | (2,−3,−5,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 6 | off | 0 |
+| `igblast` | (2,−3,−5,−1) | (2,−4,−11,−1) | (2,−4,−13,−1) | 5 | off | 0 |
 
-Every profile requires 60% identity, at least 24 V substitution columns and 10 J
-substitution columns, and stitches the co-linear V prefix and J suffix back
-onto the local alignment before ranking. A with-D path must strictly beat the
-no-D path; ties go to fewer D segments.
+Every profile requires 60 % identity, at least 24 V substitution columns and
+10 J substitution columns, and the E-value gates (accept 1, anchor 10⁻³). It
+stitches the co-linear V prefix and J suffix back onto the local alignment
+before ranking. A with-D path must strictly beat the no-D path; ties go to
+fewer D segments, then to more germline support.
 
-## Assumptions and deviations — please review
+## Assumptions and deviations from the method note
 
-The note leaves several of these unspecified; each is a named field you can change.
+Each is a named field you can change.
 
-1. **Tandem D.** A second D costs an extra 12. Swig's double-D screen is a
-   separate opt-in and is not this penalty.
-2. **Retrieval constants.**
-   - V keeps 3 genes and walks up to 16 while votes stay within `max(8, 5%)`.
-   - J keeps 3 genes.
-   - Traceback keeps the top 3 V and top 2 J local scores, plus whatever is tied with the last of those. A hit that fails the length or identity floor does not occupy a slot.
-   - V family-delta: score one allele per gene first; skip same-length siblings whose profile upper bound cannot enter that top-N. J leaves this off.
-   - `weak_votes` 16 triggers the fallback seed.
-   - `max_occurrences` 256.
-   - Minimum substitution columns: V 24, J 10, D `min_d_match`. Identity floor 0.60.
-3. **D keep.** D keeps a wide lossless set (top 16, cap 32) so a distributed
-   hit below the ordinary top-2 is not dropped. Swig reaches the same hits
-   with a second D pass.
-4. **IgBLAST J tuple** is `(2, −4, −13, −1)`, matching Swig's agreement profile.
-5. **Boundary rescue.** The 24/10 rescue is realised as `ExpandedResidual`
-   (reclaim 24 into V/J) plus the DAG's exact cut choice, not as a separate
-   post-hoc step.
-6. **Anchor window.** It is always added when anchors are present, not only
-   when the residual is weak.
-7. **D retrieval.** The note's k = 5/3 D seeds are replaced by the lossless
-   L-mer bitset prefilter.
-8. **Distributed-D.** On for `r` and `sensitive-d`. Off for `truth` and `igblast`,
-   which are the legacy non-AER-R profiles.
-9. **Ungapped pre-ranking.** Available, and off by default, because it can drop
-   an allele Swig would align. Set `ungapped: Some(UngappedParams::default())` to enable it.
-10. **Gap cost constraint.** `GapCosts::new` requires `open ≤ extend ≤ 0`. With
-    cheaper opening, Gotoh prices gap runs as repeated opens and the "consecutive
-    gap columns extend" convention (used by clipping and reporting) no longer
-    describes the optimum. DP scores themselves stay exact.
+1. **D presence.** `P_D` is derived from the D database (`DPrior::Derived`)
+   instead of the note's 12-relaxed-to-10 rule. A sweep of constant costs put
+   the relaxed rule on the same precision/recall curve as a single constant.
+2. **Tandem D.** A second D pays its own `P_D` plus 12 (`tandem_d_penalty`).
+3. **Retrieval.** V keeps 3 genes and walks up to 16 while gene votes stay
+   within `max(8, 5 %)` of the leader; every allele of a kept gene is a
+   candidate. J is exhaustive. D uses the lossless L-mer prefilter instead of
+   the note's k = 5/3 seeds.
+4. **Keep.** V and J trace until the top 3 accepted alignments (plus ties); D
+   keeps up to 32 admissible alignments, so a distributed hit below the best
+   few still reaches adjudication.
+5. **Windows.** D windows reclaim 12 bases into V and J (the note's rescue of
+   24/10 is realised by this window and the DAG's exact cut choice). The
+   conserved-anchor window is always added when anchors are present. J is
+   searched from 12 bases before the earliest V end.
+6. **Significance.** V and J hits need E ≤ 1, and a call needs a V or J hit
+   at E ≤ 10⁻³ (`EvalueGates`). The note has no reporting threshold.
+7. **Tie-breaks.** Equal-score paths go to fewer D, then to more germline
+   support; co-optimal alleles are listed with the best-supported first.
+8. **Removed note mechanisms.**
+   - The high-SHM junction "tie" (a zero-score block written onto V/J).
+   - The ungapped J path bonus, the V-identity-switched J acceptance gates and
+     the J hotspot profile.
+   - The D short-run / long-span surcharges.
+
+   Ablation on simulated reads showed no accuracy benefit for any of them
+   (see the assessment).
+9. **Ungapped pre-ranking.** Available, and off by default, because it is
+   lossy. Set `ungapped: Some(UngappedParams::default())` to enable it.
+10. **Gap cost constraint.** `GapCosts::new` requires `open ≤ extend ≤ 0`.
 
 ## Known limitations
 
-- **No reporting threshold.** A random 120-nt read receives weak V and J calls.
-  Its V E-value (~0.2 versus ~1e-144 for real reads) exposes this, but nothing
-  suppresses it yet. An E-value or minimum-score gate per segment is the
-  obvious next component, either as a `Refiner` or in `report`.
-- **Approximate E-values.** They use exact *ungapped* parameters and are
-  mildly anti-conservative for gapped alignments. Calibrate λ and K by
-  simulation for real use. They are never used for calling.
+- **One alignment per D allele per window.** A D's optimal local alignment in
+  its window is not always its optimal *clipped* alignment at the chosen cut.
+  The 12-base reclaim keeps this rare; see the assessment.
+- **Single-cut overlaps.** When two consecutive placements overlap, the DAG
+  splits the overlap at one cut and leaves no N between them. The D floor
+  `P_D + 1` is exact only when D's neighbours do not overlap each other.
+- **E-values** use exact *ungapped* λ and K and the total database length.
+  Gapped scores are slightly higher (anti-conservative); near-identical alleles
+  inflate the database length (conservative). They gate hits; they are not
+  calibrated p-values.
 - **Segment type is not checked from FASTA.** FASTA carries no segment type, so
   the CLI cannot detect a D file passed as `--j`.
-- **Benchmark conditions.** Measurements come from a 1-core container on
-  synthetic data; real IGHV families and read lengths will shift them.
-- **SIMD targets.** The kernel is AVX2 only; other CPUs, including ARM/NEON,
-  use the exact scalar path. A NEON port is 8 lanes of the same design.
+- **SIMD targets.** The kernel is AVX2 only. Other CPUs, including ARM/NEON,
+  use the exact scalar path.
 - **Compressed input.** Gzip must be piped through `zcat`; there is no built-in
   decompression.
 - **FR3 length rule.** The CDR2/FR3 boundary uses the FR3 length (38 codons
@@ -495,28 +579,24 @@ The note leaves several of these unspecified; each is a named field you can chan
 - **IUPAC codes.** Germline IUPAC codes are stored as N, and a written
   database spells them N.
 
-## Not implemented (roadmap)
+## Roadmap
 
-**Faster non-DP work.** It is now ~75 % of the time.
-- V retrieval on both strands (~80 µs per read).
-- Placement construction.
+In order of expected value; reasons and measurements are in
+[docs/ASSESSMENT.md](docs/ASSESSMENT.md).
 
-**Retrieval.**
-- Minimizers / syncmers.
-- BMI2 `pext` for spaced seeds.
-- Suffix automaton / matching statistics for D.
-
-**Kernels.**
-- Cheaper substitution selection (byte-shuffle lookup instead of five masked loads).
-- AVX-512 (32 lanes) and a NEON port.
-- WFA for near-identical V ends.
-
-**Annotation.**
-- A per-database FR3 length learned from header-annotated alleles (TR loci).
-- A consensus position prior for Cys23 relative to other conserved residues,
-  so that truncated alleles benefit without a sibling.
-
-**Engineering.**
-- Arena allocation for placements.
-- A reporting threshold on E-value / minimum score.
-- C-segment assignment.
+1. **Posterior decoding.** A forward–backward (sum-product) pass over the same
+   DAG gives calibrated posterior probabilities per allele and per D presence.
+   Every separability trick carries over: prefix log-sum-exp replaces prefix
+   maxima.
+2. **Independent cuts with N between overlapping placements.** This makes the
+   DAG exact for the segmentation model, and the D floor exact
+   unconditionally.
+3. **Wider SIMD.** An AVX-512BW kernel (32 lanes) and a NEON port (8 lanes) of
+   the same design.
+4. **Allele rescoring along the gene frame.** Score siblings along their
+   representative's traceback and run DP only where bounds straddle the cutoff.
+5. **Simulation CLI.** `vdj-assign simulate` and `evaluate` over any tool's
+   AIRR TSV, for cross-tool benchmarks on identical reads.
+6. **Annotation.** A per-database FR3 length learned from header-annotated
+   alleles (TR loci). A consensus position prior for Cys23.
+7. **C-segment assignment.**
