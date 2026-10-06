@@ -23,6 +23,14 @@
 //! query-code masks computed once per row — no assumption of match/mismatch
 //! structure.
 //!
+//! **Trick — uniform fast path.** When every lane's profile depends on base
+//! identity alone ([`SubstitutionProfile::uniform`], true for every
+//! [`crate::scoring::AffineScoring`] profile), the group stores reference
+//! *codes* instead of five interleaved profile rows, and a cell's score is
+//! one load, one comparison and a blend instead of five masked loads. `N`
+//! scores 0 and out-of-matrix cells score `−∞` exactly as in the profile
+//! path, so results are identical.
+//!
 //! **Exact scalar semantics.** Out-of-band and out-of-matrix cells read as
 //! `H = 0, I = D = −∞`, exactly like the scalar kernel's never-written
 //! columns; lanes narrower than the batch are masked. Cells past a lane's
@@ -51,6 +59,8 @@ pub const LANES: usize = 16;
 const CODES: usize = N as usize + 1;
 /// Query code for rows past a lane's query.
 const SENTINEL: i16 = N as i16 + 1;
+/// Reference code for positions past a lane's reference (uniform layout).
+const REF_SENTINEL: i16 = N as i16 + 2;
 const NEG: i16 = -16_384;
 /// Largest attainable score admitted into a lane.
 const MAX_SCORE: i64 = 8_000;
@@ -213,6 +223,9 @@ struct Shape {
     extend: [i16; LANES],
     step: [i16; LANES],
     lane_width: [i16; LANES],
+    /// Uniform layout only: per-lane match and mismatch scores.
+    matched: [i16; LANES],
+    mismatch: [i16; LANES],
 }
 
 /// Best cell of each lane in kernel coordinates.
@@ -244,8 +257,9 @@ struct LaneResult {
     start: Option<(usize, usize, Vec<Op>)>,
 }
 
-/// Lay out the group's queries and interleaved profiles; return its shape.
-fn build<const DIAG: bool>(
+/// Lay out the group's queries and, per position, either the five
+/// interleaved profile rows or (`UNIFORM`) the reference codes; return its shape.
+fn build<const DIAG: bool, const UNIFORM: bool>(
     jobs: &[AlignJob<'_>],
     lanes: &[Lane],
     query: &mut Vec<[i16; LANES]>,
@@ -257,7 +271,11 @@ fn build<const DIAG: bool>(
     query.clear();
     query.resize(rows, [SENTINEL; LANES]);
     profile.clear();
-    profile.resize(CODES * positions, [NEG; LANES]);
+    if UNIFORM {
+        profile.resize(positions, [REF_SENTINEL; LANES]);
+    } else {
+        profile.resize(CODES * positions, [NEG; LANES]);
+    }
     let mut shape = Shape {
         rows,
         width,
@@ -266,6 +284,8 @@ fn build<const DIAG: bool>(
         extend: [0; LANES],
         step: [0; LANES],
         lane_width: [0; LANES],
+        matched: [0; LANES],
+        mismatch: [0; LANES],
     };
     for (l, lane) in lanes.iter().enumerate() {
         let job = &jobs[lane.job];
@@ -278,13 +298,26 @@ fn build<const DIAG: bool>(
         } else {
             0
         };
-        for code in 0..CODES {
-            let row = job.profile.row(code as u8);
-            let column = &mut profile[code * positions..(code + 1) * positions];
-            for (j0, &score) in row.iter().enumerate() {
+        let positions = 0..positions as i64;
+        if UNIFORM {
+            let scores = job.profile.uniform().expect("uniform group");
+            shape.matched[l] = scores.matched as i16;
+            shape.mismatch[l] = scores.mismatch as i16;
+            for (j0, &code) in job.profile.codes().iter().enumerate() {
                 let t = j0 as i64 + offset;
-                if (0..positions as i64).contains(&t) {
-                    column[t as usize][l] = score as i16;
+                if positions.contains(&t) {
+                    profile[t as usize][l] = i16::from(code);
+                }
+            }
+        } else {
+            for code in 0..CODES {
+                let row = job.profile.row(code as u8);
+                let column = &mut profile[code * shape.positions..(code + 1) * shape.positions];
+                for (j0, &score) in row.iter().enumerate() {
+                    let t = j0 as i64 + offset;
+                    if positions.contains(&t) {
+                        column[t as usize][l] = score as i16;
+                    }
                 }
             }
         }
@@ -300,6 +333,7 @@ fn build<const DIAG: bool>(
 #[cfg(target_arch = "x86_64")]
 mod kernel {
     use super::{LaneBest, Shape, CODES, LANES, NEG, SENTINEL};
+    use crate::alphabet::N;
     use std::arch::x86_64::*;
 
     #[inline]
@@ -324,7 +358,7 @@ mod kernel {
     /// Fill one group. `h` and `ins` hold `width + 1` entries; entry 0 is the
     /// virtual out-of-band neighbour (`H = 0`, `I = −∞`) and is never written.
     #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn fill<const DIAG: bool, const TRACE: bool>(
+    pub(super) unsafe fn fill<const DIAG: bool, const TRACE: bool, const UNIFORM: bool>(
         shape: &Shape,
         query: &[[i16; LANES]],
         profile: &[[i16; LANES]],
@@ -352,15 +386,21 @@ mod kernel {
         );
         let (ins_bit, del_bit) = (_mm256_set1_epi16(4), _mm256_set1_epi16(8));
         let sentinel = _mm256_set1_epi16(SENTINEL);
+        let ambiguous_code = _mm256_set1_epi16(i16::from(N));
+        let (matched, mismatch) = (load(&shape.matched), load(&shape.mismatch));
         let (mut best, mut best_row, mut best_k) = (zero, zero, zero);
 
         for r in 1..=rows {
             let q = load(&query[r - 1]);
             let mut code_mask = [zero; CODES];
-            for (c, mask) in code_mask.iter_mut().enumerate() {
-                *mask = _mm256_cmpeq_epi16(q, _mm256_set1_epi16(c as i16));
+            if !UNIFORM {
+                for (c, mask) in code_mask.iter_mut().enumerate() {
+                    *mask = _mm256_cmpeq_epi16(q, _mm256_set1_epi16(c as i16));
+                }
             }
-            let past_query = _mm256_and_si256(_mm256_cmpeq_epi16(q, sentinel), neg);
+            let past_query_lanes = _mm256_cmpeq_epi16(q, sentinel);
+            let past_query = _mm256_and_si256(past_query_lanes, neg);
+            let query_ambiguous = _mm256_cmpeq_epi16(q, ambiguous_code);
             let row_vector = _mm256_set1_epi16(r as i16);
             let mut del = neg;
             let mut del_extends = zero;
@@ -386,13 +426,31 @@ mod kernel {
                     h_diag_carry = up;
                     (up, load(&ins[k + 1]), diag, k)
                 };
-                let mut s = past_query;
-                for (c, mask) in code_mask.iter().enumerate() {
-                    s = _mm256_or_si256(
-                        s,
-                        _mm256_and_si256(load(&profile[c * positions + t]), *mask),
+                let s = if UNIFORM {
+                    // matched / mismatch by identity, 0 for N, −∞ outside the matrix.
+                    let reference = load(&profile[t]);
+                    let identical = _mm256_cmpeq_epi16(q, reference);
+                    let base = _mm256_blendv_epi8(mismatch, matched, identical);
+                    let ambiguous = _mm256_or_si256(
+                        query_ambiguous,
+                        _mm256_cmpeq_epi16(reference, ambiguous_code),
                     );
-                }
+                    let base = _mm256_andnot_si256(ambiguous, base);
+                    let outside = _mm256_or_si256(
+                        past_query_lanes,
+                        _mm256_cmpgt_epi16(reference, ambiguous_code),
+                    );
+                    _mm256_blendv_epi8(base, neg, outside)
+                } else {
+                    let mut s = past_query;
+                    for (c, mask) in code_mask.iter().enumerate() {
+                        s = _mm256_or_si256(
+                            s,
+                            _mm256_and_si256(load(&profile[c * positions + t]), *mask),
+                        );
+                    }
+                    s
+                };
 
                 let ins_open = _mm256_adds_epi16(h_up, open);
                 let ins_extend = _mm256_adds_epi16(i_up, extend);
@@ -486,6 +544,7 @@ impl InterSequenceGotoh {
 
         #[cfg(target_arch = "x86_64")]
         {
+            #[allow(clippy::too_many_arguments)]
             fn run<const DIAG: bool, const TRACE: bool>(
                 jobs: &[AlignJob<'_>],
                 lanes: &[Lane],
@@ -496,10 +555,23 @@ impl InterSequenceGotoh {
                 trace: &mut Vec<[u8; LANES]>,
                 emit: &mut impl FnMut(usize, Option<LaneResult>),
             ) {
-                let shape = build::<DIAG>(jobs, lanes, query, profile);
+                let uniform = lanes
+                    .iter()
+                    .all(|l| jobs[l.job].profile.uniform().is_some());
                 // SAFETY: only reached when AVX2 was detected at construction.
-                let best =
-                    unsafe { kernel::fill::<DIAG, TRACE>(&shape, query, profile, h, ins, trace) };
+                let (shape, best) = if uniform {
+                    let shape = build::<DIAG, true>(jobs, lanes, query, profile);
+                    let best = unsafe {
+                        kernel::fill::<DIAG, TRACE, true>(&shape, query, profile, h, ins, trace)
+                    };
+                    (shape, best)
+                } else {
+                    let shape = build::<DIAG, false>(jobs, lanes, query, profile);
+                    let best = unsafe {
+                        kernel::fill::<DIAG, TRACE, false>(&shape, query, profile, h, ins, trace)
+                    };
+                    (shape, best)
+                };
                 for (l, lane) in lanes.iter().enumerate() {
                     let score = Score::from(best.score[l]);
                     if score <= 0 {
@@ -627,7 +699,7 @@ impl Aligner for InterSequenceGotoh {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scoring::AffineScoring;
+    use crate::scoring::{AffineScoring, HotspotScoring};
 
     fn rng(seed: u64) -> impl FnMut() -> u64 {
         let mut state = seed;
@@ -681,17 +753,23 @@ mod tests {
         let mut ws = InterSequenceWorkspace::default();
         let mut scalar_ws = GotohWorkspace::default();
         let (mut hits, mut alignments) = (Vec::new(), Vec::new());
-        for batch in 0..120 {
+        for batch in 0..160 {
             let size = 1 + (next() % 40) as usize;
             let cases: Vec<_> = (0..size).map(|_| case(&mut next)).collect();
+            // Every other batch mixes in position-specific (hotspot) profiles, so
+            // both the uniform fast path and the profile path are exercised.
+            let hotspots = batch % 2 == 1;
             let profiles: Vec<_> = cases
                 .iter()
                 .enumerate()
                 .map(|(k, (_, r, _))| {
-                    (
-                        SubstitutionProfile::build(&scorings[k % 4], r),
-                        scorings[k % 4].gaps,
-                    )
+                    let scoring = scorings[k % 4];
+                    let profile = if hotspots && k % 3 == 0 {
+                        SubstitutionProfile::build(&HotspotScoring::for_shm(scoring), r)
+                    } else {
+                        SubstitutionProfile::build(&scoring, r)
+                    };
+                    (profile, scoring.gaps)
                 })
                 .collect();
             let jobs: Vec<AlignJob> = cases

@@ -9,49 +9,56 @@
 use std::fmt;
 use std::sync::Arc;
 
-use crate::adjudicate::{DPresencePenalty, EngineeringObjective, PlacementDag, VdjGrammar};
+use crate::adjudicate::{EngineeringObjective, PlacementDag, PosteriorModel, VdjGrammar};
 use crate::admission::{AnyOf, DistributedEvidence, ExactRunFloor};
 use crate::align::InterSequenceGotoh;
 use crate::germline::{GermlineSet, SegmentKind};
 use crate::index::IndexError;
+use crate::orient::StrandIndex;
 use crate::pipeline::{Assigner, AssignerOptions};
 use crate::refine::{NoRefine, OuterExtend};
 use crate::retrieve::{
-    AmbiguityBudget, LmerMaskRetriever, SeedVoteParams, SeedVoteRetriever, UngappedParams,
-    UngappedPrefilter, MAX_LMER,
+    AmbiguityBudget, ExhaustiveRetriever, LmerMaskRetriever, SeedVoteParams, SeedVoteRetriever,
+    UngappedParams, UngappedPrefilter, MAX_LMER,
 };
 use crate::scoring::{AffineScoring, Score};
 use crate::seed::SeedShape;
-use crate::segment::{HitAcceptance, KeepPolicy, PreparedSegment, SegmentStage};
-use crate::window::{ExpandedResidual, WithAnchorWindow};
+use crate::segment::{
+    EvalueGates, HitAcceptance, KeepPolicy, PreparedSegment, SegmentStage, Significance,
+};
+use crate::stats::KarlinAltschul;
+use crate::window::{DownstreamWindow, ExpandedResidual, WithAnchorWindow};
 
-/// V or J: seeded, banded, vote-ranked, optionally ungapped-pre-ranked.
+/// V: seeded, banded, vote-ranked, optionally ungapped-pre-ranked.
 #[derive(Clone, Debug, PartialEq)]
-pub struct VjSegmentConfig {
+pub struct VSegmentConfig {
     pub scoring: AffineScoring,
     pub primary: SeedShape,
     pub fallback: Option<SeedShape>,
     pub seeds: SeedVoteParams,
     pub budget: AmbiguityBudget,
     /// Ungapped diagonal pre-ranking before banded DP (`None` = off).
-    /// Off by default: it is lossy, and Swig aligns the seed candidates directly.
+    /// Off by default: it is lossy.
     pub ungapped: Option<UngappedParams>,
     pub keep: KeepPolicy,
-    /// Co-linear flank stitched back onto the local alignment before ranking.
-    pub outer: OuterExtend,
     /// Minimum substitution columns and identity of an accepted local hit.
     pub accept: HitAcceptance,
-    /// Softer acceptance used while placing, then discarded when the best V
-    /// identity is above [`crate::refine::JUNCTION_TIE_IDENTITY`]. `None` =
-    /// always use [`Self::accept`]. For J under SHM: retrieve/score soft, keep
-    /// strict gates on clean (high-identity) V reads.
-    pub accept_shm: Option<HitAcceptance>,
-    /// Skip score-only DP for same-gene siblings that cannot enter the top-N
-    /// local scores, using a sound upper bound from the gene's representative.
+    /// E-value gates (`None` = no significance floor and no anchoring).
+    pub evalue: Option<EvalueGates>,
+    /// Skip score-only DP for same-gene siblings that cannot enter the top-N,
+    /// using a sound upper bound from the gene's representative.
     pub family_delta: bool,
-    /// Build substitution profiles with [`crate::scoring::HotspotScoring`]
-    /// (AID hotspot / coldspot mismatch costs). Intended for J under SHM.
-    pub hotspot: bool,
+}
+
+/// J: every allele, unbanded, in the read right of V.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JSegmentConfig {
+    pub scoring: AffineScoring,
+    pub keep: KeepPolicy,
+    pub accept: HitAcceptance,
+    /// E-value gates (`None` = no significance floor and no anchoring).
+    pub evalue: Option<EvalueGates>,
+    pub window: DownstreamWindow,
 }
 
 /// D: L-mer prefilter, unbanded DP inside junction windows, admission gates.
@@ -97,25 +104,107 @@ impl DSegmentConfig {
     }
 }
 
+/// Prior cost of including a D, in score units (see [`EngineeringObjective`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DPrior {
+    /// A fixed cost (0 = D only has to beat the no-D path).
+    Fixed(Score),
+    /// `[ln(N · window) − ln(prior_odds)] / λ`: `N` D genes in the database,
+    /// `window` junction positions, `λ` of the D substitution scores, and the
+    /// prior odds of a D against none. For human IGH (32 genes, 25 positions,
+    /// even odds) this is 11; for TRB (2 D genes) it is 6.
+    Derived { window: u32, prior_odds: f64 },
+}
+
+impl DPrior {
+    pub const DERIVED: Self = Self::Derived {
+        window: 25,
+        prior_odds: 1.0,
+    };
+
+    /// The cost for a D database of `genes` genes scored with `scoring`.
+    /// Falls back to `ln(N · window)` nats per score unit when the tuple has
+    /// no Karlin–Altschul λ (it is then not a log-odds score).
+    pub fn cost(&self, genes: usize, scoring: &AffineScoring) -> Score {
+        match *self {
+            Self::Fixed(cost) => cost,
+            Self::Derived { window, prior_odds } => {
+                let lambda = KarlinAltschul::ungapped(scoring).map_or(1.0, |ka| ka.lambda);
+                let nats = (genes.max(1) as f64 * f64::from(window.max(1))).ln() - prior_odds.ln();
+                (nats / lambda).round().max(0.0) as Score
+            }
+        }
+    }
+}
+
+/// Declarative form of [`EngineeringObjective`]; `d_prior` is resolved
+/// against the D database when the assigner is built.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ObjectiveConfig {
+    pub pair_bonus: Score,
+    pub d_prior: DPrior,
+    pub tandem_d_penalty: Score,
+    pub insertion_per_base: Score,
+}
+
+impl Default for ObjectiveConfig {
+    fn default() -> Self {
+        Self {
+            pair_bonus: 0,
+            d_prior: DPrior::DERIVED,
+            tandem_d_penalty: 12,
+            insertion_per_base: 0,
+        }
+    }
+}
+
+impl ObjectiveConfig {
+    pub fn resolve(
+        &self,
+        d: Option<&GermlineSet>,
+        d_scoring: &AffineScoring,
+    ) -> EngineeringObjective {
+        EngineeringObjective {
+            pair_bonus: self.pair_bonus,
+            d_presence: self
+                .d_prior
+                .cost(d.map_or(1, GermlineSet::gene_count), d_scoring),
+            tandem_d_penalty: self.tandem_d_penalty,
+            insertion_per_base: self.insertion_per_base,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct EngineConfig {
-    pub v: VjSegmentConfig,
+    pub v: VSegmentConfig,
     pub d: DSegmentConfig,
-    pub j: VjSegmentConfig,
+    pub j: JSegmentConfig,
     pub d_window: ExpandedResidual,
     /// Add the conserved-anchor D window when alleles carry `anchor=` positions.
     pub anchor_window: bool,
     pub grammar: VdjGrammar,
-    pub objective: EngineeringObjective,
+    pub objective: ObjectiveConfig,
     /// Minimum retained query bases after clipping, per [`SegmentKind::index`].
     pub min_retained: [u32; 3],
+    /// Report posterior probabilities (forward–backward over the placement
+    /// DAG, priors at the V scoring's λ, alignment evidence at each read's
+    /// divergence): per called segment and for D presence. With posteriors,
+    /// D placements below the objective's floor (`P_D + 1`) are kept, since
+    /// they carry probability; without, they are pruned, which never changes
+    /// the DAG's call.
+    pub posterior: bool,
     pub options: AssignerOptions,
 }
 
-impl VjSegmentConfig {
-    /// Swig R-optimized V: gap-open −9, at least 24 substitution columns, identity ≥ 0.60.
-    /// The vote budget keeps 3 genes and walks up to 16 while votes stay within the AER margin.
-    pub fn v_default() -> Self {
+impl Default for VSegmentConfig {
+    /// Gap-open −9. The vote budget keeps 3 genes and walks up to 16 while
+    /// votes stay within the ambiguity margin; the 3 best alignments that pass
+    /// the E-value gate (and ties) are kept. There is no column or identity
+    /// floor: a positive `(2, −3)` local alignment already has identity above
+    /// 3/5, the E-value gate implies a minimum length, and the note's floors
+    /// (24 columns, 60 %) changed no call (docs/ASSESSMENT.md §5).
+    fn default() -> Self {
         Self {
             scoring: AffineScoring::new(2, -3, -9, -1),
             primary: SeedShape::contiguous(9),
@@ -123,67 +212,31 @@ impl VjSegmentConfig {
             seeds: SeedVoteParams::default(),
             budget: AmbiguityBudget::default(),
             ungapped: None,
-            // Score-screen to Swig's top_v of 3. Traceback stops once three
-            // alignments pass acceptance, including the tie group at that score.
             keep: KeepPolicy {
                 top: 3,
-                slack: 0,
                 min_score: 1,
                 cap: 64,
-                prescore_above: 4,
-                screen: true,
             },
-            outer: OuterExtend::Prefix,
-            accept: HitAcceptance {
-                min_subst: 24,
-                min_identity: 0.60,
-            },
-            accept_shm: None,
+            accept: HitAcceptance::PERMISSIVE,
+            evalue: Some(EvalueGates::default()),
             family_delta: true,
-            hotspot: false,
         }
     }
+}
 
-    /// J: `(2, −3, −17, −2)`. Primary is a 5-mer (not 7): the locus is ~50 bp
-    /// with few alleles, and under SHM a 7-mer primary can lock onto decoys and
-    /// skip the short-seed fallback. No shorter fallback — 4-mers are too shared
-    /// across the tiny J set and drown the true allele. V keeps longer seeds.
-    /// Profiles use SHM hotspot mismatch costs so the true J can win under
-    /// heavy mutation when decoys disagree on cold/neutral positions.
-    /// Clean reads keep Swig-like acceptance; high-SHM V reads keep the soft gate.
-    pub fn j_default() -> Self {
+impl Default for JSegmentConfig {
+    /// `(2, −3, −17, −2)`; hits gated by E-value only, as for V.
+    fn default() -> Self {
         Self {
             scoring: AffineScoring::new(2, -3, -17, -2),
-            primary: SeedShape::contiguous(5),
-            fallback: None,
-            seeds: SeedVoteParams::default(),
-            budget: AmbiguityBudget {
-                base: 3,
-                max: 5,
-                ..AmbiguityBudget::default()
-            },
-            ungapped: None,
-            // Score-screen a few more J candidates under SHM ambiguity.
             keep: KeepPolicy {
                 top: 3,
-                slack: 0,
                 min_score: 1,
                 cap: 64,
-                prescore_above: 3,
-                screen: true,
             },
-            outer: OuterExtend::Suffix,
-            accept: HitAcceptance {
-                min_subst: 10,
-                min_identity: 0.60,
-            },
-            accept_shm: Some(HitAcceptance {
-                min_subst: 8,
-                min_identity: 0.50,
-            }),
-            // J genes rarely have enough alleles for the bound to pay off.
-            family_delta: false,
-            hotspot: true,
+            accept: HitAcceptance::PERMISSIVE,
+            evalue: Some(EvalueGates::default()),
+            window: DownstreamWindow::default(),
         }
     }
 }
@@ -193,16 +246,16 @@ impl Default for DSegmentConfig {
         Self {
             scoring: AffineScoring::new(2, -3, -13, -1),
             lmer: None,
+            // Every admissible D hit (up to 32) reaches adjudication.
             keep: KeepPolicy {
-                top: 16,
-                slack: Score::MAX / 4,
+                top: 32,
                 min_score: 0,
                 cap: 32,
-                prescore_above: 0,
-                screen: false,
             },
             min_exact_run: 4,
-            distributed: Some(crate::admission::DistributedEvidence::default()),
+            // The note's distributed-D gate admits nothing the exact run and
+            // the objective's D floor do not (docs/ASSESSMENT.md §5).
+            distributed: None,
         }
     }
 }
@@ -210,29 +263,17 @@ impl Default for DSegmentConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            v: VjSegmentConfig::v_default(),
+            v: VSegmentConfig::default(),
             d: DSegmentConfig::default(),
-            j: VjSegmentConfig::j_default(),
+            j: JSegmentConfig::default(),
             d_window: ExpandedResidual::default(),
             anchor_window: true,
             grammar: VdjGrammar::VDJ,
-            objective: EngineeringObjective {
-                pair_bonus: 24,
-                d_presence: DPresencePenalty::R_OPTIMIZED,
-                tandem_d_penalty: 12,
-                insertion_per_base: 0,
-                d_short_run_penalty: 1,
-                d_short_run_floor: 6,
-                d_long_span_soft_max: 0,
-                d_long_span_penalty: 0,
-            },
-            // Swig: V ≥ 24 aligned bases, J ≥ 10, D ≥ min_d_match. Query bases
-            // retained after a clip use the same floors.
-            min_retained: [24, 4, 10],
-            options: AssignerOptions {
-                junction_tie: true,
-                ..AssignerOptions::default()
-            },
+            objective: ObjectiveConfig::default(),
+            // A clipped V or J keeps at least one base, a D `min_d_match`.
+            min_retained: [1, 4, 1],
+            posterior: true,
+            options: AssignerOptions::default(),
         }
     }
 }
@@ -289,13 +330,13 @@ fn check(set: &GermlineSet, expected: SegmentKind) -> Result<(), BuildError> {
     Ok(())
 }
 
-/// Retriever of the default V and J stages.
-pub type DefaultVjRetriever = UngappedPrefilter<SeedVoteRetriever>;
+/// Retriever of the default V stage.
+pub type DefaultVRetriever = UngappedPrefilter<SeedVoteRetriever>;
 
-fn vj_stage(
+fn v_stage(
     set: GermlineSet,
-    config: &VjSegmentConfig,
-) -> Result<SegmentStage<DefaultVjRetriever>, BuildError> {
+    config: &VSegmentConfig,
+) -> Result<SegmentStage<DefaultVRetriever>, BuildError> {
     let kind = set.kind();
     let seeds = SeedVoteRetriever::build(
         &set,
@@ -305,46 +346,57 @@ fn vj_stage(
         config.budget,
     )
     .map_err(|source| BuildError::Index { kind, source })?;
-    let segment = Arc::new(if config.hotspot {
-        PreparedSegment::new(
-            set,
-            &crate::scoring::HotspotScoring::for_shm(config.scoring),
-            config.scoring.gaps,
-        )
-    } else {
-        PreparedSegment::new(set, &config.scoring, config.scoring.gaps)
-    });
+    let significance = config
+        .evalue
+        .and_then(|gates| Significance::new(&set, &config.scoring, gates));
+    let segment = Arc::new(PreparedSegment::new(
+        set,
+        &config.scoring,
+        config.scoring.gaps,
+    ));
     let retriever = UngappedPrefilter::new(seeds, Arc::clone(&segment), config.ungapped);
     let family_delta = config
         .family_delta
         .then(|| crate::family_bound::FamilyBoundTable::build(segment.set()));
     let mut stage = SegmentStage::new(segment, retriever, config.keep);
-    // Place with the soft SHM gate when configured; clean-V filtering restores
-    // `accept` after placement (see pipeline).
-    stage.accept = config.accept_shm.unwrap_or(config.accept);
-    stage.accept_clean = config.accept_shm.map(|_| config.accept);
-    stage.outer = config.outer;
+    stage.accept = config.accept;
+    stage.significance = significance;
+    stage.outer = OuterExtend::Prefix;
     stage.family_delta = family_delta;
     Ok(stage)
 }
 
-fn d_stage(set: GermlineSet, config: &DSegmentConfig) -> SegmentStage<LmerMaskRetriever> {
+fn j_stage(set: GermlineSet, config: &JSegmentConfig) -> SegmentStage<ExhaustiveRetriever> {
+    let retriever = ExhaustiveRetriever { alleles: set.len() };
+    let significance = config
+        .evalue
+        .and_then(|gates| Significance::new(&set, &config.scoring, gates));
+    let segment = PreparedSegment::new(set, &config.scoring, config.scoring.gaps);
+    let mut stage = SegmentStage::new(Arc::new(segment), retriever, config.keep);
+    stage.accept = config.accept;
+    stage.significance = significance;
+    stage.outer = OuterExtend::Suffix;
+    stage
+}
+
+fn d_stage(
+    set: GermlineSet,
+    config: &DSegmentConfig,
+    objective: &EngineeringObjective,
+    posterior: bool,
+) -> SegmentStage<LmerMaskRetriever> {
     let lmer = config.lmer.unwrap_or_else(|| config.lossless_lmer());
     let retriever = LmerMaskRetriever::build(&set, lmer, 1);
     let segment = PreparedSegment::new(set, &config.scoring, config.scoring.gaps);
-    let floor = config.lossless_min_score();
-    // A shared L-mer is an exact run of L, so every retrieved candidate already
-    // scores ≥ L·m. When that meets the floor, the score-only pre-pass can only
-    // prune through `top`, so it runs only above `top` candidates.
-    let floor_implied = lmer as Score * config.scoring.matched >= floor;
-    let prescore_above = if floor_implied {
-        config.keep.prescore_above.max(config.keep.top)
-    } else {
-        config.keep.prescore_above
-    };
     let keep = KeepPolicy {
-        min_score: floor,
-        prescore_above,
+        // The objective's D floor prunes only what cannot win the Viterbi
+        // call; a D below it still carries posterior mass, so posteriors keep
+        // every admissible D.
+        min_score: if posterior {
+            config.lossless_min_score()
+        } else {
+            config.lossless_min_score().max(objective.d_floor())
+        },
         ..config.keep
     };
     let mut stage = SegmentStage::new(Arc::new(segment), retriever, keep);
@@ -356,8 +408,8 @@ fn d_stage(set: GermlineSet, config: &DSegmentConfig) -> SegmentStage<LmerMaskRe
 }
 
 /// The default engine: batched banded Gotoh (AVX2 inter-sequence kernel when
-/// available), seed-vote + ungapped V/J retrieval,
-/// L-mer D prefilter, expanded residual + anchor D windows,
+/// available), k-mer orientation, seed-vote V retrieval, exhaustive J right
+/// of V, L-mer D prefilter, expanded residual + anchor D windows,
 /// exact-run-or-distributed admission, placement DAG.
 pub type DefaultAssigner = Assigner;
 
@@ -386,10 +438,30 @@ impl Assigner {
                 ..config.grammar
             }
         };
+        let strand = StrandIndex::build([&v, &j], StrandIndex::K);
+        let objective = config.objective.resolve(d.as_ref(), &config.d.scoring);
+        let mut adjudicator = PlacementDag::new(grammar, objective, config.min_retained);
+        if config.posterior {
+            if let Some(ka) = KarlinAltschul::ungapped(&config.v.scoring) {
+                let substitution = |s: &AffineScoring| (s.matched, s.mismatch);
+                adjudicator = adjudicator.with_posterior(PosteriorModel {
+                    lambda: ka.lambda,
+                    substitution: [
+                        substitution(&config.v.scoring),
+                        substitution(&config.d.scoring),
+                        substitution(&config.j.scoring),
+                    ],
+                });
+            }
+        }
         Ok(Assigner {
-            v: vj_stage(v, &config.v)?,
-            j: vj_stage(j, &config.j)?,
-            d: d.map(|set| d_stage(set, &config.d)),
+            v: v_stage(v, &config.v)?,
+            j: j_stage(j, &config.j),
+            // Only an adjudicator that computes posteriors needs the Ds below
+            // the objective's floor.
+            d: d.map(|set| d_stage(set, &config.d, &objective, adjudicator.posterior.is_some())),
+            strand,
+            j_window: config.j.window,
             aligner: InterSequenceGotoh::new(),
             d_window,
             d_admission: AnyOf(
@@ -398,7 +470,7 @@ impl Assigner {
                 },
                 config.d.distributed,
             ),
-            adjudicator: PlacementDag::new(grammar, config.objective, config.min_retained),
+            adjudicator,
             refiner: NoRefine,
             options: config.options,
         })
@@ -408,6 +480,19 @@ impl Assigner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn d_prior_scales_with_the_d_database() {
+        let scoring = AffineScoring::new(2, -3, -13, -1);
+        assert_eq!(DPrior::DERIVED.cost(32, &scoring), 11); // human IGH
+        assert_eq!(DPrior::DERIVED.cost(2, &scoring), 6); // TRB
+        assert_eq!(DPrior::Fixed(0).cost(32, &scoring), 0);
+        let more_likely = DPrior::Derived {
+            window: 25,
+            prior_odds: 4.0,
+        };
+        assert_eq!(more_likely.cost(32, &scoring), 8);
+    }
 
     #[test]
     fn derived_d_settings_are_lossless_bounds() {

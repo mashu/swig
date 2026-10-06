@@ -193,6 +193,46 @@ fn pseudogene_anchor_is_transferred_from_its_closest_sibling() {
     assert!(annotation.notes.iter().any(|n| n.contains("conserved residue is S")));
 }
 
+/// A 3′-partial allele (IMGT "partial in 3′") ends inside its Cys104 codon.
+/// Its closest sibling places the anchor past the end, so it gets no anchor,
+/// even when an out-of-frame TGT near the end looks like a weak Cys104.
+#[test]
+fn three_prime_partial_allele_gets_no_anchor() {
+    let mut rng = Rng(5);
+    let (mut v, truth, mut j, _) = database(ChainType::Heavy, 40, &mut rng);
+    let anchor = truth[0].anchor as usize;
+    let mut partial = truth[0].sequence[..anchor + 2].to_vec();
+    let decoy = anchor - 31;
+    partial[decoy..decoy + 3].copy_from_slice(b"TGT");
+    v.push("V0*02", &partial, None).unwrap();
+    let report = annotate(&mut v, Some(&mut j), AnnotateOptions::default());
+    let allele = v.alleles().last().unwrap();
+    assert_eq!(allele.anchor, None);
+    // Region starts inside the allele still come from the sibling.
+    assert_eq!(allele.regions.values(), truth[0].starts.map(Some));
+    let annotation = report.v.last().unwrap();
+    assert_eq!(annotation.source, AnchorSource::Missing);
+    assert!(annotation.notes.iter().any(|n| n.contains("past the 3′ end")), "{:?}", annotation.notes);
+}
+
+/// An allele that keeps its Cys104 but lost 21 bases just before it: the
+/// sibling alignment stops at the deletion, so the extrapolated anchor lands
+/// past the end. That is not evidence of a 3′-partial allele.
+#[test]
+fn a_deletion_before_cys104_is_not_a_partial_allele() {
+    let mut rng = Rng(6);
+    let (mut v, truth, mut j, _) = database(ChainType::Heavy, 40, &mut rng);
+    let anchor = truth[0].anchor as usize;
+    let mut deleted = truth[0].sequence[..anchor - 21].to_vec();
+    deleted.extend_from_slice(&truth[0].sequence[anchor..]);
+    v.push("V0*02", &deleted, None).unwrap();
+    let report = annotate(&mut v, Some(&mut j), AnnotateOptions::default());
+    let annotation = report.v.last().unwrap();
+    assert!(!annotation.notes.iter().any(|n| n.contains("3′-partial")), "{annotation:?}");
+    let allele = v.alleles().last().unwrap();
+    assert_eq!(allele.anchor, Some(truth[0].anchor - 21), "{annotation:?}");
+}
+
 #[test]
 fn header_values_are_never_overridden() {
     let mut rng = Rng(4);

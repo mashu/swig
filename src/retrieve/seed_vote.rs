@@ -1,16 +1,27 @@
-//! Seed voting with diagonal clustering (V and J retrieval).
+//! Seed voting with diagonal clustering (V retrieval).
 //!
 //! Every query seed that hits allele `a` at germline position `p` from query
 //! position `i` votes for the diagonal `d = i − p` of `a`. Correct alleles
-//! collect many votes on (nearly) one diagonal; the cluster's diagonal range
-//! becomes the DP band.
+//! collect many votes on (nearly) one diagonal; the cluster's diagonal range,
+//! widened by `band_pad`, becomes the DP band.
 //!
-//! **Trick — sort-and-scan voting with packed keys.** Instead of a hash map
+//! **Gene frames.** Seeds are indexed per gene frame ([`GeneFrames`]), not
+//! per allele, so a seed shared by a gene's alleles is one posting and one
+//! vote. Retrieval ranks genes; every allele of a kept gene becomes a
+//! candidate, with the frame's band shifted by the allele's offset.
+//!
+//! **Trick — radix-sorted packed votes.** Instead of a hash map
 //! `allele → diagonal → votes`, each vote is one `u64`
-//! `allele << 40 | (d + 2³¹) << 8 | weight`; the batch is sorted once
-//! (`sort_unstable` on integers, cache-friendly and branch-light) and a single
-//! linear scan groups votes by allele and by adjacent diagonal bins. No
-//! allocation per query once the scratch vector has grown.
+//! `(frame · 2^b + d + max_len) << 8 | weight`, with `b` just wide enough
+//! for the diagonals of this query. The sort key is therefore ~21 bits for an
+//! IGH-sized database, and two LSD radix passes of 11 bits order the votes
+//! by frame and diagonal in linear time; a single scan then groups them into
+//! diagonal clusters. No allocation per query once the scratch has grown.
+//!
+//! **One vote per seed and frame.** A seed occurring twice in one gene frame
+//! cannot tell which diagonal it supports, so it does not vote for that
+//! gene. Without this rule a period-3 repeat (IGHV3-48's `AGTAGTAGT`)
+//! collects votes quadratic in its length.
 //!
 //! **Trick — frequency cutoff.** Seeds with more than `max_occurrences`
 //! postings (low-complexity or family-wide k-mers) carry little information
@@ -20,11 +31,12 @@
 //! primary cluster is weak are fallback (shorter) seeds added with weight 1.
 
 use super::budget::AmbiguityBudget;
-use super::{AlleleVote, Candidate, CandidateBudget, RetrievalScratch, Retriever};
+use super::frames::GeneFrames;
+use super::{Candidate, CandidateBudget, ClusterVote, RetrievalScratch, Retriever};
 use crate::band::Band;
 use crate::germline::{GeneId, GermlineSet};
 use crate::index::{IndexError, KmerIndex};
-use crate::seed::SeedShape;
+use crate::seed::{SeedSampling, SeedShape};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SeedVoteParams {
@@ -38,16 +50,19 @@ pub struct SeedVoteParams {
     pub bin_width: i32,
     /// Empty bins tolerated inside one cluster.
     pub cluster_gap_bins: i32,
-    /// Band half-width = clamp(cluster span + pad, min, max).
+    /// The band is the cluster's diagonal range widened by `band_pad` on each
+    /// side, at most `2 · band_max + 1` diagonals wide.
     pub band_pad: i32,
-    pub band_min: i32,
     pub band_max: i32,
     /// Ignore seed geometry and align unbanded (`w < 0` in the note).
     pub unbanded: bool,
     /// Minimum weighted votes for an allele to be a candidate.
     pub min_votes: u32,
-    /// Safety pool: never return more alleles than this.
+    /// Safety pool: never return more alleles than this (all alleles of the
+    /// best genes first).
     pub max_alleles: usize,
+    /// Which k-mers are seeds, in the index and in the query alike.
+    pub sampling: SeedSampling,
 }
 
 impl Default for SeedVoteParams {
@@ -60,35 +75,95 @@ impl Default for SeedVoteParams {
             bin_width: 4,
             cluster_gap_bins: 1,
             band_pad: 8,
-            band_min: 28,
             band_max: 256,
             unbanded: false,
             min_votes: 1,
             max_alleles: 64,
+            // Closed syncmers: as sensitive as every k-mer on IgSim reads up
+            // to 30 % SHM and on reads covering 30–80 V bases, with 60 %
+            // fewer votes to sort (docs/ASSESSMENT.md §8).
+            sampling: SeedSampling::ClosedSyncmer { w: 4 },
         }
     }
 }
 
-const DIAGONAL_BIAS: i64 = 1 << 31;
-
-#[inline]
-fn pack(allele: u32, diagonal: i64, weight: u8) -> u64 {
-    (u64::from(allele) << 40)
-        | ((((diagonal + DIAGONAL_BIAS) as u64) & 0xFFFF_FFFF) << 8)
-        | u64::from(weight)
+/// Bit layout of a packed vote for one query (see the module documentation).
+#[derive(Clone, Copy, Debug)]
+struct VoteLayout {
+    /// Added to a diagonal so it is non-negative (the longest allele).
+    bias: i64,
+    /// Bits of the biased diagonal.
+    diagonal_bits: u32,
 }
 
-#[inline]
-fn unpack(key: u64) -> (u32, i32, u32) {
-    let allele = (key >> 40) as u32;
-    let diagonal = (((key >> 8) & 0xFFFF_FFFF) as i64 - DIAGONAL_BIAS) as i32;
-    (allele, diagonal, (key & 0xFF) as u32)
+impl VoteLayout {
+    const WEIGHT_BITS: u32 = 8;
+
+    fn new(query_len: usize, max_allele_len: usize) -> Self {
+        let span = (query_len + max_allele_len + 1) as u64;
+        Self {
+            bias: max_allele_len as i64,
+            diagonal_bits: 64 - span.leading_zeros(),
+        }
+    }
+
+    #[inline]
+    fn pack(&self, allele: u32, diagonal: i64, weight: u8) -> u64 {
+        let field = (u64::from(allele) << self.diagonal_bits) | (diagonal + self.bias) as u64;
+        (field << Self::WEIGHT_BITS) | u64::from(weight)
+    }
+
+    #[inline]
+    fn unpack(&self, key: u64) -> (u32, i32, u32) {
+        let field = key >> Self::WEIGHT_BITS;
+        let allele = (field >> self.diagonal_bits) as u32;
+        let diagonal = (field & ((1 << self.diagonal_bits) - 1)) as i64 - self.bias;
+        (allele, diagonal as i32, (key & 0xFF) as u32)
+    }
+
+    /// Sort-key bits above the weight.
+    fn key_bits(&self, alleles: usize) -> u32 {
+        self.diagonal_bits + (64 - (alleles as u64).leading_zeros())
+    }
+}
+
+/// Stable LSD radix sort of `keys` on bits `shift .. shift + bits`.
+fn radix_sort(keys: &mut Vec<u64>, buffer: &mut Vec<u64>, shift: u32, bits: u32) {
+    const DIGIT: u32 = 11;
+    if keys.len() < 512 {
+        keys.sort_unstable_by_key(|&k| (k >> shift) & ((1 << bits) - 1));
+        return;
+    }
+    let mut counts = [0u32; 1 << DIGIT];
+    buffer.clear();
+    buffer.resize(keys.len(), 0);
+    let mut low = shift;
+    while low < shift + bits {
+        let width = DIGIT.min(shift + bits - low);
+        let mask = (1u64 << width) - 1;
+        let counts = &mut counts[..1 << width];
+        counts.fill(0);
+        for &key in keys.iter() {
+            counts[((key >> low) & mask) as usize] += 1;
+        }
+        let mut sum = 0;
+        for count in counts.iter_mut() {
+            (*count, sum) = (sum, sum + *count);
+        }
+        for &key in keys.iter() {
+            let digit = ((key >> low) & mask) as usize;
+            buffer[counts[digit] as usize] = key;
+            counts[digit] += 1;
+        }
+        std::mem::swap(keys, buffer);
+        low += width;
+    }
 }
 
 pub struct SeedVoteRetriever<B = AmbiguityBudget> {
     primary: KmerIndex,
     fallback: Option<KmerIndex>,
-    allele_gene: Vec<GeneId>,
+    frames: GeneFrames,
     gene_count: usize,
     params: SeedVoteParams,
     budget: B,
@@ -102,12 +177,15 @@ impl<B: CandidateBudget> SeedVoteRetriever<B> {
         params: SeedVoteParams,
         budget: B,
     ) -> Result<Self, IndexError> {
+        let frames = GeneFrames::build(set, &primary);
         Ok(Self {
-            primary: KmerIndex::build(set, primary)?,
+            primary: KmerIndex::build_sampled(frames.sequences(set), primary, params.sampling)?,
             fallback: fallback
-                .map(|shape| KmerIndex::build(set, shape))
+                .map(|shape| {
+                    KmerIndex::build_sampled(frames.sequences(set), shape, params.sampling)
+                })
                 .transpose()?,
-            allele_gene: set.alleles().iter().map(|a| a.gene).collect(),
+            frames,
             gene_count: set.gene_count(),
             params,
             budget,
@@ -118,46 +196,76 @@ impl<B: CandidateBudget> SeedVoteRetriever<B> {
         &self.params
     }
 
-    fn cast_votes(&self, index: &KmerIndex, weight: u8, query: &[u8], keys: &mut Vec<u64>) {
-        for (qpos, key) in index.shape().kmers(query) {
+    #[allow(clippy::too_many_arguments)]
+    fn cast_votes(
+        &self,
+        index: &KmerIndex,
+        weight: u8,
+        query: &[u8],
+        layout: &VoteLayout,
+        keys: &mut Vec<u64>,
+        seeds: &mut Vec<(usize, u64)>,
+        ranks: &mut Vec<u64>,
+    ) {
+        let mut vote = |qpos: usize, key: u64| {
             let postings = index.postings(key);
             if postings.len() > self.params.max_occurrences {
-                continue;
+                return;
             }
-            keys.extend(
-                postings
-                    .iter()
-                    .map(|p| pack(p.allele(), qpos as i64 - i64::from(p.position()), weight)),
-            );
+            // Postings are sorted by frame: a repeat within one frame is a run.
+            for (i, p) in postings.iter().enumerate() {
+                let repeated = (i > 0 && postings[i - 1].id() == p.id())
+                    || postings.get(i + 1).is_some_and(|n| n.id() == p.id());
+                if !repeated {
+                    keys.push(layout.pack(p.id(), qpos as i64 - i64::from(p.position()), weight));
+                }
+            }
+        };
+        match self.params.sampling {
+            SeedSampling::All => index
+                .shape()
+                .kmers(query)
+                .for_each(|(qpos, key)| vote(qpos, key)),
+            sampling => {
+                sampling.seeds(index.shape(), query, seeds, ranks);
+                seeds.iter().for_each(|&(qpos, key)| vote(qpos, key));
+            }
         }
     }
 
-    /// Sort votes and keep each allele's best diagonal cluster. Returns the best cluster's votes.
-    fn cluster(&self, keys: &mut [u64], out: &mut Vec<AlleleVote>) -> u32 {
-        keys.sort_unstable();
+    /// Sort votes and keep each frame's best diagonal cluster. Returns the best cluster's votes.
+    fn cluster(
+        &self,
+        layout: &VoteLayout,
+        keys: &mut Vec<u64>,
+        buffer: &mut Vec<u64>,
+        out: &mut Vec<ClusterVote>,
+    ) -> u32 {
+        let bits = layout.key_bits(self.frames.len());
+        radix_sort(keys, buffer, VoteLayout::WEIGHT_BITS, bits);
         out.clear();
         let bin = |d: i32| d.div_euclid(self.params.bin_width);
         let max_step = 1 + self.params.cluster_gap_bins;
         let mut strongest = 0;
         let mut i = 0;
         while i < keys.len() {
-            let (allele, d0, w0) = unpack(keys[i]);
-            let mut best = AlleleVote {
-                allele,
+            let (target, d0, w0) = layout.unpack(keys[i]);
+            let mut best = ClusterVote {
+                target,
                 votes: 0,
                 d_lo: d0,
                 d_hi: d0,
             };
-            let mut current = AlleleVote {
-                allele,
+            let mut current = ClusterVote {
+                target,
                 votes: w0,
                 d_lo: d0,
                 d_hi: d0,
             };
             i += 1;
             while i < keys.len() {
-                let (a, d, w) = unpack(keys[i]);
-                if a != allele {
+                let (a, d, w) = layout.unpack(keys[i]);
+                if a != target {
                     break;
                 }
                 if bin(d) - bin(current.d_hi) <= max_step {
@@ -167,8 +275,8 @@ impl<B: CandidateBudget> SeedVoteRetriever<B> {
                     if current.votes > best.votes {
                         best = current;
                     }
-                    current = AlleleVote {
-                        allele,
+                    current = ClusterVote {
+                        target,
                         votes: w,
                         d_lo: d,
                         d_hi: d,
@@ -185,14 +293,22 @@ impl<B: CandidateBudget> SeedVoteRetriever<B> {
         strongest
     }
 
-    fn band_for(&self, vote: &AlleleVote) -> Band {
+    /// Band of `allele` from its frame's cluster: allele diagonals are frame
+    /// diagonals plus the allele's offset in the frame.
+    fn band_for(&self, vote: &ClusterVote, allele: u32) -> Band {
         if self.params.unbanded {
             return Band::Full;
         }
-        let center = (vote.d_lo + vote.d_hi).div_euclid(2);
-        let half = (vote.d_hi - vote.d_lo + self.params.band_pad)
-            .clamp(self.params.band_min, self.params.band_max);
-        Band::around(center, half)
+        let shift = self.frames.offset(allele) as i32;
+        let (lo, hi) = (
+            vote.d_lo + shift - self.params.band_pad,
+            vote.d_hi + shift + self.params.band_pad,
+        );
+        if hi - lo > 2 * self.params.band_max {
+            Band::around((lo + hi).div_euclid(2), self.params.band_max)
+        } else {
+            Band::Diagonals { lo, hi }
+        }
     }
 }
 
@@ -201,28 +317,48 @@ impl<B: CandidateBudget> Retriever for SeedVoteRetriever<B> {
         out.clear();
         let RetrievalScratch {
             keys,
+            buffer,
             votes,
             gene_votes,
             gene_order,
             ranked,
+            seeds,
+            ranks,
             ..
         } = scratch;
         keys.clear();
-        self.cast_votes(&self.primary, self.params.primary_weight, query, keys);
-        let mut strongest = self.cluster(keys, votes);
+        let layout = VoteLayout::new(query.len(), self.frames.max_len());
+        self.cast_votes(
+            &self.primary,
+            self.params.primary_weight,
+            query,
+            &layout,
+            keys,
+            seeds,
+            ranks,
+        );
+        let mut strongest = self.cluster(&layout, keys, buffer, votes);
         if let (true, Some(fallback)) = (strongest < self.params.weak_votes, &self.fallback) {
-            self.cast_votes(fallback, self.params.fallback_weight, query, keys);
-            strongest = self.cluster(keys, votes);
+            self.cast_votes(
+                fallback,
+                self.params.fallback_weight,
+                query,
+                &layout,
+                keys,
+                seeds,
+                ranks,
+            );
+            strongest = self.cluster(&layout, keys, buffer, votes);
         }
         if strongest < self.params.min_votes {
             return;
         }
 
-        // Collapse per gene (best allele's votes), rank genes, apply the budget.
+        // Collapse per gene (best frame's votes), rank genes, apply the budget.
         gene_votes.clear();
         gene_votes.resize(self.gene_count, 0);
         for v in votes.iter() {
-            let g = self.allele_gene[v.allele as usize] as usize;
+            let g = self.frames.gene(v.target) as usize;
             gene_votes[g] = gene_votes[g].max(v.votes);
         }
         gene_order.clear();
@@ -243,17 +379,24 @@ impl<B: CandidateBudget> Retriever for SeedVoteRetriever<B> {
             gene_votes[g as usize] = KEPT;
         }
 
+        // Every allele of a kept frame, strongest frames first.
         votes.retain(|v| {
             v.votes >= self.params.min_votes
-                && gene_votes[self.allele_gene[v.allele as usize] as usize] == KEPT
+                && gene_votes[self.frames.gene(v.target) as usize] == KEPT
         });
-        votes.sort_by(|a, b| b.votes.cmp(&a.votes).then(a.allele.cmp(&b.allele)));
-        votes.truncate(self.params.max_alleles);
-        out.extend(votes.iter().map(|v| Candidate {
-            allele: v.allele,
-            band: self.band_for(v),
-            votes: v.votes,
-        }));
+        votes.sort_by(|a, b| b.votes.cmp(&a.votes).then(a.target.cmp(&b.target)));
+        for vote in votes.iter() {
+            for &allele in self.frames.members(vote.target) {
+                if out.len() == self.params.max_alleles {
+                    return;
+                }
+                out.push(Candidate {
+                    allele,
+                    band: self.band_for(vote, allele),
+                    votes: vote.votes,
+                });
+            }
+        }
     }
 }
 
@@ -265,11 +408,34 @@ mod tests {
 
     #[test]
     fn packing_round_trips_negative_diagonals() {
-        for &(a, d, w) in &[(0u32, -300i64, 4u8), (12345, 0, 1), (1 << 19, 4000, 255)] {
-            let (a2, d2, w2) = unpack(pack(a, d, w));
+        let layout = VoteLayout::new(600, 400);
+        for &(a, d, w) in &[(0u32, -400i64, 4u8), (12345, 0, 1), (1 << 19, 600, 255)] {
+            let (a2, d2, w2) = layout.unpack(layout.pack(a, d, w));
             assert_eq!((a2, i64::from(d2), w2), (a, d, u32::from(w)));
         }
-        assert!(pack(1, -5, 1) < pack(1, 3, 1) && pack(1, 3, 1) < pack(2, -100, 1));
+        let key = |a, d| layout.pack(a, d, 1);
+        assert!(key(1, -5) < key(1, 3) && key(1, 3) < key(2, -100));
+    }
+
+    #[test]
+    fn radix_sort_orders_by_the_key_bits_only() {
+        let mut state = 7u64;
+        let mut keys: Vec<u64> = (0..5000)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                state >> 20
+            })
+            .collect();
+        let mut expected = keys.clone();
+        expected.sort_by_key(|&k| (k >> 8) & ((1 << 30) - 1));
+        radix_sort(&mut keys, &mut Vec::new(), 8, 30);
+        let field = |k: &u64| (k >> 8) & ((1 << 30) - 1);
+        assert_eq!(
+            keys.iter().map(field).collect::<Vec<_>>(),
+            expected.iter().map(field).collect::<Vec<_>>()
+        );
     }
 
     #[test]

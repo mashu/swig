@@ -69,9 +69,14 @@ pub struct ExpandedResidual {
 }
 
 impl Default for ExpandedResidual {
+    /// A V or J alignment reaches into the junction only through chance
+    /// matches, a few bases; 12 covers that with margin. A wider window
+    /// hurts as well as costs: a D alignment free to stretch into a V or J
+    /// tail can trade its junction core for chance matches that the cut
+    /// then removes.
     fn default() -> Self {
         Self {
-            reclaim: 24,
+            reclaim: 12,
             min_width: 4,
         }
     }
@@ -151,6 +156,37 @@ impl<P: DWindowPolicy> DWindowPolicy for WithAnchorWindow<P> {
         if start < end {
             out.push(start..end);
         }
+    }
+}
+
+/// Where J is searched: right of V, reaching `reclaim` bases back into it.
+///
+/// J follows V on every path, and a J alignment can only reach into V by
+/// chance matches at the junction edge, which [`ExpandedResidual`] bounds by
+/// the same margin. The window starts `reclaim` bases before the earliest V
+/// end, so it contains every J that a path through any V placement can use
+/// up to that overlap. Without V placements the whole read is searched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DownstreamWindow {
+    pub reclaim: u32,
+}
+
+impl Default for DownstreamWindow {
+    fn default() -> Self {
+        Self {
+            reclaim: ExpandedResidual::default().reclaim,
+        }
+    }
+}
+
+impl DownstreamWindow {
+    pub fn window(&self, query_len: usize, upstream: &[Placement]) -> Range<usize> {
+        let start = upstream
+            .iter()
+            .map(|p| p.q_end().saturating_sub(self.reclaim) as usize)
+            .min()
+            .unwrap_or(0);
+        start.min(query_len)..query_len
     }
 }
 

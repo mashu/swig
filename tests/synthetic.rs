@@ -244,7 +244,8 @@ fn tandem_d_is_a_first_class_path() {
 #[test]
 fn residual_adjudicator_is_a_drop_in_replacement() {
     let db = Db::new();
-    let residual = db.assigner(&EngineConfig::default()).with_adjudicator(ResidualAdjudicator::default());
+    let config = EngineConfig { posterior: false, ..EngineConfig::default() };
+    let residual = db.assigner(&config).with_adjudicator(ResidualAdjudicator::default());
     let mut rng = Rng(11);
     for _ in 0..20 {
         let d = rng.below(8);
@@ -297,13 +298,22 @@ fn batch_matches_sequential() {
 }
 
 // ---------------------------------------------------------------------------
-// Brute-force check of the DAG's prefix-maximum shortcut.
+// Brute-force check of the DAG's running-maximum shortcuts.
 // ---------------------------------------------------------------------------
 
+/// Exhaustive search of the segmentation model: every grammatical path, and
+/// for every transition every canonical exit cut `x` and every canonical
+/// entry cut `y ≥ x` of the next placement, with no shortcut. Memoised on
+/// `(placement, entry, D count, first)`.
 struct Brute<'a> {
     dag: &'a PlacementDag,
     placements: &'a [Placement],
-    best: Option<PathScore>,
+    memo: std::collections::HashMap<(usize, u32, u8, SegmentKind), Option<PathScore>>,
+}
+
+/// Canonical entry and exit cuts of a placement (one per Match column).
+fn cuts(p: &Placement) -> (Vec<u32>, Vec<u32>) {
+    p.clip.matches().map(|(q, ..)| (q, q + 1)).unzip()
 }
 
 impl Brute<'_> {
@@ -311,40 +321,112 @@ impl Brute<'_> {
         self.dag.min_retained[kind.index()].max(1)
     }
 
-    fn visit(&mut self, b: usize, entry: u32, acc: i32, d_used: u8, first: SegmentKind) {
+    /// Best rest of a path whose current segment is `b`, entered at `entry`.
+    fn best_from(&mut self, b: usize, entry: u32, d_used: u8, first: SegmentKind) -> Option<PathScore> {
+        let key = (b, entry, d_used, first);
+        if let Some(known) = self.memo.get(&key) {
+            return *known;
+        }
         let (grammar, model) = (&self.dag.grammar, &self.dag.model);
         let pb = &self.placements[b];
         let bonus = model.segment_bonus(pb, d_used);
+        let mut best: Option<PathScore> = None;
+        let mut consider = |candidate: PathScore| {
+            if best.map_or(true, |current| candidate > current) {
+                best = Some(candidate);
+            }
+        };
         if grammar.can_end(first, pb.kind) {
             if let Some(span) = pb.clip.span(entry, pb.q_end()).filter(|s| s.q_len() >= self.min(pb.kind)) {
-                let total = acc + span.score + bonus + model.end(first, pb.kind, d_used);
-                let candidate = PathScore { score: total, d_count: d_used };
-                if self.best.map_or(true, |best| candidate > best) {
-                    self.best = Some(candidate);
-                }
+                let score = span.score + bonus + model.end(first, pb.kind, d_used);
+                consider(PathScore { score, d_count: d_used, support: pb.score() });
             }
         }
         for e in 0..self.placements.len() {
             let pe = &self.placements[e];
-            if pe.q_start() <= pb.q_start() || !grammar.can_follow(pb.kind, pe.kind, d_used) {
+            // Kinds in grammar order wherever they start; one kind (tandem D)
+            // in order of start.
+            let same_kind_before = pe.kind == pb.kind && pe.q_start() <= pb.q_start();
+            if same_kind_before || !grammar.can_follow(pb.kind, pe.kind, d_used) {
                 continue;
             }
-            let cuts: Vec<(u32, u32)> = if pe.q_start() < pb.q_end() {
-                (pe.q_start()..=pb.q_end().min(pe.q_end() - 1)).map(|c| (c, c)).collect()
-            } else {
-                vec![(pb.q_end(), pe.q_start())]
-            };
-            for (exit, next_entry) in cuts {
-                let Some(span) = pb.clip.span(entry, exit).filter(|s| s.q_len() >= self.min(pb.kind)) else {
+            let d_next = d_used + u8::from(pe.kind == SegmentKind::D);
+            let (_, exits) = cuts(pb);
+            let (entries, _) = cuts(pe);
+            for x in exits.into_iter().filter(|&x| x > entry) {
+                let Some(span) = pb.clip.span(entry, x).filter(|s| s.q_len() >= self.min(pb.kind)) else {
                     continue;
                 };
-                let Some(next) = pe.clip.entry(next_entry) else { continue };
-                let junction = model.junction(pb.kind, pe.kind, next.q.saturating_sub(span.q_hi));
-                let d_next = d_used + u8::from(pe.kind == SegmentKind::D);
-                self.visit(e, next_entry, acc + span.score + bonus + junction, d_next, first);
+                for &y in entries.iter().filter(|&&y| y >= x) {
+                    let Some(next) = pe.clip.entry(y) else {
+                        continue;
+                    };
+                    let junction = model.junction(pb.kind, pe.kind, next.q.saturating_sub(span.q_hi));
+                    let Some(rest) = self.best_from(e, y, d_next, first) else {
+                        continue;
+                    };
+                    consider(PathScore {
+                        score: span.score + bonus + junction + rest.score,
+                        d_count: rest.d_count,
+                        support: pb.score() + rest.support,
+                    });
+                }
+            }
+        }
+        self.memo.insert(key, best);
+        best
+    }
+}
+
+/// The DAG's best path score and the exhaustive one on `placements`.
+fn dag_and_brute(dag: &PlacementDag, placements: &[Placement], scratch: &mut DagScratch) -> (Option<PathScore>, Option<PathScore>) {
+    let fast = dag.adjudicate(0, placements, scratch).map(|path| path.score);
+    let mut brute = Brute { dag, placements, memo: Default::default() };
+    let exhaustive = (0..placements.len())
+        .filter(|&s| dag.grammar.can_start(placements[s].kind))
+        .filter_map(|s| {
+            let p = &placements[s];
+            brute.best_from(s, p.q_start(), u8::from(p.kind == SegmentKind::D), p.kind)
+        })
+        .max();
+    (fast, exhaustive)
+}
+
+/// IgSim reads mutate V, D and J, so an alignment can carry mismatches right
+/// after its neighbour's end, where entering later and leaving them to N/P
+/// wins (an entry beyond the overlap). The pipeline's own placements, with and
+/// without a per-base N/P cost.
+#[test]
+fn dag_equals_brute_force_on_hypermutated_igsim_reads() {
+    use vdj_assign::sim::{SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
+    let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 11);
+    let config = EngineConfig::default();
+    let assigner = DefaultAssigner::from_config(&config, db.v.clone(), Some(db.d.clone()), db.j.clone()).unwrap();
+    let base = config.objective.resolve(Some(&db.d), &config.d.scoring);
+    let sim = Simulator::new(&db.v, Some(&db.d), &db.j, SimParams::hard()).unwrap();
+    let mut ws = assigner.workspace();
+    let mut scratch = DagScratch::default();
+    let mut beyond = 0;
+    for read in sim.reads(40, 5).unwrap() {
+        let call = assigner.assign(&encode(&read.sequence), &mut ws);
+        let mut placements = top_by_kind(&call.placements, SegmentKind::V, 3);
+        placements.extend(top_by_kind(&call.placements, SegmentKind::D, 6));
+        placements.extend(top_by_kind(&call.placements, SegmentKind::J, 3));
+        for iota in [0, -1] {
+            let model = EngineeringObjective { insertion_per_base: iota, ..base };
+            let dag = PlacementDag::new(VdjGrammar::VDJ, model, config.min_retained);
+            let (fast, exhaustive) = dag_and_brute(&dag, &placements, &mut scratch);
+            assert_eq!(fast, exhaustive, "read {} at iota {iota}", read.sequence.len());
+            // Count reads whose optimum enters some placement beyond the overlap.
+            if let Some(path) = dag.adjudicate(0, &placements, &mut scratch) {
+                beyond += usize::from(path.segments.windows(2).any(|w| {
+                    let (b, e) = (&placements[w[0].placement], &placements[w[1].placement]);
+                    e.q_start() < b.q_end() && w[1].entry > b.q_end()
+                }));
             }
         }
     }
+    assert!(beyond > 0, "the reads should exercise entries beyond the overlap");
 }
 
 fn top_by_kind(placements: &[Placement], kind: SegmentKind, n: usize) -> Vec<Placement> {
@@ -358,7 +440,11 @@ fn top_by_kind(placements: &[Placement], kind: SegmentKind, n: usize) -> Vec<Pla
 fn dag_equals_brute_force_over_all_paths_and_cuts() {
     let db = Db::new();
     let assigner = db.assigner(&EngineConfig { grammar: VdjGrammar::TANDEM_D, ..EngineConfig::default() });
-    let model = EngineeringObjective { insertion_per_base: -1, ..EngineConfig::default().objective };
+    let config = EngineConfig::default();
+    let model = EngineeringObjective {
+        insertion_per_base: -1,
+        ..config.objective.resolve(Some(&Db::set(SegmentKind::D, &db.d, None)), &config.d.scoring)
+    };
     let dag = PlacementDag::new(VdjGrammar::TANDEM_D, model, [10, 3, 6]);
     let mut rng = Rng(23);
     let mut ws = assigner.workspace();
@@ -373,14 +459,15 @@ fn dag_equals_brute_force_over_all_paths_and_cuts() {
         placements.extend(top_by_kind(&call.placements, SegmentKind::J, 3));
 
         let fast = dag.adjudicate(call.query.len(), &placements, &mut scratch);
-        let mut brute = Brute { dag: &dag, placements: &placements, best: None };
-        for s in 0..placements.len() {
-            let p = &placements[s];
-            if dag.grammar.can_start(p.kind) {
-                brute.visit(s, p.q_start(), 0, u8::from(p.kind == SegmentKind::D), p.kind);
-            }
-        }
-        assert_eq!(fast.as_ref().map(|path| path.score), brute.best);
+        let mut brute = Brute { dag: &dag, placements: &placements, memo: Default::default() };
+        let exhaustive = (0..placements.len())
+            .filter(|&s| dag.grammar.can_start(placements[s].kind))
+            .filter_map(|s| {
+                let p = &placements[s];
+                brute.best_from(s, p.q_start(), u8::from(p.kind == SegmentKind::D), p.kind)
+            })
+            .max();
+        assert_eq!(fast.as_ref().map(|path| path.score), exhaustive);
         if let Some(path) = fast {
             let kinds: Vec<SegmentKind> = path.segments.iter().map(|s| placements[s.placement].kind).collect();
             distinct_topologies.insert(kinds);
@@ -414,7 +501,10 @@ fn simd_batched_pipeline_equals_scalar_per_read() {
         assert_eq!(call.path, reference.path);
         assert_eq!(call.placements.len(), reference.placements.len());
         for (a, b) in call.placements.iter().zip(&reference.placements) {
-            assert_eq!((a.kind, &a.alleles, a.score(), a.q_start(), a.q_end()), (b.kind, &b.alleles, b.score(), b.q_start(), b.q_end()));
+            assert_eq!(
+                (a.kind, &a.alleles, a.score(), a.q_start(), a.q_end()),
+                (b.kind, &b.alleles, b.score(), b.q_start(), b.q_end())
+            );
         }
     }
 }

@@ -1,16 +1,16 @@
 //! The assignment pipeline.
 //!
 //! ```text
-//!  chunk of reads ─► per read: orient (V votes, fwd vs rc), retrieve V and J candidates
-//!                 ─► V stage over the whole chunk ─┐  one score batch + one traceback batch
-//!                 ─► J stage over the whole chunk ─┤
+//!  chunk of reads ─► per read: orient (germline k-mer support), V candidates
+//!                 ─► V stage over the whole chunk     score batch + traceback waves
+//!                 ─► per read: J window right of V; J stage over the whole chunk
 //!                 ─► per read: D windows from V/J geometry, D candidates
 //!                 ─► D stage over the whole chunk ─► per read: admission gates
 //!                 ─► per read: adjudicator (placement DAG) ─► refiner ─► Call
 //! ```
 //!
 //! **Trick — stage-wise batching across reads.** After prefiltering a read has
-//! only ~3 V, ~3 J and ~9 D candidates, far too few to fill a 16-lane SIMD
+//! only a few V, J and D candidates, far too few to fill a 16-lane SIMD
 //! register. Running each stage over a chunk of reads hands the aligner one
 //! batch per stage for the whole chunk. Every per-read decision (keep policy,
 //! D windows, admission, adjudication) is still taken per read, and batch
@@ -30,23 +30,22 @@
 
 use std::ops::Range;
 
-use crate::adjudicate::{Adjudicator, CallPath, DagScratch, PlacementDag};
+use crate::adjudicate::{Adjudicator, CallPath, DagScratch, Marginals, PlacementDag};
 use crate::admission::{Admission, DefaultAdmission};
 use crate::align::{Aligner, InterSequenceGotoh, InterSequenceWorkspace};
 use crate::alphabet::reverse_complement_into;
-use crate::config::DefaultVjRetriever;
-use crate::evidence::Evidence;
-use crate::band::Band;
-use crate::germline::{AlleleId, SegmentKind};
-use crate::orient::{Orientation, OrientationPolicy};
-use crate::placement::{mark_repeated_d_tracts, Placement};
-use crate::refine::{extend_junction_tie, NoRefine, Refiner, JUNCTION_TIE_IDENTITY};
+use crate::config::DefaultVRetriever;
+use crate::germline::SegmentKind;
+use crate::orient::{Orientation, OrientationPolicy, StrandIndex};
+use crate::placement::Placement;
+use crate::refine::{NoRefine, Refiner};
 use crate::retrieve::{
-    end_anchored_ungapped, strongest, Candidate, LmerMaskRetriever, RetrievalScratch, Retriever,
+    Candidate, ExhaustiveRetriever, LmerMaskRetriever, RetrievalScratch, Retriever,
 };
-use crate::scoring::Score;
 use crate::segment::{BatchScratch, PreparedSegment, SegmentRequest, SegmentStage};
-use crate::window::{merge_windows, DWindowPolicy, ExpandedResidual, WithAnchorWindow};
+use crate::window::{
+    merge_windows, DWindowPolicy, DownstreamWindow, ExpandedResidual, WithAnchorWindow,
+};
 
 /// Result of assigning one query.
 #[derive(Clone, Debug)]
@@ -58,6 +57,9 @@ pub struct Call {
     pub placements: Vec<Placement>,
     /// The adjudicated path, if any segment could be placed.
     pub path: Option<CallPath>,
+    /// Posterior marginals of `placements` (indexed alike), when the
+    /// adjudicator computes them and the read has a call.
+    pub marginals: Option<Marginals>,
 }
 
 /// Anything that assigns V(D)J to encoded queries with a reusable workspace.
@@ -94,15 +96,12 @@ pub trait AlleleCatalog {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AssignerOptions {
     pub orientation: OrientationPolicy,
-    /// R-optimized / Sensitive-D: write a zero-score five-base block onto a
-    /// high-SHM V 3′ end or J 5′ start after the joint partition is chosen.
-    pub junction_tie: bool,
 }
 
 pub struct Assigner<
     A = InterSequenceGotoh,
-    RV = DefaultVjRetriever,
-    RJ = RV,
+    RV = DefaultVRetriever,
+    RJ = ExhaustiveRetriever,
     RD = LmerMaskRetriever,
     W = WithAnchorWindow<ExpandedResidual>,
     Adm = DefaultAdmission,
@@ -113,6 +112,10 @@ pub struct Assigner<
     pub j: SegmentStage<RJ>,
     /// `None` for loci without D (light chains).
     pub d: Option<SegmentStage<RD>>,
+    /// Germline k-mer presence for orientation.
+    pub strand: StrandIndex,
+    /// Where J is searched relative to V.
+    pub j_window: DownstreamWindow,
     pub aligner: A,
     pub d_window: W,
     pub d_admission: Adm,
@@ -129,6 +132,18 @@ struct ReadState {
     query: Vec<u8>,
     v: Vec<Candidate>,
     j: Vec<Candidate>,
+    j_window: Range<usize>,
+}
+
+/// Buffers of the D stage.
+#[derive(Debug, Default)]
+struct DScratch {
+    /// `(read, window)` of every D search of the chunk.
+    windows: Vec<(usize, Range<usize>)>,
+    read_windows: Vec<Range<usize>>,
+    candidates: Vec<Vec<Candidate>>,
+    /// Per read, the index of its first D placement.
+    start: Vec<usize>,
 }
 
 /// Per-thread buffers of an [`Assigner`]; every buffer is reused across chunks.
@@ -137,17 +152,9 @@ pub struct Workspace<W = InterSequenceWorkspace, S = DagScratch> {
     retrieval: RetrievalScratch,
     dp: W,
     batch: BatchScratch,
-    reverse: Vec<u8>,
-    chosen: Vec<Candidate>,
-    reverse_candidates: Vec<Candidate>,
-    spare_candidates: Vec<Candidate>,
     reads: Vec<ReadState>,
     placements: Vec<Vec<Placement>>,
-    v_count: Vec<usize>,
-    d_start: Vec<usize>,
-    read_windows: Vec<Range<usize>>,
-    d_windows: Vec<(usize, Range<usize>)>,
-    d_candidates: Vec<Vec<Candidate>>,
+    d: DScratch,
     adjudication: S,
     calls: Vec<Call>,
 }
@@ -170,6 +177,8 @@ impl<A, RV, RJ, RD, W, Adm, Adj, Rf> Assigner<A, RV, RJ, RD, W, Adm, Adj, Rf> {
             v: self.v,
             j: self.j,
             d: self.d,
+            strand: self.strand,
+            j_window: self.j_window,
             aligner,
             d_window: self.d_window,
             d_admission: self.d_admission,
@@ -184,6 +193,8 @@ impl<A, RV, RJ, RD, W, Adm, Adj, Rf> Assigner<A, RV, RJ, RD, W, Adm, Adj, Rf> {
             v: self.v,
             j: self.j,
             d: self.d,
+            strand: self.strand,
+            j_window: self.j_window,
             aligner: self.aligner,
             d_window,
             d_admission: self.d_admission,
@@ -201,6 +212,8 @@ impl<A, RV, RJ, RD, W, Adm, Adj, Rf> Assigner<A, RV, RJ, RD, W, Adm, Adj, Rf> {
             v: self.v,
             j: self.j,
             d: self.d,
+            strand: self.strand,
+            j_window: self.j_window,
             aligner: self.aligner,
             d_window: self.d_window,
             d_admission,
@@ -210,6 +223,11 @@ impl<A, RV, RJ, RD, W, Adm, Adj, Rf> Assigner<A, RV, RJ, RD, W, Adm, Adj, Rf> {
         }
     }
 
+    /// Swap the adjudicator. The D stage keeps the D placements the original
+    /// one needed: built with posteriors, it keeps those below the DAG's D
+    /// floor, so pair an adjudicator without its own D significance floor
+    /// (such as [`crate::adjudicate::ResidualAdjudicator`]) with
+    /// `posterior: false`.
     pub fn with_adjudicator<Adj2>(
         self,
         adjudicator: Adj2,
@@ -218,6 +236,8 @@ impl<A, RV, RJ, RD, W, Adm, Adj, Rf> Assigner<A, RV, RJ, RD, W, Adm, Adj, Rf> {
             v: self.v,
             j: self.j,
             d: self.d,
+            strand: self.strand,
+            j_window: self.j_window,
             aligner: self.aligner,
             d_window: self.d_window,
             d_admission: self.d_admission,
@@ -232,6 +252,8 @@ impl<A, RV, RJ, RD, W, Adm, Adj, Rf> Assigner<A, RV, RJ, RD, W, Adm, Adj, Rf> {
             v: self.v,
             j: self.j,
             d: self.d,
+            strand: self.strand,
+            j_window: self.j_window,
             aligner: self.aligner,
             d_window: self.d_window,
             d_admission: self.d_admission,
@@ -245,176 +267,28 @@ impl<A, RV, RJ, RD, W, Adm, Adj, Rf> Assigner<A, RV, RJ, RD, W, Adm, Adj, Rf> {
         self.options = options;
         self
     }
-
-    /// High-SHM junction repair. V identity is measured on the called span,
-    /// after terminal extension and clipping. A zero-score five-base block is
-    /// written only into the gap before the selected D, or before the opposite
-    /// segment when D is absent.
-    fn apply_junction_tie(
-        &self,
-        query: &[u8],
-        placements: &mut [Placement],
-        path: &mut crate::adjudicate::CallPath,
-    ) {
-        use crate::germline::SegmentKind;
-        let Some(v_at) = path
-            .segments
-            .iter()
-            .position(|s| placements[s.placement].kind == SegmentKind::V)
-        else {
-            return;
-        };
-        let Some(j_at) = path
-            .segments
-            .iter()
-            .position(|s| placements[s.placement].kind == SegmentKind::J)
-        else {
-            return;
-        };
-        let v_index = path.segments[v_at].placement;
-        let v_reference = self
-            .v
-            .segment
-            .set()
-            .allele(placements[v_index].primary_allele())
-            .codes
-            .clone();
-        let v_profile = self
-            .v
-            .segment
-            .profile(placements[v_index].primary_allele())
-            .clone();
-        let identity = Evidence::from_columns(
-            placements[v_index].clip.columns(&path.segments[v_at].span),
-            query,
-            &v_reference,
-        )
-        .identity();
-        if identity > JUNCTION_TIE_IDENTITY {
-            return;
-        }
-        let d_span = path
-            .segments
-            .iter()
-            .find(|s| placements[s.placement].kind == SegmentKind::D)
-            .map(|s| s.span);
-        let v_boundary = d_span
-            .map(|s| s.q_lo)
-            .unwrap_or(path.segments[j_at].span.q_lo);
-        extend_junction_tie(
-            &mut placements[v_index],
-            &mut path.segments[v_at],
-            query,
-            &v_reference,
-            &v_profile,
-            self.v.segment.gaps(),
-            true,
-            v_boundary,
-        );
-        let j_index = path.segments[j_at].placement;
-        let j_reference = self
-            .j
-            .segment
-            .set()
-            .allele(placements[j_index].primary_allele())
-            .codes
-            .clone();
-        let j_profile = self
-            .j
-            .segment
-            .profile(placements[j_index].primary_allele())
-            .clone();
-        let j_boundary = d_span
-            .map(|s| s.q_hi)
-            .unwrap_or(path.segments[v_at].span.q_hi);
-        extend_junction_tie(
-            &mut placements[j_index],
-            &mut path.segments[j_at],
-            query,
-            &j_reference,
-            &j_profile,
-            self.j.segment.gaps(),
-            false,
-            j_boundary,
-        );
-    }
 }
 
-/// Identity of the highest-scoring V placement, or 1.0 when none (treat as clean).
-fn best_v_identity(query: &[u8], v_placements: &[Placement], v: &PreparedSegment) -> f64 {
-    let Some(best) = v_placements
+/// Requests of one stage: one per read, over `window` with `candidates`.
+fn read_requests<'a>(
+    reads: &'a [ReadState],
+    window: impl Fn(&ReadState) -> Range<usize>,
+    candidates: impl Fn(&'a ReadState) -> &'a [Candidate],
+) -> Vec<SegmentRequest<'a>> {
+    reads
         .iter()
-        .filter(|p| p.kind == SegmentKind::V)
-        .max_by_key(|p| p.score())
-    else {
-        return 1.0;
-    };
-    let reference = &v.set().allele(best.primary_allele()).codes;
-    Evidence::from_columns(best.alignment.columns(), query, reference).identity()
+        .enumerate()
+        .map(|(read, state)| SegmentRequest {
+            read,
+            query: &state.query,
+            window: window(state),
+            candidates: candidates(state),
+        })
+        .collect()
 }
 
-/// On high-SHM reads, add a mild path bonus to each J from ungapped support on
-/// the post-V suffix. Relative across J candidates; scaled so it tips close
-/// gene ties without overriding a clear DP winner.
-fn apply_j_shm_ungapped_adjust(
-    query: &[u8],
-    placed: &mut [Placement],
-    v_count: usize,
-    j: &PreparedSegment,
-) {
-    let v_end = placed[..v_count]
-        .iter()
-        .filter(|p| p.kind == SegmentKind::V)
-        .max_by_key(|p| p.score())
-        .map(|p| p.q_end() as usize)
-        .unwrap_or(0);
-    if v_end >= query.len() {
-        return;
-    }
-    let suffix = &query[v_end..];
-    let mut min_ug = Score::MAX;
-    let mut ugs = Vec::with_capacity(placed.len().saturating_sub(v_count));
-    for p in &placed[v_count..] {
-        if p.kind != SegmentKind::J {
-            ugs.push(0);
-            continue;
-        }
-        let ug = end_anchored_ungapped(suffix, j.profile(p.primary_allele()), 4);
-        min_ug = min_ug.min(ug);
-        ugs.push(ug);
-    }
-    if min_ug == Score::MAX {
-        return;
-    }
-    for (p, ug) in placed[v_count..].iter_mut().zip(ugs) {
-        if p.kind != SegmentKind::J {
-            continue;
-        }
-        // Quarter-weight relative ungapped margin (integer scores).
-        p.path_adjust = (ug - min_ug) / 4;
-    }
-}
-
-/// Add every allele missing from `out` as an unbanded candidate.
-fn supplement_all_alleles(n_alleles: usize, out: &mut Vec<Candidate>) {
-    let mut seen = vec![false; n_alleles];
-    for candidate in out.iter() {
-        let index = candidate.allele as usize;
-        if index < n_alleles {
-            seen[index] = true;
-        }
-    }
-    for (index, present) in seen.into_iter().enumerate() {
-        if !present {
-            out.push(Candidate {
-                allele: index as AlleleId,
-                band: Band::Full,
-                votes: 0,
-            });
-        }
-    }
-}
-
+/// The stages of [`VdjAssigner::assign_many`], in order. Per-read stages
+/// loop over the chunk; chunk stages hand all reads' jobs to the aligner at once.
 impl<A, RV, RJ, RD, W, Adm, Adj, Rf> Assigner<A, RV, RJ, RD, W, Adm, Adj, Rf>
 where
     A: Aligner + Send + Sync,
@@ -426,40 +300,188 @@ where
     Adj: Adjudicator,
     Rf: Refiner,
 {
-    /// Decide the strand from V retrieval strength (J breaks exact ties).
-    /// On return `chosen` holds the chosen strand's V candidates and, for
-    /// `Reverse`, `reverse` holds the reverse complement.
+    /// Strand from germline k-mer support; when that is not significant,
+    /// from the strongest V seed cluster on each strand (`state.query` and
+    /// `state.v` serve as scratch).
     fn orient(
         &self,
         query: &[u8],
+        state: &mut ReadState,
         retrieval: &mut RetrievalScratch,
-        chosen: &mut Vec<Candidate>,
-        reverse: &mut Vec<u8>,
-        reverse_candidates: &mut Vec<Candidate>,
-        spare: &mut Vec<Candidate>,
     ) -> Orientation {
-        let n = query.len();
-        self.v.retrieve(query, 0..n, retrieval, chosen);
-        let forward = strongest(chosen);
-        if !self.options.orientation.wants_reverse(forward) {
+        let policy = self.options.orientation;
+        if !policy.try_reverse {
             return Orientation::Forward;
         }
-        reverse_complement_into(query, reverse);
-        self.v
-            .retrieve(reverse, 0..n, retrieval, reverse_candidates);
-        let backward = strongest(reverse_candidates);
-        let orientation = if forward == backward {
-            self.j.retrieve(query, 0..n, retrieval, spare);
-            let j_forward = strongest(spare);
-            self.j.retrieve(reverse, 0..n, retrieval, spare);
-            OrientationPolicy::choose(j_forward, strongest(spare))
-        } else {
-            OrientationPolicy::choose(forward, backward)
-        };
-        if orientation.is_reverse() {
-            std::mem::swap(chosen, reverse_candidates);
+        let support = self.strand.support(query);
+        if support.decisive() {
+            return policy.choose(support.forward, support.reverse);
         }
-        orientation
+        let strongest =
+            |candidates: &[Candidate]| candidates.iter().map(|c| c.votes).max().unwrap_or(0);
+        self.v
+            .retrieve(query, 0..query.len(), retrieval, &mut state.v);
+        let forward = strongest(&state.v);
+        reverse_complement_into(query, &mut state.query);
+        self.v
+            .retrieve(&state.query, 0..query.len(), retrieval, &mut state.v);
+        policy.choose(forward, strongest(&state.v))
+    }
+
+    /// Stage 1, per read: orientation, oriented query, V candidates.
+    fn stage_orient<Q: AsRef<[u8]>>(
+        &self,
+        queries: &[Q],
+        reads: &mut [ReadState],
+        retrieval: &mut RetrievalScratch,
+    ) {
+        for (state, query) in reads.iter_mut().zip(queries) {
+            let query = query.as_ref();
+            let orientation = self.orient(query, state, retrieval);
+            state.orientation = Some(orientation);
+            if orientation.is_reverse() {
+                reverse_complement_into(query, &mut state.query);
+            } else {
+                state.query.clear();
+                state.query.extend_from_slice(query);
+            }
+            self.v
+                .retrieve(&state.query, 0..state.query.len(), retrieval, &mut state.v);
+        }
+    }
+
+    /// Stage 2, whole chunk: V placements.
+    fn stage_v(
+        &self,
+        reads: &[ReadState],
+        placements: &mut [Vec<Placement>],
+        dp: &mut A::Workspace,
+        batch: &mut BatchScratch,
+    ) {
+        let requests = read_requests(reads, |r| 0..r.query.len(), |r| &r.v);
+        self.v
+            .place_many(&self.aligner, &requests, dp, batch, placements);
+    }
+
+    /// Stage 3: per read, the J window right of V and its candidates; then J
+    /// placements over the whole chunk.
+    fn stage_j(
+        &self,
+        reads: &mut [ReadState],
+        placements: &mut [Vec<Placement>],
+        retrieval: &mut RetrievalScratch,
+        dp: &mut A::Workspace,
+        batch: &mut BatchScratch,
+    ) {
+        for (state, placed) in reads.iter_mut().zip(placements.iter()) {
+            state.j_window = self.j_window.window(state.query.len(), placed);
+            self.j.retrieve(
+                &state.query,
+                state.j_window.clone(),
+                retrieval,
+                &mut state.j,
+            );
+        }
+        let requests = read_requests(reads, |r| r.j_window.clone(), |r| &r.j);
+        self.j
+            .place_many(&self.aligner, &requests, dp, batch, placements);
+    }
+
+    /// Stage 4: D windows from V/J geometry and their candidates per read, D
+    /// placements over the whole chunk, then the admission gates per read.
+    #[allow(clippy::too_many_arguments)]
+    fn stage_d(
+        &self,
+        d: &SegmentStage<RD>,
+        reads: &[ReadState],
+        placements: &mut [Vec<Placement>],
+        scratch: &mut DScratch,
+        retrieval: &mut RetrievalScratch,
+        dp: &mut A::Workspace,
+        batch: &mut BatchScratch,
+    ) {
+        let DScratch {
+            windows,
+            read_windows,
+            candidates,
+            start,
+        } = scratch;
+        windows.clear();
+        for (k, (state, placed)) in reads.iter().zip(placements.iter()).enumerate() {
+            read_windows.clear();
+            let v_count = placed
+                .iter()
+                .take_while(|p| p.kind == SegmentKind::V)
+                .count();
+            let (v, j) = placed.split_at(v_count);
+            self.d_window.windows(state.query.len(), v, j, read_windows);
+            merge_windows(read_windows);
+            windows.extend(read_windows.drain(..).map(|window| (k, window)));
+        }
+        if candidates.len() < windows.len() {
+            candidates.resize_with(windows.len(), Vec::new);
+        }
+        for ((k, window), found) in windows.iter().zip(candidates.iter_mut()) {
+            d.retrieve(&reads[*k].query, window.clone(), retrieval, found);
+        }
+        let requests: Vec<SegmentRequest<'_>> = windows
+            .iter()
+            .zip(candidates.iter())
+            .map(|((k, window), candidates)| SegmentRequest {
+                read: *k,
+                query: &reads[*k].query,
+                window: window.clone(),
+                candidates,
+            })
+            .collect();
+        start.clear();
+        start.extend(placements.iter().map(Vec::len));
+        d.place_many(&self.aligner, &requests, dp, batch, placements);
+        for ((state, placed), &first) in reads.iter().zip(placements.iter_mut()).zip(start.iter()) {
+            retain_from(placed, first, |p| {
+                self.d_admission
+                    .admit(p, &state.query, d.segment.reference(p.primary_allele()))
+            });
+        }
+    }
+
+    /// Whether calls need an anchor: some V or J hit significant on its own.
+    fn requires_anchor(&self) -> bool {
+        self.v.significance.is_some() || self.j.significance.is_some()
+    }
+
+    /// Stage 5, per read: adjudication and refinement into calls. A path
+    /// without an anchor ([`Placement::anchor`]) is not a call.
+    fn stage_adjudicate(
+        &self,
+        reads: &[ReadState],
+        placements: &mut [Vec<Placement>],
+        adjudication: &mut Adj::Scratch,
+        out: &mut Vec<Call>,
+    ) {
+        out.reserve(reads.len());
+        for (state, placed) in reads.iter().zip(placements.iter_mut()) {
+            let mut path = self
+                .adjudicator
+                .adjudicate(state.query.len(), placed, adjudication)
+                .filter(|path| {
+                    !self.requires_anchor()
+                        || path.segments.iter().any(|s| placed[s.placement].anchor)
+                });
+            let marginals = path
+                .as_ref()
+                .and_then(|path| self.adjudicator.marginals(placed, path, adjudication));
+            if let Some(path) = path.as_mut() {
+                self.refiner.refine(&state.query, placed, path);
+            }
+            out.push(Call {
+                orientation: state.orientation.expect("stage 1 orients every read"),
+                query: state.query.clone(),
+                placements: std::mem::take(placed),
+                path,
+                marginals,
+            });
+        }
     }
 }
 
@@ -496,175 +518,30 @@ where
         out: &mut Vec<Call>,
     ) {
         let count = queries.len();
+        if ws.reads.len() < count {
+            ws.reads.resize_with(count, ReadState::default);
+            ws.placements.resize_with(count, Vec::new);
+        }
         let Workspace {
             retrieval,
             dp,
             batch,
-            reverse,
-            chosen,
-            reverse_candidates,
-            spare_candidates,
             reads,
             placements,
-            v_count,
-            d_start,
-            read_windows,
-            d_windows,
-            d_candidates,
+            d,
             adjudication,
             ..
         } = ws;
-        if reads.len() < count {
-            reads.resize_with(count, ReadState::default);
-            placements.resize_with(count, Vec::new);
-        }
-        v_count.resize(count, 0);
-        d_start.resize(count, 0);
         let (reads, placements) = (&mut reads[..count], &mut placements[..count]);
-
-        // Stage 1, per read: orientation, V and J candidates.
-        for (state, query) in reads.iter_mut().zip(queries) {
-            let query = query.as_ref();
-            let orientation = self.orient(
-                query,
-                retrieval,
-                chosen,
-                reverse,
-                reverse_candidates,
-                spare_candidates,
-            );
-            state.orientation = Some(orientation);
-            state.query.clear();
-            state.query.extend_from_slice(if orientation.is_reverse() {
-                reverse
-            } else {
-                query
-            });
-            std::mem::swap(&mut state.v, chosen);
-            self.j
-                .retrieve(&state.query, 0..state.query.len(), retrieval, &mut state.j);
-            // J sets are tiny (~10–20 alleles). Score every allele so SHM that
-            // destroys short seeds cannot drop the true J before DP.
-            supplement_all_alleles(self.j.segment.set().len(), &mut state.j);
-        }
         placements.iter_mut().for_each(Vec::clear);
 
-        // Stages 2 and 3, whole chunk: V, then J.
-        let requests: Vec<SegmentRequest<'_>> = reads
-            .iter()
-            .enumerate()
-            .map(|(k, r)| SegmentRequest {
-                read: k,
-                query: &r.query,
-                window: 0..r.query.len(),
-                candidates: &r.v,
-            })
-            .collect();
-        self.v
-            .place_many(&self.aligner, &requests, dp, batch, placements);
-        for (count, placed) in v_count.iter_mut().zip(placements.iter()) {
-            *count = placed.len();
+        self.stage_orient(queries, reads, retrieval);
+        self.stage_v(reads, placements, dp, batch);
+        self.stage_j(reads, placements, retrieval, dp, batch);
+        if let Some(stage) = &self.d {
+            self.stage_d(stage, reads, placements, d, retrieval, dp, batch);
         }
-        let requests: Vec<SegmentRequest<'_>> = reads
-            .iter()
-            .enumerate()
-            .map(|(k, r)| SegmentRequest {
-                read: k,
-                query: &r.query,
-                window: 0..r.query.len(),
-                candidates: &r.j,
-            })
-            .collect();
-        self.j
-            .place_many(&self.aligner, &requests, dp, batch, placements);
-        // Adaptive J: soft gate during place; on clean V reads drop soft-only
-        // hits. On high-SHM V reads, boost J path scores by end-anchored
-        // ungapped support on the post-V suffix (gene disambiguation).
-        for (k, placed) in placements.iter_mut().enumerate() {
-            let v_identity =
-                best_v_identity(&reads[k].query, &placed[..v_count[k]], &self.v.segment);
-            if v_identity > JUNCTION_TIE_IDENTITY {
-                if let Some(clean) = self.j.accept_clean {
-                    retain_from(placed, v_count[k], |p| {
-                        p.kind != SegmentKind::J || clean.allows(&p.evidence)
-                    });
-                }
-            } else {
-                apply_j_shm_ungapped_adjust(
-                    &reads[k].query,
-                    placed,
-                    v_count[k],
-                    &self.j.segment,
-                );
-            }
-        }
-
-        // Stage 4: D windows per read, D over the whole chunk, admission per read.
-        if let Some(d) = &self.d {
-            d_windows.clear();
-            for (k, (state, placed)) in reads.iter().zip(placements.iter()).enumerate() {
-                read_windows.clear();
-                let (v, j) = placed.split_at(v_count[k]);
-                self.d_window.windows(state.query.len(), v, j, read_windows);
-                merge_windows(read_windows);
-                d_windows.extend(read_windows.drain(..).map(|window| (k, window)));
-            }
-            if d_candidates.len() < d_windows.len() {
-                d_candidates.resize_with(d_windows.len(), Vec::new);
-            }
-            for ((k, window), candidates) in d_windows.iter().zip(d_candidates.iter_mut()) {
-                d.retrieve(&reads[*k].query, window.clone(), retrieval, candidates);
-            }
-            let requests: Vec<SegmentRequest<'_>> = d_windows
-                .iter()
-                .zip(d_candidates.iter())
-                .map(|((k, window), candidates)| SegmentRequest {
-                    read: *k,
-                    query: &reads[*k].query,
-                    window: window.clone(),
-                    candidates,
-                })
-                .collect();
-            for (start, placed) in d_start.iter_mut().zip(placements.iter()) {
-                *start = placed.len();
-            }
-            d.place_many(&self.aligner, &requests, dp, batch, placements);
-            let d_references: Vec<&[u8]> = d
-                .segment
-                .set()
-                .alleles()
-                .iter()
-                .map(|allele| allele.codes.as_slice())
-                .collect();
-            for (k, placed) in placements.iter_mut().enumerate() {
-                let query = &reads[k].query;
-                retain_from(placed, d_start[k], |p| {
-                    let reference = &d.segment.set().allele(p.primary_allele()).codes;
-                    self.d_admission.admit(p, query, reference)
-                });
-                mark_repeated_d_tracts(placed, query, &d_references);
-            }
-        }
-
-        // Stage 5, per read: adjudication and refinement.
-        out.reserve(count);
-        for (state, placed) in reads.iter().zip(placements.iter_mut()) {
-            let mut path = self
-                .adjudicator
-                .adjudicate(state.query.len(), placed, adjudication);
-            if let Some(path) = path.as_mut() {
-                if self.options.junction_tie {
-                    self.apply_junction_tie(&state.query, placed, path);
-                }
-                self.refiner.refine(&state.query, placed, path);
-            }
-            out.push(Call {
-                orientation: state.orientation.expect("stage 1 orients every read"),
-                query: state.query.clone(),
-                placements: std::mem::take(placed),
-                path,
-            });
-        }
+        self.stage_adjudicate(reads, placements, adjudication, out);
     }
 }
 

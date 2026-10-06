@@ -4,13 +4,17 @@
 //! "what does a second D cost?" (a scoring question). The DAG needs one
 //! structural property from a [`PathModel`]: a segment contributes
 //! *clip score + a bonus that does not depend on the cut positions*, and a
-//! junction contributes a function of its inserted length. That separability
-//! is what makes every cut evaluable in O(log n) (see [`super::PlacementDag`]).
+//! junction contributes a score linear in its inserted length. That
+//! separability is what makes every pair of cuts evaluable in O(log n) (see
+//! [`super::PlacementDag`]).
 
 use crate::germline::SegmentKind;
 use crate::placement::Placement;
 use crate::scoring::Score;
 
+/// Which segment sequences form a path. Transitions between kinds must go
+/// forward in [`SegmentKind::ALL`] order (V, D, J): the DAG visits kinds in
+/// that order ([`super::PlacementDag`]).
 pub trait Grammar: Send + Sync {
     fn can_start(&self, kind: SegmentKind) -> bool;
     /// `d_used` counts D segments up to and including `prev`.
@@ -84,9 +88,16 @@ pub trait PathModel: Send + Sync {
     /// to and including this one (so the first D sees 1).
     fn segment_bonus(&self, placement: &Placement, d_ordinal: u8) -> Score;
 
-    /// Edge score for `inserted` unassigned query bases between two segments (N/P region).
-    fn junction(&self, _prev: SegmentKind, _next: SegmentKind, _inserted: u32) -> Score {
+    /// Score per unassigned query base (N/P region) between two segments.
+    /// Junction scores are linear in the inserted length, which keeps both
+    /// cuts of a transition separable (see [`super::PlacementDag`]).
+    fn junction_per_base(&self, _prev: SegmentKind, _next: SegmentKind) -> Score {
         0
+    }
+
+    /// Edge score for `inserted` unassigned query bases between two segments.
+    fn junction(&self, prev: SegmentKind, next: SegmentKind, inserted: u32) -> Score {
+        self.junction_per_base(prev, next) * inserted as Score
     }
 
     /// Whole-path term (e.g. the V+J pair bonus).
@@ -95,87 +106,57 @@ pub trait PathModel: Send + Sync {
     }
 }
 
-/// `P_D`: base penalty for introducing D, relaxed for a strong hypothesis.
+/// The path objective, `Σ S_clip − P_D·#D − tandem·[2nd D] + pair_bonus·[V…J]
+/// + per-base N/P cost`, read as a log-likelihood ratio.
 ///
-/// Swig relaxes R-optimized's 12 down to 10 when the D scores at least 20, or
-/// when its exact ungapped tract occurs in two different D sequences
-/// ([`Placement::relaxes_d_cost`]). Sensitive-D uses a fixed 10. Legacy
-/// profiles charge nothing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DPresencePenalty {
-    pub base: Score,
-    pub relaxed: Score,
-    /// Unclipped D score that earns `relaxed`.
-    pub strong_score: Score,
-}
-
-impl DPresencePenalty {
-    /// R-optimised: 12, relaxed to 10 when the D scores at least 20 or is a repeated exact tract.
-    pub const R_OPTIMIZED: Self = Self {
-        base: 12,
-        relaxed: 10,
-        strong_score: 20,
-    };
-    /// Sensitive-D: fixed 10.
-    pub const SENSITIVE_D: Self = Self {
-        base: 10,
-        relaxed: 10,
-        strong_score: 0,
-    };
-    /// Truth and IgBLAST-agreement: D is free apart from having to beat the no-D path.
-    pub const NONE: Self = Self {
-        base: 0,
-        relaxed: 0,
-        strong_score: 0,
-    };
-
-    pub fn penalty(&self, placement: &Placement) -> Score {
-        if placement.score() >= self.strong_score || placement.relaxes_d_cost {
-            self.relaxed
-        } else {
-            self.base
-        }
-    }
-}
-
-/// The note's engineering objective, as a path model:
-/// `Σ S_clip − P_D·[D] − tandem·[2nd D] + pair_bonus·[V…J] + per-base N/P cost`.
+/// Substitution scores are log-odds (in units of `1/λ` nats) of "templated by
+/// this germline" against "random sequence"; N/P bases score 0 under both.
+/// The remaining terms are log prior odds of the path's hypotheses:
+///
+/// * `d_presence` (`P_D`) — a D is one of `N` genes at one of `L` positions of
+///   the junction, so its prior is spread over `N·L` hypotheses: including
+///   the best one is worth it when `λ·S_D > ln(N·L) − ln(prior odds of D)`.
+///   [`crate::config::DPrior`] derives it from the database at build time.
+/// * `tandem_d_penalty` — prior odds of a second D (DJ → DDJ), on top of its `P_D`.
+/// * `pair_bonus` — prior odds of a complete V…J rearrangement over a partial
+///   read. 0 by default: on full-length reads the J's own clip score already
+///   completes the path, and 0–48 changed no call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EngineeringObjective {
     pub pair_bonus: Score,
-    pub d_presence: DPresencePenalty,
+    pub d_presence: Score,
     /// Extra prior cost for every D beyond the first.
     pub tandem_d_penalty: Score,
-    /// Score per unassigned junction base (0 reproduces the note; negative
-    /// values express an N/P length prior).
+    /// Score per unassigned junction base (0 = no N/P length prior).
     pub insertion_per_base: Score,
-    /// Extra presence cost charged when a D's longest exact run is below
-    /// [`Self::d_short_run_floor`]. Suppresses distributed-D false positives
-    /// that admit on identity but lack a solid ungapped core.
-    pub d_short_run_penalty: Score,
-    /// Exact-run length at or above which no short-run surcharge applies.
-    pub d_short_run_floor: u32,
-    /// Per-base penalty for aligned reference span above
-    /// [`Self::d_long_span_soft_max`]. Prefers compact D alleles over ones that
-    /// eat into N-addition; zeroed when soft-max is 0.
-    pub d_long_span_soft_max: u32,
-    pub d_long_span_penalty: Score,
 }
 
 impl Default for EngineeringObjective {
     fn default() -> Self {
         Self {
-            pair_bonus: 24,
-            d_presence: DPresencePenalty::R_OPTIMIZED,
+            pair_bonus: 0,
+            d_presence: 11,
             tandem_d_penalty: 12,
             insertion_per_base: 0,
-            // Mild surcharge: enough to cut short-core FPs, light enough that
-            // true short Ds on IgG still beat the no-D path.
-            d_short_run_penalty: 1,
-            d_short_run_floor: 6,
-            // Off by default: even mild over-long penalties cost D recall.
-            d_long_span_soft_max: 0,
-            d_long_span_penalty: 0,
+        }
+    }
+}
+
+impl EngineeringObjective {
+    /// Smallest D local score that can improve a path: `P_D + 1`.
+    ///
+    /// A clipped span of an optimal local alignment never outscores the
+    /// whole alignment (its prefixes and suffixes score ≥ 0), so a D scoring
+    /// at most `P_D` adds at most 0. Dropping it leaves its neighbours' cuts
+    /// valid (the exit before it is ≤ the entry after it), so the no-D path
+    /// scores at least as much and "with-D must strictly beat no-D" rejects
+    /// it. With a negative per-base junction score a D could pay for itself
+    /// by replacing N bases, so no floor is derived then.
+    pub fn d_floor(&self) -> Score {
+        if self.insertion_per_base < 0 {
+            Score::MIN
+        } else {
+            self.d_presence + 1
         }
     }
 }
@@ -189,31 +170,14 @@ impl PathModel for EngineeringObjective {
                 } else {
                     0
                 };
-                let run = placement.evidence.longest_exact_run;
-                let short = if run < self.d_short_run_floor {
-                    self.d_short_run_penalty * (self.d_short_run_floor - run) as Score
-                } else {
-                    0
-                };
-                let span = placement
-                    .alignment
-                    .r_end
-                    .saturating_sub(placement.alignment.r_start);
-                let long = if self.d_long_span_soft_max > 0 && span > self.d_long_span_soft_max
-                {
-                    self.d_long_span_penalty * (span - self.d_long_span_soft_max) as Score
-                } else {
-                    0
-                };
-                -self.d_presence.penalty(placement) - tandem - short - long
+                -self.d_presence - tandem
             }
-            SegmentKind::V => 0,
-            SegmentKind::J => placement.path_adjust,
+            SegmentKind::V | SegmentKind::J => 0,
         }
     }
 
-    fn junction(&self, _prev: SegmentKind, _next: SegmentKind, inserted: u32) -> Score {
-        self.insertion_per_base * inserted as Score
+    fn junction_per_base(&self, _prev: SegmentKind, _next: SegmentKind) -> Score {
+        self.insertion_per_base
     }
 
     fn end(&self, first: SegmentKind, last: SegmentKind, _d_count: u8) -> Score {

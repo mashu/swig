@@ -177,6 +177,11 @@ impl Adjudicator for ResidualAdjudicator {
             score: PathScore {
                 score: flank_score + d_score,
                 d_count: u8::from(pd.is_some()),
+                support: [pv, pd, pj]
+                    .into_iter()
+                    .flatten()
+                    .map(|p| placements[p.placement].score())
+                    .sum(),
             },
         })
     }

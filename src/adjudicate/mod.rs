@@ -11,13 +11,23 @@
 //!   overlap, and the DAG evaluates *every* cut exactly.
 //! * [`ResidualAdjudicator`] — the ordinary commit-V/J-then-D path, kept as a
 //!   baseline and for regression comparisons.
+//!
+//! [`PlacementDag`] also reads the objective as a distribution over paths and
+//! cuts, `P ∝ exp(nats)`, and returns posterior [`Marginals`] of the
+//! placements and of the D count by forward–backward over the same DAG, with
+//! alignment evidence rescored at the read's own divergence.
 
 mod dag;
 mod model;
+mod posterior;
 mod residual;
 
 pub use dag::{DagScratch, PlacementDag};
-pub use model::{DPresencePenalty, EngineeringObjective, Grammar, PathModel, VdjGrammar};
+pub use model::{EngineeringObjective, Grammar, PathModel, VdjGrammar};
+pub use posterior::{
+    divergence, EvidenceScale, Marginals, PosteriorModel, PosteriorScratch, MAX_SPREAD,
+    OVERLAP_SPREAD,
+};
 pub use residual::{ResidualAdjudicator, ResidualScratch};
 
 use std::cmp::Ordering;
@@ -26,12 +36,22 @@ use crate::clip::ClipSpan;
 use crate::placement::Placement;
 use crate::scoring::Score;
 
-/// Path objective with the note's tie rule built in: at equal score the path
-/// with fewer D segments wins ("with-D must strictly beat no-D").
+/// Path objective with its tie rules built in, compared lexicographically:
+///
+/// 1. `score` — the objective;
+/// 2. fewer D segments ("with-D must strictly beat no-D");
+/// 3. `support` — the summed *unclipped* scores of the path's placements.
+///
+/// Rule 3 separates paths that explain the read equally well but differ in
+/// how much germline sequence supports them, typically alleles of different
+/// 3′ length at a junction where a base can belong to either side. The
+/// allele with more support admits more cuts that reach the same score, so
+/// it has the larger likelihood summed over cuts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PathScore {
     pub score: Score,
     pub d_count: u8,
+    pub support: Score,
 }
 
 impl Ord for PathScore {
@@ -39,6 +59,7 @@ impl Ord for PathScore {
         self.score
             .cmp(&other.score)
             .then(other.d_count.cmp(&self.d_count))
+            .then(self.support.cmp(&other.support))
     }
 }
 
@@ -76,4 +97,16 @@ pub trait Adjudicator: Send + Sync {
         placements: &[Placement],
         scratch: &mut Self::Scratch,
     ) -> Option<CallPath>;
+
+    /// Posterior marginals of `placements` given the adjudicated `path`, for
+    /// adjudicators with a probabilistic reading that are configured to
+    /// compute them.
+    fn marginals(
+        &self,
+        _placements: &[Placement],
+        _path: &CallPath,
+        _scratch: &mut Self::Scratch,
+    ) -> Option<Marginals> {
+        None
+    }
 }

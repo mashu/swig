@@ -19,7 +19,9 @@
 //!    distance from the 3′ end, for alleles whose motifs were weak.
 //! 4. Transfer from the most similar confidently annotated allele by
 //!    alignment ([`RelativeIndex`], [`transfer()`]) — rescues pseudogenes and
-//!    mutated motifs.
+//!    mutated motifs. When the relative's anchor codon maps at or past the
+//!    allele's 3′ end (an IMGT 3′-partial sequence), the allele holds no
+//!    anchor and none is reported: a weak motif hit there is another codon.
 //!
 //! The chain type (which fixes the FR3 length) is voted by J residues
 //! (`W` heavy, `F` light) and Trp41 contexts (`W.R` heavy, `W.Q` light).
@@ -35,7 +37,9 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 
 pub use j_motif::{find_j, JHit};
-pub use transfer::{kmers, shared, transfer, RelativeIndex, MIN_SHARED_FRACTION, MIN_SHARED_KMERS};
+pub use transfer::{
+    kmers, shared, transfer, transfer_aligned, RelativeIndex, MIN_SHARED_FRACTION, MIN_SHARED_KMERS,
+};
 pub use v_motif::{find_v, VHit, VSearch};
 
 use crate::align::GotohWorkspace;
@@ -169,7 +173,7 @@ fn regions_from_hit(hit: &VHit, chain: Option<ChainType>) -> RegionStarts {
 fn merge_regions(
     header: RegionStarts,
     derived: RegionStarts,
-    anchor: u32,
+    anchor: Option<u32>,
     len: usize,
     notes: &mut Vec<String>,
 ) -> RegionStarts {
@@ -181,7 +185,7 @@ fn merge_regions(
         }
     }
     let mut merged = RegionStarts::from_values(values);
-    while let Err(reason) = merged.check(Some(anchor), len) {
+    while let Err(reason) = merged.check(anchor, len) {
         let Some(index) = (0..5)
             .rev()
             .find(|&i| merged.values()[i].is_some() && header_values[i].is_none())
@@ -207,7 +211,29 @@ fn merge_regions(
     merged
 }
 
-/// Transfer `positions` from the nearest eligible relative; returns donor index and positions.
+/// Positions carried over from the nearest eligible relative.
+struct Relative {
+    donor: usize,
+    mapped: Vec<Option<u32>>,
+    /// The target's and the donor's bases inside their local alignment.
+    aligned: std::ops::Range<u32>,
+    donor_aligned: std::ops::Range<u32>,
+}
+
+impl Relative {
+    /// Whether the target ends, on the side of the donor's position `at`,
+    /// while still aligned to the donor (to within a codon): a partial
+    /// sequence, not an alignment that stopped short.
+    fn runs_out_before(&self, at: u32, len: usize) -> bool {
+        if at < self.donor_aligned.start {
+            self.aligned.start <= 3
+        } else {
+            self.aligned.end as usize + 3 >= len
+        }
+    }
+}
+
+/// Transfer `positions` from the nearest eligible relative.
 fn from_relative(
     set: &GermlineSet,
     target: usize,
@@ -215,16 +241,21 @@ fn from_relative(
     index: &mut RelativeIndex,
     positions_of: impl Fn(usize) -> Vec<Option<u32>>,
     workspace: &mut GotohWorkspace,
-) -> Option<(usize, Vec<Option<u32>>)> {
+) -> Option<Relative> {
     let donor = index.nearest(target, eligible)?;
     let alleles = set.alleles();
-    let mapped = transfer(
+    let (mapped, alignment) = transfer_aligned(
         &alleles[target].codes,
         &alleles[donor].codes,
         &positions_of(donor),
         workspace,
     )?;
-    Some((donor, mapped))
+    Some(Relative {
+        donor,
+        mapped,
+        aligned: alignment.q_start..alignment.q_end,
+        donor_aligned: alignment.r_start..alignment.r_end,
+    })
 }
 
 /// The relative index of `set`, built on first use.
@@ -319,12 +350,14 @@ fn annotate_j(
             None
         };
         let codes_len = j.alleles()[index].codes.len();
-        match donor.and_then(|(d, mapped)| {
-            mapped[0]
-                .filter(|&a| a as usize + 3 <= codes_len)
-                .map(|a| (d, a))
-        }) {
-            Some((donor, anchor)) => {
+        let fits = |r: &Relative| r.mapped[0].is_some_and(|a| a as usize + 3 <= codes_len);
+        let partial =
+            |r: &Relative| anchors[r.donor].is_some_and(|a| r.runs_out_before(a, codes_len));
+        match donor {
+            Some(Relative { donor, mapped, .. })
+                if mapped[0].is_some_and(|a| a as usize + 3 <= codes_len) =>
+            {
+                let anchor = mapped[0].expect("checked above");
                 let residue = residue_at(&j.alleles()[index].codes, anchor);
                 if !matches!(residue, b'W' | b'F') {
                     result[index]
@@ -336,7 +369,15 @@ fn annotate_j(
                 };
                 anchors[index] = Some(anchor);
             }
-            None => {
+            // A partial allele: the relative's anchor codon maps outside it,
+            // and the allele ends while still aligned to the relative.
+            Some(r) if !fits(&r) && partial(&r) => {
+                result[index].notes.push(format!(
+                    "partial: the anchor codon of {} maps outside the sequence",
+                    j.alleles()[r.donor].name
+                ));
+            }
+            _ => {
                 if let Some(h) = weak[index] {
                     result[index].source = AnchorSource::LowConfidence;
                     result[index]
@@ -473,7 +514,7 @@ pub fn annotate(
                 merge_regions(
                     allele.regions,
                     regions_from_hit(&hit, chain),
-                    anchor,
+                    Some(anchor),
                     len_of(v, index),
                     &mut result[index].notes,
                 )
@@ -509,7 +550,7 @@ pub fn annotate(
             continue;
         }
         let relatives = relatives(&mut relative_index, v);
-        let Some((donor, mapped)) = from_relative(
+        let Some(Relative { donor, mapped, .. }) = from_relative(
             v,
             index,
             &unambiguous,
@@ -564,9 +605,12 @@ pub fn annotate(
             None
         };
         let len = len_of(v, index);
-        match donor.filter(|(_, mapped)| mapped[0].is_some_and(|a| a as usize + 3 <= len)) {
-            Some((donor, mapped)) => {
-                let anchor = mapped[0].expect("filtered above");
+        let partial = |r: &Relative| anchors[r.donor].is_some_and(|a| r.runs_out_before(a, len));
+        match donor {
+            Some(Relative { donor, mapped, .. })
+                if mapped[0].is_some_and(|a| a as usize + 3 <= len) =>
+            {
+                let anchor = mapped[0].expect("checked above");
                 let derived = RegionStarts::from_values([
                     mapped[1], mapped[2], mapped[3], mapped[4], mapped[5],
                 ]);
@@ -575,21 +619,53 @@ pub fn annotate(
                 if residue != b'C' {
                     notes.push(format!("conserved residue is {}", char::from(residue)));
                 }
-                regions[index] =
-                    merge_regions(v.alleles()[index].regions, derived, anchor, len, notes);
+                regions[index] = merge_regions(
+                    v.alleles()[index].regions,
+                    derived,
+                    Some(anchor),
+                    len,
+                    notes,
+                );
                 result[index].source = AnchorSource::Transfer {
                     from: v.alleles()[donor].name.clone(),
                 };
                 anchors[index] = Some(anchor);
             }
-            None => {
+            // The closest relative's anchor codon maps at or past the 3′ end
+            // and the allele ends while still aligned to it: a 3′-partial
+            // allele, which holds no Cys104. A weak motif hit would be some
+            // other codon, so the anchor stays missing; the relative's region
+            // starts inside the allele are kept.
+            Some(r) if partial(&r) => {
+                let derived = RegionStarts::from_values([
+                    r.mapped[1],
+                    r.mapped[2],
+                    r.mapped[3],
+                    r.mapped[4],
+                    r.mapped[5],
+                ]);
+                let notes = &mut result[index].notes;
+                notes.push(format!(
+                    "3′-partial: the anchor codon of {} maps past the 3′ end",
+                    v.alleles()[r.donor].name
+                ));
+                regions[index] =
+                    merge_regions(v.alleles()[index].regions, derived, None, len, notes);
+            }
+            relative => {
                 if let Some(hit) = hits[index] {
                     let notes = &mut result[index].notes;
-                    notes.push("weak motifs; no similar annotated allele".into());
+                    notes.push(match relative {
+                        Some(r) => format!(
+                            "weak motifs; the anchor of {} does not fit and their alignment stops short",
+                            v.alleles()[r.donor].name
+                        ),
+                        None => "weak motifs; no similar annotated allele".into(),
+                    });
                     regions[index] = merge_regions(
                         v.alleles()[index].regions,
                         regions_from_hit(&hit, chain),
-                        hit.anchor(),
+                        Some(hit.anchor()),
                         len,
                         notes,
                     );

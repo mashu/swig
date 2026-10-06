@@ -210,6 +210,13 @@ impl SubstitutionModel for HotspotScoring {
     }
 }
 
+/// Match and mismatch scores of a position-independent profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UniformScores {
+    pub matched: Score,
+    pub mismatch: Score,
+}
+
 /// `ALPHABET_SIZE` rows × `len` columns of substitution scores for one allele.
 #[derive(Clone, Debug)]
 pub struct SubstitutionProfile {
@@ -217,6 +224,12 @@ pub struct SubstitutionProfile {
     rows: Vec<Score>,
     max: Score,
     min: Score,
+    /// Reference codes (ambiguity collapsed to `N`).
+    codes: Vec<u8>,
+    /// `Some` when every entry is `matched` / `mismatch` / 0 (for `N`) by
+    /// identity alone, as for [`AffineScoring`]; kernels may then compare
+    /// codes instead of reading the profile.
+    uniform: Option<UniformScores>,
 }
 
 impl SubstitutionProfile {
@@ -235,12 +248,26 @@ impl SubstitutionProfile {
         }
         let max = rows.iter().copied().max().unwrap_or(0);
         let min = rows.iter().copied().min().unwrap_or(0);
+        let codes: Vec<u8> = reference.iter().map(|&c| c.min(N)).collect();
+        let uniform = uniform_scores(&rows, &codes);
         Self {
             len,
             rows,
             max,
             min,
+            codes,
+            uniform,
         }
+    }
+
+    /// Match/mismatch scores when the profile depends on identity alone.
+    pub fn uniform(&self) -> Option<UniformScores> {
+        self.uniform
+    }
+
+    /// Reference codes, ambiguity collapsed to `N`.
+    pub fn codes(&self) -> &[u8] {
+        &self.codes
     }
 
     /// Largest single-cell score; bounds any alignment score by `max × min(n, m)`.
@@ -275,10 +302,65 @@ impl SubstitutionProfile {
     }
 }
 
+/// The uniform scores reproducing `rows` exactly, if any: `matched` where
+/// the query code equals a canonical reference code, 0 where either is `N`,
+/// `mismatch` elsewhere.
+fn uniform_scores(rows: &[Score], codes: &[u8]) -> Option<UniformScores> {
+    let len = codes.len();
+    let at = |q: usize, j: usize| rows[q * len + j];
+    let canonical = codes.iter().position(|&c| c < N);
+    let scores = match canonical {
+        Some(j) => UniformScores {
+            matched: at(usize::from(codes[j]), j),
+            mismatch: at(usize::from((codes[j] + 1) % N), j),
+        },
+        None => UniformScores {
+            matched: 0,
+            mismatch: 0,
+        },
+    };
+    let expected = |q: u8, r: u8| {
+        if q >= N || r >= N {
+            0
+        } else if q == r {
+            scores.matched
+        } else {
+            scores.mismatch
+        }
+    };
+    let exact = (0..ALPHABET_SIZE as u8).all(|q| {
+        codes
+            .iter()
+            .enumerate()
+            .all(|(j, &r)| at(usize::from(q), j) == expected(q, r))
+    });
+    exact.then_some(scores)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::alphabet::encode;
+
+    #[test]
+    fn uniform_profiles_are_recognised_and_hotspot_profiles_are_not() {
+        let scoring = AffineScoring::new(2, -3, -5, -1);
+        let reference = encode(b"AGCTGTCNNA");
+        let uniform = SubstitutionProfile::build(&scoring, &reference);
+        assert_eq!(
+            uniform.uniform(),
+            Some(UniformScores {
+                matched: 2,
+                mismatch: -3
+            })
+        );
+        assert_eq!(uniform.codes(), &reference[..]);
+        let hotspot = HotspotScoring::for_shm(AffineScoring::new(2, -3, -17, -2));
+        assert_eq!(
+            SubstitutionProfile::build(&hotspot, &reference).uniform(),
+            None
+        );
+    }
 
     #[test]
     fn profile_matches_uniform_scoring() {

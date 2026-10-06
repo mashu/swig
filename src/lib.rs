@@ -56,6 +56,7 @@ pub mod retrieve;
 pub mod scoring;
 pub mod seed;
 pub mod segment;
+pub mod sim;
 pub mod stats;
 pub mod translate;
 pub mod window;
@@ -63,8 +64,8 @@ pub mod window;
 /// The names most programs need.
 pub mod prelude {
     pub use crate::adjudicate::{
-        Adjudicator, CallPath, CalledSegment, DPresencePenalty, EngineeringObjective, Grammar,
-        PathModel, PathScore, PlacementDag, ResidualAdjudicator, VdjGrammar,
+        Adjudicator, CallPath, CalledSegment, EngineeringObjective, Grammar, PathModel, PathScore,
+        PlacementDag, ResidualAdjudicator, VdjGrammar,
     };
     pub use crate::admission::{
         Admission, AdmitAll, AllOf, AnyOf, DistributedEvidence, ExactRunFloor,
@@ -74,17 +75,20 @@ pub mod prelude {
     pub use crate::band::Band;
     pub use crate::batch::{assign_all, assign_map};
     pub use crate::config::{
-        BuildError, DSegmentConfig, DefaultAssigner, EngineConfig, VjSegmentConfig,
+        BuildError, DPrior, DSegmentConfig, DefaultAssigner, EngineConfig, JSegmentConfig,
+        ObjectiveConfig, VSegmentConfig,
     };
     pub use crate::germline::{GermlineSet, SegmentKind};
-    pub use crate::orient::{Orientation, OrientationPolicy};
+    pub use crate::orient::{Orientation, OrientationPolicy, StrandIndex};
     pub use crate::pipeline::{AlleleCatalog, Assigner, AssignerOptions, Call, VdjAssigner};
     pub use crate::profiles::CallingProfile;
     pub use crate::reads::{ReadFormat, ReadReader, ReadRecord};
     pub use crate::refine::{NoRefine, Refiner};
     pub use crate::report::{AirrRecord, SupportModels};
-    pub use crate::retrieve::{Candidate, Retriever};
+    pub use crate::retrieve::{Candidate, ExhaustiveRetriever, Retriever};
     pub use crate::scoring::{AffineScoring, HotspotScoring};
     pub use crate::stats::KarlinAltschul;
-    pub use crate::window::{DWindowPolicy, ExpandedResidual, ResidualWindow, WithAnchorWindow};
+    pub use crate::window::{
+        DWindowPolicy, DownstreamWindow, ExpandedResidual, ResidualWindow, WithAnchorWindow,
+    };
 }
