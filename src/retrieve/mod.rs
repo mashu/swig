@@ -53,6 +53,9 @@ pub struct RetrievalScratch {
     pub ranked: Vec<u32>,
     pub counts: Vec<u32>,
     pub ranked_candidates: Vec<(Score, Candidate)>,
+    /// Sampled query seeds and their s-mer ranks ([`crate::seed::SeedSampling`]).
+    pub seeds: Vec<(usize, u64)>,
+    pub ranks: Vec<u64>,
 }
 
 pub trait Retriever: Send + Sync {

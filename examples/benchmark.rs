@@ -80,6 +80,26 @@ fn main() -> Result<(), Box<dyn Error>> {
         config.d_window.reclaim = reclaim;
         config.j.window.reclaim = reclaim;
     }
+    if let Some(sampling) = value("--sampling") {
+        // all | closed:W | open:W | min:W
+        use vdj_assign::seed::SeedSampling;
+        let (kind, w) = sampling.split_once(':').unwrap_or((sampling.as_str(), "0"));
+        let w: u8 = w.parse()?;
+        config.v.seeds.sampling = match kind {
+            "all" => SeedSampling::All,
+            "closed" => SeedSampling::ClosedSyncmer { w },
+            "open" => SeedSampling::OpenSyncmer { w },
+            "min" => SeedSampling::Minimizer { w },
+            other => return Err(format!("unknown sampling '{other}'").into()),
+        };
+    }
+    if let Some(votes) = value("--weak-votes") {
+        config.v.seeds.weak_votes = votes.parse()?;
+    }
+    if let Some(reclaim) = value("--j-reclaim") {
+        // How far before the earliest V end J is searched (huge = whole read).
+        config.j.window.reclaim = reclaim.parse()?;
+    }
     if let Some(pad) = value("--band-pad") {
         config.v.seeds.band_pad = pad.parse()?;
     }
@@ -158,7 +178,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     let sim = Simulator::new(&db.v, db.d.as_ref(), &db.j, params)?;
     let simulated = sim.reads(reads, seed)?;
     let assigner = DefaultAssigner::from_config(&config, db.v.clone(), db.d.clone(), db.j.clone())?;
-    let queries: Vec<Vec<u8>> = simulated.iter().map(|r| encode(&r.sequence)).collect();
+    // `--tail N`: keep the last N bases of each read (germline sense only),
+    // as a short read covering part of V.
+    let tail: Option<usize> = value("--tail").map(|v| v.parse()).transpose()?;
+    if tail.is_some() && rc != 0.0 {
+        return Err("--tail needs --rc 0".into());
+    }
+    let queries: Vec<Vec<u8>> = simulated
+        .iter()
+        .map(|r| {
+            let keep = tail.map_or(0, |n| r.sequence.len().saturating_sub(n));
+            encode(&r.sequence[keep..])
+        })
+        .collect();
 
     let started = Instant::now();
     let calls = assign_all(&assigner, &queries, threads);

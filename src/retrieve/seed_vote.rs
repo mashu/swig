@@ -36,7 +36,7 @@ use super::{Candidate, CandidateBudget, ClusterVote, RetrievalScratch, Retriever
 use crate::band::Band;
 use crate::germline::{GeneId, GermlineSet};
 use crate::index::{IndexError, KmerIndex};
-use crate::seed::SeedShape;
+use crate::seed::{SeedSampling, SeedShape};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SeedVoteParams {
@@ -61,6 +61,8 @@ pub struct SeedVoteParams {
     /// Safety pool: never return more alleles than this (all alleles of the
     /// best genes first).
     pub max_alleles: usize,
+    /// Which k-mers are seeds, in the index and in the query alike.
+    pub sampling: SeedSampling,
 }
 
 impl Default for SeedVoteParams {
@@ -77,6 +79,10 @@ impl Default for SeedVoteParams {
             unbanded: false,
             min_votes: 1,
             max_alleles: 64,
+            // Closed syncmers: as sensitive as every k-mer on IgSim reads up
+            // to 30 % SHM and on reads covering 30–80 V bases, with 60 %
+            // fewer votes to sort (docs/ASSESSMENT.md §8).
+            sampling: SeedSampling::ClosedSyncmer { w: 4 },
         }
     }
 }
@@ -173,9 +179,11 @@ impl<B: CandidateBudget> SeedVoteRetriever<B> {
     ) -> Result<Self, IndexError> {
         let frames = GeneFrames::build(set, &primary);
         Ok(Self {
-            primary: KmerIndex::build_from(frames.sequences(set), primary)?,
+            primary: KmerIndex::build_sampled(frames.sequences(set), primary, params.sampling)?,
             fallback: fallback
-                .map(|shape| KmerIndex::build_from(frames.sequences(set), shape))
+                .map(|shape| {
+                    KmerIndex::build_sampled(frames.sequences(set), shape, params.sampling)
+                })
                 .transpose()?,
             frames,
             gene_count: set.gene_count(),
@@ -188,6 +196,7 @@ impl<B: CandidateBudget> SeedVoteRetriever<B> {
         &self.params
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn cast_votes(
         &self,
         index: &KmerIndex,
@@ -195,11 +204,13 @@ impl<B: CandidateBudget> SeedVoteRetriever<B> {
         query: &[u8],
         layout: &VoteLayout,
         keys: &mut Vec<u64>,
+        seeds: &mut Vec<(usize, u64)>,
+        ranks: &mut Vec<u64>,
     ) {
-        for (qpos, key) in index.shape().kmers(query) {
+        let mut vote = |qpos: usize, key: u64| {
             let postings = index.postings(key);
             if postings.len() > self.params.max_occurrences {
-                continue;
+                return;
             }
             // Postings are sorted by frame: a repeat within one frame is a run.
             for (i, p) in postings.iter().enumerate() {
@@ -208,6 +219,16 @@ impl<B: CandidateBudget> SeedVoteRetriever<B> {
                 if !repeated {
                     keys.push(layout.pack(p.id(), qpos as i64 - i64::from(p.position()), weight));
                 }
+            }
+        };
+        match self.params.sampling {
+            SeedSampling::All => index
+                .shape()
+                .kmers(query)
+                .for_each(|(qpos, key)| vote(qpos, key)),
+            sampling => {
+                sampling.seeds(index.shape(), query, seeds, ranks);
+                seeds.iter().for_each(|&(qpos, key)| vote(qpos, key));
             }
         }
     }
@@ -301,6 +322,8 @@ impl<B: CandidateBudget> Retriever for SeedVoteRetriever<B> {
             gene_votes,
             gene_order,
             ranked,
+            seeds,
+            ranks,
             ..
         } = scratch;
         keys.clear();
@@ -311,10 +334,20 @@ impl<B: CandidateBudget> Retriever for SeedVoteRetriever<B> {
             query,
             &layout,
             keys,
+            seeds,
+            ranks,
         );
         let mut strongest = self.cluster(&layout, keys, buffer, votes);
         if let (true, Some(fallback)) = (strongest < self.params.weak_votes, &self.fallback) {
-            self.cast_votes(fallback, self.params.fallback_weight, query, &layout, keys);
+            self.cast_votes(
+                fallback,
+                self.params.fallback_weight,
+                query,
+                &layout,
+                keys,
+                seeds,
+                ranks,
+            );
             strongest = self.cluster(&layout, keys, buffer, votes);
         }
         if strongest < self.params.min_votes {

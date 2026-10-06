@@ -22,7 +22,7 @@
 use std::fmt;
 
 use crate::germline::GermlineSet;
-use crate::seed::SeedShape;
+use crate::seed::{SeedSampling, SeedShape};
 
 const POSITION_BITS: u32 = 12;
 /// Largest germline position representable in a posting.
@@ -125,7 +125,17 @@ impl KmerIndex {
         sequences: impl IntoIterator<Item = IndexedSequence<'a>>,
         shape: SeedShape,
     ) -> Result<Self, IndexError> {
+        Self::build_sampled(sequences, shape, SeedSampling::All)
+    }
+
+    /// As [`KmerIndex::build_from`], indexing only the seeds `sampling` keeps.
+    pub fn build_sampled<'a>(
+        sequences: impl IntoIterator<Item = IndexedSequence<'a>>,
+        shape: SeedShape,
+        sampling: SeedSampling,
+    ) -> Result<Self, IndexError> {
         let mut pairs: Vec<(u64, Posting)> = Vec::new();
+        let (mut seeds, mut ranks) = (Vec::new(), Vec::new());
         for sequence in sequences {
             if sequence.id > MAX_ALLELE {
                 return Err(IndexError::TooManyAlleles(sequence.id as usize + 1));
@@ -137,8 +147,9 @@ impl KmerIndex {
                     len: end,
                 });
             }
+            sampling.seeds(&shape, sequence.codes, &mut seeds, &mut ranks);
             pairs.extend(
-                shape.kmers(sequence.codes).map(|(pos, key)| {
+                seeds.iter().map(|&(pos, key)| {
                     (key, Posting::new(sequence.id, sequence.offset + pos as u32))
                 }),
             );
