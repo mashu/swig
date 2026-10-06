@@ -234,8 +234,10 @@ The full description, with the guarantee of each search step, is in
   score 0 under both hypotheses. Affine gaps price indels.
 - **The path objective** is `Σ clipped segment scores − P_D·#D − tandem·[2nd D]
   + pair_bonus·[V…J]`, maximised exactly over the topologies VJ / VDJ / VDDJ,
-  over the placements, and over every cut through overlaps. Ties go to fewer D,
-  then to more germline support (the summed unclipped scores).
+  over the placements, and over both cuts between neighbours (the earlier one
+  exits at `x`, the later enters at `y ≥ x`, and the bases between are N/P).
+  Ties go to fewer D, then to more germline support (the summed unclipped
+  scores).
 - **`P_D` is derived, not tuned.** A D is one of `N` genes at one of `L`
   junction positions. Including it pays off when `λ·S_D > ln(N·L) − ln(prior
   odds)`, which gives 11 for human IGH (32 genes, L = 25, even odds) and 6
@@ -396,8 +398,7 @@ L is derived from the admission gates so it can never drop an admissible hit:
 alignment never outscores the whole alignment. So a D scoring at most `P_D`
 can only add ≤ 0 to a path, and the strict with-D-beats-no-D rule rejects it.
 The D stage therefore keeps only scores ≥ `P_D + 1` (and ≥ the gates' own
-floor). This is exact when the placements flanking the D do not overlap each
-other.
+floor). Dropping a D leaves its neighbours' cuts valid, so this is exact.
 
 ### Adjudication
 
@@ -405,11 +406,13 @@ other.
 of any sub-alignment between two query cuts in O(1), with exact affine gap
 accounting at the new edges.
 
-**DAG with prefix maxima.** Clip scores are separable in (entry, exit), and so
-is the support tie-break. For every overlap cut, the best predecessor state
-is therefore a lexicographic prefix maximum found by one binary search. Every
-cut through every overlap is evaluated, and the result provably equals
-brute-force enumeration (tested).
+**DAG with running maxima.** Clip scores are separable in (entry, exit), the
+N/P score is linear in the gap, and the support tie-break is separable too.
+For every exit cut, the best predecessor state is a lexicographic prefix
+maximum found by one binary search; for every entry cut of the next
+placement, the best exit before it is a running maximum read in O(1). Every
+pair of cuts is evaluated, and the result provably equals exhaustive
+enumeration (tested).
 
 ### Parallelism and allocation
 
@@ -477,8 +480,10 @@ SNPs, so no score-based caller can do better.
 ## Validation
 
 - **DAG optimality:** `dag_equals_brute_force_over_all_paths_and_cuts`
-  enumerates every VJ/VDJ/VDDJ path and every cut, with a per-base insertion
-  cost and the lexicographic support tie-break, and requires the same optimum.
+  enumerates every VJ/VDJ/VDDJ path and every pair of exit and entry cuts,
+  with a per-base insertion cost and the lexicographic support tie-break, and
+  requires the same optimum. `two_cuts_leave_a_shared_mismatch_stretch_to_n`
+  checks a constructed read where no single cut is optimal.
 - **Kernel exactness:**
   - The scalar kernel equals a textbook Gotoh across three gap regimes.
   - Every traceback rescores to its reported score.
@@ -561,9 +566,6 @@ Each is a named field you can change.
 - **One alignment per D allele per window.** A D's optimal local alignment in
   its window is not always its optimal *clipped* alignment at the chosen cut.
   The 12-base reclaim keeps this rare; see the assessment.
-- **Single-cut overlaps.** When two consecutive placements overlap, the DAG
-  splits the overlap at one cut and leaves no N between them. The D floor
-  `P_D + 1` is exact only when D's neighbours do not overlap each other.
 - **E-values** use exact *ungapped* λ and K and the total database length.
   Gapped scores are slightly higher (anti-conservative); near-identical alleles
   inflate the database length (conservative). They gate hits; they are not
@@ -598,13 +600,10 @@ In order of expected value; reasons and measurements are in
    DAG gives calibrated posterior probabilities per allele and per D presence.
    Every separability trick carries over: prefix log-sum-exp replaces prefix
    maxima.
-2. **Independent cuts with N between overlapping placements.** This makes the
-   DAG exact for the segmentation model, and the D floor exact
-   unconditionally.
-3. **Wider SIMD.** An AVX-512BW kernel (32 lanes) and a NEON port (8 lanes) of
+2. **Wider SIMD.** An AVX-512BW kernel (32 lanes) and a NEON port (8 lanes) of
    the same design.
-4. **Allele rescoring along the gene frame.** Score siblings along their
+3. **Allele rescoring along the gene frame.** Score siblings along their
    representative's traceback and run DP only where bounds straddle the cutoff.
-5. **Annotation.** A per-database FR3 length learned from header-annotated
+4. **Annotation.** A per-database FR3 length learned from header-annotated
    alleles (TR loci). A consensus position prior for Cys23.
-6. **C-segment assignment.**
+5. **C-segment assignment.**

@@ -297,31 +297,46 @@ fn batch_matches_sequential() {
 }
 
 // ---------------------------------------------------------------------------
-// Brute-force check of the DAG's prefix-maximum shortcut.
+// Brute-force check of the DAG's running-maximum shortcuts.
 // ---------------------------------------------------------------------------
 
+/// Exhaustive search of the segmentation model: every grammatical path, and
+/// for every transition every exit cut `x` and entry cut `y ≥ x` within
+/// `MARGIN` bases of the placements' meeting point — wider than the DAG's own
+/// search (entries only inside the overlap), so it also checks that the DAG's
+/// restriction loses nothing. Memoised on `(placement, entry, D count, first)`.
 struct Brute<'a> {
     dag: &'a PlacementDag,
     placements: &'a [Placement],
-    best: Option<PathScore>,
+    memo: std::collections::HashMap<(usize, u32, u8, SegmentKind), Option<PathScore>>,
 }
+
+const MARGIN: u32 = 12;
 
 impl Brute<'_> {
     fn min(&self, kind: SegmentKind) -> u32 {
         self.dag.min_retained[kind.index()].max(1)
     }
 
-    fn visit(&mut self, b: usize, entry: u32, acc: i32, support: i32, d_used: u8, first: SegmentKind) {
+    /// Best rest of a path whose current segment is `b`, entered at `entry`.
+    fn best_from(&mut self, b: usize, entry: u32, d_used: u8, first: SegmentKind) -> Option<PathScore> {
+        let key = (b, entry, d_used, first);
+        if let Some(known) = self.memo.get(&key) {
+            return *known;
+        }
         let (grammar, model) = (&self.dag.grammar, &self.dag.model);
         let pb = &self.placements[b];
         let bonus = model.segment_bonus(pb, d_used);
+        let mut best: Option<PathScore> = None;
+        let mut consider = |candidate: PathScore| {
+            if best.map_or(true, |current| candidate > current) {
+                best = Some(candidate);
+            }
+        };
         if grammar.can_end(first, pb.kind) {
             if let Some(span) = pb.clip.span(entry, pb.q_end()).filter(|s| s.q_len() >= self.min(pb.kind)) {
-                let total = acc + span.score + bonus + model.end(first, pb.kind, d_used);
-                let candidate = PathScore { score: total, d_count: d_used, support: support + pb.score() };
-                if self.best.map_or(true, |best| candidate > best) {
-                    self.best = Some(candidate);
-                }
+                let score = span.score + bonus + model.end(first, pb.kind, d_used);
+                consider(PathScore { score, d_count: d_used, support: pb.score() });
             }
         }
         for e in 0..self.placements.len() {
@@ -329,21 +344,32 @@ impl Brute<'_> {
             if pe.q_start() <= pb.q_start() || !grammar.can_follow(pb.kind, pe.kind, d_used) {
                 continue;
             }
-            let cuts: Vec<(u32, u32)> = if pe.q_start() < pb.q_end() {
-                (pe.q_start()..=pb.q_end().min(pe.q_end() - 1)).map(|c| (c, c)).collect()
-            } else {
-                vec![(pb.q_end(), pe.q_start())]
-            };
-            for (exit, next_entry) in cuts {
-                let Some(span) = pb.clip.span(entry, exit).filter(|s| s.q_len() >= self.min(pb.kind)) else {
+            let meet = pb.q_end().min(pe.q_start());
+            let exits = meet.saturating_sub(MARGIN).max(entry + 1)..=pb.q_end();
+            let last_entry = (pb.q_end().max(pe.q_start()) + MARGIN).min(pe.q_end() - 1);
+            let d_next = d_used + u8::from(pe.kind == SegmentKind::D);
+            for x in exits {
+                let Some(span) = pb.clip.span(entry, x).filter(|s| s.q_len() >= self.min(pb.kind)) else {
                     continue;
                 };
-                let Some(next) = pe.clip.entry(next_entry) else { continue };
-                let junction = model.junction(pb.kind, pe.kind, next.q.saturating_sub(span.q_hi));
-                let d_next = d_used + u8::from(pe.kind == SegmentKind::D);
-                self.visit(e, next_entry, acc + span.score + bonus + junction, support + pb.score(), d_next, first);
+                for y in pe.q_start().max(x)..=last_entry {
+                    let Some(next) = pe.clip.entry(y) else {
+                        continue;
+                    };
+                    let junction = model.junction(pb.kind, pe.kind, next.q.saturating_sub(span.q_hi));
+                    let Some(rest) = self.best_from(e, y, d_next, first) else {
+                        continue;
+                    };
+                    consider(PathScore {
+                        score: span.score + bonus + junction + rest.score,
+                        d_count: rest.d_count,
+                        support: pb.score() + rest.support,
+                    });
+                }
             }
         }
+        self.memo.insert(key, best);
+        best
     }
 }
 
@@ -377,14 +403,15 @@ fn dag_equals_brute_force_over_all_paths_and_cuts() {
         placements.extend(top_by_kind(&call.placements, SegmentKind::J, 3));
 
         let fast = dag.adjudicate(call.query.len(), &placements, &mut scratch);
-        let mut brute = Brute { dag: &dag, placements: &placements, best: None };
-        for s in 0..placements.len() {
-            let p = &placements[s];
-            if dag.grammar.can_start(p.kind) {
-                brute.visit(s, p.q_start(), 0, 0, u8::from(p.kind == SegmentKind::D), p.kind);
-            }
-        }
-        assert_eq!(fast.as_ref().map(|path| path.score), brute.best);
+        let mut brute = Brute { dag: &dag, placements: &placements, memo: Default::default() };
+        let exhaustive = (0..placements.len())
+            .filter(|&s| dag.grammar.can_start(placements[s].kind))
+            .filter_map(|s| {
+                let p = &placements[s];
+                brute.best_from(s, p.q_start(), u8::from(p.kind == SegmentKind::D), p.kind)
+            })
+            .max();
+        assert_eq!(fast.as_ref().map(|path| path.score), exhaustive);
         if let Some(path) = fast {
             let kinds: Vec<SegmentKind> = path.segments.iter().map(|s| placements[s.placement].kind).collect();
             distinct_topologies.insert(kinds);
@@ -418,7 +445,10 @@ fn simd_batched_pipeline_equals_scalar_per_read() {
         assert_eq!(call.path, reference.path);
         assert_eq!(call.placements.len(), reference.placements.len());
         for (a, b) in call.placements.iter().zip(&reference.placements) {
-            assert_eq!((a.kind, &a.alleles, a.score(), a.q_start(), a.q_end()), (b.kind, &b.alleles, b.score(), b.q_start(), b.q_end()));
+            assert_eq!(
+                (a.kind, &a.alleles, a.score(), a.q_start(), a.q_end()),
+                (b.kind, &b.alleles, b.score(), b.q_start(), b.q_end())
+            );
         }
     }
 }

@@ -4,8 +4,9 @@
 //! "what does a second D cost?" (a scoring question). The DAG needs one
 //! structural property from a [`PathModel`]: a segment contributes
 //! *clip score + a bonus that does not depend on the cut positions*, and a
-//! junction contributes a function of its inserted length. That separability
-//! is what makes every cut evaluable in O(log n) (see [`super::PlacementDag`]).
+//! junction contributes a score linear in its inserted length. That
+//! separability is what makes every pair of cuts evaluable in O(log n) (see
+//! [`super::PlacementDag`]).
 
 use crate::germline::SegmentKind;
 use crate::placement::Placement;
@@ -84,9 +85,16 @@ pub trait PathModel: Send + Sync {
     /// to and including this one (so the first D sees 1).
     fn segment_bonus(&self, placement: &Placement, d_ordinal: u8) -> Score;
 
-    /// Edge score for `inserted` unassigned query bases between two segments (N/P region).
-    fn junction(&self, _prev: SegmentKind, _next: SegmentKind, _inserted: u32) -> Score {
+    /// Score per unassigned query base (N/P region) between two segments.
+    /// Junction scores are linear in the inserted length, which keeps both
+    /// cuts of a transition separable (see [`super::PlacementDag`]).
+    fn junction_per_base(&self, _prev: SegmentKind, _next: SegmentKind) -> Score {
         0
+    }
+
+    /// Edge score for `inserted` unassigned query bases between two segments.
+    fn junction(&self, prev: SegmentKind, next: SegmentKind, inserted: u32) -> Score {
+        self.junction_per_base(prev, next) * inserted as Score
     }
 
     /// Whole-path term (e.g. the V+J pair bonus).
@@ -134,10 +142,11 @@ impl EngineeringObjective {
     ///
     /// A clipped span of an optimal local alignment never outscores the
     /// whole alignment (its prefixes and suffixes score ≥ 0), so a D scoring
-    /// at most `P_D` adds at most 0, and "with-D must strictly beat no-D"
-    /// rejects it — exactly, when the placements flanking the D do not
-    /// overlap each other. With a negative per-base junction score a D could
-    /// pay for itself by replacing N bases, so no floor is derived then.
+    /// at most `P_D` adds at most 0. Dropping it leaves its neighbours' cuts
+    /// valid (the exit before it is ≤ the entry after it), so the no-D path
+    /// scores at least as much and "with-D must strictly beat no-D" rejects
+    /// it. With a negative per-base junction score a D could pay for itself
+    /// by replacing N bases, so no floor is derived then.
     pub fn d_floor(&self) -> Score {
         if self.insertion_per_base < 0 {
             Score::MIN
@@ -162,8 +171,8 @@ impl PathModel for EngineeringObjective {
         }
     }
 
-    fn junction(&self, _prev: SegmentKind, _next: SegmentKind, inserted: u32) -> Score {
-        self.insertion_per_base * inserted as Score
+    fn junction_per_base(&self, _prev: SegmentKind, _next: SegmentKind) -> Score {
+        self.insertion_per_base
     }
 
     fn end(&self, first: SegmentKind, last: SegmentKind, _d_count: u8) -> Score {

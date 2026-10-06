@@ -54,10 +54,11 @@ placements in read order that the grammar allows (`adjudicate/model.rs`):
 V → D{0..max_d} → J,     partial paths allowed (V…, …J, V…J);  max_d = 1 (VDJ) or 2 (VDDJ)
 ```
 
-When two consecutive placements overlap on the read, a *cut* `c` assigns
-bases `< c` to the first and `≥ c` to the second. Each placement is then
-*clipped* to the alignment columns it keeps. When they do not overlap, the
-bases between them are N/P.
+Between two consecutive placements there are two *cuts*: the first keeps
+read bases before its *exit* `x`, the second keeps bases from its *entry*
+`y ≥ x` on, and the `y − x` bases between them are N/P. Each placement is
+then *clipped* to the alignment columns it keeps. Overlapping placements may
+therefore split the overlap at any point, or leave part of it to neither.
 
 ### 2.3 Objective
 
@@ -132,29 +133,41 @@ one term per cut. The support key is cut-independent.
 
 Placements are nodes, sorted by read start. A state is
 `(node, entry cut, D count, first segment kind)`. Its value is the best path
-score before the node's own segment, with support as a second key. For a
-transition `b → e` through cut `c`, the value is
+score before the node's own segment, with support as a second key. With a
+linear N/P score `ι·(y − x)`, a transition `b → e` that exits `b` at `x`
+and enters `e` at `y ≥ x` has the value
 
 ```text
-max over states s of b with q_lo(s) ≤ exit_b(c).q − min_retained(b):
-    [score(s) − entry_prefix(s), support(s)]   +   exit_b(c).prefix + bonus(b) + junction(b, e)
+max over x ≤ y, and states s of b with q_lo(s) ≤ exit_b(x).q − min_retained(b):
+    [score(s) − entry_prefix(s), support(s)]
+  + exit_b(x).prefix − ι·exit_b(x).q
+  + bonus(b) + ι·entry_e(y).q
 ```
 
-The maximand depends on `s` only through `(score − entry_prefix, support)`.
-The constraint is a threshold on `q_lo(s)`. Sorting a node's states by
-`q_lo` once and keeping running lexicographic maxima turns each
-(transition, cut) into one binary search.
+Every term is a function of `s`, of `x`, or of `y` alone. So:
 
-Complexity is `O(S log S + T·C·log S)` per read, with `S` states, `T`
-transitions and `C` cuts per overlap, instead of `O(S·T·C)`.
+1. *Best state for an exit.* The maximand depends on `s` only through
+   `(score − entry_prefix, support)`, and the constraint is a threshold on
+   `q_lo(s)`. Sorting a node's states by `q_lo` once and keeping running
+   lexicographic maxima answers each exit with one binary search.
+2. *Best exit for an entry.* The best `x ≤ y` is a running maximum over the
+   node's exits, built once per node and successor kind and read in O(1)
+   per entry.
+
+Entries are tried only inside the overlap, or at `e`'s first base when the
+placements do not overlap. Moving an entry further right clips a prefix of an
+optimal local alignment, which scores ≥ 0 (Lemma 1), and only lengthens the
+N/P run, so it never helps when `ι ≥ 0`.
+
+Complexity is `O(S log S + L log S + T·C)` per node, with `S` states, `L`
+exit cuts, `T` successors and `C` entry cuts, instead of `O(S·T·L·C)`.
 
 **Theorem 1.** The DAG returns the optimum of §2.3 over all grammatical
-paths, placements and cuts (single cut per overlap). This is checked by
-brute-force enumeration in `tests/synthetic.rs`.
-
-*Restriction.* Overlapping neighbours share one cut, with no N/P between
-them. Allowing two cuts with N/P in between is the general segmentation
-model; it is on the roadmap (§8).
+paths, placements and pairs of cuts. This is checked by an exhaustive,
+memoised enumeration in `tests/synthetic.rs` that tries every exit and every
+entry `y ≥ x` within 12 bases of the meeting point (wider than the DAG's own
+entry range), and by a constructed case in `adjudicate/dag.rs` where leaving
+a shared mismatch stretch to N beats every single cut.
 
 ## 5. Search
 
@@ -171,7 +184,7 @@ step can lose.
 | J | `retrieve/exhaustive.rs`, `window.rs` | bounded | Every J allele, unbanded, in `[min V end − 12, read end)`: a J can reach back into V only through chance edge matches. |
 | D windows | `window.rs` | bounded | `[best V end − 12, best J start + 12)` plus the conserved-anchor window `[V Cys104 + 3, J Trp/Phe118)`. |
 | D prefilter | `retrieve/lmer_mask.rs` | lossless w.r.t. gates | Shares ≥ 1 L-mer, with `L` derived from the gates (`min_d_match`, or 4 with distributed-D, by pigeonhole). |
-| D floor | `config.rs`, `adjudicate/model.rs` | lossless\* | Score ≥ max(gate floor, `P_D + 1`): by Lemma 1, a D at or below `P_D` adds ≤ 0. \*Exact when D's neighbours do not overlap each other. |
+| D floor | `config.rs`, `adjudicate/model.rs` | lossless | Score ≥ max(gate floor, `P_D + 1`): by Lemma 1, a D at or below `P_D` adds ≤ 0, and dropping it leaves its neighbours' cuts valid (exit ≤ entry), so the no-D path is at least as good (requires `ι ≥ 0`). |
 | D admission | `admission.rs` | defined | Exact run ≥ `min_d_match`, or distributed evidence (≥ 16 columns, ≥ 14 matches, ≥ 80 % identity, rescore ≥ 19). |
 
 *Gene frames.* The alleles of a gene are placed in one coordinate system,
@@ -235,8 +248,5 @@ this objective can do better.
    log-sum-exp arrays replace prefix maxima, and a backward pass gives
    per-placement posterior marginals. This yields calibrated allele and
    D-presence probabilities and maximum-posterior-marginal calls.
-2. **Two cuts per overlap.** Let consecutive overlapping placements be clipped
-   independently with N/P between them. The running maximum over the earlier
-   cut keeps this `O(T·C log S)`, and makes the D floor exact unconditionally.
-3. **Calibrated statistics.** Fit gapped λ and K, and an effective database
+2. **Calibrated statistics.** Fit gapped λ and K, and an effective database
    size for near-identical alleles, by simulation.

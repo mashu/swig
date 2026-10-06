@@ -129,6 +129,16 @@ Each change was measured on the same reads before it was kept.
     one keep algorithm. `config` separates V (seeded) and J (exhaustive)
     settings and declarative objective settings (`ObjectiveConfig`) from
     resolved numbers (`EngineeringObjective`).
+11. **Two cuts between neighbours** (`adjudicate/dag.rs`). The DAG used one
+    cut per overlap with no N/P between overlapping placements, an
+    approximation of the segmentation model that also made the D floor exact
+    only when D's neighbours did not overlap. Each placement now has its own
+    exit and entry cut (`x ≤ y`, N/P between). A running maximum over exits
+    keeps the cost per entry O(1). The DAG is exact for the model, and the D
+    floor is exact unconditionally. On 3000-read benchmarks, accuracy moved by
+    at most ±0.2 pp (real hard junction 98.28 → 98.35 %, synthetic hard D
+    79.02 → 79.24 %) and throughput is unchanged within noise. It is a
+    correctness fix for the paper's model statement, not an accuracy lever.
 
 ## 4. Results
 
@@ -172,9 +182,10 @@ work.
    because a 9-nt chance match is indistinguishable from a 9-nt D remnant.
    `P_D` sets the trade-off, and the prior odds are the single knob.
    Precision/recall curves, not one number, belong in the paper.
-3. **One alignment per D allele and window**, and **a single cut per
-   overlap**. Both are approximations of the segmentation model (§8 of
-   ALGORITHM.md).
+3. **One alignment per D allele and window.** A D's optimal local alignment
+   in its window is not always its optimal clipped alignment at the chosen
+   cuts; the 12-base reclaim keeps this rare. It is the one remaining
+   approximation of the segmentation model.
 4. **Constants still inherited from the note.** These have not been derived
    and should get a sensitivity analysis:
    - `pair_bonus` 24 and `tandem` 12;
@@ -201,8 +212,7 @@ In order of expected value:
    probabilities and maximum-posterior-marginal calls. It turns limitation 2
    into a reported confidence rather than a hard call, and generalises the
    support tie-break.
-2. **Two cuts per overlap with N/P between**, so the DAG is exact for the
-   segmentation model and the D floor is exact unconditionally.
+2. ~~**Two cuts per overlap with N/P between**~~ — done (§3, item 11).
 3. **Sensitivity analysis** of the inherited constants on the simulator,
    across presets and both databases, with each constant either derived or
    shown to be flat.
