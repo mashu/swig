@@ -21,7 +21,7 @@
 
 use std::fmt;
 
-use crate::germline::{AlleleId, GermlineSet};
+use crate::germline::GermlineSet;
 use crate::seed::SeedShape;
 
 const POSITION_BITS: u32 = 12;
@@ -38,12 +38,13 @@ pub struct Posting(u32);
 
 impl Posting {
     #[inline]
-    fn new(allele: AlleleId, position: u32) -> Self {
-        Posting((allele << POSITION_BITS) | position)
+    fn new(id: u32, position: u32) -> Self {
+        Posting((id << POSITION_BITS) | position)
     }
 
+    /// Id of the indexed sequence (an allele, or a gene frame).
     #[inline]
-    pub fn allele(self) -> AlleleId {
+    pub fn id(self) -> u32 {
         self.0 >> POSITION_BITS
     }
 
@@ -93,27 +94,57 @@ pub struct KmerIndex {
     postings: Vec<Posting>,
 }
 
+/// One sequence to index: its k-mers are posted under `id` at `offset + position`.
+#[derive(Clone, Copy, Debug)]
+pub struct IndexedSequence<'a> {
+    pub id: u32,
+    pub name: &'a str,
+    pub codes: &'a [u8],
+    pub offset: u32,
+}
+
 impl KmerIndex {
+    /// Index every allele of `set` under its own id.
     pub fn build(set: &GermlineSet, shape: SeedShape) -> Result<Self, IndexError> {
-        if set.len() > MAX_ALLELE as usize + 1 {
-            return Err(IndexError::TooManyAlleles(set.len()));
-        }
+        let sequences = set
+            .alleles()
+            .iter()
+            .enumerate()
+            .map(|(id, allele)| IndexedSequence {
+                id: id as u32,
+                name: &allele.name,
+                codes: &allele.codes,
+                offset: 0,
+            });
+        Self::build_from(sequences, shape)
+    }
+
+    /// Index `sequences`; identical postings (same key, id and position) are
+    /// stored once, so sequences sharing a frame share their common seeds.
+    pub fn build_from<'a>(
+        sequences: impl IntoIterator<Item = IndexedSequence<'a>>,
+        shape: SeedShape,
+    ) -> Result<Self, IndexError> {
         let mut pairs: Vec<(u64, Posting)> = Vec::new();
-        for (id, allele) in set.alleles().iter().enumerate() {
-            if allele.codes.len() > MAX_POSITION as usize + 1 {
+        for sequence in sequences {
+            if sequence.id > MAX_ALLELE {
+                return Err(IndexError::TooManyAlleles(sequence.id as usize + 1));
+            }
+            let end = sequence.offset as usize + sequence.codes.len();
+            if end > MAX_POSITION as usize + 1 {
                 return Err(IndexError::SequenceTooLong {
-                    allele: allele.name.clone(),
-                    len: allele.codes.len(),
+                    allele: sequence.name.to_string(),
+                    len: end,
                 });
             }
-            let id = AlleleId::try_from(id).expect("checked against MAX_ALLELE");
             pairs.extend(
-                shape
-                    .kmers(&allele.codes)
-                    .map(|(pos, key)| (key, Posting::new(id, pos as u32))),
+                shape.kmers(sequence.codes).map(|(pos, key)| {
+                    (key, Posting::new(sequence.id, sequence.offset + pos as u32))
+                }),
             );
         }
         pairs.sort_unstable();
+        pairs.dedup();
         let postings: Vec<Posting> = pairs.iter().map(|&(_, p)| p).collect();
 
         let lookup = if shape.key_bits() <= DIRECT_KEY_BITS {
@@ -198,7 +229,7 @@ mod tests {
         let hits: Vec<_> = small
             .postings(key)
             .iter()
-            .map(|p| (p.allele(), p.position()))
+            .map(|p| (p.id(), p.position()))
             .collect();
         assert_eq!(hits, vec![(0, 0), (0, 4), (1, 2)]);
 
@@ -208,7 +239,7 @@ mod tests {
         let hits: Vec<_> = large
             .postings(key13)
             .iter()
-            .map(|p| (p.allele(), p.position()))
+            .map(|p| (p.id(), p.position()))
             .collect();
         assert_eq!(hits, vec![(2, 2)]);
         assert!(large.postings(key13 ^ 1).is_empty());

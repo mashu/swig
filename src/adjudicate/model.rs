@@ -129,6 +129,24 @@ impl Default for EngineeringObjective {
     }
 }
 
+impl EngineeringObjective {
+    /// Smallest D local score that can improve a path: `P_D + 1`.
+    ///
+    /// A clipped span of an optimal local alignment never outscores the
+    /// whole alignment (its prefixes and suffixes score ≥ 0), so a D scoring
+    /// at most `P_D` adds at most 0, and "with-D must strictly beat no-D"
+    /// rejects it — exactly, when the placements flanking the D do not
+    /// overlap each other. With a negative per-base junction score a D could
+    /// pay for itself by replacing N bases, so no floor is derived then.
+    pub fn d_floor(&self) -> Score {
+        if self.insertion_per_base < 0 {
+            Score::MIN
+        } else {
+            self.d_presence + 1
+        }
+    }
+}
+
 impl PathModel for EngineeringObjective {
     fn segment_bonus(&self, placement: &Placement, d_ordinal: u8) -> Score {
         match placement.kind {

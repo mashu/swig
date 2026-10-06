@@ -69,9 +69,14 @@ pub struct ExpandedResidual {
 }
 
 impl Default for ExpandedResidual {
+    /// A V or J alignment reaches into the junction only through chance
+    /// matches, a few bases; 12 covers that with margin. A wider window
+    /// hurts as well as costs: a D alignment free to stretch into a V or J
+    /// tail can trade its junction core for chance matches that the cut
+    /// then removes.
     fn default() -> Self {
         Self {
-            reclaim: 24,
+            reclaim: 12,
             min_width: 4,
         }
     }
@@ -168,7 +173,9 @@ pub struct DownstreamWindow {
 
 impl Default for DownstreamWindow {
     fn default() -> Self {
-        Self { reclaim: 24 }
+        Self {
+            reclaim: ExpandedResidual::default().reclaim,
+        }
     }
 }
 

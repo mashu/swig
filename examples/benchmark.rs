@@ -55,6 +55,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Some(penalty) = value("--p-d") {
         config.objective.d_prior = vdj_assign::config::DPrior::Fixed(penalty.parse()?);
     }
+    if let Some(limit) = value("--max-alleles") {
+        config.v.seeds.max_alleles = limit.parse()?;
+    }
+    if let Some(limit) = value("--max-occ") {
+        config.v.seeds.max_occurrences = limit.parse()?;
+    }
+    if let Some(reclaim) = value("--reclaim") {
+        let reclaim: u32 = reclaim.parse()?;
+        config.d_window.reclaim = reclaim;
+        config.j.window.reclaim = reclaim;
+    }
+    if let Some(pad) = value("--band-pad") {
+        config.v.seeds.band_pad = pad.parse()?;
+    }
     for ablation in value("--ablate")
         .unwrap_or_default()
         .split(',')

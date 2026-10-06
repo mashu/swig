@@ -358,12 +358,16 @@ fn j_stage(set: GermlineSet, config: &JSegmentConfig) -> SegmentStage<Exhaustive
     stage
 }
 
-fn d_stage(set: GermlineSet, config: &DSegmentConfig) -> SegmentStage<LmerMaskRetriever> {
+fn d_stage(
+    set: GermlineSet,
+    config: &DSegmentConfig,
+    objective: &EngineeringObjective,
+) -> SegmentStage<LmerMaskRetriever> {
     let lmer = config.lmer.unwrap_or_else(|| config.lossless_lmer());
     let retriever = LmerMaskRetriever::build(&set, lmer, 1);
     let segment = PreparedSegment::new(set, &config.scoring, config.scoring.gaps);
     let keep = KeepPolicy {
-        min_score: config.lossless_min_score(),
+        min_score: config.lossless_min_score().max(objective.d_floor()),
         ..config.keep
     };
     let mut stage = SegmentStage::new(Arc::new(segment), retriever, keep);
@@ -410,7 +414,7 @@ impl Assigner {
         Ok(Assigner {
             v: v_stage(v, &config.v)?,
             j: j_stage(j, &config.j),
-            d: d.map(|set| d_stage(set, &config.d)),
+            d: d.map(|set| d_stage(set, &config.d, &objective)),
             strand,
             j_window: config.j.window,
             aligner: InterSequenceGotoh::new(),
