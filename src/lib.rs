@@ -64,8 +64,8 @@ pub mod window;
 /// The names most programs need.
 pub mod prelude {
     pub use crate::adjudicate::{
-        Adjudicator, CallPath, CalledSegment, DPresencePenalty, EngineeringObjective, Grammar,
-        PathModel, PathScore, PlacementDag, ResidualAdjudicator, VdjGrammar,
+        Adjudicator, CallPath, CalledSegment, EngineeringObjective, Grammar, PathModel, PathScore,
+        PlacementDag, ResidualAdjudicator, VdjGrammar,
     };
     pub use crate::admission::{
         Admission, AdmitAll, AllOf, AnyOf, DistributedEvidence, ExactRunFloor,
@@ -75,7 +75,8 @@ pub mod prelude {
     pub use crate::band::Band;
     pub use crate::batch::{assign_all, assign_map};
     pub use crate::config::{
-        BuildError, DSegmentConfig, DefaultAssigner, EngineConfig, JSegmentConfig, VSegmentConfig,
+        BuildError, DPrior, DSegmentConfig, DefaultAssigner, EngineConfig, JSegmentConfig,
+        ObjectiveConfig, VSegmentConfig,
     };
     pub use crate::germline::{GermlineSet, SegmentKind};
     pub use crate::orient::{Orientation, OrientationPolicy, StrandIndex};

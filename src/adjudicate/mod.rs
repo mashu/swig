@@ -17,7 +17,7 @@ mod model;
 mod residual;
 
 pub use dag::{DagScratch, PlacementDag};
-pub use model::{DPresencePenalty, EngineeringObjective, Grammar, PathModel, VdjGrammar};
+pub use model::{EngineeringObjective, Grammar, PathModel, VdjGrammar};
 pub use residual::{ResidualAdjudicator, ResidualScratch};
 
 use std::cmp::Ordering;

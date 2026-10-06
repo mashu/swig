@@ -358,7 +358,11 @@ fn top_by_kind(placements: &[Placement], kind: SegmentKind, n: usize) -> Vec<Pla
 fn dag_equals_brute_force_over_all_paths_and_cuts() {
     let db = Db::new();
     let assigner = db.assigner(&EngineConfig { grammar: VdjGrammar::TANDEM_D, ..EngineConfig::default() });
-    let model = EngineeringObjective { insertion_per_base: -1, ..EngineConfig::default().objective };
+    let config = EngineConfig::default();
+    let model = EngineeringObjective {
+        insertion_per_base: -1,
+        ..config.objective.resolve(Some(&Db::set(SegmentKind::D, &db.d, None)), &config.d.scoring)
+    };
     let dag = PlacementDag::new(VdjGrammar::TANDEM_D, model, [10, 3, 6]);
     let mut rng = Rng(23);
     let mut ws = assigner.workspace();

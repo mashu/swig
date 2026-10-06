@@ -23,9 +23,6 @@ pub struct Placement {
     pub clip: ClipIndex,
     /// Evidence of the unclipped alignment.
     pub evidence: Evidence,
-    /// The exact ungapped D tract occurs in at least two distinct D sequences.
-    /// R-optimized uses this to relax the D-presence penalty. Other segments leave it false.
-    pub relaxes_d_cost: bool,
 }
 
 impl Placement {
@@ -46,7 +43,6 @@ impl Placement {
             alignment,
             clip,
             evidence,
-            relaxes_d_cost: false,
         }
     }
 
@@ -96,49 +92,4 @@ pub fn merge_identical(placements: &mut Vec<Placement>, from: usize) {
         }
     }
     placements.truncate(kept);
-}
-
-/// Mark D placements whose exact ungapped tract is shared by two distinct D sequences.
-///
-/// `references[allele]` is that allele's codes. Identical sequences count once,
-/// matching Swig's template-class relaxation.
-pub fn mark_repeated_d_tracts(placements: &mut [Placement], query: &[u8], references: &[&[u8]]) {
-    for placement in placements.iter_mut().filter(|p| p.kind == SegmentKind::D) {
-        let Some(reference) = references.get(placement.primary_allele() as usize).copied() else {
-            continue;
-        };
-        if !exact_canonical_tract(placement, query, reference) {
-            continue;
-        }
-        let tract = &query[placement.q_start() as usize..placement.q_end() as usize];
-        if tract.is_empty() {
-            continue;
-        }
-        let mut classes = 0u32;
-        let mut seen: Vec<&[u8]> = Vec::new();
-        for candidate in references {
-            if candidate.windows(tract.len()).any(|window| window == tract)
-                && !seen.iter().any(|prior| *prior == *candidate)
-            {
-                seen.push(candidate);
-                classes += 1;
-                if classes >= 2 {
-                    placement.relaxes_d_cost = true;
-                    break;
-                }
-            }
-        }
-    }
-}
-
-fn exact_canonical_tract(placement: &Placement, query: &[u8], reference: &[u8]) -> bool {
-    placement
-        .alignment
-        .ops
-        .iter()
-        .all(|op| *op == crate::align::Op::Match)
-        && placement.alignment.columns().all(|(_, q, r)| {
-            let (a, b) = (query[q as usize], reference[r as usize]);
-            a < crate::alphabet::N && a == b
-        })
 }

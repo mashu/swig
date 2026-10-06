@@ -37,7 +37,7 @@ use crate::alphabet::reverse_complement_into;
 use crate::config::DefaultVRetriever;
 use crate::germline::SegmentKind;
 use crate::orient::{Orientation, OrientationPolicy, StrandIndex};
-use crate::placement::{mark_repeated_d_tracts, Placement};
+use crate::placement::Placement;
 use crate::refine::{NoRefine, Refiner};
 use crate::retrieve::{
     Candidate, ExhaustiveRetriever, LmerMaskRetriever, RetrievalScratch, Retriever,
@@ -426,20 +426,12 @@ where
                 *start = placed.len();
             }
             d.place_many(&self.aligner, &requests, dp, batch, placements);
-            let d_references: Vec<&[u8]> = d
-                .segment
-                .set()
-                .alleles()
-                .iter()
-                .map(|allele| allele.codes.as_slice())
-                .collect();
             for (k, placed) in placements.iter_mut().enumerate() {
                 let query = &reads[k].query;
                 retain_from(placed, d_start[k], |p| {
                     self.d_admission
                         .admit(p, query, d.segment.reference(p.primary_allele()))
                 });
-                mark_repeated_d_tracts(placed, query, &d_references);
             }
         }
 

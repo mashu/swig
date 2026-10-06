@@ -52,6 +52,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     if flag("--tandem-d") {
         config.grammar = VdjGrammar::TANDEM_D;
     }
+    if let Some(penalty) = value("--p-d") {
+        config.objective.d_prior = vdj_assign::config::DPrior::Fixed(penalty.parse()?);
+    }
     for ablation in value("--ablate")
         .unwrap_or_default()
         .split(',')

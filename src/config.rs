@@ -24,6 +24,7 @@ use crate::retrieve::{
 use crate::scoring::{AffineScoring, Score};
 use crate::seed::SeedShape;
 use crate::segment::{HitAcceptance, KeepPolicy, PreparedSegment, SegmentStage};
+use crate::stats::KarlinAltschul;
 use crate::window::{DownstreamWindow, ExpandedResidual, WithAnchorWindow};
 
 /// V: seeded, banded, vote-ranked, optionally ungapped-pre-ranked.
@@ -97,6 +98,77 @@ impl DSegmentConfig {
     }
 }
 
+/// Prior cost of including a D, in score units (see [`EngineeringObjective`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DPrior {
+    /// A fixed cost (0 = D only has to beat the no-D path).
+    Fixed(Score),
+    /// `[ln(N · window) − ln(prior_odds)] / λ`: `N` D genes in the database,
+    /// `window` junction positions, `λ` of the D substitution scores, and the
+    /// prior odds of a D against none. For human IGH (32 genes, 25 positions,
+    /// even odds) this is 11; for TRB (2 D genes) it is 6.
+    Derived { window: u32, prior_odds: f64 },
+}
+
+impl DPrior {
+    pub const DERIVED: Self = Self::Derived {
+        window: 25,
+        prior_odds: 1.0,
+    };
+
+    /// The cost for a D database of `genes` genes scored with `scoring`.
+    /// Falls back to `ln(N · window)` nats per score unit when the tuple has
+    /// no Karlin–Altschul λ (it is then not a log-odds score).
+    pub fn cost(&self, genes: usize, scoring: &AffineScoring) -> Score {
+        match *self {
+            Self::Fixed(cost) => cost,
+            Self::Derived { window, prior_odds } => {
+                let lambda = KarlinAltschul::ungapped(scoring).map_or(1.0, |ka| ka.lambda);
+                let nats = (genes.max(1) as f64 * f64::from(window.max(1))).ln() - prior_odds.ln();
+                (nats / lambda).round().max(0.0) as Score
+            }
+        }
+    }
+}
+
+/// Declarative form of [`EngineeringObjective`]; `d_prior` is resolved
+/// against the D database when the assigner is built.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ObjectiveConfig {
+    pub pair_bonus: Score,
+    pub d_prior: DPrior,
+    pub tandem_d_penalty: Score,
+    pub insertion_per_base: Score,
+}
+
+impl Default for ObjectiveConfig {
+    fn default() -> Self {
+        Self {
+            pair_bonus: 24,
+            d_prior: DPrior::DERIVED,
+            tandem_d_penalty: 12,
+            insertion_per_base: 0,
+        }
+    }
+}
+
+impl ObjectiveConfig {
+    pub fn resolve(
+        &self,
+        d: Option<&GermlineSet>,
+        d_scoring: &AffineScoring,
+    ) -> EngineeringObjective {
+        EngineeringObjective {
+            pair_bonus: self.pair_bonus,
+            d_presence: self
+                .d_prior
+                .cost(d.map_or(1, GermlineSet::gene_count), d_scoring),
+            tandem_d_penalty: self.tandem_d_penalty,
+            insertion_per_base: self.insertion_per_base,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct EngineConfig {
     pub v: VSegmentConfig,
@@ -106,7 +178,7 @@ pub struct EngineConfig {
     /// Add the conserved-anchor D window when alleles carry `anchor=` positions.
     pub anchor_window: bool,
     pub grammar: VdjGrammar,
-    pub objective: EngineeringObjective,
+    pub objective: ObjectiveConfig,
     /// Minimum retained query bases after clipping, per [`SegmentKind::index`].
     pub min_retained: [u32; 3],
     pub options: AssignerOptions,
@@ -184,7 +256,7 @@ impl Default for EngineConfig {
             d_window: ExpandedResidual::default(),
             anchor_window: true,
             grammar: VdjGrammar::VDJ,
-            objective: EngineeringObjective::default(),
+            objective: ObjectiveConfig::default(),
             // V ≥ 24 aligned bases, J ≥ 10, D ≥ min_d_match. Query bases
             // retained after a clip use the same floors.
             min_retained: [24, 4, 10],
@@ -334,6 +406,7 @@ impl Assigner {
             }
         };
         let strand = StrandIndex::build([&v, &j], StrandIndex::K);
+        let objective = config.objective.resolve(d.as_ref(), &config.d.scoring);
         Ok(Assigner {
             v: v_stage(v, &config.v)?,
             j: j_stage(j, &config.j),
@@ -348,7 +421,7 @@ impl Assigner {
                 },
                 config.d.distributed,
             ),
-            adjudicator: PlacementDag::new(grammar, config.objective, config.min_retained),
+            adjudicator: PlacementDag::new(grammar, objective, config.min_retained),
             refiner: NoRefine,
             options: config.options,
         })
@@ -358,6 +431,19 @@ impl Assigner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn d_prior_scales_with_the_d_database() {
+        let scoring = AffineScoring::new(2, -3, -13, -1);
+        assert_eq!(DPrior::DERIVED.cost(32, &scoring), 11); // human IGH
+        assert_eq!(DPrior::DERIVED.cost(2, &scoring), 6); // TRB
+        assert_eq!(DPrior::Fixed(0).cost(32, &scoring), 0);
+        let more_likely = DPrior::Derived {
+            window: 25,
+            prior_odds: 4.0,
+        };
+        assert_eq!(more_likely.cost(32, &scoring), 8);
+    }
 
     #[test]
     fn derived_d_settings_are_lossless_bounds() {

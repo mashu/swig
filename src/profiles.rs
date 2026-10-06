@@ -1,10 +1,11 @@
-//! Swig calling profiles as configuration values.
+//! Calling profiles as configuration values.
 //!
-//! [`EngineConfig::default`](crate::config::EngineConfig::default) is R-optimized,
-//! which is Swig's default (`aer_robust` + `r_optimized`).
+//! The profiles keep the scoring tuples and gates of the method note's
+//! profiles; the D-presence cost of `r` and `sensitive-d` is derived from the
+//! D database ([`DPrior`]) instead of the note's constants.
+//! [`EngineConfig::default`](crate::config::EngineConfig::default) is `r`.
 
-use crate::adjudicate::DPresencePenalty;
-use crate::config::EngineConfig;
+use crate::config::{DPrior, EngineConfig};
 use crate::germline::SegmentKind;
 use crate::scoring::AffineScoring;
 
@@ -12,11 +13,12 @@ use crate::scoring::AffineScoring;
 pub enum CallingProfile {
     /// Legacy human-IGH tuples. V gap-open −5, `min_d_match` 6, no D-presence cost.
     TruthOptimized,
-    /// Swig default. V gap-open −9, `min_d_match` 4, distributed-D, `P_D` 12 relaxed to 10.
+    /// Default. V gap-open −9, `min_d_match` 4, distributed-D, `P_D` derived
+    /// from the D database at even prior odds (11 for human IGH).
     ROptimized,
     /// IgBLAST-agreement: D `(2,−4,−11,−1)`, J `(2,−4,−13,−1)`, `min_d_match` 5.
     IgBlastAgreement,
-    /// R-optimized scoring with a fixed D-presence cost of 10.
+    /// R-optimized scoring with D twice as likely a priori (`P_D` 9 for human IGH).
     SensitiveD,
 }
 
@@ -56,7 +58,7 @@ impl CallingProfile {
                 config.d.min_exact_run = 6;
                 config.d.distributed = None;
                 config.min_retained[SegmentKind::D.index()] = 6;
-                config.objective.d_presence = DPresencePenalty::NONE;
+                config.objective.d_prior = DPrior::Fixed(0);
             }
             Self::IgBlastAgreement => {
                 config.v.scoring = AffineScoring::new(2, -3, -5, -1);
@@ -65,10 +67,13 @@ impl CallingProfile {
                 config.d.min_exact_run = 5;
                 config.d.distributed = None;
                 config.min_retained[SegmentKind::D.index()] = 5;
-                config.objective.d_presence = DPresencePenalty::NONE;
+                config.objective.d_prior = DPrior::Fixed(0);
             }
             Self::SensitiveD => {
-                config.objective.d_presence = DPresencePenalty::SENSITIVE_D;
+                config.objective.d_prior = DPrior::Derived {
+                    window: 25,
+                    prior_odds: 2.0,
+                };
             }
         }
         config
@@ -99,14 +104,11 @@ mod tests {
         let r = CallingProfile::ROptimized.config();
         assert_eq!(r.v.scoring, AffineScoring::new(2, -3, -9, -1));
         assert_eq!(r.d.min_exact_run, 4);
-        assert_eq!(r.objective.d_presence, DPresencePenalty::R_OPTIMIZED);
+        assert_eq!(r.objective.d_prior, DPrior::DERIVED);
         assert_eq!(EngineConfig::default().d.min_exact_run, 4);
         let sensitive = CallingProfile::SensitiveD.config();
         assert_eq!(sensitive.v.scoring, r.v.scoring);
-        assert_eq!(
-            sensitive.objective.d_presence,
-            DPresencePenalty::SENSITIVE_D
-        );
+        assert_ne!(sensitive.objective.d_prior, r.objective.d_prior);
         let igblast = CallingProfile::IgBlastAgreement.config();
         assert_eq!(igblast.j.scoring, AffineScoring::new(2, -4, -13, -1));
         assert_eq!(igblast.d.min_exact_run, 5);

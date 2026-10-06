@@ -95,59 +95,26 @@ pub trait PathModel: Send + Sync {
     }
 }
 
-/// `P_D`: base penalty for introducing D, relaxed for a strong hypothesis.
+/// The path objective, `Σ S_clip − P_D·#D − tandem·[2nd D] + pair_bonus·[V…J]
+/// + per-base N/P cost`, read as a log-likelihood ratio.
 ///
-/// Swig relaxes R-optimized's 12 down to 10 when the D scores at least 20, or
-/// when its exact ungapped tract occurs in two different D sequences
-/// ([`Placement::relaxes_d_cost`]). Sensitive-D uses a fixed 10. Legacy
-/// profiles charge nothing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DPresencePenalty {
-    pub base: Score,
-    pub relaxed: Score,
-    /// Unclipped D score that earns `relaxed`.
-    pub strong_score: Score,
-}
-
-impl DPresencePenalty {
-    /// R-optimised: 12, relaxed to 10 when the D scores at least 20 or is a repeated exact tract.
-    pub const R_OPTIMIZED: Self = Self {
-        base: 12,
-        relaxed: 10,
-        strong_score: 20,
-    };
-    /// Sensitive-D: fixed 10.
-    pub const SENSITIVE_D: Self = Self {
-        base: 10,
-        relaxed: 10,
-        strong_score: 0,
-    };
-    /// Truth and IgBLAST-agreement: D is free apart from having to beat the no-D path.
-    pub const NONE: Self = Self {
-        base: 0,
-        relaxed: 0,
-        strong_score: 0,
-    };
-
-    pub fn penalty(&self, placement: &Placement) -> Score {
-        if placement.score() >= self.strong_score || placement.relaxes_d_cost {
-            self.relaxed
-        } else {
-            self.base
-        }
-    }
-}
-
-/// The note's engineering objective, as a path model:
-/// `Σ S_clip − P_D·[D] − tandem·[2nd D] + pair_bonus·[V…J] + per-base N/P cost`.
+/// Substitution scores are log-odds (in units of `1/λ` nats) of "templated by
+/// this germline" against "random sequence"; N/P bases score 0 under both.
+/// The remaining terms are log prior odds of the path's hypotheses:
+///
+/// * `d_presence` (`P_D`) — a D is one of `N` genes at one of `L` positions of
+///   the junction, so its prior is spread over `N·L` hypotheses: including
+///   the best one is worth it when `λ·S_D > ln(N·L) − ln(prior odds of D)`.
+///   [`crate::config::DPrior`] derives it from the database at build time.
+/// * `tandem_d_penalty` — prior odds of a second D (DJ → DDJ), on top of its `P_D`.
+/// * `pair_bonus` — prior odds of a complete V…J rearrangement over a partial read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EngineeringObjective {
     pub pair_bonus: Score,
-    pub d_presence: DPresencePenalty,
+    pub d_presence: Score,
     /// Extra prior cost for every D beyond the first.
     pub tandem_d_penalty: Score,
-    /// Score per unassigned junction base (0 reproduces the note; negative
-    /// values express an N/P length prior).
+    /// Score per unassigned junction base (0 = no N/P length prior).
     pub insertion_per_base: Score,
 }
 
@@ -155,7 +122,7 @@ impl Default for EngineeringObjective {
     fn default() -> Self {
         Self {
             pair_bonus: 24,
-            d_presence: DPresencePenalty::R_OPTIMIZED,
+            d_presence: 11,
             tandem_d_penalty: 12,
             insertion_per_base: 0,
         }
@@ -171,7 +138,7 @@ impl PathModel for EngineeringObjective {
                 } else {
                     0
                 };
-                -self.d_presence.penalty(placement) - tandem
+                -self.d_presence - tandem
             }
             SegmentKind::V | SegmentKind::J => 0,
         }
