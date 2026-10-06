@@ -65,8 +65,8 @@ therefore split the overlap at any point, or leave part of it to neither.
 ```text
 score(path) = Σ_segments S_clip(segment)
             − P_D · #D − tandem · [second D]
-            + pair_bonus · [path starts with V and ends with J]
-            + insertion_per_base · #N/P bases          (0 by default)
+            + pair_bonus · [path starts with V and ends with J]  (0 by default)
+            + insertion_per_base · #N/P bases                    (0 by default)
 ```
 
 The non-alignment terms are log prior odds in score units:
@@ -80,7 +80,8 @@ The non-alignment terms are log prior odds in score units:
   The legacy profiles set `P_D = 0`.
 - **`tandem`**: the prior odds of a second D (DJ → DDJ), on top of its own `P_D`.
 - **`pair_bonus`**: the prior odds of a complete V…J rearrangement against a
-  partial read.
+  partial read. It is 0 by default: on full-length reads the J's own clip
+  score completes the path, and values 0–48 changed no call.
 
 The adjudicator returns the path maximising, lexicographically:
 
@@ -247,12 +248,12 @@ step can lose.
 | V retrieval | `retrieve/seed_vote.rs`, `retrieve/frames.rs` | heuristic | Seed votes per gene frame, best diagonal cluster per frame. Keep 3 genes, and up to 16 while votes are within `max(8, 5 %)` of the leader. Every allele of a kept gene becomes a candidate. |
 | V band | `retrieve/seed_vote.rs` | bounded | Cluster's diagonal range, shifted by the allele's frame offset, ± 8 diagonals: holds unless an indel longer than 8 escapes the seeds. |
 | V scoring | `segment.rs`, `family_bound.rs` | lossless | Score-only DP; a same-length sibling is skipped when `S(rep) + Δ(rep, sibling)` cannot reach the current top-3 cutoff (sound upper bound). |
-| V/J keep | `segment.rs` | defined | Trace back until the top 3 *accepted* alignments plus ties; acceptance requires ≥ 24 (V) / 10 (J) substitution columns, identity ≥ 0.6, and E ≤ 1. |
+| V/J keep | `segment.rs` | defined | Trace back until the top 3 alignments with E ≤ 1, plus ties. No length or identity floor: a positive `(2, −3)` local alignment has identity > 3/5 and the E-value implies a length. |
 | J | `retrieve/exhaustive.rs`, `window.rs` | bounded | Every J allele, unbanded, in `[min V end − 12, read end)`: a J can reach back into V only through chance edge matches. |
 | D windows | `window.rs` | bounded | `[best V end − 12, best J start + 12)` plus the conserved-anchor window `[V Cys104 + 3, J Trp/Phe118)`. |
-| D prefilter | `retrieve/lmer_mask.rs` | lossless w.r.t. gates | Shares ≥ 1 L-mer, with `L` derived from the gates (`min_d_match`, or 4 with distributed-D, by pigeonhole). |
+| D prefilter | `retrieve/lmer_mask.rs` | lossless w.r.t. gates | Shares ≥ 1 L-mer, with `L` derived from the gates (`min_d_match`; 4 with the optional distributed-D gate, by pigeonhole). |
 | D floor | `config.rs`, `adjudicate/model.rs` | lossless | Score ≥ max(gate floor, `P_D + 1`): by Lemma 1, a D at or below `P_D` adds ≤ 0, and dropping it leaves its neighbours' cuts valid (exit ≤ entry), so the no-D path is at least as good (requires `ι ≥ 0`). |
-| D admission | `admission.rs` | defined | Exact run ≥ `min_d_match`, or distributed evidence (≥ 16 columns, ≥ 14 matches, ≥ 80 % identity, rescore ≥ 19). |
+| D admission | `admission.rs` | defined | Exact run ≥ `min_d_match` = 4 (3, 5 and 6 are all worse). The note's distributed-evidence alternative is optional and off: it admitted no D that changed a call. |
 
 *Gene frames.* The alleles of a gene are placed in one coordinate system,
 `frame position = allele position + offset`. An allele joins its gene's frame

@@ -495,8 +495,8 @@ mod tests {
         let path = dag
             .adjudicate(query.len(), &placements, &mut DagScratch::default())
             .expect("a VJ path");
-        // Single cut: 40 + 2 + pair bonus 24 = 66. Two cuts (V to 11, J from 15): 68.
-        assert_eq!(path.score.score, 68);
+        // Single cut: 40 + 2 = 42. Two cuts (V to 11, J from 15): 44.
+        assert_eq!(path.score.score, 44);
         let (v_seg, j_seg) = (path.segments[0], path.segments[1]);
         assert_eq!((v_seg.span.q_hi, j_seg.span.q_lo), (11, 15));
     }

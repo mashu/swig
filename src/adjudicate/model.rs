@@ -115,7 +115,9 @@ pub trait PathModel: Send + Sync {
 ///   the best one is worth it when `λ·S_D > ln(N·L) − ln(prior odds of D)`.
 ///   [`crate::config::DPrior`] derives it from the database at build time.
 /// * `tandem_d_penalty` — prior odds of a second D (DJ → DDJ), on top of its `P_D`.
-/// * `pair_bonus` — prior odds of a complete V…J rearrangement over a partial read.
+/// * `pair_bonus` — prior odds of a complete V…J rearrangement over a partial
+///   read. 0 by default: on full-length reads the J's own clip score already
+///   completes the path, and 0–48 changed no call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EngineeringObjective {
     pub pair_bonus: Score,
@@ -129,7 +131,7 @@ pub struct EngineeringObjective {
 impl Default for EngineeringObjective {
     fn default() -> Self {
         Self {
-            pair_bonus: 24,
+            pair_bonus: 0,
             d_presence: 11,
             tandem_d_penalty: 12,
             insertion_per_base: 0,

@@ -214,19 +214,22 @@ work.
 3. **Calls and posteriors use different evidence scales.** The Viterbi call
    reads scores at the fixed λ, the posterior at the read's divergence, so
    the posterior's mode can disagree with the call (a short exact D against
-   a longer one with a mismatch on an unmutated read). Calling from the
-   per-read model is the next step.
+   a longer one with a mismatch on an unmutated read). Measured on 4000
+   reads per preset: taking D presence *and* allele from the posterior
+   (maximum marginal) gains 0.2–0.8 pp of D accuracy but raises the D-free
+   false-positive rate by 13–16 pp, so total D errors do not fall (mid 287
+   vs 271, hard 681 vs 685). Keeping the Viterbi presence decision and
+   taking only the allele from the posterior gains 0.1–0.3 pp at an
+   unchanged false-positive rate; it is not adopted because the reported
+   alignment would then need a second, conditioned Viterbi pass.
 4. **One alignment per D allele and window.** A D's optimal local alignment
    in its window is not always its optimal clipped alignment at the chosen
    cuts; the 12-base reclaim keeps this rare. It is the one remaining
    approximation of the segmentation model.
-5. **Constants still inherited from the note.** These have not been derived
-   and should get a sensitivity analysis:
-   - `pair_bonus` 24 and `tandem` 12;
-   - acceptance at 60 % identity with 24/10 columns;
-   - the budget (3–16 genes, 5 %/8 votes) and seed lengths 9/7;
-   - `max_occurrences` 256;
-   - distributed-D thresholds.
+5. **Constants inherited from the note** — now measured (§7): five are
+   inert and default to neutral values; the rest are speed knobs or have a
+   measured optimum at the inherited value. `tandem` (12) was not swept:
+   VDDJ reads are 0.1 % of IgSim reads.
 6. **E-values are approximate.** They use ungapped λ/K (anti-conservative for
    gapped scores) and the total database length (conservative for
    near-identical alleles). They gate hits; they are not p-values.
@@ -245,9 +248,7 @@ In order of expected value:
    calls from the per-read model (limitation 3) and a D prior from the D
    search's own statistics (limitation 2).
 2. ~~**Two cuts per overlap with N/P between**~~ — done (§3, item 11).
-3. **Sensitivity analysis** of the inherited constants on the simulator,
-   across presets and both databases, with each constant either derived or
-   shown to be flat.
+3. ~~**Sensitivity analysis**~~ — done (§7).
 4. **Cross-tool benchmark.** Run IgBLAST, partis and Swig through
    `vdj-assign simulate` / `evaluate` (implemented: any AIRR TSV is scored with
    the same metrics on identical reads) at several SHM levels, and report
@@ -259,3 +260,42 @@ In order of expected value:
    top gene.
 7. **Calibrated statistics.** Fit gapped λ/K and an effective database size
    by simulation.
+
+## 7. Sensitivity analysis of the inherited constants
+
+One constant at a time around the defaults, on real human IGH at the mid and
+hard presets (3000 reads each, plus 1000 random reads); `examples/benchmark`
+takes each constant as a flag. "Flat" means every accuracy metric (V, V
+gene, D, J, junction, D-free false positives, random-read calls) and every
+calibration error was unchanged.
+
+| Constant | Inherited value | Range tested | Effect | Now |
+|---|---|---|---|---|
+| V…J pair bonus | 24 | 0, 12, 36, 48 | flat | 0 |
+| V acceptance | 24 columns, 60 % | 12–48 columns; 50–70 % | flat | none |
+| J acceptance | 10 columns, 60 % | 6–18 columns; 50–70 % | flat | none |
+| Distributed-D gate | on (16/14/80 %/19) | off; looser; tighter | flat | off |
+| Retained bases V / J | 24 / 10 | V 1–36, J 1–14 | flat | 1 / 1 |
+| Retained bases D | 4 | 3, 5 | D-presence ECE ±0.1 pp | 4 (= `min_d_match`) |
+| Seed lengths | 9 / 7 | 11/7, 11/9, 9/–, 8/6, 7/– | V ≤ ±0.07 pp | 9 / 7 |
+| `max_occurrences` | 256 | 64–1024 | flat | 256 |
+| Band padding | 8 | 4, 12 | flat (speed only) | 8 |
+| Budget base genes | 3 | 2, 4, 5, 8 | hard V −0.20 / +0.10 / +0.20 / +0.20 pp; slower | 3 (knob) |
+| Budget margin | 5 % / 8 votes | 2–10 %; 4–16 | ≤ 0.07 pp | 5 % / 8 |
+| `min_d_match` | 4 | 3, 5, 6 | D −0.03 to −0.92 pp | 4 (optimum) |
+| `P_D` | 11 (derived) | 5–17 | D accuracy vs D-free false positives (mid: 94.2 % / 61 % at 5, 93.2 % / 23 % at 11, 87.2 % / 0 % at 17) | 11 |
+
+Two results matter for the paper:
+
+- **Five inherited mechanisms were redundant** given the E-value gates and the
+  D floor, and now default to neutral values (the fields remain for profiles
+  and experiments). The 60 % identity floor is no accident: it is the
+  break-even identity of `(2, −3)` (`2m − 3x > 0 ⇔ m/(m + x) > 3/5`), so a
+  positive local score already implies it. All five together changed no call
+  on real or synthetic databases at any preset, left calibration unchanged
+  (within 0.03 pp), and kept random-read calls at 0.04 % of 20,000.
+- **The derived `P_D` is the calibration optimum.** D-presence calibration
+  error is lowest at `P_D = 11` on both presets (mid 2.25 %, hard 1.66 %; 2.71 %
+  and 2.59 % at 9, 3.36 % and 5.37 % at 13), so the posterior independently
+  supports the value the derivation gives. Accuracy alone cannot choose it:
+  D accuracy and D-free false positives trade monotonically.

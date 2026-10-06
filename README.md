@@ -237,8 +237,8 @@ The full description, with the guarantee of each search step, is in
   log-likelihood ratio, in units of 1/λ nats with λ = 0.634, of "templated by
   this germline at 11.2 % divergence" against "random sequence". N and P bases
   score 0 under both hypotheses. Affine gaps price indels.
-- **The path objective** is `Σ clipped segment scores − P_D·#D − tandem·[2nd D]
-  + pair_bonus·[V…J]`, maximised exactly over the topologies VJ / VDJ / VDDJ,
+- **The path objective** is `Σ clipped segment scores − P_D·#D − tandem·[2nd D]`,
+  maximised exactly over the topologies VJ / VDJ / VDDJ,
   over the placements, and over both cuts between neighbours (the earlier one
   exits at `x`, the later enters at `y ≥ x`, and the bases between are N/P).
   Ties go to fewer D, then to more germline support (the summed unclipped
@@ -270,7 +270,7 @@ no runtime type checks.
 | `CandidateBudget` | `AmbiguityBudget{3, 16, 5 %, 8}` | `FixedBudget` |
 | `SubstitutionModel` | `AffineScoring` | `HotspotScoring` (position-specific; the kernel's profile path) |
 | `DWindowPolicy` | `WithAnchorWindow<ExpandedResidual>` | `ResidualWindow`, `ExpandedResidual` |
-| `Admission` | `AnyOf<ExactRunFloor, Option<DistributedEvidence>>` | `AdmitAll`, `AllOf`, any `Option<A>` |
+| `Admission` | `AnyOf<ExactRunFloor, Option<DistributedEvidence>>` (distributed-D off by default) | `AdmitAll`, `AllOf`, any `Option<A>` |
 | `Adjudicator` | `PlacementDag<VdjGrammar, EngineeringObjective>` | `ResidualAdjudicator` |
 | `Grammar`, `PathModel` | `VdjGrammar::{VDJ, TANDEM_D, VJ}`, `EngineeringObjective` | your own path grammar / objective |
 | `Refiner` | `NoRefine` | extension point |
@@ -401,8 +401,9 @@ admission and adjudication stay per read.
 
 **Lossless D prefilter.** Per-L-mer allele bitsets (one OR per query L-mer).
 L is derived from the admission gates so it can never drop an admissible hit:
-`L = min_d_match` with only the exact-run gate, `L = 4` with distributed-D
-(≥ 80 % identity over ≥ 16 columns forces an exact run ≥ 4, by pigeonhole).
+`L = min_d_match` with only the exact-run gate (the default), `L = 4` with the
+optional distributed-D gate (≥ 80 % identity over ≥ 16 columns forces an
+exact run ≥ 4, by pigeonhole).
 
 **Score floor from the objective.** A clipped span of an optimal local
 alignment never outscores the whole alignment. So a D scoring at most `P_D`
@@ -549,15 +550,14 @@ placements pooled, mid-preset ECEs were 4.6 / 7.7 / 3.9 / 2.1.
 
 The default is `r`. `r_optimized` is accepted as an alias.
 
-| Profile | V tuple | D tuple | J tuple | `min_d_match` | Distributed-D | `P_D` (human IGH) |
-|---|---|---|---|---|---|---|
-| `r` (default) | (2,−3,−9,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 4 | on | derived, even odds: 11 |
-| `sensitive-d` | (2,−3,−9,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 4 | on | derived, odds 2: 9 |
-| `truth` | (2,−3,−5,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 6 | off | 0 |
-| `igblast` | (2,−3,−5,−1) | (2,−4,−11,−1) | (2,−4,−13,−1) | 5 | off | 0 |
+| Profile | V tuple | D tuple | J tuple | `min_d_match` | `P_D` (human IGH) |
+|---|---|---|---|---|---|
+| `r` (default) | (2,−3,−9,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 4 | derived, even odds: 11 |
+| `sensitive-d` | (2,−3,−9,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 4 | derived, odds 2: 9 |
+| `truth` | (2,−3,−5,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 6 | 0 |
+| `igblast` | (2,−3,−5,−1) | (2,−4,−11,−1) | (2,−4,−13,−1) | 5 | 0 |
 
-Every profile requires 60 % identity, at least 24 V substitution columns and
-10 J substitution columns, and the E-value gates (accept 1, anchor 10⁻³). It
+Every profile gates V and J hits by E-value (accept 1, anchor 10⁻³) and
 stitches the co-linear V prefix and J suffix back onto the local alignment
 before ranking. A with-D path must strictly beat the no-D path; ties go to
 fewer D segments, then to more germline support.
@@ -574,9 +574,8 @@ Each is a named field you can change.
    within `max(8, 5 %)` of the leader; every allele of a kept gene is a
    candidate. J is exhaustive. D uses the lossless L-mer prefilter instead of
    the note's k = 5/3 seeds.
-4. **Keep.** V and J trace until the top 3 accepted alignments (plus ties); D
-   keeps up to 32 admissible alignments, so a distributed hit below the best
-   few still reaches adjudication.
+4. **Keep.** V and J trace until the top 3 alignments that pass the E-value
+   gate (plus ties); D keeps up to 32 admissible alignments.
 5. **Windows.** D windows reclaim 12 bases into V and J (the note's rescue of
    24/10 is realised by this window and the DAG's exact cut choice). The
    conserved-anchor window is always added when anchors are present. J is
@@ -590,6 +589,11 @@ Each is a named field you can change.
    - The ungapped J path bonus, the V-identity-switched J acceptance gates and
      the J hotspot profile.
    - The D short-run / long-span surcharges.
+   - Inert by sensitivity analysis, so neutral by default (the fields
+     remain): the V/J acceptance floors (24/10 columns, 60 % identity, which
+     is the break-even identity of `(2, −3)` and so implied by a positive
+     local score), the V…J pair bonus (24), the distributed-D gate, and the
+     24/10-base retention floors.
 
    Ablation on simulated reads showed no accuracy benefit for any of them
    (see the assessment).

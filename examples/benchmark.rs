@@ -83,6 +83,51 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Some(pad) = value("--band-pad") {
         config.v.seeds.band_pad = pad.parse()?;
     }
+    // Sensitivity analysis of the remaining constants (comma-separated values).
+    let list = |name: &str| -> Option<Vec<String>> {
+        value(name).map(|v| v.split(',').map(str::to_string).collect())
+    };
+    if let Some(bonus) = value("--pair-bonus") {
+        config.objective.pair_bonus = bonus.parse()?;
+    }
+    if let Some(tandem) = value("--tandem") {
+        config.objective.tandem_d_penalty = tandem.parse()?;
+    }
+    for (name, accept) in [
+        ("--v-accept", &mut config.v.accept),
+        ("--j-accept", &mut config.j.accept),
+    ] {
+        if let Some(v) = list(name) {
+            accept.min_subst = v[0].parse()?;
+            accept.min_identity = v[1].parse()?;
+        }
+    }
+    if let Some(v) = list("--seeds") {
+        config.v.primary = vdj_assign::seed::SeedShape::contiguous(v[0].parse()?);
+        let fallback: usize = v[1].parse()?;
+        config.v.fallback =
+            (fallback > 0).then(|| vdj_assign::seed::SeedShape::contiguous(fallback));
+    }
+    if let Some(v) = list("--budget") {
+        config.v.budget.base = v[0].parse()?;
+        config.v.budget.max = v[1].parse()?;
+        config.v.budget.relative = v[2].parse()?;
+        config.v.budget.absolute = v[3].parse()?;
+    }
+    if let Some(run) = value("--min-d-run") {
+        config.d.min_exact_run = run.parse()?;
+    }
+    if let Some(v) = list("--dist-d") {
+        if let Some(gate) = config.d.distributed.as_mut() {
+            gate.min_columns = v[0].parse()?;
+            gate.min_matches = v[1].parse()?;
+            gate.min_identity = v[2].parse()?;
+            gate.min_rescore = v[3].parse()?;
+        }
+    }
+    if let Some(v) = list("--min-retained") {
+        config.min_retained = [v[0].parse()?, v[1].parse()?, v[2].parse()?];
+    }
     for ablation in value("--ablate")
         .unwrap_or_default()
         .split(',')

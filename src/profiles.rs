@@ -13,8 +13,8 @@ use crate::scoring::AffineScoring;
 pub enum CallingProfile {
     /// Legacy human-IGH tuples. V gap-open −5, `min_d_match` 6, no D-presence cost.
     TruthOptimized,
-    /// Default. V gap-open −9, `min_d_match` 4, distributed-D, `P_D` derived
-    /// from the D database at even prior odds (11 for human IGH).
+    /// Default. V gap-open −9, `min_d_match` 4, `P_D` derived from the D
+    /// database at even prior odds (11 for human IGH).
     ROptimized,
     /// IgBLAST-agreement: D `(2,−4,−11,−1)`, J `(2,−4,−13,−1)`, `min_d_match` 5.
     IgBlastAgreement,
@@ -56,7 +56,6 @@ impl CallingProfile {
             Self::TruthOptimized => {
                 config.v.scoring = AffineScoring::new(2, -3, -5, -1);
                 config.d.min_exact_run = 6;
-                config.d.distributed = None;
                 config.min_retained[SegmentKind::D.index()] = 6;
                 config.objective.d_prior = DPrior::Fixed(0);
             }
@@ -65,7 +64,6 @@ impl CallingProfile {
                 config.d.scoring = AffineScoring::new(2, -4, -11, -1);
                 config.j.scoring = AffineScoring::new(2, -4, -13, -1);
                 config.d.min_exact_run = 5;
-                config.d.distributed = None;
                 config.min_retained[SegmentKind::D.index()] = 5;
                 config.objective.d_prior = DPrior::Fixed(0);
             }
@@ -95,12 +93,9 @@ mod tests {
                 assert_ne!(a, b);
             }
         }
-        assert!(CallingProfile::ROptimized.config().d.distributed.is_some());
-        assert!(CallingProfile::TruthOptimized
-            .config()
-            .d
-            .distributed
-            .is_none());
+        assert!(CallingProfile::ALL
+            .iter()
+            .all(|p| p.config().d.distributed.is_none()));
         let r = CallingProfile::ROptimized.config();
         assert_eq!(r.v.scoring, AffineScoring::new(2, -3, -9, -1));
         assert_eq!(r.d.min_exact_run, 4);

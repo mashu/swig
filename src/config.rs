@@ -150,7 +150,7 @@ pub struct ObjectiveConfig {
 impl Default for ObjectiveConfig {
     fn default() -> Self {
         Self {
-            pair_bonus: 24,
+            pair_bonus: 0,
             d_prior: DPrior::DERIVED,
             tandem_d_penalty: 12,
             insertion_per_base: 0,
@@ -195,9 +195,12 @@ pub struct EngineConfig {
 }
 
 impl Default for VSegmentConfig {
-    /// Gap-open −9, at least 24 substitution columns, identity ≥ 0.60. The
-    /// vote budget keeps 3 genes and walks up to 16 while votes stay within
-    /// the ambiguity margin; the 3 best accepted alignments (and ties) are kept.
+    /// Gap-open −9. The vote budget keeps 3 genes and walks up to 16 while
+    /// votes stay within the ambiguity margin; the 3 best alignments that pass
+    /// the E-value gate (and ties) are kept. There is no column or identity
+    /// floor: a positive `(2, −3)` local alignment already has identity above
+    /// 3/5, the E-value gate implies a minimum length, and the note's floors
+    /// (24 columns, 60 %) changed no call (docs/ASSESSMENT.md §5).
     fn default() -> Self {
         Self {
             scoring: AffineScoring::new(2, -3, -9, -1),
@@ -211,10 +214,7 @@ impl Default for VSegmentConfig {
                 min_score: 1,
                 cap: 64,
             },
-            accept: HitAcceptance {
-                min_subst: 24,
-                min_identity: 0.60,
-            },
+            accept: HitAcceptance::PERMISSIVE,
             evalue: Some(EvalueGates::default()),
             family_delta: true,
         }
@@ -222,7 +222,7 @@ impl Default for VSegmentConfig {
 }
 
 impl Default for JSegmentConfig {
-    /// `(2, −3, −17, −2)`, at least 10 substitution columns, identity ≥ 0.60.
+    /// `(2, −3, −17, −2)`; hits gated by E-value only, as for V.
     fn default() -> Self {
         Self {
             scoring: AffineScoring::new(2, -3, -17, -2),
@@ -231,10 +231,7 @@ impl Default for JSegmentConfig {
                 min_score: 1,
                 cap: 64,
             },
-            accept: HitAcceptance {
-                min_subst: 10,
-                min_identity: 0.60,
-            },
+            accept: HitAcceptance::PERMISSIVE,
             evalue: Some(EvalueGates::default()),
             window: DownstreamWindow::default(),
         }
@@ -246,15 +243,16 @@ impl Default for DSegmentConfig {
         Self {
             scoring: AffineScoring::new(2, -3, -13, -1),
             lmer: None,
-            // Every admissible D hit (up to 32): a distributed-D hit below the
-            // best few must still reach adjudication.
+            // Every admissible D hit (up to 32) reaches adjudication.
             keep: KeepPolicy {
                 top: 32,
                 min_score: 0,
                 cap: 32,
             },
             min_exact_run: 4,
-            distributed: Some(crate::admission::DistributedEvidence::default()),
+            // The note's distributed-D gate admits nothing the exact run and
+            // the objective's D floor do not (docs/ASSESSMENT.md §5).
+            distributed: None,
         }
     }
 }
@@ -269,9 +267,8 @@ impl Default for EngineConfig {
             anchor_window: true,
             grammar: VdjGrammar::VDJ,
             objective: ObjectiveConfig::default(),
-            // V ≥ 24 aligned bases, J ≥ 10, D ≥ min_d_match. Query bases
-            // retained after a clip use the same floors.
-            min_retained: [24, 4, 10],
+            // A clipped V or J keeps at least one base, a D `min_d_match`.
+            min_retained: [1, 4, 1],
             posterior: true,
             options: AssignerOptions::default(),
         }
