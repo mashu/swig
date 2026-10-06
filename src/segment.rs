@@ -24,7 +24,8 @@ use crate::germline::{AlleleId, GermlineSet, SegmentKind};
 use crate::placement::{merge_identical, Placement};
 use crate::refine::{extend_outer, OuterExtend};
 use crate::retrieve::{Candidate, RetrievalScratch, Retriever};
-use crate::scoring::{GapCosts, Score, SubstitutionModel, SubstitutionProfile};
+use crate::scoring::{AffineScoring, GapCosts, Score, SubstitutionModel, SubstitutionProfile};
+use crate::stats::KarlinAltschul;
 
 /// Length and identity floor applied to a local alignment before outer extension.
 ///
@@ -186,11 +187,48 @@ impl BatchScratch {
     }
 }
 
+/// Karlin–Altschul significance floor: an accepted hit must have an E-value
+/// of at most `max_evalue` against the whole database, for the query window
+/// that was searched, i.e. a local score of at least
+/// `⌈(ln(K·m·n) − ln E_max) / λ⌉` (`m` window length, `n` database length).
+///
+/// It separates calls from chance: without it every read, random sequence
+/// included, has some 10-column J alignment at 60 % identity.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Significance {
+    pub statistics: KarlinAltschul,
+    /// Total length of the database (all alleles; conservative for
+    /// near-identical alleles).
+    pub database_len: usize,
+    pub max_evalue: f64,
+}
+
+impl Significance {
+    pub fn new(set: &GermlineSet, scoring: &AffineScoring, max_evalue: f64) -> Option<Self> {
+        Some(Self {
+            statistics: KarlinAltschul::ungapped(scoring)?,
+            database_len: set.alleles().iter().map(|a| a.codes.len()).sum(),
+            max_evalue,
+        })
+    }
+
+    /// Smallest local score with E-value ≤ `max_evalue` for a window of `query_len`.
+    pub fn min_score(&self, query_len: usize) -> Score {
+        let KarlinAltschul { lambda, k, .. } = self.statistics;
+        let space = k * query_len.max(1) as f64 * self.database_len.max(1) as f64;
+        ((space.ln() - self.max_evalue.ln()) / lambda)
+            .ceil()
+            .max(0.0) as Score
+    }
+}
+
 pub struct SegmentStage<R> {
     pub segment: Arc<PreparedSegment>,
     pub retriever: R,
     pub keep: KeepPolicy,
     pub accept: HitAcceptance,
+    /// `None` accepts hits of any significance.
+    pub significance: Option<Significance>,
     /// Stitch the co-linear V prefix or J suffix back on after traceback, then re-rank.
     pub outer: OuterExtend,
     /// Score one allele per gene first and skip same-length siblings whose
@@ -205,6 +243,7 @@ impl<R: Retriever> SegmentStage<R> {
             retriever,
             keep,
             accept: HitAcceptance::PERMISSIVE,
+            significance: None,
             outer: OuterExtend::None,
             family_delta: None,
         }
@@ -223,6 +262,15 @@ impl<R: Retriever> SegmentStage<R> {
         out: &mut Vec<Candidate>,
     ) {
         self.retriever.retrieve(&query[window], scratch, out);
+    }
+
+    /// Lowest local score worth keeping for `request`: the keep floor, raised
+    /// to the significance floor of its window.
+    fn floor(&self, request: &SegmentRequest<'_>) -> Score {
+        let significant = self
+            .significance
+            .map_or(Score::MIN, |s| s.min_score(request.window.len()));
+        self.keep.min_score.max(significant)
     }
 
     fn job<'a>(&'a self, request: &SegmentRequest<'a>, candidate: &Candidate) -> AlignJob<'a> {
@@ -343,7 +391,7 @@ impl<R: Retriever> SegmentStage<R> {
             .collect();
         aligner.score_batch(&jobs, dp, &mut batch.hits);
         for (&(index, candidate), hit) in batch.owners.iter().zip(&batch.hits) {
-            if let Some(hit) = hit.filter(|h| h.score >= self.keep.min_score) {
+            if let Some(hit) = hit.filter(|h| h.score >= self.floor(&requests[index])) {
                 batch.ranked[index].push((candidate, hit.score));
             }
         }
@@ -412,7 +460,7 @@ impl<R: Retriever> SegmentStage<R> {
             aligner.score_batch(&jobs, dp, &mut batch.hits);
             for (&(index, candidate), hit) in batch.owners.iter().zip(&batch.hits) {
                 rep_scores.push((index, candidate.allele, hit.map(|h| h.score)));
-                if let Some(hit) = hit.filter(|h| h.score >= self.keep.min_score) {
+                if let Some(hit) = hit.filter(|h| h.score >= self.floor(&requests[index])) {
                     batch.ranked[index].push((candidate, hit.score));
                 }
             }
@@ -433,7 +481,8 @@ impl<R: Retriever> SegmentStage<R> {
                 // No representative score, or alleles of different length: no bound.
                 None => true,
                 Some(bound) => {
-                    bound >= self.keep.min_score && cutoffs[index].map_or(true, |c| bound >= c)
+                    bound >= self.floor(&requests[index])
+                        && cutoffs[index].map_or(true, |c| bound >= c)
                 }
             };
             if must_score {
@@ -490,10 +539,10 @@ impl<R: Retriever> SegmentStage<R> {
                 let Some(mut alignment) = alignment else {
                     continue;
                 };
-                if alignment.score < self.keep.min_score {
+                let request = &requests[index];
+                if alignment.score < self.floor(request) {
                     continue;
                 }
-                let request = &requests[index];
                 alignment.shift_query(request.window.start as u32);
                 let local = alignment.score;
                 let placement = Placement::new(
@@ -641,6 +690,29 @@ mod tests {
         }
         assert_eq!(placed[0], placed[1]);
         assert!(placed[0].contains(&0));
+    }
+
+    #[test]
+    fn significance_floor_follows_the_search_space() {
+        let (stage, _, _) = v_stage(false);
+        let scoring = AffineScoring::new(2, -3, -9, -1);
+        let strict = Significance::new(stage.segment.set(), &scoring, 1e-3).unwrap();
+        let loose = Significance {
+            max_evalue: 1.0,
+            ..strict
+        };
+        // E = K·m·n·e^{−λS}: S grows with ln(m) and with −ln(E) / λ.
+        assert!(strict.min_score(600) > strict.min_score(60));
+        let gap = strict.min_score(300) - loose.min_score(300);
+        assert!((gap - (1e3f64.ln() / strict.statistics.lambda) as Score).abs() <= 1);
+        let floor = strict.min_score(300);
+        let evalue = |s: Score| {
+            strict.statistics.k
+                * 300.0
+                * strict.database_len as f64
+                * (-strict.statistics.lambda * f64::from(s)).exp()
+        };
+        assert!(evalue(floor) <= 1e-3 && evalue(floor - 1) > 1e-3);
     }
 
     #[test]

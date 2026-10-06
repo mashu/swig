@@ -55,6 +55,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Some(penalty) = value("--p-d") {
         config.objective.d_prior = vdj_assign::config::DPrior::Fixed(penalty.parse()?);
     }
+    if let Some(e) = value("--evalue") {
+        let e: f64 = e.parse()?;
+        let e = (e > 0.0).then_some(e);
+        config.v.max_evalue = e;
+        config.j.max_evalue = e;
+    }
     if let Some(limit) = value("--max-alleles") {
         config.v.seeds.max_alleles = limit.parse()?;
     }
@@ -117,5 +123,32 @@ fn main() -> Result<(), Box<dyn Error>> {
         reads as f64 / seconds
     );
     println!("{evaluation}");
+
+    // Negative control: random reads with the simulated length distribution.
+    if let Some(n) = value("--random") {
+        let n: usize = n.parse()?;
+        let mut rng = vdj_assign::sim::Rng::new(seed ^ 0xA5A5);
+        let random: Vec<Vec<u8>> = simulated
+            .iter()
+            .cycle()
+            .take(n)
+            .map(|r| (0..r.sequence.len()).map(|_| rng.base()).collect())
+            .collect();
+        let queries: Vec<Vec<u8>> = random.iter().map(|r| encode(r)).collect();
+        let calls = assign_all(&assigner, &queries, threads);
+        let (mut v, mut j, mut path) = (0, 0, 0);
+        for call in &calls {
+            let record = AirrRecord::from_call("r", "", call, &assigner, &[None, None, None]);
+            v += usize::from(record.v.is_some());
+            j += usize::from(record.j.is_some());
+            path += usize::from(record.path_score.is_some());
+        }
+        println!(
+            "random reads {n}: with a path {:.2}%  V called {:.2}%  J called {:.2}%",
+            100.0 * path as f64 / n as f64,
+            100.0 * v as f64 / n as f64,
+            100.0 * j as f64 / n as f64
+        );
+    }
     Ok(())
 }
