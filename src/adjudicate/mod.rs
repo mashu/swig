@@ -18,6 +18,7 @@
 //! alignment evidence rescored at the read's own divergence.
 
 mod dag;
+mod lattice;
 mod model;
 mod posterior;
 mod residual;
