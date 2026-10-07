@@ -17,7 +17,7 @@ use vdj_assign::align::{Aligner, InterSequenceWorkspace};
 use vdj_assign::annotate::AnnotateOptions;
 use vdj_assign::prelude::*;
 use vdj_assign::prepare::prepare;
-use vdj_assign::refine::{extend_outer, OuterExtend};
+use vdj_assign::refine::{OuterExtend, extend_outer};
 use vdj_assign::scoring::GapCosts;
 use vdj_assign::scoring::SubstitutionProfile;
 use vdj_assign::sim::{Region, SimParams, Simulator, SyntheticDatabase, SyntheticSpec};

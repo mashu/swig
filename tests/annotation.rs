@@ -7,7 +7,7 @@
 //! W occur), random mutation of non-conserved framework residues, random
 //! synonymous codons, and optional 5′ truncation that shifts the frame.
 
-use vdj_assign::annotate::{annotate, AnchorSource, AnnotateOptions, ChainType};
+use vdj_assign::annotate::{AnchorSource, AnnotateOptions, ChainType, annotate};
 use vdj_assign::prelude::*;
 use vdj_assign::translate::{codon, translate};
 
@@ -55,7 +55,9 @@ fn back_translate(protein: &[u8], rng: &mut Rng) -> Vec<u8> {
 }
 
 fn random_residues(len: usize, rng: &mut Rng) -> Vec<u8> {
-    (0..len).map(|_| RESIDUES[rng.below(RESIDUES.len())]).collect()
+    (0..len)
+        .map(|_| RESIDUES[rng.below(RESIDUES.len())])
+        .collect()
 }
 
 /// Mutate ~12 % of residues except the conserved `keep` indices.
@@ -63,7 +65,13 @@ fn mutate(template: &[u8], keep: &[usize], rng: &mut Rng) -> Vec<u8> {
     template
         .iter()
         .enumerate()
-        .map(|(i, &aa)| if !keep.contains(&i) && rng.below(100) < 12 { RESIDUES[rng.below(20)] } else { aa })
+        .map(|(i, &aa)| {
+            if !keep.contains(&i) && rng.below(100) < 12 {
+                RESIDUES[rng.below(20)]
+            } else {
+                aa
+            }
+        })
         .collect()
 }
 
@@ -98,7 +106,11 @@ fn synthetic_v(chain: ChainType, rng: &mut Rng, truncate: usize) -> SyntheticV {
     let fr2 = mutate(fr2, &[2, 5, 7, 8], rng);
     let fr3 = mutate(fr3, &[fr3.len() - 1, fr3.len() - 2, fr3.len() - 3], rng);
     let mut protein = fr1.clone();
-    protein.extend(random_residues(cdr1_len, rng).iter().map(|&a| if a == b'C' { b'S' } else { a }));
+    protein.extend(
+        random_residues(cdr1_len, rng)
+            .iter()
+            .map(|&a| if a == b'C' { b'S' } else { a }),
+    );
     let fr2_start = protein.len();
     protein.extend(&fr2);
     let cdr2_start = protein.len();
@@ -113,7 +125,13 @@ fn synthetic_v(chain: ChainType, rng: &mut Rng, truncate: usize) -> SyntheticV {
     SyntheticV {
         sequence: sequence[truncate..].to_vec(),
         anchor: shift(cys104),
-        starts: [((3 - truncate) % 3) as u32, shift(fr1.len()), shift(fr2_start), shift(cdr2_start), shift(fr3_start)],
+        starts: [
+            ((3 - truncate) % 3) as u32,
+            shift(fr1.len()),
+            shift(fr2_start),
+            shift(cdr2_start),
+            shift(fr3_start),
+        ],
     }
 }
 
@@ -129,7 +147,11 @@ fn synthetic_j(chain: ChainType, rng: &mut Rng) -> (Vec<u8>, u32) {
     (sequence, (lead + 3 * anchor_index) as u32)
 }
 
-fn database(chain: ChainType, genes: usize, rng: &mut Rng) -> (GermlineSet, Vec<SyntheticV>, GermlineSet, Vec<u32>) {
+fn database(
+    chain: ChainType,
+    genes: usize,
+    rng: &mut Rng,
+) -> (GermlineSet, Vec<SyntheticV>, GermlineSet, Vec<u32>) {
     let mut v = GermlineSet::new(SegmentKind::V);
     let mut truth = Vec::new();
     for g in 0..genes {
@@ -156,7 +178,12 @@ fn recovers_exact_boundaries_for_heavy_and_light_genes() {
         let report = annotate(&mut v, Some(&mut j), AnnotateOptions::default());
         assert_eq!(report.chain, Some(chain));
         for (allele, expected) in v.alleles().iter().zip(&truth) {
-            assert_eq!(allele.anchor, Some(expected.anchor), "{chain:?} {} anchor", allele.name);
+            assert_eq!(
+                allele.anchor,
+                Some(expected.anchor),
+                "{chain:?} {} anchor",
+                allele.name
+            );
             assert_eq!(
                 allele.regions.values(),
                 expected.starts.map(Some),
@@ -189,8 +216,18 @@ fn pseudogene_anchor_is_transferred_from_its_closest_sibling() {
     assert_eq!(rescued.anchor, Some(truth[0].anchor));
     assert_eq!(rescued.regions.values(), truth[0].starts.map(Some));
     let annotation = report.v.last().unwrap();
-    assert_eq!(annotation.source, AnchorSource::Transfer { from: "V0*01".into() });
-    assert!(annotation.notes.iter().any(|n| n.contains("conserved residue is S")));
+    assert_eq!(
+        annotation.source,
+        AnchorSource::Transfer {
+            from: "V0*01".into()
+        }
+    );
+    assert!(
+        annotation
+            .notes
+            .iter()
+            .any(|n| n.contains("conserved residue is S"))
+    );
 }
 
 /// A 3′-partial allele (IMGT "partial in 3′") ends inside its Cys104 codon.
@@ -212,7 +249,14 @@ fn three_prime_partial_allele_gets_no_anchor() {
     assert_eq!(allele.regions.values(), truth[0].starts.map(Some));
     let annotation = report.v.last().unwrap();
     assert_eq!(annotation.source, AnchorSource::Missing);
-    assert!(annotation.notes.iter().any(|n| n.contains("past the 3′ end")), "{:?}", annotation.notes);
+    assert!(
+        annotation
+            .notes
+            .iter()
+            .any(|n| n.contains("past the 3′ end")),
+        "{:?}",
+        annotation.notes
+    );
 }
 
 /// An allele that keeps its Cys104 but lost 21 bases just before it: the
@@ -228,7 +272,10 @@ fn a_deletion_before_cys104_is_not_a_partial_allele() {
     v.push("V0*02", &deleted, None).unwrap();
     let report = annotate(&mut v, Some(&mut j), AnnotateOptions::default());
     let annotation = report.v.last().unwrap();
-    assert!(!annotation.notes.iter().any(|n| n.contains("3′-partial")), "{annotation:?}");
+    assert!(
+        !annotation.notes.iter().any(|n| n.contains("3′-partial")),
+        "{annotation:?}"
+    );
     let allele = v.alleles().last().unwrap();
     assert_eq!(allele.anchor, Some(truth[0].anchor - 21), "{annotation:?}");
 }
@@ -237,9 +284,19 @@ fn a_deletion_before_cys104_is_not_a_partial_allele() {
 fn header_values_are_never_overridden() {
     let mut rng = Rng(4);
     let gene = synthetic_v(ChainType::Heavy, &mut rng, 0);
-    let text = format!(">V1*01 anchor={} cdr1=3\n{}\n", gene.anchor, String::from_utf8(gene.sequence.clone()).unwrap());
+    let text = format!(
+        ">V1*01 anchor={} cdr1=3\n{}\n",
+        gene.anchor,
+        String::from_utf8(gene.sequence.clone()).unwrap()
+    );
     let mut v = GermlineSet::from_fasta(SegmentKind::V, &text).unwrap();
-    let report = annotate(&mut v, None, AnnotateOptions { chain: Some(ChainType::Heavy) });
+    let report = annotate(
+        &mut v,
+        None,
+        AnnotateOptions {
+            chain: Some(ChainType::Heavy),
+        },
+    );
     assert_eq!(report.v[0].source, AnchorSource::Header);
     let regions = v.allele(0).regions;
     assert_eq!(regions.cdr1, Some(3));
@@ -271,15 +328,27 @@ fn every_error_is_flagged_across_many_databases() {
             let report = annotate(&mut v, Some(&mut j), AnnotateOptions::default());
             for (id, (allele, expected)) in v.alleles().iter().zip(&truth).enumerate() {
                 total += 1;
-                assert_eq!(allele.anchor, Some(expected.anchor), "{chain:?} seed {seed} {}", allele.name);
+                assert_eq!(
+                    allele.anchor,
+                    Some(expected.anchor),
+                    "{chain:?} seed {seed} {}",
+                    allele.name
+                );
                 let got = allele.regions.values();
                 let want = expected.starts.map(Some);
                 for field in [0, 2, 3, 4] {
-                    assert_eq!(got[field], want[field], "{chain:?} seed {seed} {} field {field}", allele.name);
+                    assert_eq!(
+                        got[field], want[field],
+                        "{chain:?} seed {seed} {} field {field}",
+                        allele.name
+                    );
                 }
                 if got[1] != want[1] {
                     assert!(
-                        report.v[id].notes.iter().any(|n| n.contains("Cys23 ambiguous")),
+                        report.v[id]
+                            .notes
+                            .iter()
+                            .any(|n| n.contains("Cys23 ambiguous")),
                         "{chain:?} seed {seed} {}: silent CDR1 error",
                         allele.name
                     );
@@ -290,7 +359,9 @@ fn every_error_is_flagged_across_many_databases() {
                 assert_eq!(allele.anchor, Some(expected));
             }
         }
-        eprintln!("{chain:?}: {total} alleles, {flagged_errors} flagged CDR1 errors, no silent errors");
+        eprintln!(
+            "{chain:?}: {total} alleles, {flagged_errors} flagged CDR1 errors, no silent errors"
+        );
     }
 }
 
@@ -308,7 +379,12 @@ fn ambiguous_cys23_of_a_truncated_allele_is_resolved_from_its_sibling() {
     let allele = v.alleles().last().unwrap();
     assert_eq!(allele.regions.cdr1, Some(truth[0].starts[1] - 2));
     let notes = &report.v.last().unwrap().notes;
-    assert!(notes.iter().any(|n| n == "ambiguous Cys23 resolved from V0*01"), "{notes:?}");
+    assert!(
+        notes
+            .iter()
+            .any(|n| n == "ambiguous Cys23 resolved from V0*01"),
+        "{notes:?}"
+    );
 }
 
 #[test]
@@ -331,13 +407,16 @@ fn read_regions_match_the_simulated_rearrangement() {
         j_truth.push((sequence, anchor));
     }
     let mut d = GermlineSet::new(SegmentKind::D);
-    let d_seqs: Vec<Vec<u8>> = (0..6).map(|_| (0..17).map(|_| b"ACGT"[rng.below(4)]).collect()).collect();
+    let d_seqs: Vec<Vec<u8>> = (0..6)
+        .map(|_| (0..17).map(|_| b"ACGT"[rng.below(4)]).collect())
+        .collect();
     for (g, seq) in d_seqs.iter().enumerate() {
         d.push(&format!("D{g}*01"), seq, None).unwrap();
     }
     let db = prepare(v, Some(d), j, AnnotateOptions::default()).unwrap();
     assert_eq!(db.annotation.uncertain(), 0);
-    let assigner = DefaultAssigner::from_config(&EngineConfig::default(), db.v, db.d, db.j).unwrap();
+    let assigner =
+        DefaultAssigner::from_config(&EngineConfig::default(), db.v, db.d, db.j).unwrap();
     let mut ws = assigner.workspace();
     let (mut in_frame, mut out_of_frame) = (0, 0);
     for read in 0..200 {
@@ -355,7 +434,16 @@ fn read_regions_match_the_simulated_rearrangement() {
         query.extend(j_seq);
         let reverse = read % 2 == 1;
         let input = if reverse {
-            query.iter().rev().map(|&b| match b { b'A' => b'T', b'C' => b'G', b'G' => b'C', _ => b'A' }).collect()
+            query
+                .iter()
+                .rev()
+                .map(|&b| match b {
+                    b'A' => b'T',
+                    b'C' => b'G',
+                    b'G' => b'C',
+                    _ => b'A',
+                })
+                .collect()
         } else {
             query.clone()
         };
@@ -372,13 +460,20 @@ fn read_regions_match_the_simulated_rearrangement() {
         assert_eq!(regions.junction, Some(gene.anchor..w + 3), "read {read}");
         assert_eq!(regions.cdr3, Some(gene.anchor + 3..w), "read {read}");
         assert_eq!(regions.fwr4, Some(w..query.len() as u32), "read {read}");
-        let frame_ok = (w + 3 - gene.anchor) % 3 == 0;
+        let frame_ok = (w + 3 - gene.anchor).is_multiple_of(3);
         assert_eq!(regions.vj_in_frame, Some(frame_ok));
         let codes = encode(&query);
         let stop = translate(&codes[..query.len()], (gene.anchor % 3) as usize).contains(&b'*');
         assert_eq!(regions.stop_codon, Some(stop), "read {read}");
         assert_eq!(regions.productive, Some(frame_ok && !stop));
-        if frame_ok { in_frame += 1 } else { out_of_frame += 1 }
+        if frame_ok {
+            in_frame += 1
+        } else {
+            out_of_frame += 1
+        }
     }
-    assert!(in_frame > 20 && out_of_frame > 20, "both junction frames exercised");
+    assert!(
+        in_frame > 20 && out_of_frame > 20,
+        "both junction frames exercised"
+    );
 }

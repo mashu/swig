@@ -25,8 +25,8 @@ mod residual;
 pub use dag::{DagScratch, PlacementDag};
 pub use model::{EngineeringObjective, Grammar, PathModel, VdjGrammar};
 pub use posterior::{
-    divergence, EvidenceScale, Marginals, PosteriorModel, PosteriorScratch, MAX_SPREAD,
-    OVERLAP_SPREAD,
+    EvidenceScale, MAX_SPREAD, Marginals, OVERLAP_SPREAD, PosteriorModel, PosteriorScratch,
+    divergence,
 };
 pub use residual::{ResidualAdjudicator, ResidualScratch};
 

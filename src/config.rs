@@ -18,8 +18,8 @@ use crate::orient::StrandIndex;
 use crate::pipeline::{Assigner, AssignerOptions};
 use crate::refine::{NoRefine, OuterExtend};
 use crate::retrieve::{
-    AmbiguityBudget, ExhaustiveRetriever, LmerMaskRetriever, SeedVoteParams, SeedVoteRetriever,
-    UngappedParams, UngappedPrefilter, MAX_LMER,
+    AmbiguityBudget, ExhaustiveRetriever, LmerMaskRetriever, MAX_LMER, SeedVoteParams,
+    SeedVoteRetriever, UngappedParams, UngappedPrefilter,
 };
 use crate::scoring::{AffineScoring, Score};
 use crate::seed::SeedShape;
@@ -441,18 +441,18 @@ impl Assigner {
         let strand = StrandIndex::build([&v, &j], StrandIndex::K);
         let objective = config.objective.resolve(d.as_ref(), &config.d.scoring);
         let mut adjudicator = PlacementDag::new(grammar, objective, config.min_retained);
-        if config.posterior {
-            if let Some(ka) = KarlinAltschul::ungapped(&config.v.scoring) {
-                let substitution = |s: &AffineScoring| (s.matched, s.mismatch);
-                adjudicator = adjudicator.with_posterior(PosteriorModel {
-                    lambda: ka.lambda,
-                    substitution: [
-                        substitution(&config.v.scoring),
-                        substitution(&config.d.scoring),
-                        substitution(&config.j.scoring),
-                    ],
-                });
-            }
+        if config.posterior
+            && let Some(ka) = KarlinAltschul::ungapped(&config.v.scoring)
+        {
+            let substitution = |s: &AffineScoring| (s.matched, s.mismatch);
+            adjudicator = adjudicator.with_posterior(PosteriorModel {
+                lambda: ka.lambda,
+                substitution: [
+                    substitution(&config.v.scoring),
+                    substitution(&config.d.scoring),
+                    substitution(&config.j.scoring),
+                ],
+            });
         }
         Ok(Assigner {
             v: v_stage(v, &config.v)?,

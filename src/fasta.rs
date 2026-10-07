@@ -50,12 +50,12 @@ pub fn parse_fasta(text: &str) -> Result<Vec<FastaRecord>, FastaError> {
     for (index, line) in text.lines().enumerate() {
         let line = line.trim_end();
         if let Some(header) = line.strip_prefix('>') {
-            if let Some(last) = records.last() {
-                if last.sequence.is_empty() {
-                    return Err(FastaError::EmptyRecord {
-                        header: last.header.clone(),
-                    });
-                }
+            if let Some(last) = records.last()
+                && last.sequence.is_empty()
+            {
+                return Err(FastaError::EmptyRecord {
+                    header: last.header.clone(),
+                });
             }
             records.push(FastaRecord {
                 header: header.trim().to_string(),
@@ -70,12 +70,12 @@ pub fn parse_fasta(text: &str) -> Result<Vec<FastaRecord>, FastaError> {
                 .extend(line.bytes().filter(|b| b.is_ascii_alphabetic()));
         }
     }
-    if let Some(last) = records.last() {
-        if last.sequence.is_empty() {
-            return Err(FastaError::EmptyRecord {
-                header: last.header.clone(),
-            });
-        }
+    if let Some(last) = records.last()
+        && last.sequence.is_empty()
+    {
+        return Err(FastaError::EmptyRecord {
+            header: last.header.clone(),
+        });
     }
     Ok(records)
 }

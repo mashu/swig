@@ -137,13 +137,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Some(run) = value("--min-d-run") {
         config.d.min_exact_run = run.parse()?;
     }
-    if let Some(v) = list("--dist-d") {
-        if let Some(gate) = config.d.distributed.as_mut() {
-            gate.min_columns = v[0].parse()?;
-            gate.min_matches = v[1].parse()?;
-            gate.min_identity = v[2].parse()?;
-            gate.min_rescore = v[3].parse()?;
-        }
+    if let Some(v) = list("--dist-d")
+        && let Some(gate) = config.d.distributed.as_mut()
+    {
+        gate.min_columns = v[0].parse()?;
+        gate.min_matches = v[1].parse()?;
+        gate.min_identity = v[2].parse()?;
+        gate.min_rescore = v[3].parse()?;
     }
     if let Some(v) = list("--min-retained") {
         config.min_retained = [v[0].parse()?, v[1].parse()?, v[2].parse()?];

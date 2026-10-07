@@ -93,9 +93,11 @@ mod tests {
                 assert_ne!(a, b);
             }
         }
-        assert!(CallingProfile::ALL
-            .iter()
-            .all(|p| p.config().d.distributed.is_none()));
+        assert!(
+            CallingProfile::ALL
+                .iter()
+                .all(|p| p.config().d.distributed.is_none())
+        );
         let r = CallingProfile::ROptimized.config();
         assert_eq!(r.v.scoring, AffineScoring::new(2, -3, -9, -1));
         assert_eq!(r.d.min_exact_run, 4);

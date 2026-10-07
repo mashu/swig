@@ -40,22 +40,24 @@ pub fn is_hotspot_target(reference: &[u8], position: usize) -> bool {
     let n = reference.len();
     let b = reference[position];
     // WRCY — mutable C
-    if b == C && position >= 2 && position + 1 < n {
-        if is_w(reference[position - 2])
-            && is_r(reference[position - 1])
-            && is_y(reference[position + 1])
-        {
-            return true;
-        }
+    if b == C
+        && position >= 2
+        && position + 1 < n
+        && is_w(reference[position - 2])
+        && is_r(reference[position - 1])
+        && is_y(reference[position + 1])
+    {
+        return true;
     }
     // RGYW — mutable G
-    if b == G && position >= 1 && position + 2 < n {
-        if is_r(reference[position - 1])
-            && is_y(reference[position + 1])
-            && is_w(reference[position + 2])
-        {
-            return true;
-        }
+    if b == G
+        && position >= 1
+        && position + 2 < n
+        && is_r(reference[position - 1])
+        && is_y(reference[position + 1])
+        && is_w(reference[position + 2])
+    {
+        return true;
     }
     false
 }
@@ -66,16 +68,13 @@ pub fn is_coldspot_target(reference: &[u8], position: usize) -> bool {
     let n = reference.len();
     let b = reference[position];
     // SYC — mutable C
-    if b == C && position >= 2 {
-        if is_s(reference[position - 2]) && is_y(reference[position - 1]) {
-            return true;
-        }
+    if b == C && position >= 2 && is_s(reference[position - 2]) && is_y(reference[position - 1]) {
+        return true;
     }
     // GRS — mutable G
-    if b == G && position + 2 < n {
-        if is_r(reference[position + 1]) && is_s(reference[position + 2]) {
-            return true;
-        }
+    if b == G && position + 2 < n && is_r(reference[position + 1]) && is_s(reference[position + 2])
+    {
+        return true;
     }
     false
 }

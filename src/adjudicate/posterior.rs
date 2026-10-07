@@ -1213,7 +1213,7 @@ mod tests {
         let profile = SubstitutionProfile::build(&scoring, &reference);
         let mut ops = vec![Op::Match; 5];
         ops.push(Op::Ins);
-        ops.extend(std::iter::repeat(Op::Match).take(7));
+        ops.extend(std::iter::repeat_n(Op::Match, 7));
         let (mut q, mut r, mut score) = (21usize, 0usize, 0);
         for &op in &ops {
             match op {

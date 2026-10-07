@@ -71,11 +71,11 @@ mod tests {
         let budget = AmbiguityBudget::default();
         let clear: Vec<u32> = [400, 200]
             .into_iter()
-            .chain(std::iter::repeat(10).take(20))
+            .chain(std::iter::repeat_n(10, 20))
             .collect();
         let near: Vec<u32> = [400, 395, 390]
             .into_iter()
-            .chain(std::iter::repeat(10).take(20))
+            .chain(std::iter::repeat_n(10, 20))
             .collect();
         let deep = vec![100u32; 20];
         assert_eq!(budget.genes_to_keep(&clear), 3);

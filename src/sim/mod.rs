@@ -34,7 +34,7 @@ pub use evaluate::{Assignment, DPresence, Evaluation, SegmentCall, SegmentStats}
 pub use params::{IlluminaError, SimParams};
 pub use random::{Count, GatedRate, Rate, Rng};
 pub use simulate::{
-    reverse_complement, Region, SimError, SimulatedRead, Simulator, Trims, NO_ORIGIN,
+    NO_ORIGIN, Region, SimError, SimulatedRead, Simulator, Trims, reverse_complement,
 };
 pub use synthetic::{SyntheticDatabase, SyntheticSpec};
 pub use truth::{Slot, TrueSegment, Truth};

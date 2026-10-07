@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use vdj_assign::annotate::{AnnotateOptions, ChainType};
 use vdj_assign::prelude::*;
-use vdj_assign::prepare::{prepare, PreparedDatabase};
+use vdj_assign::prepare::{PreparedDatabase, prepare};
 use vdj_assign::reads::ReadReader;
 use vdj_assign::sim::{Assignment, Evaluation, Rng, SimParams, Simulator, Truth};
 
@@ -168,7 +168,7 @@ fn parse_args() -> Result<Option<Args>, String> {
                 return Err(format!(
                     "{} takes no positional argument ('{extra}')",
                     mode.name()
-                ))
+                ));
             }
         }
     }
@@ -304,7 +304,9 @@ fn run_prepare(args: &Args) -> Result<(), Box<dyn Error>> {
 
 fn run_assign(args: &Args) -> Result<(), Box<dyn Error>> {
     if cfg!(debug_assertions) {
-        eprintln!("vdj-assign: warning: debug build, typically 10-50x slower; build with `cargo build --release`");
+        eprintln!(
+            "vdj-assign: warning: debug build, typically 10-50x slower; build with `cargo build --release`"
+        );
     }
     let reads = args
         .reads
@@ -402,7 +404,9 @@ fn run_simulate(args: &Args) -> Result<(), Box<dyn Error>> {
     }
     reads.flush()?;
     truth.flush()?;
-    eprintln!("vdj-assign: wrote {count} reads to {out}.fasta and their truth to {out}.truth.tsv (preset {preset}, seed {seed})");
+    eprintln!(
+        "vdj-assign: wrote {count} reads to {out}.fasta and their truth to {out}.truth.tsv (preset {preset}, seed {seed})"
+    );
     Ok(())
 }
 
@@ -445,7 +449,9 @@ fn run_evaluate(args: &Args) -> Result<(), Box<dyn Error>> {
         evaluation.add(&truth, &call);
     }
     if missing > 0 {
-        eprintln!("vdj-assign: {missing} simulated reads have no row in {calls_path}; counted as unassigned");
+        eprintln!(
+            "vdj-assign: {missing} simulated reads have no row in {calls_path}; counted as unassigned"
+        );
     }
     println!("{evaluation}");
     Ok(())

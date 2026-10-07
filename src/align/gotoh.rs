@@ -38,7 +38,7 @@
 
 use super::{Aligner, Alignment, Op, ScoreHit};
 use crate::band::Band;
-use crate::scoring::{GapCosts, Score, SubstitutionProfile, NEG_INF};
+use crate::scoring::{GapCosts, NEG_INF, Score, SubstitutionProfile};
 
 // Traceback codes, shared with the SIMD kernel (`super::inter_seq`).
 pub(super) const SRC_ZERO: u8 = 0;
@@ -384,7 +384,7 @@ mod tests {
                 let p = (next() as usize) % query.len();
                 query[p] = (next() % 4) as u8;
             }
-            if next() % 2 == 0 {
+            if next().is_multiple_of(2) {
                 let p = (next() as usize) % query.len();
                 query.insert(p, (next() % 4) as u8);
             }

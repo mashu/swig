@@ -44,7 +44,7 @@ use crate::retrieve::{
 };
 use crate::segment::{BatchScratch, PreparedSegment, SegmentRequest, SegmentStage};
 use crate::window::{
-    merge_windows, DWindowPolicy, DownstreamWindow, ExpandedResidual, WithAnchorWindow,
+    DWindowPolicy, DownstreamWindow, ExpandedResidual, WithAnchorWindow, merge_windows,
 };
 
 /// Result of assigning one query.

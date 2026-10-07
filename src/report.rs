@@ -19,7 +19,7 @@ use std::fmt::Write as _;
 
 use crate::adjudicate::CalledSegment;
 use crate::align::Op;
-use crate::alphabet::{decode, decode_base, N};
+use crate::alphabet::{N, decode, decode_base};
 use crate::evidence::Evidence;
 use crate::germline::SegmentKind;
 use crate::pipeline::{AlleleCatalog, Call};
@@ -69,17 +69,6 @@ pub struct AirrRecord {
     /// Oriented query as ASCII (region sequences are slices of it).
     oriented: String,
 }
-
-/// Region columns in output order, with their accessor.
-const REGION_COLUMNS: [(&str, fn(&ReadRegions) -> &Option<std::ops::Range<u32>>); 7] = [
-    ("fwr1", |r| &r.fwr1),
-    ("cdr1", |r| &r.cdr1),
-    ("fwr2", |r| &r.fwr2),
-    ("cdr2", |r| &r.cdr2),
-    ("fwr3", |r| &r.fwr3),
-    ("fwr4", |r| &r.fwr4),
-    ("cdr3", |r| &r.cdr3),
-];
 
 /// Per-kind statistics for support values (indexed by [`SegmentKind::index`]).
 pub type SupportModels = [Option<KarlinAltschul>; 3];
@@ -363,7 +352,7 @@ impl AirrRecord {
         }
         columns.push("path_score".to_string());
         columns.push("d_presence_posterior".to_string());
-        for (name, _) in REGION_COLUMNS {
+        for name in ReadRegions::NAMES {
             columns.extend([
                 name.to_string(),
                 format!("{name}_start"),
@@ -407,7 +396,7 @@ impl AirrRecord {
                     s.sequence_alignment.clone(),
                     s.germline_alignment.clone(),
                 ]),
-                None => fields.extend(std::iter::repeat(String::new()).take(SEGMENT_FIELDS.len())),
+                None => fields.extend(std::iter::repeat_n(String::new(), SEGMENT_FIELDS.len())),
             }
         }
         for np in [&self.np1, &self.np2, &self.np3] {
@@ -423,8 +412,8 @@ impl AirrRecord {
         );
         let slice =
             |range: &std::ops::Range<u32>| &self.oriented[range.start as usize..range.end as usize];
-        for (_, get) in REGION_COLUMNS {
-            match get(&self.regions) {
+        for interval in self.regions.intervals() {
+            match interval {
                 Some(range) => fields.extend([
                     slice(range).to_string(),
                     (range.start + 1).to_string(),

@@ -5,7 +5,7 @@ use std::fmt;
 use std::io::{self, Write};
 
 use crate::alphabet;
-use crate::fasta::{parse_fasta, FastaError};
+use crate::fasta::{FastaError, parse_fasta};
 
 /// Gene segment type. The derive order (V < D < J) is genomic order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

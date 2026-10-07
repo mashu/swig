@@ -36,7 +36,7 @@ impl Band {
                 let i = row as i64;
                 let first = (i - i64::from(hi)).max(1);
                 let last = (i - i64::from(lo)).min(ref_len as i64);
-                (first <= last).then(|| (first as usize, last as usize))
+                (first <= last).then_some((first as usize, last as usize))
             }
         }
     }

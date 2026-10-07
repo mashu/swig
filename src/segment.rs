@@ -21,8 +21,8 @@ use crate::clip::ClipIndex;
 use crate::evidence::Evidence;
 use crate::family_bound::FamilyBoundTable;
 use crate::germline::{AlleleId, GermlineSet, SegmentKind};
-use crate::placement::{merge_identical, Placement};
-use crate::refine::{extend_outer, OuterExtend};
+use crate::placement::{Placement, merge_identical};
+use crate::refine::{OuterExtend, extend_outer};
 use crate::retrieve::{Candidate, RetrievalScratch, Retriever};
 use crate::scoring::{AffineScoring, GapCosts, Score, SubstitutionModel, SubstitutionProfile};
 use crate::stats::KarlinAltschul;
@@ -504,7 +504,7 @@ impl<R: Retriever> SegmentStage<R> {
                 None => true,
                 Some(bound) => {
                     bound >= self.floor(&requests[index])
-                        && cutoffs[index].map_or(true, |c| bound >= c)
+                        && cutoffs[index].is_none_or(|c| bound >= c)
                 }
             };
             if must_score {

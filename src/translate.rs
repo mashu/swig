@@ -74,8 +74,8 @@ mod tests {
         assert_eq!(translate(&codes, 0), b"MWC***QXF");
         let mut frames = [Vec::new(), Vec::new(), Vec::new()];
         translate_frames(&codes, &mut frames);
-        for frame in 0..3 {
-            assert_eq!(frames[frame], translate(&codes, frame));
+        for (frame, translated) in frames.iter().enumerate() {
+            assert_eq!(*translated, translate(&codes, frame));
         }
     }
 }

@@ -20,7 +20,7 @@ use crate::adjudicate::CalledSegment;
 use crate::germline::{Allele, SegmentKind};
 use crate::pipeline::{AlleleCatalog, Call};
 use crate::placement::Placement;
-use crate::translate::{codon, STOP};
+use crate::translate::{STOP, codon};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReadRegions {
@@ -60,7 +60,7 @@ fn called<'a, C: AlleleCatalog>(
         .iter()
         .filter(|s| call.placements[s.placement].kind == kind);
     let called = if kind == SegmentKind::J {
-        segments.last()?
+        segments.next_back()?
     } else {
         segments.next()?
     };
@@ -79,10 +79,21 @@ fn called<'a, C: AlleleCatalog>(
 /// `[start, end)` clamped to `[floor, ceil)`, if non-empty.
 fn interval(start: Option<i64>, end: Option<i64>, floor: i64, ceil: i64) -> Option<Range<u32>> {
     let (start, end) = (start?.max(floor), end?.min(ceil));
-    (start < end).then(|| start as u32..end as u32)
+    (start < end).then_some(start as u32..end as u32)
 }
 
 impl ReadRegions {
+    /// AIRR names of the FR/CDR regions, in output column order.
+    pub const NAMES: [&'static str; 7] = ["fwr1", "cdr1", "fwr2", "cdr2", "fwr3", "fwr4", "cdr3"];
+
+    /// The FR/CDR intervals in [`ReadRegions::NAMES`] order.
+    pub fn intervals(&self) -> [Option<&Range<u32>>; 7] {
+        [
+            &self.fwr1, &self.cdr1, &self.fwr2, &self.cdr2, &self.fwr3, &self.fwr4, &self.cdr3,
+        ]
+        .map(Option::as_ref)
+    }
+
     pub fn from_call<C: AlleleCatalog>(call: &Call, catalog: &C) -> Self {
         let n = call.query.len() as i64;
         let v = called(call, catalog, SegmentKind::V);
@@ -105,12 +116,14 @@ impl ReadRegions {
         if let Some(j) = &j {
             out.fwr4 = interval(trp118, Some(i64::from(j.called.span.q_hi)), 0, n);
         }
-        if let (Some(c), Some(w)) = (cys104, trp118) {
-            if c >= 0 && w + 3 <= n && c < w {
-                out.junction = Some(c as u32..(w + 3) as u32);
-                out.cdr3 = interval(Some(c + 3), Some(w), 0, n);
-                out.vj_in_frame = Some((w + 3 - c) % 3 == 0);
-            }
+        if let (Some(c), Some(w)) = (cys104, trp118)
+            && c >= 0
+            && w + 3 <= n
+            && c < w
+        {
+            out.junction = Some(c as u32..(w + 3) as u32);
+            out.cdr3 = interval(Some(c + 3), Some(w), 0, n);
+            out.vj_in_frame = Some((w + 3 - c) % 3 == 0);
         }
         // Stop codons in the V reading frame from the V alignment start to the J end.
         if let (Some(v), Some(c)) = (&v, cys104) {

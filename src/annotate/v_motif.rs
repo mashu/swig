@@ -18,7 +18,7 @@
 //! Spacing (codons): Trp41 → Cys104 44–70 (CDR2 of 0–12 aa plus FR3),
 //! Cys23 → Trp41 10–20 (CDR1 of 4–14 aa), Cys104 → 3′ end 1–15.
 
-use crate::translate::{translate_frames, STOP};
+use crate::translate::{STOP, translate_frames};
 
 /// Nucleotides from the Cys104 codon start to the V 3′ end.
 const TAIL_NT: std::ops::RangeInclusive<usize> = 3..=45;
@@ -229,9 +229,7 @@ pub fn find_v(codes: &[u8], search: VSearch, frames: &mut [Vec<u8>; 3]) -> Optio
                 chain_vote,
                 cys23_alternatives,
             };
-            if best.map_or(true, |b| {
-                (hit.score, hit.confident) > (b.score, b.confident)
-            }) {
+            if best.is_none_or(|b| (hit.score, hit.confident) > (b.score, b.confident)) {
                 best = Some(hit);
             }
         }

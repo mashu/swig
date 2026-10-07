@@ -24,13 +24,29 @@ impl Setup {
     }
 
     fn assigner(&self, config: &EngineConfig) -> DefaultAssigner {
-        DefaultAssigner::from_config(config, self.db.v.clone(), Some(self.db.d.clone()), self.db.j.clone())
-            .expect("synthetic database builds")
+        DefaultAssigner::from_config(
+            config,
+            self.db.v.clone(),
+            Some(self.db.d.clone()),
+            self.db.j.clone(),
+        )
+        .expect("synthetic database builds")
     }
 
-    fn evaluate(&self, params: SimParams, reads: usize, seed: u64, config: &EngineConfig) -> Evaluation {
-        let sim = Simulator::new(&self.db.v, Some(&self.db.d), &self.db.j, params.with_reverse_complement(0.5))
-            .expect("simulator");
+    fn evaluate(
+        &self,
+        params: SimParams,
+        reads: usize,
+        seed: u64,
+        config: &EngineConfig,
+    ) -> Evaluation {
+        let sim = Simulator::new(
+            &self.db.v,
+            Some(&self.db.d),
+            &self.db.j,
+            params.with_reverse_complement(0.5),
+        )
+        .expect("simulator");
         let simulated = sim.reads(reads, seed).expect("reads");
         let assigner = self.assigner(config);
         let queries: Vec<Vec<u8>> = simulated.iter().map(|r| encode(&r.sequence)).collect();
@@ -55,32 +71,80 @@ fn unmutated_reads_are_assigned_exactly() {
     let e = Setup::new().evaluate(SimParams::easy(), 300, 1, &EngineConfig::default());
     assert_eq!(e.oriented, e.reads, "orientation");
     assert_eq!(e.unassigned, 0);
-    assert!(e.v.equivalent_rate() >= 99.5, "V {:.2}", e.v.equivalent_rate());
-    assert!(e.j.equivalent_rate() >= 99.5, "J {:.2}", e.j.equivalent_rate());
-    assert!(e.d.equivalent_rate() >= 97.0, "D {:.2}", e.d.equivalent_rate());
-    assert!(e.junction_rate() >= 99.5, "junction {:.2}", e.junction_rate());
+    assert!(
+        e.v.equivalent_rate() >= 99.5,
+        "V {:.2}",
+        e.v.equivalent_rate()
+    );
+    assert!(
+        e.j.equivalent_rate() >= 99.5,
+        "J {:.2}",
+        e.j.equivalent_rate()
+    );
+    assert!(
+        e.d.equivalent_rate() >= 97.0,
+        "D {:.2}",
+        e.d.equivalent_rate()
+    );
+    assert!(
+        e.junction_rate() >= 99.5,
+        "junction {:.2}",
+        e.junction_rate()
+    );
 }
 
 #[test]
 fn igm_like_reads_keep_their_accuracy() {
     let e = Setup::new().evaluate(SimParams::mid(), 500, 2, &EngineConfig::default());
     assert!(percent(e.oriented, e.reads) >= 99.8);
-    assert!(e.v.equivalent_rate() >= 98.5, "V {:.2}", e.v.equivalent_rate());
+    assert!(
+        e.v.equivalent_rate() >= 98.5,
+        "V {:.2}",
+        e.v.equivalent_rate()
+    );
     assert!(e.v.gene_rate() >= 99.5, "V gene {:.2}", e.v.gene_rate());
-    assert!(e.j.equivalent_rate() >= 98.0, "J {:.2}", e.j.equivalent_rate());
-    assert!(e.d.equivalent_rate() >= 82.5, "D {:.2}", e.d.equivalent_rate());
-    assert!(e.junction_rate() >= 99.0, "junction {:.2}", e.junction_rate());
+    assert!(
+        e.j.equivalent_rate() >= 98.0,
+        "J {:.2}",
+        e.j.equivalent_rate()
+    );
+    assert!(
+        e.d.equivalent_rate() >= 82.5,
+        "D {:.2}",
+        e.d.equivalent_rate()
+    );
+    assert!(
+        e.junction_rate() >= 99.0,
+        "junction {:.2}",
+        e.junction_rate()
+    );
 }
 
 #[test]
 fn igg_like_hypermutated_reads_keep_their_accuracy() {
     let e = Setup::new().evaluate(SimParams::hard(), 500, 3, &EngineConfig::default());
     assert!(percent(e.oriented, e.reads) >= 99.6);
-    assert!(e.v.equivalent_rate() >= 96.0, "V {:.2}", e.v.equivalent_rate());
+    assert!(
+        e.v.equivalent_rate() >= 96.0,
+        "V {:.2}",
+        e.v.equivalent_rate()
+    );
     assert!(e.v.gene_rate() >= 99.0, "V gene {:.2}", e.v.gene_rate());
-    assert!(e.j.equivalent_rate() >= 95.5, "J {:.2}", e.j.equivalent_rate());
-    assert!(e.d.equivalent_rate() >= 74.0, "D {:.2}", e.d.equivalent_rate());
-    assert!(e.junction_rate() >= 98.5, "junction {:.2}", e.junction_rate());
+    assert!(
+        e.j.equivalent_rate() >= 95.5,
+        "J {:.2}",
+        e.j.equivalent_rate()
+    );
+    assert!(
+        e.d.equivalent_rate() >= 74.0,
+        "D {:.2}",
+        e.d.equivalent_rate()
+    );
+    assert!(
+        e.junction_rate() >= 98.5,
+        "junction {:.2}",
+        e.junction_rate()
+    );
 }
 
 #[test]
@@ -101,7 +165,12 @@ fn posteriors_are_calibrated() {
     for (params, seed) in [(SimParams::mid(), 11), (SimParams::hard(), 12)] {
         let e = setup.evaluate(params, 500, seed, &EngineConfig::default());
         for (label, c) in [("V", e.calibration.v), ("J", e.calibration.j)] {
-            eprintln!("{label}: n {} ECE {:.3} % Brier {:.4}", c.count(), 100.0 * c.ece(), c.brier());
+            eprintln!(
+                "{label}: n {} ECE {:.3} % Brier {:.4}",
+                c.count(),
+                100.0 * c.ece(),
+                c.brier()
+            );
             assert!(c.count() >= 495, "{label}: {} posteriors", c.count());
             assert!(c.ece() <= 0.03, "{label} ECE {:.3} %", 100.0 * c.ece());
             assert!(c.brier() <= 0.04, "{label} Brier {:.4}", c.brier());
@@ -132,8 +201,13 @@ fn random_reads_receive_no_call() {
 #[test]
 fn airr_tsv_rows_score_like_the_records_they_were_written_from() {
     let setup = Setup::new();
-    let sim = Simulator::new(&setup.db.v, Some(&setup.db.d), &setup.db.j, SimParams::mid().with_reverse_complement(0.5))
-        .expect("simulator");
+    let sim = Simulator::new(
+        &setup.db.v,
+        Some(&setup.db.d),
+        &setup.db.j,
+        SimParams::mid().with_reverse_complement(0.5),
+    )
+    .expect("simulator");
     let assigner = setup.assigner(&EngineConfig::default());
     let header = AirrRecord::tsv_header();
     let columns: Vec<&str> = header.split('\t').collect();
@@ -143,23 +217,37 @@ fn airr_tsv_rows_score_like_the_records_they_were_written_from() {
         let sequence = String::from_utf8_lossy(&read.sequence);
         let id = format!("r{i}");
         let record = AirrRecord::from_call(&id, &sequence, &call, &assigner, &[None, None, None]);
-        let (parsed_id, mut parsed) = Assignment::from_airr(&columns, &record.to_tsv()).expect("AIRR row");
+        let (parsed_id, mut parsed) =
+            Assignment::from_airr(&columns, &record.to_tsv()).expect("AIRR row");
         assert_eq!(parsed_id, id);
         let mut direct = Assignment::from_record(&record);
-        assert_eq!(record.d_presence_posterior.is_some(), record.path_score.is_some(), "posteriors by default");
+        assert_eq!(
+            record.d_presence_posterior.is_some(),
+            record.path_score.is_some(),
+            "posteriors by default"
+        );
         // Posteriors are written with six decimals (more near 0 and 1).
         let probabilities = |a: &mut Assignment| {
             let mut out = vec![a.d_presence.take()];
             out.extend(a.segments.iter_mut().flatten().map(|s| s.posterior.take()));
             out
         };
-        for (p, q) in probabilities(&mut parsed).into_iter().zip(probabilities(&mut direct)) {
-            assert!(p.zip(q).map_or(p == q, |(p, q)| (p - q).abs() <= 5e-7), "{p:?} vs {q:?}");
+        for (p, q) in probabilities(&mut parsed)
+            .into_iter()
+            .zip(probabilities(&mut direct))
+        {
+            assert!(
+                p.zip(q).map_or(p == q, |(p, q)| (p - q).abs() <= 5e-7),
+                "{p:?} vs {q:?}"
+            );
         }
         assert_eq!(parsed, direct);
         let truth = Truth::from_read(&sim, read, &id);
         let header = Truth::tsv_header();
         let truth_columns: Vec<&str> = header.split('\t').collect();
-        assert_eq!(Truth::from_tsv(&truth_columns, &truth.to_tsv()).expect("truth row"), truth);
+        assert_eq!(
+            Truth::from_tsv(&truth_columns, &truth.to_tsv()).expect("truth row"),
+            truth
+        );
     }
 }

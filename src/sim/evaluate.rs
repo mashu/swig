@@ -466,7 +466,11 @@ impl fmt::Display for Evaluation {
                 s.exact_rate(),
                 pct(s.truth_listed, s.reads),
                 s.gene_rate(),
-                if s.called == 0 { f64::NAN } else { s.names as f64 / s.called as f64 },
+                if s.called == 0 {
+                    f64::NAN
+                } else {
+                    s.names as f64 / s.called as f64
+                },
                 s.spurious,
                 mean(s.start_error),
                 mean(s.end_error),

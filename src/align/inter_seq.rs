@@ -46,7 +46,7 @@
 //! (`max profile entry × min(n, m)`) and its costs stay far from that
 //! sentinel; others fall back to the scalar kernel.
 
-use super::gotoh::{traceback_with, BandedGotoh, GotohWorkspace};
+use super::gotoh::{BandedGotoh, GotohWorkspace, traceback_with};
 use super::{AlignJob, Aligner, Alignment, Op, ScoreHit};
 use crate::alphabet::N;
 use crate::band::Band;
@@ -332,27 +332,30 @@ fn build<const DIAG: bool, const UNIFORM: bool>(
 
 #[cfg(target_arch = "x86_64")]
 mod kernel {
-    use super::{LaneBest, Shape, CODES, LANES, NEG, SENTINEL};
+    use super::{CODES, LANES, LaneBest, NEG, SENTINEL, Shape};
     use crate::alphabet::N;
     use std::arch::x86_64::*;
 
     #[inline]
     #[target_feature(enable = "avx2")]
     unsafe fn load(v: &[i16; LANES]) -> __m256i {
-        _mm256_loadu_si256(v.as_ptr().cast())
+        unsafe { _mm256_loadu_si256(v.as_ptr().cast()) }
     }
 
     #[inline]
     #[target_feature(enable = "avx2")]
     unsafe fn store(v: &mut [i16; LANES], x: __m256i) {
-        _mm256_storeu_si256(v.as_mut_ptr().cast(), x)
+        unsafe { _mm256_storeu_si256(v.as_mut_ptr().cast(), x) }
     }
 
     #[inline]
     #[target_feature(enable = "avx2")]
     unsafe fn store_codes(v: &mut [u8; LANES], x: __m256i) {
-        let packed = _mm_packus_epi16(_mm256_castsi256_si128(x), _mm256_extracti128_si256::<1>(x));
-        _mm_storeu_si128(v.as_mut_ptr().cast(), packed)
+        unsafe {
+            let packed =
+                _mm_packus_epi16(_mm256_castsi256_si128(x), _mm256_extracti128_si256::<1>(x));
+            _mm_storeu_si128(v.as_mut_ptr().cast(), packed)
+        }
     }
 
     /// Fill one group. `h` and `ins` hold `width + 1` entries; entry 0 is the
@@ -366,146 +369,151 @@ mod kernel {
         ins: &mut Vec<[i16; LANES]>,
         trace: &mut Vec<[u8; LANES]>,
     ) -> LaneBest {
-        let (rows, width, positions) = (shape.rows, shape.width, shape.positions);
-        h.clear();
-        h.resize(width + 1, [0; LANES]);
-        ins.clear();
-        ins.resize(width + 1, [NEG; LANES]);
-        if TRACE {
-            trace.clear();
-            trace.resize(rows * width, [0; LANES]);
-        }
-        let zero = _mm256_setzero_si256();
-        let neg = _mm256_set1_epi16(NEG);
-        let (open, extend, step) = (load(&shape.open), load(&shape.extend), load(&shape.step));
-        let lane_width = load(&shape.lane_width);
-        let (one, two, three) = (
-            _mm256_set1_epi16(1),
-            _mm256_set1_epi16(2),
-            _mm256_set1_epi16(3),
-        );
-        let (ins_bit, del_bit) = (_mm256_set1_epi16(4), _mm256_set1_epi16(8));
-        let sentinel = _mm256_set1_epi16(SENTINEL);
-        let ambiguous_code = _mm256_set1_epi16(i16::from(N));
-        let (matched, mismatch) = (load(&shape.matched), load(&shape.mismatch));
-        let (mut best, mut best_row, mut best_k) = (zero, zero, zero);
-
-        for r in 1..=rows {
-            let q = load(&query[r - 1]);
-            let mut code_mask = [zero; CODES];
-            if !UNIFORM {
-                for (c, mask) in code_mask.iter_mut().enumerate() {
-                    *mask = _mm256_cmpeq_epi16(q, _mm256_set1_epi16(c as i16));
-                }
+        unsafe {
+            let (rows, width, positions) = (shape.rows, shape.width, shape.positions);
+            h.clear();
+            h.resize(width + 1, [0; LANES]);
+            ins.clear();
+            ins.resize(width + 1, [NEG; LANES]);
+            if TRACE {
+                trace.clear();
+                trace.resize(rows * width, [0; LANES]);
             }
-            let past_query_lanes = _mm256_cmpeq_epi16(q, sentinel);
-            let past_query = _mm256_and_si256(past_query_lanes, neg);
-            let query_ambiguous = _mm256_cmpeq_epi16(q, ambiguous_code);
-            let row_vector = _mm256_set1_epi16(r as i16);
-            let mut del = neg;
-            let mut del_extends = zero;
-            let mut h_diag_carry = zero; // rectangular layout: H(i−1, j−1)
+            let zero = _mm256_setzero_si256();
+            let neg = _mm256_set1_epi16(NEG);
+            let (open, extend, step) = (load(&shape.open), load(&shape.extend), load(&shape.step));
+            let lane_width = load(&shape.lane_width);
+            let (one, two, three) = (
+                _mm256_set1_epi16(1),
+                _mm256_set1_epi16(2),
+                _mm256_set1_epi16(3),
+            );
+            let (ins_bit, del_bit) = (_mm256_set1_epi16(4), _mm256_set1_epi16(8));
+            let sentinel = _mm256_set1_epi16(SENTINEL);
+            let ambiguous_code = _mm256_set1_epi16(i16::from(N));
+            let (matched, mismatch) = (load(&shape.matched), load(&shape.mismatch));
+            let (mut best, mut best_row, mut best_k) = (zero, zero, zero);
 
-            for step_index in 0..width {
-                // Diagonal layout walks k downwards (left neighbour is k + 1).
-                let k = if DIAG {
-                    width - 1 - step_index
-                } else {
-                    step_index
-                };
-                let (h_up, i_up, h_diag, t) = if DIAG {
-                    (
-                        load(&h[k]),
-                        load(&ins[k]),
-                        load(&h[k + 1]),
-                        r + width - 1 - k,
-                    )
-                } else {
-                    let up = load(&h[k + 1]);
-                    let diag = h_diag_carry;
-                    h_diag_carry = up;
-                    (up, load(&ins[k + 1]), diag, k)
-                };
-                let s = if UNIFORM {
-                    // matched / mismatch by identity, 0 for N, −∞ outside the matrix.
-                    let reference = load(&profile[t]);
-                    let identical = _mm256_cmpeq_epi16(q, reference);
-                    let base = _mm256_blendv_epi8(mismatch, matched, identical);
-                    let ambiguous = _mm256_or_si256(
-                        query_ambiguous,
-                        _mm256_cmpeq_epi16(reference, ambiguous_code),
-                    );
-                    let base = _mm256_andnot_si256(ambiguous, base);
-                    let outside = _mm256_or_si256(
-                        past_query_lanes,
-                        _mm256_cmpgt_epi16(reference, ambiguous_code),
-                    );
-                    _mm256_blendv_epi8(base, neg, outside)
-                } else {
-                    let mut s = past_query;
-                    for (c, mask) in code_mask.iter().enumerate() {
-                        s = _mm256_or_si256(
-                            s,
-                            _mm256_and_si256(load(&profile[c * positions + t]), *mask),
+            for r in 1..=rows {
+                let q = load(&query[r - 1]);
+                let mut code_mask = [zero; CODES];
+                if !UNIFORM {
+                    for (c, mask) in code_mask.iter_mut().enumerate() {
+                        *mask = _mm256_cmpeq_epi16(q, _mm256_set1_epi16(c as i16));
+                    }
+                }
+                let past_query_lanes = _mm256_cmpeq_epi16(q, sentinel);
+                let past_query = _mm256_and_si256(past_query_lanes, neg);
+                let query_ambiguous = _mm256_cmpeq_epi16(q, ambiguous_code);
+                let row_vector = _mm256_set1_epi16(r as i16);
+                let mut del = neg;
+                let mut del_extends = zero;
+                let mut h_diag_carry = zero; // rectangular layout: H(i−1, j−1)
+
+                for step_index in 0..width {
+                    // Diagonal layout walks k downwards (left neighbour is k + 1).
+                    let k = if DIAG {
+                        width - 1 - step_index
+                    } else {
+                        step_index
+                    };
+                    let (h_up, i_up, h_diag, t) = if DIAG {
+                        (
+                            load(&h[k]),
+                            load(&ins[k]),
+                            load(&h[k + 1]),
+                            r + width - 1 - k,
+                        )
+                    } else {
+                        let up = load(&h[k + 1]);
+                        let diag = h_diag_carry;
+                        h_diag_carry = up;
+                        (up, load(&ins[k + 1]), diag, k)
+                    };
+                    let s = if UNIFORM {
+                        // matched / mismatch by identity, 0 for N, −∞ outside the matrix.
+                        let reference = load(&profile[t]);
+                        let identical = _mm256_cmpeq_epi16(q, reference);
+                        let base = _mm256_blendv_epi8(mismatch, matched, identical);
+                        let ambiguous = _mm256_or_si256(
+                            query_ambiguous,
+                            _mm256_cmpeq_epi16(reference, ambiguous_code),
+                        );
+                        let base = _mm256_andnot_si256(ambiguous, base);
+                        let outside = _mm256_or_si256(
+                            past_query_lanes,
+                            _mm256_cmpgt_epi16(reference, ambiguous_code),
+                        );
+                        _mm256_blendv_epi8(base, neg, outside)
+                    } else {
+                        let mut s = past_query;
+                        for (c, mask) in code_mask.iter().enumerate() {
+                            s = _mm256_or_si256(
+                                s,
+                                _mm256_and_si256(load(&profile[c * positions + t]), *mask),
+                            );
+                        }
+                        s
+                    };
+
+                    let ins_open = _mm256_adds_epi16(h_up, open);
+                    let ins_extend = _mm256_adds_epi16(i_up, extend);
+                    let mut ins_score = _mm256_max_epi16(ins_open, ins_extend);
+                    let diag = _mm256_adds_epi16(h_diag, s);
+                    let t0 = _mm256_max_epi16(diag, zero);
+                    let t_all = _mm256_max_epi16(t0, ins_score);
+                    let mut score = _mm256_max_epi16(t_all, del);
+
+                    if TRACE {
+                        let source = _mm256_and_si256(_mm256_cmpgt_epi16(diag, zero), one);
+                        let source =
+                            _mm256_blendv_epi8(source, two, _mm256_cmpgt_epi16(ins_score, t0));
+                        let source =
+                            _mm256_blendv_epi8(source, three, _mm256_cmpgt_epi16(del, t_all));
+                        let bits = _mm256_or_si256(
+                            _mm256_and_si256(_mm256_cmpgt_epi16(ins_extend, ins_open), ins_bit),
+                            _mm256_and_si256(del_extends, del_bit),
+                        );
+                        store_codes(
+                            &mut trace[(r - 1) * width + k],
+                            _mm256_or_si256(source, bits),
                         );
                     }
-                    s
-                };
 
-                let ins_open = _mm256_adds_epi16(h_up, open);
-                let ins_extend = _mm256_adds_epi16(i_up, extend);
-                let mut ins_score = _mm256_max_epi16(ins_open, ins_extend);
-                let diag = _mm256_adds_epi16(h_diag, s);
-                let t0 = _mm256_max_epi16(diag, zero);
-                let t_all = _mm256_max_epi16(t0, ins_score);
-                let mut score = _mm256_max_epi16(t_all, del);
+                    let del_open = _mm256_adds_epi16(t_all, open);
+                    let mut next_extends =
+                        _mm256_cmpgt_epi16(_mm256_adds_epi16(del, extend), del_open);
+                    let mut next_del = _mm256_max_epi16(del_open, _mm256_adds_epi16(del, step));
+                    let k_vector = _mm256_set1_epi16(k as i16);
+                    if DIAG {
+                        // Lanes whose band is narrower than the group's: k ≥ width_l does not exist.
+                        let in_band = _mm256_cmpgt_epi16(lane_width, k_vector);
+                        score = _mm256_and_si256(score, in_band);
+                        ins_score = _mm256_blendv_epi8(neg, ins_score, in_band);
+                        next_del = _mm256_blendv_epi8(neg, next_del, in_band);
+                        next_extends = _mm256_and_si256(next_extends, in_band);
+                    }
+                    store(&mut h[k + 1], score);
+                    store(&mut ins[k + 1], ins_score);
+                    del = next_del;
+                    del_extends = next_extends;
 
-                if TRACE {
-                    let source = _mm256_and_si256(_mm256_cmpgt_epi16(diag, zero), one);
-                    let source = _mm256_blendv_epi8(source, two, _mm256_cmpgt_epi16(ins_score, t0));
-                    let source = _mm256_blendv_epi8(source, three, _mm256_cmpgt_epi16(del, t_all));
-                    let bits = _mm256_or_si256(
-                        _mm256_and_si256(_mm256_cmpgt_epi16(ins_extend, ins_open), ins_bit),
-                        _mm256_and_si256(del_extends, del_bit),
-                    );
-                    store_codes(
-                        &mut trace[(r - 1) * width + k],
-                        _mm256_or_si256(source, bits),
-                    );
+                    let improved = _mm256_cmpgt_epi16(score, best);
+                    best = _mm256_max_epi16(best, score);
+                    best_row = _mm256_blendv_epi8(best_row, row_vector, improved);
+                    best_k = _mm256_blendv_epi8(best_k, k_vector, improved);
                 }
-
-                let del_open = _mm256_adds_epi16(t_all, open);
-                let mut next_extends = _mm256_cmpgt_epi16(_mm256_adds_epi16(del, extend), del_open);
-                let mut next_del = _mm256_max_epi16(del_open, _mm256_adds_epi16(del, step));
-                let k_vector = _mm256_set1_epi16(k as i16);
-                if DIAG {
-                    // Lanes whose band is narrower than the group's: k ≥ width_l does not exist.
-                    let in_band = _mm256_cmpgt_epi16(lane_width, k_vector);
-                    score = _mm256_and_si256(score, in_band);
-                    ins_score = _mm256_blendv_epi8(neg, ins_score, in_band);
-                    next_del = _mm256_blendv_epi8(neg, next_del, in_band);
-                    next_extends = _mm256_and_si256(next_extends, in_band);
-                }
-                store(&mut h[k + 1], score);
-                store(&mut ins[k + 1], ins_score);
-                del = next_del;
-                del_extends = next_extends;
-
-                let improved = _mm256_cmpgt_epi16(score, best);
-                best = _mm256_max_epi16(best, score);
-                best_row = _mm256_blendv_epi8(best_row, row_vector, improved);
-                best_k = _mm256_blendv_epi8(best_k, k_vector, improved);
             }
+            let mut out = LaneBest {
+                score: [0; LANES],
+                row: [0; LANES],
+                k: [0; LANES],
+            };
+            store(&mut out.score, best);
+            store(&mut out.row, best_row);
+            store(&mut out.k, best_k);
+            out
         }
-        let mut out = LaneBest {
-            score: [0; LANES],
-            row: [0; LANES],
-            k: [0; LANES],
-        };
-        store(&mut out.score, best);
-        store(&mut out.row, best_row);
-        store(&mut out.k, best_k);
-        out
     }
 }
 
@@ -819,16 +827,18 @@ mod tests {
         let scoring = AffineScoring::new(100, -3, -5, -1);
         let reference: Vec<u8> = (0..200).map(|i| (i % 4) as u8).collect();
         let profile = SubstitutionProfile::build(&scoring, &reference);
-        assert!(lane_of(
-            0,
-            &AlignJob {
-                query: &reference,
-                profile: &profile,
-                gaps: scoring.gaps,
-                band: Band::Full
-            }
-        )
-        .is_none());
+        assert!(
+            lane_of(
+                0,
+                &AlignJob {
+                    query: &reference,
+                    profile: &profile,
+                    gaps: scoring.gaps,
+                    band: Band::Full
+                }
+            )
+            .is_none()
+        );
         let jobs = vec![
             AlignJob {
                 query: &reference,

@@ -48,7 +48,7 @@
 //! the first predecessor in DAG order.
 
 use super::model::{Grammar, PathModel, VdjGrammar};
-use super::posterior::{divergence, Marginals, PosteriorModel, PosteriorScratch};
+use super::posterior::{Marginals, PosteriorModel, PosteriorScratch, divergence};
 use super::{Adjudicator, CallPath, CalledSegment, EngineeringObjective, PathScore};
 use crate::germline::SegmentKind;
 use crate::placement::Placement;
@@ -576,10 +576,10 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
             self.gather(s, e);
             let (first, end) = s.nodes[e].slots;
             for t in first..end {
-                if let Some((score, cell)) = self.emit(placements, s, t) {
-                    if best.map_or(true, |(current, _)| score > current) {
-                        best = Some((score, cell));
-                    }
+                if let Some((score, cell)) = self.emit(placements, s, t)
+                    && best.is_none_or(|(current, _)| score > current)
+                {
+                    best = Some((score, cell));
                 }
             }
         }
