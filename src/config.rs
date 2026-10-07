@@ -89,18 +89,21 @@ impl DSegmentConfig {
         run.min(distributed_cap).min(MAX_LMER)
     }
 
-    /// Traceback score floor implied by the gates: an alignment containing an
-    /// exact run of `k` has local score `≥ k·m`; a distributed-D hit rescored
-    /// under the D tuple itself scores `≥ min_rescore`. The configured floor is
-    /// lowered to that bound, never raised above it.
+    /// Traceback score floor of the D stage: the configured keep floor,
+    /// raised to the lowest local score an admissible hit can have. An
+    /// alignment holding an exact run of `k` scores at least `k·m` (the run
+    /// alone is a local alignment); a distributed-D hit rescored under the D
+    /// tuple itself scores at least `min_rescore`; under another tuple it
+    /// only has a positive score. Raising the floor to that bound therefore
+    /// drops nothing the gates would admit.
     pub fn lossless_min_score(&self) -> Score {
-        let run_floor = self.scoring.matched * self.min_exact_run as Score;
-        let floor = match &self.distributed {
-            None => run_floor,
-            Some(gate) if gate.scoring == self.scoring => run_floor.min(gate.min_rescore),
-            Some(_) => self.keep.min_score.min(run_floor),
+        let run = self.scoring.matched * self.min_exact_run as Score;
+        let admissible = match &self.distributed {
+            None => run,
+            Some(gate) if gate.scoring == self.scoring => run.min(gate.min_rescore),
+            Some(_) => 1,
         };
-        floor.max(self.keep.min_score.min(floor))
+        self.keep.min_score.max(admissible)
     }
 }
 
@@ -357,7 +360,7 @@ fn v_stage(
     let retriever = UngappedPrefilter::new(seeds, Arc::clone(&segment), config.ungapped);
     let family_delta = config
         .family_delta
-        .then(|| crate::family_bound::FamilyBoundTable::build(segment.set()));
+        .then(|| crate::family_bound::FamilyBoundTable::build(&segment));
     let mut stage = SegmentStage::new(segment, retriever, config.keep);
     stage.accept = config.accept;
     stage.significance = significance;
@@ -498,10 +501,18 @@ mod tests {
     fn derived_d_settings_are_lossless_bounds() {
         let mut d = DSegmentConfig::default();
         assert_eq!((d.lossless_lmer(), d.lossless_min_score()), (4, 8));
-        d.distributed = None;
         d.min_exact_run = 6;
         assert_eq!((d.lossless_lmer(), d.lossless_min_score()), (6, 12));
         d.distributed = Some(DistributedEvidence::default());
         assert_eq!((d.lossless_lmer(), d.lossless_min_score()), (4, 12));
+        // A distributed gate under another tuple bounds nothing.
+        d.distributed = Some(DistributedEvidence {
+            scoring: AffineScoring::new(1, -1, -5, -1),
+            ..DistributedEvidence::default()
+        });
+        assert_eq!(d.lossless_min_score(), 1);
+        // A configured floor above the bound is kept.
+        d.keep.min_score = 15;
+        assert_eq!(d.lossless_min_score(), 15);
     }
 }

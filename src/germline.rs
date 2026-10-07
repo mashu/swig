@@ -206,6 +206,18 @@ impl GermlineSet {
         }
     }
 
+    /// Allele label of a FASTA id. IMGT reference headers read
+    /// `accession|allele|species|functionality|…`, so a `|`-separated id
+    /// gives its first field that names an allele (`GENE*NN`), else its
+    /// first field.
+    pub fn allele_label(id: &str) -> &str {
+        let mut fields = id.split('|');
+        match id.split('|').find(|field| field.contains('*')) {
+            Some(allele) => allele,
+            None => fields.next().unwrap_or(id),
+        }
+    }
+
     /// Gene part of an allele label (`IGHV1-2*02` → `IGHV1-2`).
     pub fn gene_of_name(name: &str) -> &str {
         name.split('*').next().unwrap_or(name)
@@ -258,7 +270,7 @@ impl GermlineSet {
     pub fn from_fasta(kind: SegmentKind, text: &str) -> Result<Self, GermlineError> {
         let mut set = Self::new(kind);
         for record in parse_fasta(text)? {
-            let name = record.id();
+            let name = Self::allele_label(record.id());
             let position = |key: &str| {
                 record
                     .attribute(key)
@@ -422,6 +434,17 @@ mod tests {
         assert_eq!(set.allele(0).gene, set.allele(1).gene);
         assert_eq!(set.allele(1).anchor, Some(1));
         assert_eq!(set.gene_name(set.allele(2).gene), "IGHV3-23");
+    }
+
+    #[test]
+    fn reads_allele_names_from_imgt_headers() {
+        let text = ">M99641|IGHV1-18*01|Homo_sapiens|F|V-REGION|188..483|296 nt|1| | |\nACGT\n\
+                    >X|IGHV1-18*02|Homo_sapiens|F|\nACGA\n>plain*01 anchor=1\nACGG\n>A|B\nTTTT\n";
+        let set = GermlineSet::from_fasta(SegmentKind::V, text).unwrap();
+        let names: Vec<&str> = set.alleles().iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["IGHV1-18*01", "IGHV1-18*02", "plain*01", "A"]);
+        assert_eq!(set.gene_count(), 3);
+        assert_eq!(set.allele(2).anchor, Some(1));
     }
 
     #[test]

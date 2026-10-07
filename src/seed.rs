@@ -10,8 +10,8 @@
 //! as `1101101111` ignores the "0" positions, so a substitution there leaves the
 //! seed intact (PatternHunter; also used by modern long-read mappers). The
 //! shape is data, not a type: switching from contiguous to spaced seeds changes
-//! nothing downstream. On x86-64 with BMI2 the gather in [`SeedShape::key`] is a
-//! single `pext` instruction; the portable loop here is the reference version.
+//! nothing downstream. Contiguous shapes (the default) skip the gather in
+//! [`SeedShape::key`] entirely.
 
 use std::fmt;
 

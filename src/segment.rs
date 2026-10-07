@@ -423,7 +423,8 @@ impl<R: Retriever> SegmentStage<R> {
     /// then only the siblings whose sound upper bound `S(rep) + Δ(rep, sibling)`
     /// reaches the `top`-th best representative score (see [`crate::family_bound`]).
     /// The cutoff can only rise as more alleles are scored, so a sibling below
-    /// it can never enter the top scores.
+    /// it can never enter the top scores. A sibling in another band than its
+    /// representative has no bound and is always scored.
     fn rank_with_bounds<'a, A: Aligner>(
         &'a self,
         aligner: &A,
@@ -432,47 +433,53 @@ impl<R: Retriever> SegmentStage<R> {
         dp: &mut A::Workspace,
         batch: &mut BatchScratch,
     ) {
-        // Representative of each gene: the candidate with most votes (lowest id on ties).
-        let mut siblings: Vec<(usize, Candidate, AlleleId)> = Vec::new();
-        let mut representatives: Vec<Candidate> = Vec::new();
+        // `(request, sibling, job of its representative)`.
+        let mut siblings: Vec<(usize, Candidate, usize)> = Vec::new();
+        let mut representatives: Vec<(Candidate, usize)> = Vec::new();
         batch.owners.clear();
         for (index, request) in requests.iter().enumerate() {
             if !self.needs_scores(request) {
                 continue;
             }
+            // Representative of each gene: the candidate with most votes
+            // (lowest id on ties); jobs follow candidate order.
+            let strength = |c: &Candidate| (c.votes, std::cmp::Reverse(c.allele));
             representatives.clear();
             for &candidate in request.candidates {
                 let gene = table.gene(candidate.allele);
                 match representatives
                     .iter_mut()
-                    .find(|r| table.gene(r.allele) == gene)
+                    .find(|(r, _)| table.gene(r.allele) == gene)
                 {
-                    Some(rep)
-                        if (candidate.votes, std::cmp::Reverse(candidate.allele))
-                            > (rep.votes, std::cmp::Reverse(rep.allele)) =>
-                    {
-                        *rep = candidate
-                    }
+                    Some((rep, _)) if strength(&candidate) > strength(rep) => *rep = candidate,
                     Some(_) => {}
-                    None => representatives.push(candidate),
+                    None => representatives.push((candidate, usize::MAX)),
                 }
             }
             for &candidate in request.candidates {
                 let gene = table.gene(candidate.allele);
-                let rep = representatives
-                    .iter()
-                    .find(|r| table.gene(r.allele) == gene)
+                let (rep, job) = representatives
+                    .iter_mut()
+                    .find(|(r, _)| table.gene(r.allele) == gene)
                     .expect("every gene has a representative");
                 if rep.allele == candidate.allele {
+                    *job = batch.owners.len();
                     batch.owners.push((index, candidate));
-                } else {
-                    siblings.push((index, candidate, rep.allele));
+                }
+            }
+            for &candidate in request.candidates {
+                let gene = table.gene(candidate.allele);
+                let &(rep, job) = representatives
+                    .iter()
+                    .find(|(r, _)| table.gene(r.allele) == gene)
+                    .expect("every gene has a representative");
+                if rep.allele != candidate.allele {
+                    siblings.push((index, candidate, job));
                 }
             }
         }
-        // Representative scores are kept even below `min_score`: a weak
-        // representative can still bound a sibling that clears the floor.
-        let mut rep_scores: Vec<(usize, AlleleId, Option<Score>)> = Vec::new();
+        // Representative scores are kept even below the floor: a weak
+        // representative can still bound a sibling that clears it.
         if !batch.owners.is_empty() {
             let jobs: Vec<AlignJob<'a>> = batch
                 .owners
@@ -481,33 +488,26 @@ impl<R: Retriever> SegmentStage<R> {
                 .collect();
             aligner.score_batch(&jobs, dp, &mut batch.hits);
             for (&(index, candidate), hit) in batch.owners.iter().zip(&batch.hits) {
-                rep_scores.push((index, candidate.allele, hit.map(|h| h.score)));
                 if let Some(hit) = hit.filter(|h| h.score >= self.floor(&requests[index])) {
                     batch.ranked[index].push((candidate, hit.score));
                 }
             }
         }
-
         let cutoffs: Vec<Option<Score>> = (0..requests.len())
             .map(|index| top_score(&batch.ranked[index], self.keep.top, &mut batch.scores))
             .collect();
-        batch.owners.clear();
-        for (index, candidate, rep) in siblings {
-            let rep_score = rep_scores
-                .iter()
-                .find(|&&(r, allele, _)| r == index && allele == rep)
-                .and_then(|&(_, _, score)| score);
-            let bound =
-                rep_score.and_then(|s| table.upper_bound(&self.segment, rep, candidate.allele, s));
-            let must_score = match bound {
-                // No representative score, or alleles of different length: no bound.
-                None => true,
-                Some(bound) => {
-                    bound >= self.floor(&requests[index])
-                        && cutoffs[index].is_none_or(|c| bound >= c)
-                }
-            };
-            if must_score {
+        let representative_jobs = std::mem::take(&mut batch.owners);
+        for (index, candidate, job) in siblings {
+            let (_, rep) = representative_jobs[job];
+            // No positive cell means the representative's optimum is 0.
+            let rep_score = batch.hits[job].map_or(0, |h| h.score);
+            let bound = (rep.band == candidate.band)
+                .then(|| table.upper_bound(rep.allele, candidate.allele, rep_score))
+                .flatten();
+            let prunable = bound.is_some_and(|bound| {
+                bound < self.floor(&requests[index]) || cutoffs[index].is_some_and(|c| bound < c)
+            });
+            if !prunable {
                 batch.owners.push((index, candidate));
             }
         }
@@ -679,7 +679,7 @@ mod tests {
             min_identity: 0.50,
         };
         if family_delta {
-            stage.family_delta = Some(FamilyBoundTable::build(segment.set()));
+            stage.family_delta = Some(FamilyBoundTable::build(&segment));
         }
         let query = encode(a1);
         let candidates = [(0, 40), (1, 30), (2, 5)]

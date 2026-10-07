@@ -1,4 +1,6 @@
-//! Karlin–Altschul support values for reporting (never used for calling).
+//! Karlin–Altschul statistics: the E-value gates of V and J hits
+//! ([`crate::segment::Significance`]), the λ that turns scores into nats for
+//! the D prior and the posteriors, and the reported `*_support` E-values.
 //!
 //! `E = K m′ n′ e^{−λS}` with the BLAST length adjustment
 //! `ℓ = ln(K m n) / H`, `m′ = m − ℓ`, `n′ = n − N ℓ`.

@@ -163,9 +163,9 @@ impl SubstitutionModel for AffineScoring {
 /// (SYC / GRS) cost `coldspot_mismatch`; everything else uses `base.mismatch`.
 /// Ambiguous bases still score 0.
 ///
-/// Built into J profiles by default: under heavy SHM the true allele's hotspot
-/// mismatches are discounted relative to decoys whose disagreements sit on
-/// cold or neutral positions.
+/// Not used by the shipped profiles: as a J profile it gained nothing on
+/// simulated reads, whose SHM has no hotspot targeting (docs/ASSESSMENT.md).
+/// It also exercises the aligners' position-specific profile path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HotspotScoring {
     pub base: AffineScoring,
