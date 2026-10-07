@@ -11,34 +11,22 @@
 //! with probability `--rc` (default 0.5). Throughput is measured on the
 //! given number of threads (default 1).
 
+mod common;
+
 use std::error::Error;
 use std::time::Instant;
 
-use vdj_assign::annotate::AnnotateOptions;
+use common::Args;
 use vdj_assign::prelude::*;
-use vdj_assign::prepare::prepare;
-use vdj_assign::sim::{
-    Assignment, Evaluation, SimParams, Simulator, SyntheticDatabase, SyntheticSpec, Truth,
-};
-
-fn load(kind: SegmentKind, path: &str) -> Result<GermlineSet, Box<dyn Error>> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-    Ok(GermlineSet::from_fasta(kind, &text)?)
-}
+use vdj_assign::sim::{Assignment, Evaluation, SimParams, Simulator, Truth};
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let value = |name: &str| {
-        args.iter()
-            .position(|a| a == name)
-            .and_then(|i| args.get(i + 1))
-            .cloned()
-    };
-    let flag = |name: &str| args.iter().any(|a| a == name);
-    let reads: usize = value("--reads").map_or(Ok(5000), |v| v.parse())?;
-    let seed: u64 = value("--seed").map_or(Ok(1), |v| v.parse())?;
-    let threads: usize = value("--threads").map_or(Ok(1), |v| v.parse())?;
-    let rc: f64 = value("--rc").map_or(Ok(0.5), |v| v.parse())?;
+    let args = Args::from_env();
+    let value = |name: &str| args.value(name);
+    let reads: usize = args.number("--reads", 20000)?;
+    let seed: u64 = args.number("--seed", 1)?;
+    let threads: usize = args.number("--threads", 1)?;
+    let rc: f64 = args.number("--rc", 0.5)?;
     let preset = value("--preset").unwrap_or_else(|| "mid".to_string());
     let mut params = SimParams::preset(&preset)
         .ok_or("unknown preset")?
@@ -51,7 +39,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         None => CallingProfile::ROptimized,
     };
     let mut config = profile.config();
-    if flag("--tandem-d") {
+    if args.flag("--tandem-d") {
         config.grammar = VdjGrammar::TANDEM_D;
     }
     if let Some(penalty) = value("--p-d") {
@@ -162,19 +150,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let (v, d, j) = match (value("--v"), value("--j")) {
-        (Some(v), Some(j)) => (
-            load(SegmentKind::V, &v)?,
-            value("--d").map(|d| load(SegmentKind::D, &d)).transpose()?,
-            load(SegmentKind::J, &j)?,
-        ),
-        _ => {
-            let db = SyntheticDatabase::generate(&SyntheticSpec::default(), seed);
-            (db.v, Some(db.d), db.j)
-        }
-    };
-    let db = prepare(v, d, j, AnnotateOptions::default())?;
-    eprintln!("database: {}", db.summary());
+    let db = args.database(seed)?;
     let sim = Simulator::new(&db.v, db.d.as_ref(), &db.j, params)?;
     let simulated = sim.reads(reads, seed)?;
     let assigner = DefaultAssigner::from_config(&config, db.v.clone(), db.d.clone(), db.j.clone())?;
