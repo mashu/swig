@@ -24,9 +24,11 @@ impl CandidateBudget for FixedBudget {
 /// count `L` (in votes, `unit` votes per seed) differ by chance by about
 /// `unit · √(2L / unit) = √(2 · unit · L)` votes. The margin is `z` such
 /// standard deviations: relative to the leader, but wider in proportion where
-/// counts are small. A fixed margin was too narrow for strong reads and a
-/// proportional one too narrow for weak (heavily mutated) ones.
-/// J uses `base == max == 3`, so it does not expand.
+/// counts are small. A proportional margin is too narrow for weak (heavily
+/// mutated) reads (docs/ASSESSMENT.md, item 18). When 7-mers vote too
+/// (1 vote each), the counts mix weights and the margin, computed at
+/// `unit = 4`, is between one and two times `z` actual standard deviations.
+/// Used for V; J is searched exhaustively.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AmbiguityBudget {
     pub base: usize,

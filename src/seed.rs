@@ -146,16 +146,18 @@ impl SeedShape {
 /// smallest one sits where required (Edgar 2021). A *window guarantee* holds
 /// when any `w` consecutive k-mers contain a seed: then every unmutated
 /// stretch of `k + w − 1` bases shared by read and germline yields a seed
-/// both sides hold.
+/// both sides hold. It needs neighbouring seeds to share s-mers, i.e. a
+/// contiguous shape; on a spaced shape selection is still per key (so read
+/// and germline agree), but seeds can be far apart.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SeedSampling {
     /// Every k-mer.
     #[default]
     All,
     /// Closed syncmers: the smallest s-mer is first or last. Density about
-    /// `2/(w + 1)`. Context-free, with the window guarantee: of the `2w`
-    /// s-mers that `w` consecutive k-mers hold, the first smallest is first
-    /// in, or last in, one of them.
+    /// `2/(w + 1)`. Context-free, with the window guarantee on contiguous
+    /// shapes: of the `2w` s-mers that `w` consecutive k-mers hold, the first
+    /// smallest is first in, or last in, one of them.
     ClosedSyncmer { w: u8 },
     /// Open syncmers: the smallest s-mer is at the middle position `w / 2`,
     /// the offset that maximises conservation (Shaw & Yu 2022). Density
@@ -527,6 +529,15 @@ mod tests {
             .filter(|&(_, key)| matches!(smallest_smer(key, 9, 4), 0 | 4))
             .collect();
         assert_eq!(seeds, by_key);
+    }
+
+    /// The all-zero key (poly-A) is not its own image under the order, so it
+    /// does not rank first among the s-mers.
+    #[test]
+    fn poly_a_is_not_the_smallest_smer() {
+        assert_ne!(order(0), 0);
+        let below = (0u64..1024).filter(|&v| order(v) < order(0)).count();
+        assert!(below > 0, "poly-A 5-mer must not rank first");
     }
 
     #[test]

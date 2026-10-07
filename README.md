@@ -19,7 +19,7 @@ Zero dependencies, Rust ≥ 1.75, edition 2021.
 
 ```sh
 cargo build --release                          # always run the release build
-cargo test                                     # 77 unit, 9 annotation, 11 synthetic, 7 simulated-accuracy tests
+cargo test                                     # 78 unit, 9 annotation, 11 synthetic, 7 simulated-accuracy tests
 
 target/release/vdj-assign --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta \
     [--profile r|truth|igblast|sensitive-d] [--threads N] [--tandem-d] \
@@ -333,25 +333,27 @@ holds fewer than 25 nine-mer seeds, where a count's Poisson relative error
 difference between two seed counts near the leader's: relative to the leader,
 but proportionally wider where counts are small (mutated reads). Measured
 jointly on human IGH (hard and mid presets, fixed 20 and 30 % SHM, 200-nt
-3′ fragments) and the synthetic database, against the previous fixed margin
-(8 votes or 5 %), 16-vote trigger and closed syncmers: mean V gene over the
-seven conditions 85.2 → 88.1 %, 30 % SHM 75.4 → 84.7 %, hard preset
-98.06 → 98.50 %. A proportional margin (10–30 % of `L`) loses 4–9 points at
-30 % SHM; z above 2 changes nothing.
+3′ fragments) and the synthetic database, against the previous release
+(fixed margin of 8 votes or 5 %, 16-vote trigger, closed syncmers): mean V
+gene over the seven conditions 85.2 → 88.1 %, 30 % SHM 75.7 → 84.7 %, hard
+preset 98.36 → 98.50 %. A proportional margin (10–30 % of `L`) loses 4–9
+points at 30 % SHM; z above 2 adds at most 0.1 point (the 16-gene cap binds).
 
 Sampled seeds (`SeedSampling`) remain available and correct: closed syncmers
 (Edgar 2021; the smallest `s`-mer of the seed's key, `s = k − w`, first or
 last) are context-free, so a seed shared by read and germline is kept in both
 or neither, and have a *window guarantee*: any `w` consecutive k-mers hold
-one, so every unmutated stretch of `k + w − 1` bases (12 for 9-mers, `w = 4`)
-yields a shared seed (0 seedless 12-base windows on IGHV). Open syncmers (the
-smallest `s`-mer in the middle, Shaw & Yu 2022) are context-free without that
-guarantee (5 % of 12-base IGHV windows seedless at `w = 2`); minimisers have
-the guarantee but are not context-free. Under the noise-based margin,
-every k-mer beats them: closed syncmers (`w = 4`, 40 % of k-mers) are
-1.1 points of mean V gene behind (4.4 at 30 % SHM) for 0.4 % fewer
-instructions on the hard preset (and slightly more at 30 % SHM). Their earlier
-parity came from the fixed margin.
+one on a contiguous shape, so every unmutated stretch of `k + w − 1` bases
+(12 for 9-mers, `w = 4`) yields a shared seed (0 seedless 12-base windows on
+IGHV). Open syncmers (the smallest `s`-mer in the middle, Shaw & Yu 2022) are
+context-free without that guarantee (5 % of 12-base IGHV windows seedless at
+`w = 2`); minimisers have the guarantee but are not context-free. Under the
+noise-based margin every k-mer beats closed and open syncmers (minimisers
+were not re-measured): closed syncmers (`w = 4`, 40 % of k-mers) are 1.1
+points of mean V gene behind (4.4 at 30 % SHM) for 0.4 % fewer instructions
+on the hard preset (and slightly more at 30 % SHM). Their earlier parity came
+from the fixed margin and was fragile: a different hash order alone moved
+them 0.3 points on the hard preset.
 
 **Strand from a k-mer bitset.** A presence bitset over all 4¹¹ k-mers of the V
 and J germline (512 KiB). One pass computes forward and reverse-complement
@@ -527,7 +529,7 @@ preset, germline-equivalent accuracy in %, before → after the redesign:
 |---|---|---|---|---|---|---|---|
 | easy (no SHM) | 99.94 → **100** | 99.54 → **99.84** | 99.92 → **99.98** | 98.78 → **99.29** | 99.90 → **99.94** | 99.94 → **100** | 30.5 → **0** |
 | mid (IgM-like) | 100 → 100 | 97.76 → **97.94** | 99.84 → 99.84 | 91.96 → **93.00** | 98.84 → 98.80 | 99.93 → **99.97** | 30.2 → **0** |
-| hard (IgG-like) | 99.98 → **100** | 89.74 → **89.96** | 98.44 → **98.50** | 81.72 → **83.58** | 92.70 → **93.32** | 98.39 → **99.55** | 31.2 → **0** |
+| hard (IgG-like) | 99.98 → 99.98 | 89.74 → **89.96** | 98.44 → **98.50** | 81.72 → **83.58** | 92.70 → **93.32** | 98.39 → **99.55** | 31.2 → **0** |
 
 Junctions "after" use the corrected anchors of 3′-partial V alleles, which
 leave those alleles' reads without a templated junction (hard: 2416 → 2214

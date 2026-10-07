@@ -341,7 +341,10 @@ impl<B: CandidateBudget> Retriever for SeedVoteRetriever<B> {
             ranks,
         );
         let mut strongest = self.cluster(&layout, keys, buffer, votes);
-        let weak = self.params.weak_seeds * u32::from(self.params.primary_weight);
+        let weak = self
+            .params
+            .weak_seeds
+            .saturating_mul(u32::from(self.params.primary_weight));
         if let (true, Some(fallback)) = (strongest < weak, &self.fallback) {
             self.cast_votes(
                 fallback,

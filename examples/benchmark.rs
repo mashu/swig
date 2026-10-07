@@ -144,7 +144,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             (fallback > 0).then(|| vdj_assign::seed::SeedShape::contiguous(fallback));
     }
     if let Some(v) = list("--budget") {
-        // base,max,z
+        if v.len() != 3 {
+            return Err("--budget expects base,max,z".into());
+        }
         config.v.budget.base = v[0].parse()?;
         config.v.budget.max = v[1].parse()?;
         config.v.budget.z = v[2].parse()?;

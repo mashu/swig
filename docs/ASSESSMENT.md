@@ -285,7 +285,8 @@ Each change was measured on the same reads before it was kept.
 
     | Setting | Hard | 30 % SHM | Mean of 7 conditions |
     |---|---|---|---|
-    | before: closed syncmers, fixed margin, 4-seed trigger | 98.06 | 75.37 | 85.24 |
+    | previous release: closed syncmers, fixed margin, 4-seed trigger | 98.36 | 75.70 | 85.16 |
+    | the same after the seed audit's new order (444d966) | 98.06 | 75.37 | 85.24 |
     | closed syncmers, proportional margin 10 / 30 % of `L`, 7-mers always | 98.06 / 98.40 | 70.88 / 75.98 | 83.44 / 85.25 |
     | every k-mer, `z = 1` / `1.5` / `2` / `3`, 7-mers always* | 98.38–98.40 | 82.44–84.72 | 87.29–88.19 |
     | **every k-mer, `z = 2`, 25-seed trigger (default)** | **98.50** | **84.65** | **88.12** |
@@ -294,25 +295,38 @@ Each change was measured on the same reads before it was kept.
     | every k-mer, `z = 2`, 7-mers always | 98.40 | 84.70 | 88.17 |
 
     \*At 30 % SHM, 7-mers always equals the 25-seed trigger (84.70 vs
-    84.65); on the hard preset it is 0.1 point lower. A proportional margin must reach 50 % of the
-    leader to match the fixed one at 30 % SHM, and over-widens strong reads.
-    The 16-gene cap then binds (`z = 3`, 4 change nothing; a cap of 32 adds
-    one point at 30 % SHM on the synthetic database only). Accuracy
-    saturates between 25 and 50 seeds; always adding 7-mers is no better
-    and costs 18 % of instructions per read.
+    84.65); on the hard preset it is 0.1 point lower. Against the previous
+    release the default gains 0.14 points of V gene on the hard preset, 9.0
+    at 30 % SHM and 3.0 on the mean of seven conditions.
 
-    *Sampling reversed.* Under the noise-based margin, every k-mer beats
-    closed syncmers by 1.1 points of mean V gene (4.4 at 30 % SHM) for 0.4 %
-    fewer instructions, and open syncmers' edge (item 15, §8) disappears: the
-    syncmers' parity with every k-mer, and open syncmers' lead, came from how
-    sparser seeds interacted with the fixed margin and trigger. Every k-mer
-    is the default; `SeedSampling` stays as an option.
+    With closed syncmers a proportional margin must reach 50 % of `L` to
+    match the fixed one at 30 % SHM (4-seed trigger: 72.47 at 30 %, 76.19
+    at 50 %, against 75.37); with every k-mer 15–30 % already matches it,
+    but even 50 % stays below `z = 2` (83.98 against 84.70, 7-mers always).
+    Above `z = 2` the 16-gene cap binds: `z = 3` adds at most 0.1 point
+    (synthetic, 30 % SHM), and a cap of 32 adds one point there only.
+    Accuracy saturates between 25 and 50 seeds; always adding 7-mers is no
+    better and costs 13 % more instructions per read than the 25-seed
+    trigger on the hard preset (0.3 % at 30 % SHM, where the trigger fires
+    on most reads anyway).
 
-    Cost: +4.1 % instructions per read on the hard preset, +6.1 % at 30 %
-    SHM. Position accuracy: mean V start/end error on the hard preset is
-    0.55 / 0.93 bases (0.55–0.59 / 0.88–0.98 across every setting swept);
-    D, J and D-free false positives did not change. V calibration improved
-    (hard ECE 1.31 → 1.13 %).
+    *Sampling reversed.* Under the noise-based margin, closed syncmers
+    trail every k-mer by 1.1 points of mean V gene (4.4 at 30 % SHM) for
+    0.4 % fewer instructions on the hard preset, and open syncmers' edge
+    (item 15, §8) disappears: the syncmers' parity with every k-mer, and
+    open syncmers' lead, came from how sparser seeds interacted with the
+    fixed margin and trigger. Every k-mer is the default; `SeedSampling`
+    stays as an option. Minimisers were not re-measured under the new
+    margin.
+
+    Cost against the previous defaults: +4.1 % instructions per read on the
+    hard preset, +6.1 % at 30 % SHM. Position accuracy: mean V start/end
+    error on the hard preset is 0.55 / 0.93 bases (0.55–0.59 / 0.88–1.02
+    across every setting swept). On the hard preset D, J and D-free false
+    positives did not change; at 30 % SHM D and J rose by 0.7–1.3 points
+    and D-free false positives by 1.3–2.3 (more reads reach a V call). V
+    calibration improved (hard ECE 1.31 → 1.13 % against the previous
+    release).
 
 ## 4. Results
 
@@ -367,10 +381,11 @@ allele's distinguishing positions.
 These are listed honestly, for the paper's limitations section and for future
 work.
 
-1. **V at extreme SHM.** The hard-preset V gene regression against the start
-   (98.44 → 98.24 %) is gone: the noise-based margin (item 18) gives
-   98.50 %. At a fixed 30 % SHM, V gene is 85.2 % and V allele 53.8 %, and
-   3.3 % of reads are misoriented or unassigned. The V posterior is overconfident
+1. **V at extreme SHM.** The hard-preset V gene shortfall against the
+   starting code (98.44 %; the previous release had 98.36 %) is gone: the
+   noise-based margin (item 18) gives 98.50 %. At a fixed 30 % SHM, V gene
+   is 85.2 % and V allele 53.8 %; 3.3 % of reads are misoriented and 3.9 %
+   get no V or J call. The V posterior is overconfident
    there (ECE 16 %): when retrieval misses the true gene, no candidate can
    carry its mass. The 16-gene cap binds at that divergence; raising it
    helped only the synthetic database.
@@ -514,13 +529,20 @@ recommendations, read from the primary sources:
 Our closed syncmers matched Edgar's definition and tie rule; an audit found
 the order fixed poly-A s-mers as smallest, spaced shapes ranked the raw
 sequence instead of the key, `w` was clamped silently, and the docs stated a
-loose window bound (13 bases). All are fixed and tested (`seed.rs`).
+loose window bound (13 bases). All are fixed and tested (`seed.rs`). On a
+spaced shape, selection by key keeps read and germline consistent but has no
+window guarantee (neighbouring keys share no s-mers); the default shapes are
+contiguous.
 
 With the old fixed gene margin, closed syncmers (`w = 4`, 40 % of k-mers)
 matched every k-mer on the presets and edged it at high SHM (fixed 30 % SHM,
 V gene 76.35 vs 74.90 %), for 2.3 % fewer instructions, so they became the
 default (item 15); open syncmers (`w = 2`) measured better still. That
-parity was an artefact of the fixed margin and vote trigger. Under the
+parity was fragile: the audit's new order alone, which changes which 40 % of
+k-mers are kept, moved closed syncmers on the hard preset from 98.36 to
+98.06 % V gene (V ECE 1.31 → 1.58 %) while every k-mer stayed at 98.24 %,
+and it came from how sparser seeds interacted with the fixed margin and vote
+trigger. Under the
 noise-based margin (item 18) every k-mer is better: mean V gene over seven
 conditions 88.12 vs 87.05 % (closed `w = 4`) and 86.95 % (open `w = 2`,
 7-mers always), 84.65 vs 80.25 % at 30 % SHM, equal on the presets, for
@@ -528,7 +550,7 @@ conditions 88.12 vs 87.05 % (closed `w = 4`) and 86.95 % (open `w = 2`,
 again; the sampled schemes remain options. The window guarantee does not
 affect boundaries: seeds only choose candidates and the alignment band
 (cluster ± 8 diagonals), and mean V boundary errors were 0.55–0.59 /
-0.88–0.98 bases on the hard preset for every scheme. It could matter only
+0.88–1.02 bases on the hard preset for every scheme. It could matter only
 for an indel longer than 8 bases with no shared seed beyond it, which the
 simulator does not produce.
 
