@@ -27,8 +27,9 @@
 //! postings (low-complexity or family-wide k-mers) carry little information
 //! and dominate work; they are skipped, as in the method note.
 //!
-//! **Two-tier seeds.** Primary seeds vote with weight 4. Only when the best
-//! primary cluster is weak are fallback (shorter) seeds added with weight 1.
+//! **Two-tier seeds.** Primary seeds vote with weight 4. While the best
+//! primary cluster holds too few seeds to rank genes, fallback (shorter)
+//! seeds, which survive mutation more often, are added with weight 1.
 
 use super::budget::AmbiguityBudget;
 use super::frames::GeneFrames;
@@ -42,8 +43,10 @@ use crate::seed::{SeedSampling, SeedShape};
 pub struct SeedVoteParams {
     pub primary_weight: u8,
     pub fallback_weight: u8,
-    /// Add fallback seeds when the best primary cluster has fewer weighted votes.
-    pub weak_votes: u32,
+    /// Add fallback seeds while the best primary cluster holds fewer than
+    /// this many primary seeds: a count of `n` seeds has a Poisson relative
+    /// error of `1/√n`, above 20 % below 25 seeds, too noisy to rank genes.
+    pub weak_seeds: u32,
     /// Skip seeds with more postings than this.
     pub max_occurrences: usize,
     /// Diagonal bin width for clustering.
@@ -70,7 +73,7 @@ impl Default for SeedVoteParams {
         Self {
             primary_weight: 4,
             fallback_weight: 1,
-            weak_votes: 16,
+            weak_seeds: 25,
             max_occurrences: 256,
             bin_width: 4,
             cluster_gap_bins: 1,
@@ -79,10 +82,10 @@ impl Default for SeedVoteParams {
             unbanded: false,
             min_votes: 1,
             max_alleles: 64,
-            // Closed syncmers: as sensitive as every k-mer on IgSim reads up
-            // to 30 % SHM and on reads covering 30–80 V bases, with 60 %
-            // fewer votes to sort (docs/ASSESSMENT.md §8).
-            sampling: SeedSampling::ClosedSyncmer { w: 4 },
+            // Every k-mer: with the noise-based gene margin, sampled seeds
+            // (closed or open syncmers) lose V accuracy at high SHM and on
+            // short reads for < 1 % fewer instructions (docs/ASSESSMENT.md §8).
+            sampling: SeedSampling::All,
         }
     }
 }
@@ -338,7 +341,8 @@ impl<B: CandidateBudget> Retriever for SeedVoteRetriever<B> {
             ranks,
         );
         let mut strongest = self.cluster(&layout, keys, buffer, votes);
-        if let (true, Some(fallback)) = (strongest < self.params.weak_votes, &self.fallback) {
+        let weak = self.params.weak_seeds * u32::from(self.params.primary_weight);
+        if let (true, Some(fallback)) = (strongest < weak, &self.fallback) {
             self.cast_votes(
                 fallback,
                 self.params.fallback_weight,

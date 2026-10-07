@@ -108,8 +108,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             other => return Err(format!("unknown sampling '{other}'").into()),
         };
     }
-    if let Some(votes) = value("--weak-votes") {
-        config.v.seeds.weak_votes = votes.parse()?;
+    if let Some(seeds) = value("--weak-seeds") {
+        config.v.seeds.weak_seeds = seeds.parse()?;
     }
     if let Some(reclaim) = value("--j-reclaim") {
         // How far before the earliest V end J is searched (huge = whole read).
