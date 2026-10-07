@@ -2,7 +2,7 @@
 name = "vdj_assign"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "Seeded, banded affine V(D)J germline assignment with placement-DAG adjudication"
 
 [dependencies]

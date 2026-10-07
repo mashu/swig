@@ -4,6 +4,7 @@
 //! cargo run --release --example benchmark -- [--v V.fasta --d D.fasta --j J.fasta]
 //!     [--preset easy|mid|hard] [--shm RATE] [--reads N] [--seed S] [--rc P]
 //!     [--profile r|truth|igblast|sensitive-d] [--tandem-d] [--threads N]
+//!     [--simd avx512|avx2|neon|portable|scalar]
 //! ```
 //!
 //! Without germline files a synthetic IGH-like database is generated
@@ -39,6 +40,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         None => CallingProfile::ROptimized,
     };
     let mut config = profile.config();
+    if let Some(name) = value("--simd") {
+        config.simd =
+            Some(vdj_assign::align::Backend::from_name(&name).ok_or("unknown --simd backend")?);
+    }
     if args.flag("--tandem-d") {
         config.grammar = VdjGrammar::TANDEM_D;
     }

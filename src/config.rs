@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::adjudicate::{EngineeringObjective, PlacementDag, PosteriorModel, VdjGrammar};
 use crate::admission::{AnyOf, DistributedEvidence, ExactRunFloor};
-use crate::align::InterSequenceGotoh;
+use crate::align::{Backend, InterSequenceGotoh};
 use crate::flank::OuterExtend;
 use crate::germline::{GermlineSet, SegmentKind};
 use crate::index::IndexError;
@@ -197,6 +197,9 @@ pub struct EngineConfig {
     /// they carry probability; without, they are pruned, which never changes
     /// the DAG's call.
     pub posterior: bool,
+    /// Instruction set of the alignment kernel; `None` picks the fastest
+    /// this CPU runs ([`Backend::detect`]).
+    pub simd: Option<Backend>,
     pub options: AssignerOptions,
 }
 
@@ -276,6 +279,7 @@ impl Default for EngineConfig {
             // A clipped V or J keeps at least one base, a D `min_d_match`.
             min_retained: [1, 4, 1],
             posterior: true,
+            simd: None,
             options: AssignerOptions::default(),
         }
     }
@@ -292,6 +296,8 @@ pub enum BuildError {
         found: SegmentKind,
     },
     Empty(SegmentKind),
+    /// The requested SIMD backend does not run on this CPU.
+    Unsupported(Backend),
 }
 
 impl fmt::Display for BuildError {
@@ -307,6 +313,9 @@ impl fmt::Display for BuildError {
                 )
             }
             Self::Empty(kind) => write!(f, "the {} germline set is empty", kind.label()),
+            Self::Unsupported(backend) => {
+                write!(f, "this CPU does not support the {} kernel", backend.name())
+            }
         }
     }
 }
@@ -465,7 +474,11 @@ impl Assigner {
             d: d.map(|set| d_stage(set, &config.d, &objective, adjudicator.posterior.is_some())),
             strand,
             j_window: config.j.window,
-            aligner: InterSequenceGotoh::new(),
+            aligner: match config.simd {
+                None => InterSequenceGotoh::new(),
+                Some(backend) => InterSequenceGotoh::with_backend(backend)
+                    .ok_or(BuildError::Unsupported(backend))?,
+            },
             d_window,
             d_admission: AnyOf(
                 ExactRunFloor {

@@ -17,6 +17,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use vdj_assign::align::Backend;
 use vdj_assign::annotate::{AnnotateOptions, ChainType};
 use vdj_assign::prelude::*;
 use vdj_assign::prepare::{PreparedDatabase, prepare};
@@ -60,6 +61,8 @@ options:
   --forward-only       do not try the reverse complement
   --no-anchor-window   do not add the conserved-anchor D window
   --no-posterior       skip posterior probabilities (*_posterior columns; ~30 % faster)
+  --simd NAME          alignment kernel: avx512 | avx2 | neon | portable | scalar
+                       (default: the fastest this CPU supports, avx512 excepted)
   --residual           ordinary commit-V/J-then-D adjudication instead of the DAG
   -h, --help           this message";
 
@@ -96,6 +99,7 @@ struct Args {
     reads: Option<String>,
     profile: Option<String>,
     threads: Option<String>,
+    simd: Option<String>,
     chain: Option<String>,
     tandem_d: bool,
     forward_only: bool,
@@ -153,6 +157,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--chain" if !evaluate => set_once(&mut args.chain, "--chain", value("--chain")?)?,
             "--profile" if assign => set_once(&mut args.profile, "--profile", value("--profile")?)?,
             "--threads" if assign => set_once(&mut args.threads, "--threads", value("--threads")?)?,
+            "--simd" if assign => set_once(&mut args.simd, "--simd", value("--simd")?)?,
             "--tandem-d" if assign => args.tandem_d = true,
             "--forward-only" if assign => args.forward_only = true,
             "--no-anchor-window" if assign => args.no_anchor_window = true,
@@ -341,6 +346,11 @@ fn run_assign(args: &Args) -> Result<(), Box<dyn Error>> {
         config.options.orientation = OrientationPolicy::FORWARD_ONLY;
     }
     config.anchor_window = !args.no_anchor_window;
+    config.simd = args
+        .simd
+        .as_deref()
+        .map(|name| Backend::from_name(name).ok_or_else(|| format!("unknown --simd '{name}'")))
+        .transpose()?;
     // The residual adjudicator computes no posteriors.
     config.posterior = !args.no_posterior && !args.residual;
     let support: SupportModels = [
