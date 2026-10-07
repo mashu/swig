@@ -376,8 +376,10 @@ mod kernel {
             ins.clear();
             ins.resize(width + 1, [NEG; LANES]);
             if TRACE {
-                trace.clear();
-                trace.resize(rows * width, [0; LANES]);
+                // Every cell is written before traceback reads it: grow only.
+                if trace.len() < rows * width {
+                    trace.resize(rows * width, [0; LANES]);
+                }
             }
             let zero = _mm256_setzero_si256();
             let neg = _mm256_set1_epi16(NEG);

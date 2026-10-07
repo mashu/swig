@@ -113,8 +113,11 @@ fn fill<const TRACE: bool>(
     ins.clear();
     ins.resize(m + 1, NEG_INF);
     if TRACE {
-        trace.clear();
-        trace.resize(band.cells(n, m), 0);
+        // Every in-band cell is written before traceback reads it: grow only.
+        let cells = band.cells(n, m);
+        if trace.len() < cells {
+            trace.resize(cells, 0);
+        }
         row_first_col.clear();
         row_first_col.resize(n + 1, 0);
         row_offset.clear();
