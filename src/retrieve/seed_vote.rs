@@ -419,15 +419,8 @@ mod tests {
 
     #[test]
     fn radix_sort_orders_by_the_key_bits_only() {
-        let mut state = 7u64;
-        let mut keys: Vec<u64> = (0..5000)
-            .map(|_| {
-                state = state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                state >> 20
-            })
-            .collect();
+        let mut next = crate::testing::rng(7);
+        let mut keys: Vec<u64> = (0..5000).map(|_| next() >> 20).collect();
         let mut expected = keys.clone();
         expected.sort_by_key(|&k| (k >> 8) & ((1 << 30) - 1));
         radix_sort(&mut keys, &mut Vec::new(), 8, 30);

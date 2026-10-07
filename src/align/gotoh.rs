@@ -313,20 +313,7 @@ mod tests {
 
     const SCORING: AffineScoring = AffineScoring::new(2, -3, -5, -1);
 
-    fn rng(seed: u64) -> impl FnMut() -> u64 {
-        let mut state = seed;
-        move || {
-            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = state;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^ (z >> 31)
-        }
-    }
-
-    fn random_codes(next: &mut impl FnMut() -> u64, len: usize) -> Vec<u8> {
-        (0..len).map(|_| (next() % 4) as u8).collect()
-    }
+    use crate::testing::{random_codes, rng};
 
     fn rescore(aln: &Alignment, query: &[u8], reference: &[u8]) -> Score {
         let mut score = 0;

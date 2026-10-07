@@ -231,7 +231,7 @@ impl Significance {
     pub fn new(set: &GermlineSet, scoring: &AffineScoring, gates: EvalueGates) -> Option<Self> {
         Some(Self {
             statistics: KarlinAltschul::ungapped(scoring)?,
-            database_len: set.alleles().iter().map(|a| a.codes.len()).sum(),
+            database_len: set.total_len(),
             gates,
         })
     }

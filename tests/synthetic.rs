@@ -9,40 +9,16 @@ use std::collections::HashSet;
 use vdj_assign::adjudicate::{Adjudicator, DagScratch, PathScore};
 use vdj_assign::placement::Placement;
 use vdj_assign::prelude::*;
+use vdj_assign::sim::Rng;
 
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-
-    fn range(&mut self, lo: usize, hi: usize) -> usize {
-        lo + self.below(hi - lo + 1)
-    }
-
-    fn bases(&mut self, len: usize) -> String {
-        (0..len)
-            .map(|_| char::from(b"ACGT"[self.below(4)]))
-            .collect()
-    }
+/// Random ASCII bases as a string.
+fn bases(rng: &mut Rng, len: usize) -> String {
+    String::from_utf8(rng.bases(len)).expect("ASCII bases")
 }
 
+/// A different base than `base`.
 fn substitute(base: char, rng: &mut Rng) -> char {
-    loop {
-        let b = char::from(b"ACGT"[rng.below(4)]);
-        if b != base {
-            return b;
-        }
-    }
+    char::from(rng.substitute(base as u8))
 }
 
 struct Db {
@@ -57,10 +33,10 @@ const J_ANCHOR: usize = 15;
 
 impl Db {
     fn new() -> Self {
-        let mut rng = Rng(2024);
+        let mut rng = Rng::new(2024);
         let mut v = Vec::new();
         for g in 1..=6 {
-            let first = rng.bases(V_LEN);
+            let first = bases(&mut rng, V_LEN);
             let mut second: Vec<char> = first.chars().collect();
             for p in [50, 150, 250] {
                 second[p] = substitute(second[p], &mut rng);
@@ -69,10 +45,10 @@ impl Db {
             v.push((format!("IGHV{g}-1*02"), second.into_iter().collect()));
         }
         let d = (1..=8)
-            .map(|g| (format!("IGHD{g}-1*01"), rng.bases(13 + g)))
+            .map(|g| (format!("IGHD{g}-1*01"), bases(&mut rng, 13 + g)))
             .collect();
         let j = (1..=4)
-            .map(|g| (format!("IGHJ{g}*01"), rng.bases(48)))
+            .map(|g| (format!("IGHJ{g}*01"), bases(&mut rng, 48)))
             .collect();
         Self { v, d, j }
     }
@@ -107,7 +83,7 @@ struct Sim {
 fn simulate(db: &Db, rng: &mut Rng, d_choice: &[usize], shm_rate: f64) -> Sim {
     let (v_name, v_seq) = &db.v[rng.below(db.v.len())];
     let (j_name, j_seq) = &db.j[rng.below(db.j.len())];
-    let v_part: String = v_seq[10..V_LEN - rng.range(0, 3)]
+    let v_part: String = v_seq[10..V_LEN - rng.range(0, 3) as usize]
         .chars()
         .map(|b| {
             if (rng.below(10_000) as f64) < shm_rate * 10_000.0 {
@@ -121,15 +97,15 @@ fn simulate(db: &Db, rng: &mut Rng, d_choice: &[usize], shm_rate: f64) -> Sim {
     let mut d_names = Vec::new();
     for &d in d_choice {
         let (d_name, d_seq) = &db.d[d];
-        let (left, right) = (rng.range(0, 2), rng.range(0, 2));
-        let n_len = rng.range(3, 6);
-        query += &rng.bases(n_len);
+        let (left, right) = (rng.range(0, 2) as usize, rng.range(0, 2) as usize);
+        let n_len = rng.range(3, 6) as usize;
+        query += &bases(rng, n_len);
         query += &d_seq[left..d_seq.len() - right];
         d_names.push(d_name.clone());
     }
-    let n_len = rng.range(3, 6);
-    query += &rng.bases(n_len);
-    query += &j_seq[rng.range(0, 3)..];
+    let n_len = rng.range(3, 6) as usize;
+    query += &bases(rng, n_len);
+    query += &j_seq[rng.range(0, 3) as usize..];
     Sim {
         query,
         v: v_name.clone(),
@@ -171,7 +147,7 @@ fn reverse_complement(seq: &str) -> String {
 fn calls_vdj_alleles_on_clean_rearrangements() {
     let db = Db::new();
     let assigner = db.assigner(&EngineConfig::default());
-    let mut rng = Rng(1);
+    let mut rng = Rng::new(1);
     let (mut d_correct, trials) = (0, 60);
     for _ in 0..trials {
         let d = rng.below(db.d.len());
@@ -204,7 +180,7 @@ fn calls_vdj_alleles_on_clean_rearrangements() {
 fn reverse_complement_reads_are_reoriented() {
     let db = Db::new();
     let assigner = db.assigner(&EngineConfig::default());
-    let mut rng = Rng(7);
+    let mut rng = Rng::new(7);
     for _ in 0..20 {
         let d = rng.below(8);
         let sim = simulate(&db, &mut rng, &[d], 0.0);
@@ -230,7 +206,7 @@ fn reverse_complement_reads_are_reoriented() {
 fn hypermutated_reads_keep_their_v_gene() {
     let db = Db::new();
     let assigner = db.assigner(&EngineConfig::default());
-    let mut rng = Rng(99);
+    let mut rng = Rng::new(99);
     for _ in 0..40 {
         let d = rng.below(8);
         let sim = simulate(&db, &mut rng, &[d], 0.08);
@@ -245,7 +221,7 @@ fn hypermutated_reads_keep_their_v_gene() {
 fn junctions_without_d_do_not_invent_one() {
     let db = Db::new();
     let assigner = db.assigner(&EngineConfig::default());
-    let mut rng = Rng(3);
+    let mut rng = Rng::new(3);
     let trials = 40;
     let with_d = (0..trials)
         .filter(|_| {
@@ -269,7 +245,7 @@ fn tandem_d_is_a_first_class_path() {
         ..EngineConfig::default()
     });
     let single = db.assigner(&EngineConfig::default());
-    let mut rng = Rng(5);
+    let mut rng = Rng::new(5);
     let mut both_correct = 0;
     let trials = 30;
     for _ in 0..trials {
@@ -300,7 +276,7 @@ fn residual_adjudicator_is_a_drop_in_replacement() {
     let residual = db
         .assigner(&config)
         .with_adjudicator(ResidualAdjudicator::default());
-    let mut rng = Rng(11);
+    let mut rng = Rng::new(11);
     for _ in 0..20 {
         let d = rng.below(8);
         let sim = simulate(&db, &mut rng, &[d], 0.0);
@@ -317,7 +293,7 @@ fn called_segments_never_share_query_bases() {
         grammar: VdjGrammar::TANDEM_D,
         ..EngineConfig::default()
     });
-    let mut rng = Rng(13);
+    let mut rng = Rng::new(13);
     let mut ws = assigner.workspace();
     for _ in 0..50 {
         let n_d = rng.below(3);
@@ -336,7 +312,7 @@ fn called_segments_never_share_query_bases() {
 fn batch_matches_sequential() {
     let db = Db::new();
     let assigner = db.assigner(&EngineConfig::default());
-    let mut rng = Rng(17);
+    let mut rng = Rng::new(17);
     let queries: Vec<Vec<u8>> = (0..300)
         .map(|_| {
             let d = rng.below(8);
@@ -558,7 +534,7 @@ fn dag_equals_brute_force_over_all_paths_and_cuts() {
         )
     };
     let dag = PlacementDag::new(VdjGrammar::TANDEM_D, model, [10, 3, 6]);
-    let mut rng = Rng(23);
+    let mut rng = Rng::new(23);
     let mut ws = assigner.workspace();
     let mut scratch = DagScratch::default();
     let mut distinct_topologies = HashSet::new();
@@ -613,7 +589,7 @@ fn simd_batched_pipeline_equals_scalar_per_read() {
     };
     let simd = db.assigner(&config);
     let scalar = db.assigner(&config).with_aligner(BandedGotoh);
-    let mut rng = Rng(29);
+    let mut rng = Rng::new(29);
     let queries: Vec<Vec<u8>> = (0..400)
         .map(|_| {
             let ds: Vec<usize> = (0..rng.below(3)).map(|_| rng.below(8)).collect();

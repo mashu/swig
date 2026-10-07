@@ -1195,15 +1195,7 @@ mod tests {
     /// are carried relative to each cut, so nothing overflows.
     #[test]
     fn strong_junction_costs_stay_in_range() {
-        let mut x = 7u64;
-        let query: Vec<u8> = (0..340)
-            .map(|_| {
-                x = x
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                ((x >> 33) & 3) as u8
-            })
-            .collect();
+        let query = crate::sim::Rng::new(7).codes(340);
         let mutate = |range: std::ops::Range<usize>, every: usize| -> Vec<u8> {
             range
                 .enumerate()
@@ -1239,15 +1231,7 @@ mod tests {
     /// is below the `f64` range as a factor; it must go into the log scale.
     #[test]
     fn long_costly_gaps_keep_their_mass() {
-        let mut x = 11u64;
-        let query: Vec<u8> = (0..360)
-            .map(|_| {
-                x = x
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                ((x >> 33) & 3) as u8
-            })
-            .collect();
+        let query = crate::sim::Rng::new(11).codes(360);
         let placements = vec![
             placement(SegmentKind::V, &query, &query[..30], 0),
             placement(SegmentKind::J, &query, &query[330..], 330),
@@ -1273,15 +1257,7 @@ mod tests {
     /// wrong ones.
     #[test]
     fn overlaps_beyond_the_f64_range_are_refused() {
-        let mut x = 5u64;
-        let query: Vec<u8> = (0..700)
-            .map(|_| {
-                x = x
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                ((x >> 33) & 3) as u8
-            })
-            .collect();
+        let query = crate::sim::Rng::new(5).codes(700);
         let placements = vec![
             placement(SegmentKind::V, &query, &query[..600], 0),
             placement(SegmentKind::J, &query, &query[60..], 60),

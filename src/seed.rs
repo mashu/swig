@@ -318,13 +318,7 @@ mod tests {
     }
 
     fn random_codes(len: usize, seed: u64) -> Vec<u8> {
-        let mut x = seed;
-        (0..len)
-            .map(|_| {
-                x = order(x.wrapping_add(0x9e37_79b9_7f4a_7c15));
-                (x & 3) as u8
-            })
-            .collect()
+        crate::sim::Rng::new(seed).codes(len)
     }
 
     #[test]

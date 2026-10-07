@@ -184,6 +184,8 @@ pub struct GermlineSet {
     alleles: Vec<Allele>,
     genes: Vec<String>,
     gene_ids: HashMap<String, GeneId>,
+    /// Summed allele lengths (the search space of E-values).
+    total_len: usize,
 }
 
 fn parse_position(name: &str, key: &str, value: &str) -> Result<u32, GermlineError> {
@@ -203,6 +205,7 @@ impl GermlineSet {
             alleles: Vec::new(),
             genes: Vec::new(),
             gene_ids: HashMap::new(),
+            total_len: 0,
         }
     }
 
@@ -254,6 +257,7 @@ impl GermlineSet {
                 next_gene
             });
         let id = AlleleId::try_from(self.alleles.len()).expect("allele count fits u32");
+        self.total_len += codes.len();
         self.alleles.push(Allele {
             name: name.to_string(),
             gene,
@@ -410,6 +414,11 @@ impl GermlineSet {
     #[inline]
     pub fn allele(&self, id: AlleleId) -> &Allele {
         &self.alleles[id as usize]
+    }
+
+    /// Summed length of all alleles.
+    pub fn total_len(&self) -> usize {
+        self.total_len
     }
 
     pub fn gene_count(&self) -> usize {

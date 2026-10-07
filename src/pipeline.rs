@@ -171,56 +171,32 @@ fn retain_from<T>(items: &mut Vec<T>, from: usize, mut keep: impl FnMut(&T) -> b
     items.truncate(kept);
 }
 
+/// The assigner with one component replaced: the other fields move across.
+macro_rules! replace {
+    ($assigner:ident { $($kept:ident),* } $field:ident: $value:expr) => {
+        Assigner {
+            $field: $value,
+            $($kept: $assigner.$kept),*
+        }
+    };
+}
+
+/// Swapping a component changes the assigner's type, so the whole pipeline
+/// monomorphises again around it.
 impl<A, RV, RJ, RD, W, Adm, Adj, Rf> Assigner<A, RV, RJ, RD, W, Adm, Adj, Rf> {
     pub fn with_aligner<A2>(self, aligner: A2) -> Assigner<A2, RV, RJ, RD, W, Adm, Adj, Rf> {
-        Assigner {
-            v: self.v,
-            j: self.j,
-            d: self.d,
-            strand: self.strand,
-            j_window: self.j_window,
-            aligner,
-            d_window: self.d_window,
-            d_admission: self.d_admission,
-            adjudicator: self.adjudicator,
-            refiner: self.refiner,
-            options: self.options,
-        }
+        replace!(self { v, j, d, strand, j_window, d_window, d_admission, adjudicator, refiner, options } aligner: aligner)
     }
 
     pub fn with_d_window<W2>(self, d_window: W2) -> Assigner<A, RV, RJ, RD, W2, Adm, Adj, Rf> {
-        Assigner {
-            v: self.v,
-            j: self.j,
-            d: self.d,
-            strand: self.strand,
-            j_window: self.j_window,
-            aligner: self.aligner,
-            d_window,
-            d_admission: self.d_admission,
-            adjudicator: self.adjudicator,
-            refiner: self.refiner,
-            options: self.options,
-        }
+        replace!(self { v, j, d, strand, j_window, aligner, d_admission, adjudicator, refiner, options } d_window: d_window)
     }
 
     pub fn with_d_admission<Adm2>(
         self,
         d_admission: Adm2,
     ) -> Assigner<A, RV, RJ, RD, W, Adm2, Adj, Rf> {
-        Assigner {
-            v: self.v,
-            j: self.j,
-            d: self.d,
-            strand: self.strand,
-            j_window: self.j_window,
-            aligner: self.aligner,
-            d_window: self.d_window,
-            d_admission,
-            adjudicator: self.adjudicator,
-            refiner: self.refiner,
-            options: self.options,
-        }
+        replace!(self { v, j, d, strand, j_window, aligner, d_window, adjudicator, refiner, options } d_admission: d_admission)
     }
 
     /// Swap the adjudicator. The D stage keeps the D placements the original
@@ -232,35 +208,11 @@ impl<A, RV, RJ, RD, W, Adm, Adj, Rf> Assigner<A, RV, RJ, RD, W, Adm, Adj, Rf> {
         self,
         adjudicator: Adj2,
     ) -> Assigner<A, RV, RJ, RD, W, Adm, Adj2, Rf> {
-        Assigner {
-            v: self.v,
-            j: self.j,
-            d: self.d,
-            strand: self.strand,
-            j_window: self.j_window,
-            aligner: self.aligner,
-            d_window: self.d_window,
-            d_admission: self.d_admission,
-            adjudicator,
-            refiner: self.refiner,
-            options: self.options,
-        }
+        replace!(self { v, j, d, strand, j_window, aligner, d_window, d_admission, refiner, options } adjudicator: adjudicator)
     }
 
     pub fn with_refiner<Rf2>(self, refiner: Rf2) -> Assigner<A, RV, RJ, RD, W, Adm, Adj, Rf2> {
-        Assigner {
-            v: self.v,
-            j: self.j,
-            d: self.d,
-            strand: self.strand,
-            j_window: self.j_window,
-            aligner: self.aligner,
-            d_window: self.d_window,
-            d_admission: self.d_admission,
-            adjudicator: self.adjudicator,
-            refiner,
-            options: self.options,
-        }
+        replace!(self { v, j, d, strand, j_window, aligner, d_window, d_admission, adjudicator, options } refiner: refiner)
     }
 
     pub fn with_options(mut self, options: AssignerOptions) -> Self {
@@ -300,53 +252,61 @@ where
     Adj: Adjudicator,
     Rf: Refiner,
 {
-    /// Strand from germline k-mer support; when that is not significant,
-    /// from the strongest V seed cluster on each strand (`state.query` and
-    /// `state.v` serve as scratch).
-    fn orient(
-        &self,
-        query: &[u8],
-        state: &mut ReadState,
-        retrieval: &mut RetrievalScratch,
-    ) -> Orientation {
-        let policy = self.options.orientation;
-        if !policy.try_reverse {
-            return Orientation::Forward;
-        }
-        let support = self.strand.support(query);
-        if support.decisive() {
-            return policy.choose(support.forward, support.reverse);
-        }
-        let strongest =
-            |candidates: &[Candidate]| candidates.iter().map(|c| c.votes).max().unwrap_or(0);
-        self.v
-            .retrieve(query, 0..query.len(), retrieval, &mut state.v);
-        let forward = strongest(&state.v);
-        reverse_complement_into(query, &mut state.query);
-        self.v
-            .retrieve(&state.query, 0..query.len(), retrieval, &mut state.v);
-        policy.choose(forward, strongest(&state.v))
-    }
-
     /// Stage 1, per read: orientation, oriented query, V candidates.
+    ///
+    /// The strand comes from germline k-mer support. When that is not
+    /// significant, V is retrieved on both strands and the strongest seed
+    /// cluster decides; the chosen strand's candidates are kept.
     fn stage_orient<Q: AsRef<[u8]>>(
         &self,
         queries: &[Q],
         reads: &mut [ReadState],
         retrieval: &mut RetrievalScratch,
     ) {
+        let policy = self.options.orientation;
+        let strongest =
+            |candidates: &[Candidate]| candidates.iter().map(|c| c.votes).max().unwrap_or(0);
         for (state, query) in reads.iter_mut().zip(queries) {
             let query = query.as_ref();
-            let orientation = self.orient(query, state, retrieval);
-            state.orientation = Some(orientation);
-            if orientation.is_reverse() {
-                reverse_complement_into(query, &mut state.query);
+            let whole = 0..query.len();
+            let decided = if policy.try_reverse {
+                let support = self.strand.support(query);
+                support
+                    .decisive()
+                    .then(|| policy.choose(support.forward, support.reverse))
             } else {
-                state.query.clear();
-                state.query.extend_from_slice(query);
-            }
-            self.v
-                .retrieve(&state.query, 0..state.query.len(), retrieval, &mut state.v);
+                Some(Orientation::Forward)
+            };
+            let orientation = match decided {
+                Some(orientation) => {
+                    if orientation.is_reverse() {
+                        reverse_complement_into(query, &mut state.query);
+                    } else {
+                        state.query.clear();
+                        state.query.extend_from_slice(query);
+                    }
+                    self.v
+                        .retrieve(&state.query, whole, retrieval, &mut state.v);
+                    orientation
+                }
+                None => {
+                    // `state.j` is free until stage 3: it holds the reverse strand's candidates.
+                    self.v
+                        .retrieve(query, whole.clone(), retrieval, &mut state.v);
+                    reverse_complement_into(query, &mut state.query);
+                    self.v
+                        .retrieve(&state.query, whole, retrieval, &mut state.j);
+                    let orientation = policy.choose(strongest(&state.v), strongest(&state.j));
+                    if orientation.is_reverse() {
+                        std::mem::swap(&mut state.v, &mut state.j);
+                    } else {
+                        state.query.clear();
+                        state.query.extend_from_slice(query);
+                    }
+                    orientation
+                }
+            };
+            state.orientation = Some(orientation);
         }
     }
 

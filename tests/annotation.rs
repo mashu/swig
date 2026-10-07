@@ -9,22 +9,8 @@
 
 use vdj_assign::annotate::{AnchorSource, AnnotateOptions, ChainType, annotate};
 use vdj_assign::prelude::*;
+use vdj_assign::sim::Rng;
 use vdj_assign::translate::{codon, translate};
-
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-}
 
 const RESIDUES: &[u8] = b"ACDEFGHIKLMNPQRSTVWY";
 
@@ -173,7 +159,7 @@ fn database(
 #[test]
 fn recovers_exact_boundaries_for_heavy_and_light_genes() {
     for (chain, seed) in [(ChainType::Heavy, 1), (ChainType::Light, 2)] {
-        let mut rng = Rng(seed);
+        let mut rng = Rng::new(seed);
         let (mut v, truth, mut j, j_truth) = database(chain, 300, &mut rng);
         let report = annotate(&mut v, Some(&mut j), AnnotateOptions::default());
         assert_eq!(report.chain, Some(chain));
@@ -201,7 +187,7 @@ fn recovers_exact_boundaries_for_heavy_and_light_genes() {
 
 #[test]
 fn pseudogene_anchor_is_transferred_from_its_closest_sibling() {
-    let mut rng = Rng(3);
+    let mut rng = Rng::new(3);
     let (mut v, truth, mut j, _) = database(ChainType::Heavy, 40, &mut rng);
     // A copy of V0 with Cys104 and Trp41 destroyed and two substitutions elsewhere.
     let mut broken = truth[0].sequence.clone();
@@ -235,7 +221,7 @@ fn pseudogene_anchor_is_transferred_from_its_closest_sibling() {
 /// even when an out-of-frame TGT near the end looks like a weak Cys104.
 #[test]
 fn three_prime_partial_allele_gets_no_anchor() {
-    let mut rng = Rng(5);
+    let mut rng = Rng::new(5);
     let (mut v, truth, mut j, _) = database(ChainType::Heavy, 40, &mut rng);
     let anchor = truth[0].anchor as usize;
     let mut partial = truth[0].sequence[..anchor + 2].to_vec();
@@ -264,7 +250,7 @@ fn three_prime_partial_allele_gets_no_anchor() {
 /// past the end. That is not evidence of a 3′-partial allele.
 #[test]
 fn a_deletion_before_cys104_is_not_a_partial_allele() {
-    let mut rng = Rng(6);
+    let mut rng = Rng::new(6);
     let (mut v, truth, mut j, _) = database(ChainType::Heavy, 40, &mut rng);
     let anchor = truth[0].anchor as usize;
     let mut deleted = truth[0].sequence[..anchor - 21].to_vec();
@@ -282,7 +268,7 @@ fn a_deletion_before_cys104_is_not_a_partial_allele() {
 
 #[test]
 fn header_values_are_never_overridden() {
-    let mut rng = Rng(4);
+    let mut rng = Rng::new(4);
     let gene = synthetic_v(ChainType::Heavy, &mut rng, 0);
     let text = format!(
         ">V1*01 anchor={} cdr1=3\n{}\n",
@@ -306,7 +292,7 @@ fn header_values_are_never_overridden() {
 
 #[test]
 fn annotation_of_thousands_of_alleles_takes_milliseconds() {
-    let mut rng = Rng(5);
+    let mut rng = Rng::new(5);
     let (mut v, _, mut j, _) = database(ChainType::Heavy, 3000, &mut rng);
     let started = std::time::Instant::now();
     annotate(&mut v, Some(&mut j), AnnotateOptions::default());
@@ -323,7 +309,7 @@ fn every_error_is_flagged_across_many_databases() {
     for chain in [ChainType::Heavy, ChainType::Light] {
         let (mut total, mut flagged_errors) = (0, 0);
         for seed in 100..120 {
-            let mut rng = Rng(seed);
+            let mut rng = Rng::new(seed);
             let (mut v, truth, mut j, j_truth) = database(chain, 300, &mut rng);
             let report = annotate(&mut v, Some(&mut j), AnnotateOptions::default());
             for (id, (allele, expected)) in v.alleles().iter().zip(&truth).enumerate() {
@@ -367,7 +353,7 @@ fn every_error_is_flagged_across_many_databases() {
 
 #[test]
 fn ambiguous_cys23_of_a_truncated_allele_is_resolved_from_its_sibling() {
-    let mut rng = Rng(6);
+    let mut rng = Rng::new(6);
     let (mut v, truth, mut j, _) = database(ChainType::Light, 30, &mut rng);
     // A 5′-truncated copy of V0 whose Cys23 gets a decoy Cys right after it.
     let mut sequence = truth[0].sequence.clone();
@@ -391,7 +377,7 @@ fn ambiguous_cys23_of_a_truncated_allele_is_resolved_from_its_sibling() {
 fn read_regions_match_the_simulated_rearrangement() {
     use vdj_assign::prepare::prepare;
     use vdj_assign::read_regions::ReadRegions;
-    let mut rng = Rng(7);
+    let mut rng = Rng::new(7);
     let mut v = GermlineSet::new(SegmentKind::V);
     let mut v_truth = Vec::new();
     for g in 0..30 {

@@ -80,6 +80,16 @@ impl Rng {
         b"ACGT"[self.below(4)]
     }
 
+    /// `len` random bases as ASCII.
+    pub fn bases(&mut self, len: usize) -> Vec<u8> {
+        (0..len).map(|_| self.base()).collect()
+    }
+
+    /// `len` random base codes (`0..4`, see [`crate::alphabet`]).
+    pub fn codes(&mut self, len: usize) -> Vec<u8> {
+        (0..len).map(|_| self.below(4) as u8).collect()
+    }
+
     /// A different canonical base than `base` (uniform over the other three).
     pub fn substitute(&mut self, base: u8) -> u8 {
         let others: [u8; 3] = match base {

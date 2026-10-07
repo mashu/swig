@@ -58,6 +58,8 @@ pub mod seed;
 pub mod segment;
 pub mod sim;
 pub mod stats;
+#[cfg(test)]
+mod testing;
 pub mod translate;
 pub mod window;
 

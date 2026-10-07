@@ -129,10 +129,16 @@ fn segment_report<C: AlleleCatalog>(
                     .is_some_and(|s| s.score == called_score)
         })
         .collect();
-    let mut tied: Vec<_> = std::iter::once(dag_placement)
-        .chain(tied_indices.iter().map(|&i| &call.placements[i]))
+    // The called placement first, so it wins ties of the sort key.
+    let mut tied: Vec<&Placement> = std::iter::once(dag_placement)
+        .chain(
+            tied_indices
+                .iter()
+                .filter(|&&i| i != called.placement)
+                .map(|&i| &call.placements[i]),
+        )
         .collect();
-    tied.sort_by_key(|p| {
+    tied.sort_by_cached_key(|p| {
         let own = p
             .clip
             .span(called.entry, called.exit)
@@ -255,9 +261,8 @@ fn segment_report<C: AlleleCatalog>(
     push_run(&mut cigar, 'S', call.query.len() as u32 - span.q_hi);
 
     let evidence = Evidence::from_columns(placement.clip.columns(&span), &call.query, reference);
-    let db_len: usize = set.alleles().iter().map(|a| a.codes.len()).sum();
-    let evalue =
-        support[kind.index()].map(|ka| ka.evalue(span.score, call.query.len(), db_len, set.len()));
+    let evalue = support[kind.index()]
+        .map(|ka| ka.evalue(span.score, call.query.len(), set.total_len(), set.len()));
 
     Some(SegmentReport {
         call: names.join(","),

@@ -184,13 +184,8 @@ mod tests {
             &SubstitutionProfile::build(&SCORING, &sib),
         )
         .unwrap();
-        let mut state = 3u64;
-        let mut next = || {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            (state >> 33) as usize
-        };
+        let mut words = crate::testing::rng(3);
+        let mut next = || words() as usize;
         for _ in 0..300 {
             // A mutated, shifted, indel-carrying copy of either allele.
             let source = if next() % 2 == 0 { &rep } else { &sib };
