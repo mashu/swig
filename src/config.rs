@@ -204,8 +204,10 @@ pub struct EngineConfig {
 }
 
 impl Default for VSegmentConfig {
-    /// Gap-open −9. The vote budget keeps 3 genes and walks up to 16 while
-    /// votes stay within the ambiguity margin; the 3 best alignments that pass
+    /// Gap-open −9. Every 9-mer votes (7-mers too while the leader holds
+    /// fewer than 25 seeds). The vote budget keeps 3 genes and walks up to 16
+    /// while votes stay within two standard deviations of the leader's
+    /// (`AmbiguityBudget`); the 3 best alignments that pass
     /// the E-value gate (and ties) are kept. There is no column or identity
     /// floor: a positive `(2, −3)` local alignment already has identity above
     /// 3/5, the E-value gate implies a minimum length, and the note's floors
