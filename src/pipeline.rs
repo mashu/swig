@@ -6,7 +6,7 @@
 //!                 ─► per read: J window right of V; J stage over the whole chunk
 //!                 ─► per read: D windows from V/J geometry, D candidates
 //!                 ─► D stage over the whole chunk ─► per read: admission gates
-//!                 ─► per read: adjudicator (placement DAG) ─► refiner ─► Call
+//!                 ─► per read: adjudicator (placement DAG) ─► Call
 //! ```
 //!
 //! **Trick — stage-wise batching across reads.** After prefiltering a read has
@@ -38,7 +38,6 @@ use crate::config::DefaultVRetriever;
 use crate::germline::SegmentKind;
 use crate::orient::{Orientation, OrientationPolicy, StrandIndex};
 use crate::placement::Placement;
-use crate::refine::{NoRefine, Refiner};
 use crate::retrieve::{
     Candidate, ExhaustiveRetriever, LmerMaskRetriever, RetrievalScratch, Retriever,
 };
@@ -106,7 +105,6 @@ pub struct Assigner<
     W = WithAnchorWindow<ExpandedResidual>,
     Adm = DefaultAdmission,
     Adj = PlacementDag,
-    Rf = NoRefine,
 > {
     pub v: SegmentStage<RV>,
     pub j: SegmentStage<RJ>,
@@ -120,7 +118,6 @@ pub struct Assigner<
     pub d_window: W,
     pub d_admission: Adm,
     pub adjudicator: Adj,
-    pub refiner: Rf,
     pub options: AssignerOptions,
 }
 
@@ -183,20 +180,20 @@ macro_rules! replace {
 
 /// Swapping a component changes the assigner's type, so the whole pipeline
 /// monomorphises again around it.
-impl<A, RV, RJ, RD, W, Adm, Adj, Rf> Assigner<A, RV, RJ, RD, W, Adm, Adj, Rf> {
-    pub fn with_aligner<A2>(self, aligner: A2) -> Assigner<A2, RV, RJ, RD, W, Adm, Adj, Rf> {
-        replace!(self { v, j, d, strand, j_window, d_window, d_admission, adjudicator, refiner, options } aligner: aligner)
+impl<A, RV, RJ, RD, W, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj> {
+    pub fn with_aligner<A2>(self, aligner: A2) -> Assigner<A2, RV, RJ, RD, W, Adm, Adj> {
+        replace!(self { v, j, d, strand, j_window, d_window, d_admission, adjudicator, options } aligner: aligner)
     }
 
-    pub fn with_d_window<W2>(self, d_window: W2) -> Assigner<A, RV, RJ, RD, W2, Adm, Adj, Rf> {
-        replace!(self { v, j, d, strand, j_window, aligner, d_admission, adjudicator, refiner, options } d_window: d_window)
+    pub fn with_d_window<W2>(self, d_window: W2) -> Assigner<A, RV, RJ, RD, W2, Adm, Adj> {
+        replace!(self { v, j, d, strand, j_window, aligner, d_admission, adjudicator, options } d_window: d_window)
     }
 
     pub fn with_d_admission<Adm2>(
         self,
         d_admission: Adm2,
-    ) -> Assigner<A, RV, RJ, RD, W, Adm2, Adj, Rf> {
-        replace!(self { v, j, d, strand, j_window, aligner, d_window, adjudicator, refiner, options } d_admission: d_admission)
+    ) -> Assigner<A, RV, RJ, RD, W, Adm2, Adj> {
+        replace!(self { v, j, d, strand, j_window, aligner, d_window, adjudicator, options } d_admission: d_admission)
     }
 
     /// Swap the adjudicator. The D stage keeps the D placements the original
@@ -207,12 +204,8 @@ impl<A, RV, RJ, RD, W, Adm, Adj, Rf> Assigner<A, RV, RJ, RD, W, Adm, Adj, Rf> {
     pub fn with_adjudicator<Adj2>(
         self,
         adjudicator: Adj2,
-    ) -> Assigner<A, RV, RJ, RD, W, Adm, Adj2, Rf> {
-        replace!(self { v, j, d, strand, j_window, aligner, d_window, d_admission, refiner, options } adjudicator: adjudicator)
-    }
-
-    pub fn with_refiner<Rf2>(self, refiner: Rf2) -> Assigner<A, RV, RJ, RD, W, Adm, Adj, Rf2> {
-        replace!(self { v, j, d, strand, j_window, aligner, d_window, d_admission, adjudicator, options } refiner: refiner)
+    ) -> Assigner<A, RV, RJ, RD, W, Adm, Adj2> {
+        replace!(self { v, j, d, strand, j_window, aligner, d_window, d_admission, options } adjudicator: adjudicator)
     }
 
     pub fn with_options(mut self, options: AssignerOptions) -> Self {
@@ -241,7 +234,7 @@ fn read_requests<'a>(
 
 /// The stages of [`VdjAssigner::assign_many`], in order. Per-read stages
 /// loop over the chunk; chunk stages hand all reads' jobs to the aligner at once.
-impl<A, RV, RJ, RD, W, Adm, Adj, Rf> Assigner<A, RV, RJ, RD, W, Adm, Adj, Rf>
+impl<A, RV, RJ, RD, W, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj>
 where
     A: Aligner + Send + Sync,
     RV: Retriever,
@@ -250,7 +243,6 @@ where
     W: DWindowPolicy,
     Adm: Admission,
     Adj: Adjudicator,
-    Rf: Refiner,
 {
     /// Stage 1, per read: orientation, oriented query, V candidates.
     ///
@@ -410,7 +402,7 @@ where
         self.v.significance.is_some() || self.j.significance.is_some()
     }
 
-    /// Stage 5, per read: adjudication and refinement into calls. A path
+    /// Stage 5, per read: adjudication into calls. A path
     /// without an anchor ([`Placement::anchor`]) is not a call.
     fn stage_adjudicate(
         &self,
@@ -421,7 +413,7 @@ where
     ) {
         out.reserve(reads.len());
         for (state, placed) in reads.iter().zip(placements.iter_mut()) {
-            let mut path = self
+            let path = self
                 .adjudicator
                 .adjudicate(state.query.len(), placed, adjudication)
                 .filter(|path| {
@@ -431,9 +423,6 @@ where
             let marginals = path
                 .as_ref()
                 .and_then(|path| self.adjudicator.marginals(placed, path, adjudication));
-            if let Some(path) = path.as_mut() {
-                self.refiner.refine(&state.query, placed, path);
-            }
             out.push(Call {
                 orientation: state.orientation.expect("stage 1 orients every read"),
                 query: state.query.clone(),
@@ -445,7 +434,7 @@ where
     }
 }
 
-impl<A, RV, RJ, RD, W, Adm, Adj, Rf> VdjAssigner for Assigner<A, RV, RJ, RD, W, Adm, Adj, Rf>
+impl<A, RV, RJ, RD, W, Adm, Adj> VdjAssigner for Assigner<A, RV, RJ, RD, W, Adm, Adj>
 where
     A: Aligner + Send + Sync,
     RV: Retriever,
@@ -454,7 +443,6 @@ where
     W: DWindowPolicy,
     Adm: Admission,
     Adj: Adjudicator,
-    Rf: Refiner,
 {
     type Workspace = Workspace<A::Workspace, Adj::Scratch>;
 
@@ -505,7 +493,7 @@ where
     }
 }
 
-impl<A, RV, RJ, RD, W, Adm, Adj, Rf> AlleleCatalog for Assigner<A, RV, RJ, RD, W, Adm, Adj, Rf> {
+impl<A, RV, RJ, RD, W, Adm, Adj> AlleleCatalog for Assigner<A, RV, RJ, RD, W, Adm, Adj> {
     fn segment(&self, kind: SegmentKind) -> Option<&PreparedSegment> {
         match kind {
             SegmentKind::V => Some(&self.v.segment),

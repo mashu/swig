@@ -13,7 +13,7 @@
 //! allocation in between, and leaving any part of the overlap or of either
 //! alignment to N/P are all evaluated exactly. The first segment keeps its
 //! start and the last its end (V and J are extended to the read's ends on
-//! purpose, see [`crate::refine::extend_outer`]).
+//! purpose, see [`crate::flank::extend_outer`]).
 //!
 //! Cuts are *canonical* ([`crate::clip::ClipIndex::matches`]): an entry on
 //! the first retained base, an exit right after the last, so every distinct

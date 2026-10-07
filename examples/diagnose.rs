@@ -17,8 +17,8 @@ use std::error::Error;
 
 use common::Args;
 use vdj_assign::align::{Aligner, InterSequenceWorkspace};
+use vdj_assign::flank::{OuterExtend, extend_outer};
 use vdj_assign::prelude::*;
-use vdj_assign::refine::{OuterExtend, extend_outer};
 use vdj_assign::scoring::GapCosts;
 use vdj_assign::scoring::SubstitutionProfile;
 use vdj_assign::sim::{Region, SimParams, Simulator};

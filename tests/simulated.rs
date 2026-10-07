@@ -263,11 +263,31 @@ fn accuracy_at_scale() {
     // (preset, seed, V, V gene, D, J, junction, V ECE, J ECE)
     let presets = [
         // Measured: 99.99 100 99.53 99.95 100, ECE 0.02 0.25.
-        (SimParams::easy(), 21, 99.8, 99.9, 99.2, 99.8, 99.9, 0.2, 0.5),
+        (
+            SimParams::easy(),
+            21,
+            99.8,
+            99.9,
+            99.2,
+            99.8,
+            99.9,
+            0.2,
+            0.5,
+        ),
         // Measured: 99.53 100 84.50 99.40 99.99, ECE 0.04 0.20.
         (SimParams::mid(), 22, 99.3, 99.9, 83.5, 99.1, 99.9, 0.3, 0.5),
         // Measured: 97.57 99.85 75.86 95.93 99.71, ECE 0.13 0.40.
-        (SimParams::hard(), 23, 97.0, 99.6, 74.8, 95.3, 99.4, 0.5, 0.8),
+        (
+            SimParams::hard(),
+            23,
+            97.0,
+            99.6,
+            74.8,
+            95.3,
+            99.4,
+            0.5,
+            0.8,
+        ),
     ];
     for (params, seed, v, v_gene, d, j, junction, v_ece, j_ece) in presets {
         let e = setup.evaluate(params, 20_000, seed, &EngineConfig::default());
@@ -279,11 +299,17 @@ fn accuracy_at_scale() {
             ("junction", e.junction_rate(), junction),
         ];
         for (label, measured, floor) in checks {
-            assert!(measured >= floor, "seed {seed} {label} {measured:.2} < {floor}");
+            assert!(
+                measured >= floor,
+                "seed {seed} {label} {measured:.2} < {floor}"
+            );
         }
         assert!(100.0 * e.calibration.v.ece() <= v_ece, "seed {seed} V ECE");
         assert!(100.0 * e.calibration.j.ece() <= j_ece, "seed {seed} J ECE");
         let random_calls = e.unassigned;
-        assert!(random_calls <= e.reads / 1000, "seed {seed}: {random_calls} unassigned");
+        assert!(
+            random_calls <= e.reads / 1000,
+            "seed {seed}: {random_calls} unassigned"
+        );
     }
 }

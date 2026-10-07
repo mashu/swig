@@ -12,11 +12,11 @@ use std::sync::Arc;
 use crate::adjudicate::{EngineeringObjective, PlacementDag, PosteriorModel, VdjGrammar};
 use crate::admission::{AnyOf, DistributedEvidence, ExactRunFloor};
 use crate::align::InterSequenceGotoh;
+use crate::flank::OuterExtend;
 use crate::germline::{GermlineSet, SegmentKind};
 use crate::index::IndexError;
 use crate::orient::StrandIndex;
 use crate::pipeline::{Assigner, AssignerOptions};
-use crate::refine::{NoRefine, OuterExtend};
 use crate::retrieve::{
     AmbiguityBudget, ExhaustiveRetriever, LmerMaskRetriever, MAX_LMER, SeedVoteParams,
     SeedVoteRetriever, UngappedParams, UngappedPrefilter,
@@ -474,7 +474,6 @@ impl Assigner {
                 config.d.distributed,
             ),
             adjudicator,
-            refiner: NoRefine,
             options: config.options,
         })
     }

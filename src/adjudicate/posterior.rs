@@ -29,7 +29,7 @@
 //!
 //! **Domain.** As in the Viterbi DAG, the first segment keeps its start and
 //! the last segment its end: V and J are extended to the read's ends on
-//! purpose ([`crate::refine::extend_outer`]). Between neighbours, every pair
+//! purpose ([`crate::flank::extend_outer`]). Between neighbours, every pair
 //! of cuts `x ≤ y` is summed, the domain the Viterbi DAG maximises over.
 //! Each segmentation is counted once by taking *canonical* cuts
 //! ([`crate::clip::ClipIndex::matches`]): an entry cut on the first retained
