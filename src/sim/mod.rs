@@ -30,7 +30,9 @@ pub mod simulate;
 pub mod synthetic;
 pub mod truth;
 
-pub use evaluate::{Assignment, DPresence, Evaluation, SegmentCall, SegmentStats};
+pub use evaluate::{
+    Assignment, DPresence, Evaluation, Paired, PairedOutcome, SegmentCall, SegmentStats,
+};
 pub use params::{IlluminaError, SimParams};
 pub use random::{Count, GatedRate, Rate, Rng};
 pub use simulate::{
