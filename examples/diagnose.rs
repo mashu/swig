@@ -11,21 +11,17 @@
 //! cargo run --release --example diagnose -- --v V.fasta --d D.fasta --j J.fasta --preset hard [--reads N] [--show K]
 //! ```
 
+mod common;
+
 use std::error::Error;
 
+use common::Args;
 use vdj_assign::align::{Aligner, InterSequenceWorkspace};
-use vdj_assign::annotate::AnnotateOptions;
+use vdj_assign::flank::{OuterExtend, extend_outer};
 use vdj_assign::prelude::*;
-use vdj_assign::prepare::prepare;
-use vdj_assign::refine::{extend_outer, OuterExtend};
 use vdj_assign::scoring::GapCosts;
 use vdj_assign::scoring::SubstitutionProfile;
-use vdj_assign::sim::{Region, SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
-
-fn load(kind: SegmentKind, path: &str) -> Result<GermlineSet, Box<dyn Error>> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-    Ok(GermlineSet::from_fasta(kind, &text)?)
-}
+use vdj_assign::sim::{Region, SimParams, Simulator};
 
 /// Exhaustive ranking of every allele: (score, allele), best first.
 fn exhaustive(
@@ -77,32 +73,16 @@ fn equivalent(set: &GermlineSet, body: &[u8]) -> Vec<usize> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let value = |name: &str| {
-        args.iter()
-            .position(|a| a == name)
-            .and_then(|i| args.get(i + 1))
-            .cloned()
-    };
-    let reads: usize = value("--reads").map_or(Ok(2000), |v| v.parse())?;
-    let show: usize = value("--show").map_or(Ok(5), |v| v.parse())?;
-    let seed: u64 = value("--seed").map_or(Ok(1), |v| v.parse())?;
+    let args = Args::from_env();
+    let value = |name: &str| args.value(name);
+    let reads: usize = args.number("--reads", 5000)?;
+    let show: usize = args.number("--show", 5)?;
+    let seed: u64 = args.number("--seed", 1)?;
     let preset = value("--preset").unwrap_or_else(|| "hard".to_string());
     let params = SimParams::preset(&preset)
         .ok_or("unknown preset")?
         .with_reverse_complement(0.5);
-    let (v, d, j) = match (value("--v"), value("--j")) {
-        (Some(v), Some(j)) => (
-            load(SegmentKind::V, &v)?,
-            value("--d").map(|d| load(SegmentKind::D, &d)).transpose()?,
-            load(SegmentKind::J, &j)?,
-        ),
-        _ => {
-            let db = SyntheticDatabase::generate(&SyntheticSpec::default(), seed);
-            (db.v, Some(db.d), db.j)
-        }
-    };
-    let db = prepare(v, d, j, AnnotateOptions::default())?;
+    let db = args.database(seed)?;
     let config = CallingProfile::ROptimized.config();
     let sim = Simulator::new(&db.v, db.d.as_ref(), &db.j, params)?;
     let simulated = sim.reads(reads, seed)?;

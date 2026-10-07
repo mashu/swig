@@ -18,6 +18,7 @@
 //! alignment evidence rescored at the read's own divergence.
 
 mod dag;
+mod lattice;
 mod model;
 mod posterior;
 mod residual;
@@ -25,8 +26,8 @@ mod residual;
 pub use dag::{DagScratch, PlacementDag};
 pub use model::{EngineeringObjective, Grammar, PathModel, VdjGrammar};
 pub use posterior::{
-    divergence, EvidenceScale, Marginals, PosteriorModel, PosteriorScratch, MAX_SPREAD,
-    OVERLAP_SPREAD,
+    EvidenceScale, MAX_SPREAD, Marginals, OVERLAP_SPREAD, PosteriorModel, PosteriorScratch,
+    divergence,
 };
 pub use residual::{ResidualAdjudicator, ResidualScratch};
 

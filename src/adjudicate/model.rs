@@ -5,8 +5,8 @@
 //! structural property from a [`PathModel`]: a segment contributes
 //! *clip score + a bonus that does not depend on the cut positions*, and a
 //! junction contributes a score linear in its inserted length. That
-//! separability is what makes every pair of cuts evaluable in O(log n) (see
-//! [`super::PlacementDag`]).
+//! separability is what lets running maxima (or sums) evaluate every pair of
+//! cuts in O(1) amortised per cut (see [`super::PlacementDag`]).
 
 use crate::germline::SegmentKind;
 use crate::placement::Placement;

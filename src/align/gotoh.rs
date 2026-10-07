@@ -38,7 +38,7 @@
 
 use super::{Aligner, Alignment, Op, ScoreHit};
 use crate::band::Band;
-use crate::scoring::{GapCosts, Score, SubstitutionProfile, NEG_INF};
+use crate::scoring::{GapCosts, NEG_INF, Score, SubstitutionProfile};
 
 // Traceback codes, shared with the SIMD kernel (`super::inter_seq`).
 pub(super) const SRC_ZERO: u8 = 0;
@@ -113,8 +113,11 @@ fn fill<const TRACE: bool>(
     ins.clear();
     ins.resize(m + 1, NEG_INF);
     if TRACE {
-        trace.clear();
-        trace.resize(band.cells(n, m), 0);
+        // Every in-band cell is written before traceback reads it: grow only.
+        let cells = band.cells(n, m);
+        if trace.len() < cells {
+            trace.resize(cells, 0);
+        }
         row_first_col.clear();
         row_first_col.resize(n + 1, 0);
         row_offset.clear();
@@ -313,20 +316,7 @@ mod tests {
 
     const SCORING: AffineScoring = AffineScoring::new(2, -3, -5, -1);
 
-    fn rng(seed: u64) -> impl FnMut() -> u64 {
-        let mut state = seed;
-        move || {
-            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = state;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^ (z >> 31)
-        }
-    }
-
-    fn random_codes(next: &mut impl FnMut() -> u64, len: usize) -> Vec<u8> {
-        (0..len).map(|_| (next() % 4) as u8).collect()
-    }
+    use crate::testing::{random_codes, rng};
 
     fn rescore(aln: &Alignment, query: &[u8], reference: &[u8]) -> Score {
         let mut score = 0;
@@ -384,7 +374,7 @@ mod tests {
                 let p = (next() as usize) % query.len();
                 query[p] = (next() % 4) as u8;
             }
-            if next() % 2 == 0 {
+            if next().is_multiple_of(2) {
                 let p = (next() as usize) % query.len();
                 query.insert(p, (next() % 4) as u8);
             }

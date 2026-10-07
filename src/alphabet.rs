@@ -51,11 +51,7 @@ pub fn is_canonical(code: u8) -> bool {
 /// Watson–Crick complement of a code; `N` stays `N`.
 #[inline]
 pub fn complement(code: u8) -> u8 {
-    if code < N {
-        3 - code
-    } else {
-        N
-    }
+    if code < N { 3 - code } else { N }
 }
 
 /// Decode one code back to an upper-case ASCII symbol.

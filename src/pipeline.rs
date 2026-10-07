@@ -6,7 +6,7 @@
 //!                 ─► per read: J window right of V; J stage over the whole chunk
 //!                 ─► per read: D windows from V/J geometry, D candidates
 //!                 ─► D stage over the whole chunk ─► per read: admission gates
-//!                 ─► per read: adjudicator (placement DAG) ─► refiner ─► Call
+//!                 ─► per read: adjudicator (placement DAG) ─► Call
 //! ```
 //!
 //! **Trick — stage-wise batching across reads.** After prefiltering a read has
@@ -38,13 +38,12 @@ use crate::config::DefaultVRetriever;
 use crate::germline::SegmentKind;
 use crate::orient::{Orientation, OrientationPolicy, StrandIndex};
 use crate::placement::Placement;
-use crate::refine::{NoRefine, Refiner};
 use crate::retrieve::{
     Candidate, ExhaustiveRetriever, LmerMaskRetriever, RetrievalScratch, Retriever,
 };
 use crate::segment::{BatchScratch, PreparedSegment, SegmentRequest, SegmentStage};
 use crate::window::{
-    merge_windows, DWindowPolicy, DownstreamWindow, ExpandedResidual, WithAnchorWindow,
+    DWindowPolicy, DownstreamWindow, ExpandedResidual, WithAnchorWindow, merge_windows,
 };
 
 /// Result of assigning one query.
@@ -106,7 +105,6 @@ pub struct Assigner<
     W = WithAnchorWindow<ExpandedResidual>,
     Adm = DefaultAdmission,
     Adj = PlacementDag,
-    Rf = NoRefine,
 > {
     pub v: SegmentStage<RV>,
     pub j: SegmentStage<RJ>,
@@ -120,7 +118,6 @@ pub struct Assigner<
     pub d_window: W,
     pub d_admission: Adm,
     pub adjudicator: Adj,
-    pub refiner: Rf,
     pub options: AssignerOptions,
 }
 
@@ -171,56 +168,32 @@ fn retain_from<T>(items: &mut Vec<T>, from: usize, mut keep: impl FnMut(&T) -> b
     items.truncate(kept);
 }
 
-impl<A, RV, RJ, RD, W, Adm, Adj, Rf> Assigner<A, RV, RJ, RD, W, Adm, Adj, Rf> {
-    pub fn with_aligner<A2>(self, aligner: A2) -> Assigner<A2, RV, RJ, RD, W, Adm, Adj, Rf> {
+/// The assigner with one component replaced: the other fields move across.
+macro_rules! replace {
+    ($assigner:ident { $($kept:ident),* } $field:ident: $value:expr) => {
         Assigner {
-            v: self.v,
-            j: self.j,
-            d: self.d,
-            strand: self.strand,
-            j_window: self.j_window,
-            aligner,
-            d_window: self.d_window,
-            d_admission: self.d_admission,
-            adjudicator: self.adjudicator,
-            refiner: self.refiner,
-            options: self.options,
+            $field: $value,
+            $($kept: $assigner.$kept),*
         }
+    };
+}
+
+/// Swapping a component changes the assigner's type, so the whole pipeline
+/// monomorphises again around it.
+impl<A, RV, RJ, RD, W, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj> {
+    pub fn with_aligner<A2>(self, aligner: A2) -> Assigner<A2, RV, RJ, RD, W, Adm, Adj> {
+        replace!(self { v, j, d, strand, j_window, d_window, d_admission, adjudicator, options } aligner: aligner)
     }
 
-    pub fn with_d_window<W2>(self, d_window: W2) -> Assigner<A, RV, RJ, RD, W2, Adm, Adj, Rf> {
-        Assigner {
-            v: self.v,
-            j: self.j,
-            d: self.d,
-            strand: self.strand,
-            j_window: self.j_window,
-            aligner: self.aligner,
-            d_window,
-            d_admission: self.d_admission,
-            adjudicator: self.adjudicator,
-            refiner: self.refiner,
-            options: self.options,
-        }
+    pub fn with_d_window<W2>(self, d_window: W2) -> Assigner<A, RV, RJ, RD, W2, Adm, Adj> {
+        replace!(self { v, j, d, strand, j_window, aligner, d_admission, adjudicator, options } d_window: d_window)
     }
 
     pub fn with_d_admission<Adm2>(
         self,
         d_admission: Adm2,
-    ) -> Assigner<A, RV, RJ, RD, W, Adm2, Adj, Rf> {
-        Assigner {
-            v: self.v,
-            j: self.j,
-            d: self.d,
-            strand: self.strand,
-            j_window: self.j_window,
-            aligner: self.aligner,
-            d_window: self.d_window,
-            d_admission,
-            adjudicator: self.adjudicator,
-            refiner: self.refiner,
-            options: self.options,
-        }
+    ) -> Assigner<A, RV, RJ, RD, W, Adm2, Adj> {
+        replace!(self { v, j, d, strand, j_window, aligner, d_window, adjudicator, options } d_admission: d_admission)
     }
 
     /// Swap the adjudicator. The D stage keeps the D placements the original
@@ -231,36 +204,8 @@ impl<A, RV, RJ, RD, W, Adm, Adj, Rf> Assigner<A, RV, RJ, RD, W, Adm, Adj, Rf> {
     pub fn with_adjudicator<Adj2>(
         self,
         adjudicator: Adj2,
-    ) -> Assigner<A, RV, RJ, RD, W, Adm, Adj2, Rf> {
-        Assigner {
-            v: self.v,
-            j: self.j,
-            d: self.d,
-            strand: self.strand,
-            j_window: self.j_window,
-            aligner: self.aligner,
-            d_window: self.d_window,
-            d_admission: self.d_admission,
-            adjudicator,
-            refiner: self.refiner,
-            options: self.options,
-        }
-    }
-
-    pub fn with_refiner<Rf2>(self, refiner: Rf2) -> Assigner<A, RV, RJ, RD, W, Adm, Adj, Rf2> {
-        Assigner {
-            v: self.v,
-            j: self.j,
-            d: self.d,
-            strand: self.strand,
-            j_window: self.j_window,
-            aligner: self.aligner,
-            d_window: self.d_window,
-            d_admission: self.d_admission,
-            adjudicator: self.adjudicator,
-            refiner,
-            options: self.options,
-        }
+    ) -> Assigner<A, RV, RJ, RD, W, Adm, Adj2> {
+        replace!(self { v, j, d, strand, j_window, aligner, d_window, d_admission, options } adjudicator: adjudicator)
     }
 
     pub fn with_options(mut self, options: AssignerOptions) -> Self {
@@ -289,7 +234,7 @@ fn read_requests<'a>(
 
 /// The stages of [`VdjAssigner::assign_many`], in order. Per-read stages
 /// loop over the chunk; chunk stages hand all reads' jobs to the aligner at once.
-impl<A, RV, RJ, RD, W, Adm, Adj, Rf> Assigner<A, RV, RJ, RD, W, Adm, Adj, Rf>
+impl<A, RV, RJ, RD, W, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj>
 where
     A: Aligner + Send + Sync,
     RV: Retriever,
@@ -298,55 +243,62 @@ where
     W: DWindowPolicy,
     Adm: Admission,
     Adj: Adjudicator,
-    Rf: Refiner,
 {
-    /// Strand from germline k-mer support; when that is not significant,
-    /// from the strongest V seed cluster on each strand (`state.query` and
-    /// `state.v` serve as scratch).
-    fn orient(
-        &self,
-        query: &[u8],
-        state: &mut ReadState,
-        retrieval: &mut RetrievalScratch,
-    ) -> Orientation {
-        let policy = self.options.orientation;
-        if !policy.try_reverse {
-            return Orientation::Forward;
-        }
-        let support = self.strand.support(query);
-        if support.decisive() {
-            return policy.choose(support.forward, support.reverse);
-        }
-        let strongest =
-            |candidates: &[Candidate]| candidates.iter().map(|c| c.votes).max().unwrap_or(0);
-        self.v
-            .retrieve(query, 0..query.len(), retrieval, &mut state.v);
-        let forward = strongest(&state.v);
-        reverse_complement_into(query, &mut state.query);
-        self.v
-            .retrieve(&state.query, 0..query.len(), retrieval, &mut state.v);
-        policy.choose(forward, strongest(&state.v))
-    }
-
     /// Stage 1, per read: orientation, oriented query, V candidates.
+    ///
+    /// The strand comes from germline k-mer support. When that is not
+    /// significant, V is retrieved on both strands and the strongest seed
+    /// cluster decides; the chosen strand's candidates are kept.
     fn stage_orient<Q: AsRef<[u8]>>(
         &self,
         queries: &[Q],
         reads: &mut [ReadState],
         retrieval: &mut RetrievalScratch,
     ) {
+        let policy = self.options.orientation;
+        let strongest =
+            |candidates: &[Candidate]| candidates.iter().map(|c| c.votes).max().unwrap_or(0);
         for (state, query) in reads.iter_mut().zip(queries) {
             let query = query.as_ref();
-            let orientation = self.orient(query, state, retrieval);
-            state.orientation = Some(orientation);
-            if orientation.is_reverse() {
-                reverse_complement_into(query, &mut state.query);
+            let whole = 0..query.len();
+            let decided = if policy.try_reverse {
+                let support = self.strand.support(query);
+                support
+                    .decisive()
+                    .then(|| policy.choose(support.forward, support.reverse))
             } else {
-                state.query.clear();
-                state.query.extend_from_slice(query);
-            }
-            self.v
-                .retrieve(&state.query, 0..state.query.len(), retrieval, &mut state.v);
+                Some(Orientation::Forward)
+            };
+            let orientation = match decided {
+                Some(orientation) => {
+                    if orientation.is_reverse() {
+                        reverse_complement_into(query, &mut state.query);
+                    } else {
+                        state.query.clear();
+                        state.query.extend_from_slice(query);
+                    }
+                    self.v
+                        .retrieve(&state.query, whole, retrieval, &mut state.v);
+                    orientation
+                }
+                None => {
+                    // `state.j` is free until stage 3: it holds the reverse strand's candidates.
+                    self.v
+                        .retrieve(query, whole.clone(), retrieval, &mut state.v);
+                    reverse_complement_into(query, &mut state.query);
+                    self.v
+                        .retrieve(&state.query, whole, retrieval, &mut state.j);
+                    let orientation = policy.choose(strongest(&state.v), strongest(&state.j));
+                    if orientation.is_reverse() {
+                        std::mem::swap(&mut state.v, &mut state.j);
+                    } else {
+                        state.query.clear();
+                        state.query.extend_from_slice(query);
+                    }
+                    orientation
+                }
+            };
+            state.orientation = Some(orientation);
         }
     }
 
@@ -450,7 +402,7 @@ where
         self.v.significance.is_some() || self.j.significance.is_some()
     }
 
-    /// Stage 5, per read: adjudication and refinement into calls. A path
+    /// Stage 5, per read: adjudication into calls. A path
     /// without an anchor ([`Placement::anchor`]) is not a call.
     fn stage_adjudicate(
         &self,
@@ -461,7 +413,7 @@ where
     ) {
         out.reserve(reads.len());
         for (state, placed) in reads.iter().zip(placements.iter_mut()) {
-            let mut path = self
+            let path = self
                 .adjudicator
                 .adjudicate(state.query.len(), placed, adjudication)
                 .filter(|path| {
@@ -471,9 +423,6 @@ where
             let marginals = path
                 .as_ref()
                 .and_then(|path| self.adjudicator.marginals(placed, path, adjudication));
-            if let Some(path) = path.as_mut() {
-                self.refiner.refine(&state.query, placed, path);
-            }
             out.push(Call {
                 orientation: state.orientation.expect("stage 1 orients every read"),
                 query: state.query.clone(),
@@ -485,7 +434,7 @@ where
     }
 }
 
-impl<A, RV, RJ, RD, W, Adm, Adj, Rf> VdjAssigner for Assigner<A, RV, RJ, RD, W, Adm, Adj, Rf>
+impl<A, RV, RJ, RD, W, Adm, Adj> VdjAssigner for Assigner<A, RV, RJ, RD, W, Adm, Adj>
 where
     A: Aligner + Send + Sync,
     RV: Retriever,
@@ -494,7 +443,6 @@ where
     W: DWindowPolicy,
     Adm: Admission,
     Adj: Adjudicator,
-    Rf: Refiner,
 {
     type Workspace = Workspace<A::Workspace, Adj::Scratch>;
 
@@ -545,7 +493,7 @@ where
     }
 }
 
-impl<A, RV, RJ, RD, W, Adm, Adj, Rf> AlleleCatalog for Assigner<A, RV, RJ, RD, W, Adm, Adj, Rf> {
+impl<A, RV, RJ, RD, W, Adm, Adj> AlleleCatalog for Assigner<A, RV, RJ, RD, W, Adm, Adj> {
     fn segment(&self, kind: SegmentKind) -> Option<&PreparedSegment> {
         match kind {
             SegmentKind::V => Some(&self.v.segment),

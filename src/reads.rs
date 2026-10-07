@@ -64,12 +64,25 @@ impl fmt::Display for ReadError {
                 "input is gzip-compressed; decompress on the fly, e.g. `zcat reads.fastq.gz | vdj-assign ... -`"
             ),
             Self::UnknownFormat { line, found } => {
-                write!(f, "line {line}: expected FASTA ('>') or FASTQ ('@'), found {found:?}")
+                write!(
+                    f,
+                    "line {line}: expected FASTA ('>') or FASTQ ('@'), found {found:?}"
+                )
             }
-            Self::SequenceBeforeHeader { line } => write!(f, "sequence data before the first header (line {line})"),
-            Self::ExpectedFastqHeader { line } => write!(f, "line {line}: expected a FASTQ header starting with '@'"),
-            Self::MissingSeparator { header } => write!(f, "FASTQ record '{header}' has no '+' separator line"),
-            Self::QualityLength { header, sequence, quality } => write!(
+            Self::SequenceBeforeHeader { line } => {
+                write!(f, "sequence data before the first header (line {line})")
+            }
+            Self::ExpectedFastqHeader { line } => {
+                write!(f, "line {line}: expected a FASTQ header starting with '@'")
+            }
+            Self::MissingSeparator { header } => {
+                write!(f, "FASTQ record '{header}' has no '+' separator line")
+            }
+            Self::QualityLength {
+                header,
+                sequence,
+                quality,
+            } => write!(
                 f,
                 "FASTQ record '{header}': {quality} quality characters for {sequence} bases"
             ),

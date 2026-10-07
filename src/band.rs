@@ -36,7 +36,7 @@ impl Band {
                 let i = row as i64;
                 let first = (i - i64::from(hi)).max(1);
                 let last = (i - i64::from(lo)).min(ref_len as i64);
-                (first <= last).then(|| (first as usize, last as usize))
+                (first <= last).then_some((first as usize, last as usize))
             }
         }
     }
@@ -89,5 +89,19 @@ mod tests {
         }
         assert!(band.exhausted(40, 30));
         assert!(band.cells(40, 30) < 40 * 30);
+    }
+
+    #[test]
+    fn bands_outside_the_matrix_are_empty() {
+        // Entirely right of the matrix (query far ahead of the reference)…
+        let right = Band::Diagonals { lo: 50, hi: 60 };
+        assert_eq!(right.cells(30, 20), 0);
+        assert!((1..=30).all(|i| right.columns(i, 20).is_none()));
+        // …and entirely left of it.
+        let left = Band::Diagonals { lo: -60, hi: -50 };
+        assert_eq!(left.cells(30, 20), 0);
+        assert!(left.exhausted(1, 20) || left.columns(1, 20).is_none());
+        assert_eq!(Band::Full.cells(3, 0), 0);
+        assert_eq!(Band::around(0, 0).cells(5, 5), 5);
     }
 }

@@ -44,8 +44,10 @@ pub fn translate_into(codes: &[u8], frame: usize, out: &mut Vec<u8>) {
         codes
             .get(frame..)
             .unwrap_or_default()
-            .chunks_exact(3)
-            .map(|c| codon(c[0], c[1], c[2])),
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|&[a, b, c]| codon(a, b, c)),
     );
 }
 
@@ -74,8 +76,8 @@ mod tests {
         assert_eq!(translate(&codes, 0), b"MWC***QXF");
         let mut frames = [Vec::new(), Vec::new(), Vec::new()];
         translate_frames(&codes, &mut frames);
-        for frame in 0..3 {
-            assert_eq!(frames[frame], translate(&codes, frame));
+        for (frame, translated) in frames.iter().enumerate() {
+            assert_eq!(*translated, translate(&codes, frame));
         }
     }
 }

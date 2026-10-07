@@ -132,7 +132,7 @@ impl Adjudicator for ResidualAdjudicator {
         // 1. Commit the flanks: best V×J (+ pair bonus), or a lone V / J.
         let mut best: Option<(Score, Option<Pick>, Option<Pick>)> = None;
         let mut consider = |score: Score, pv: Option<Pick>, pj: Option<Pick>| {
-            if best.map_or(true, |(s, _, _)| score > s) {
+            if best.is_none_or(|(s, _, _)| score > s) {
                 best = Some((score, pv, pj));
             }
         };

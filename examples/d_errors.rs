@@ -21,20 +21,16 @@
 //!     [--no-anchor-window] [--j-reclaim N]
 //! ```
 
+mod common;
+
 use std::error::Error;
 use std::ops::Range;
 
-use vdj_assign::annotate::AnnotateOptions;
+use common::Args;
 use vdj_assign::placement::Placement;
 use vdj_assign::prelude::*;
-use vdj_assign::prepare::prepare;
-use vdj_assign::sim::{SimParams, Simulator, Slot, SyntheticDatabase, SyntheticSpec, Truth};
+use vdj_assign::sim::{SimParams, Simulator, Slot, Truth};
 use vdj_assign::window::DWindowPolicy;
-
-fn load(kind: SegmentKind, path: &str) -> Result<GermlineSet, Box<dyn Error>> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-    Ok(GermlineSet::from_fasta(kind, &text)?)
-}
 
 fn overlaps(a: &Range<usize>, b: &Range<usize>) -> bool {
     a.start < b.end && b.start < a.end
@@ -58,35 +54,19 @@ struct Tally {
 const COVER: [&str; 3] = ["J covers", "V covers", "neither"];
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let value = |name: &str| {
-        args.iter()
-            .position(|a| a == name)
-            .and_then(|i| args.get(i + 1))
-            .cloned()
-    };
-    let reads: usize = value("--reads").map_or(Ok(5000), |v| v.parse())?;
-    let seed: u64 = value("--seed").map_or(Ok(1), |v| v.parse())?;
+    let args = Args::from_env();
+    let value = |name: &str| args.value(name);
+    let reads: usize = args.number("--reads", 20000)?;
+    let seed: u64 = args.number("--seed", 1)?;
     let preset = value("--preset").unwrap_or_else(|| "hard".to_string());
     let params = SimParams::preset(&preset)
         .ok_or("unknown preset")?
         .with_reverse_complement(0.0);
-    let (v, d, j) = match (value("--v"), value("--j")) {
-        (Some(v), Some(j)) => (
-            load(SegmentKind::V, &v)?,
-            value("--d").map(|d| load(SegmentKind::D, &d)).transpose()?,
-            load(SegmentKind::J, &j)?,
-        ),
-        _ => {
-            let db = SyntheticDatabase::generate(&SyntheticSpec::default(), seed);
-            (db.v, Some(db.d), db.j)
-        }
-    };
-    let db = prepare(v, d, j, AnnotateOptions::default())?;
+    let db = args.database(seed)?;
     let mut config = CallingProfile::ROptimized.config();
     // Counterfactuals: D windows from the V/J placements alone, and J
     // searched over the whole read.
-    config.anchor_window = !args.iter().any(|a| a == "--no-anchor-window");
+    config.anchor_window = !args.flag("--no-anchor-window");
     if let Some(reclaim) = value("--j-reclaim") {
         config.j.window.reclaim = reclaim.parse()?;
     }

@@ -9,6 +9,7 @@
 //! vdj-assign evaluate --truth sim.truth.tsv calls.tsv
 //! ```
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
@@ -16,18 +17,19 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use vdj_assign::align::Backend;
 use vdj_assign::annotate::{AnnotateOptions, ChainType};
 use vdj_assign::prelude::*;
-use vdj_assign::prepare::{prepare, PreparedDatabase};
+use vdj_assign::prepare::{PreparedDatabase, prepare};
 use vdj_assign::reads::ReadReader;
-use vdj_assign::sim::{Assignment, Evaluation, Rng, SimParams, Simulator, Truth};
+use vdj_assign::sim::{Assignment, Evaluation, Paired, Rng, SimParams, Simulator, Truth};
 
 const USAGE: &str = "\
 usage: vdj-assign --v V.fasta --j J.fasta [--d D.fasta] [options] <reads.fasta|reads.fastq|->
        vdj-assign prepare --v V.fasta --j J.fasta [--d D.fasta] [--chain heavy|light] --out DIR
        vdj-assign simulate --v V.fasta --j J.fasta [--d D.fasta] --out PREFIX
                   [--preset easy|mid|hard] [--reads N] [--seed S] [--rc P] [--shm RATE]
-       vdj-assign evaluate --truth PREFIX.truth.tsv <calls.tsv>
+       vdj-assign evaluate --truth PREFIX.truth.tsv <calls.tsv> [other.tsv]
 
 simulate writes PREFIX.fasta and PREFIX.truth.tsv: reads from the IgSim model
 (presets as in IgSim.jl; --rc reverse-complements that fraction, default 0.5;
@@ -35,6 +37,9 @@ simulate writes PREFIX.fasta and PREFIX.truth.tsv: reads from the IgSim model
 germline-equivalent alleles, segment intervals and junctions. evaluate scores
 an AIRR Rearrangement TSV from any tool against that truth (germline-
 equivalence-aware allele, gene, boundary, D-presence and junction accuracy).
+Given a second calls file, evaluate also compares the two read by read:
+accuracy difference with its 95 % confidence interval and an exact McNemar
+test on the reads only one of them gets right.
 
 Reads may be FASTA or FASTQ (detected from the first character); '-' reads
 stdin, so compressed input can be streamed: zcat reads.fastq.gz | vdj-assign ... -
@@ -56,6 +61,8 @@ options:
   --forward-only       do not try the reverse complement
   --no-anchor-window   do not add the conserved-anchor D window
   --no-posterior       skip posterior probabilities (*_posterior columns; ~30 % faster)
+  --simd NAME          alignment kernel: avx512 | avx2 | neon | portable | scalar
+                       (default: the fastest this CPU supports, avx512 excepted)
   --residual           ordinary commit-V/J-then-D adjudication instead of the DAG
   -h, --help           this message";
 
@@ -92,6 +99,7 @@ struct Args {
     reads: Option<String>,
     profile: Option<String>,
     threads: Option<String>,
+    simd: Option<String>,
     chain: Option<String>,
     tandem_d: bool,
     forward_only: bool,
@@ -104,6 +112,8 @@ struct Args {
     rc: Option<String>,
     shm: Option<String>,
     truth: Option<String>,
+    /// `evaluate`: a second calls file to compare against the first.
+    other: Option<String>,
 }
 
 /// Store `value` in `slot`, rejecting a second occurrence of the option.
@@ -147,6 +157,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--chain" if !evaluate => set_once(&mut args.chain, "--chain", value("--chain")?)?,
             "--profile" if assign => set_once(&mut args.profile, "--profile", value("--profile")?)?,
             "--threads" if assign => set_once(&mut args.threads, "--threads", value("--threads")?)?,
+            "--simd" if assign => set_once(&mut args.simd, "--simd", value("--simd")?)?,
             "--tandem-d" if assign => args.tandem_d = true,
             "--forward-only" if assign => args.forward_only = true,
             "--no-anchor-window" if assign => args.no_anchor_window = true,
@@ -161,6 +172,9 @@ fn parse_args() -> Result<Option<Args>, String> {
             flag if flag.starts_with("--") => {
                 return Err(format!("unknown option '{flag}' for {}", mode.name()));
             }
+            path if evaluate && args.reads.is_some() => {
+                set_once(&mut args.other, "a second calls file", path.to_string())?
+            }
             path if assign || evaluate => {
                 set_once(&mut args.reads, "the reads or calls file", path.to_string())?
             }
@@ -168,7 +182,7 @@ fn parse_args() -> Result<Option<Args>, String> {
                 return Err(format!(
                     "{} takes no positional argument ('{extra}')",
                     mode.name()
-                ))
+                ));
             }
         }
     }
@@ -304,7 +318,9 @@ fn run_prepare(args: &Args) -> Result<(), Box<dyn Error>> {
 
 fn run_assign(args: &Args) -> Result<(), Box<dyn Error>> {
     if cfg!(debug_assertions) {
-        eprintln!("vdj-assign: warning: debug build, typically 10-50x slower; build with `cargo build --release`");
+        eprintln!(
+            "vdj-assign: warning: debug build, typically 10-50x slower; build with `cargo build --release`"
+        );
     }
     let reads = args
         .reads
@@ -330,6 +346,11 @@ fn run_assign(args: &Args) -> Result<(), Box<dyn Error>> {
         config.options.orientation = OrientationPolicy::FORWARD_ONLY;
     }
     config.anchor_window = !args.no_anchor_window;
+    config.simd = args
+        .simd
+        .as_deref()
+        .map(|name| Backend::from_name(name).ok_or_else(|| format!("unknown --simd '{name}'")))
+        .transpose()?;
     // The residual adjudicator computes no posteriors.
     config.posterior = !args.no_posterior && !args.residual;
     let support: SupportModels = [
@@ -402,8 +423,25 @@ fn run_simulate(args: &Args) -> Result<(), Box<dyn Error>> {
     }
     reads.flush()?;
     truth.flush()?;
-    eprintln!("vdj-assign: wrote {count} reads to {out}.fasta and their truth to {out}.truth.tsv (preset {preset}, seed {seed})");
+    eprintln!(
+        "vdj-assign: wrote {count} reads to {out}.fasta and their truth to {out}.truth.tsv (preset {preset}, seed {seed})"
+    );
     Ok(())
+}
+
+/// The rows of an AIRR TSV of calls, by `sequence_id`.
+fn read_calls(path: &str) -> Result<HashMap<String, Assignment>, Box<dyn Error>> {
+    let text = fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    let mut lines = text.lines();
+    let header: Vec<&str> = lines
+        .next()
+        .ok_or_else(|| format!("{path}: empty calls file"))?
+        .split('\t')
+        .collect();
+    lines
+        .filter(|l| !l.is_empty())
+        .map(|line| Ok(Assignment::from_airr(&header, line).map_err(|e| format!("{path}: {e}"))?))
+        .collect()
 }
 
 fn run_evaluate(args: &Args) -> Result<(), Box<dyn Error>> {
@@ -415,19 +453,9 @@ fn run_evaluate(args: &Args) -> Result<(), Box<dyn Error>> {
         .reads
         .as_deref()
         .ok_or("evaluate needs an AIRR TSV of calls")?;
+    let calls = read_calls(calls_path)?;
+    let other = args.other.as_deref().map(read_calls).transpose()?;
     let truth_text = fs::read_to_string(truth_path).map_err(|e| format!("{truth_path}: {e}"))?;
-    let calls_text = fs::read_to_string(calls_path).map_err(|e| format!("{calls_path}: {e}"))?;
-    let mut lines = calls_text.lines();
-    let header: Vec<&str> = lines
-        .next()
-        .ok_or("empty calls file")?
-        .split('\t')
-        .collect();
-    let mut calls = std::collections::HashMap::new();
-    for line in lines.filter(|l| !l.is_empty()) {
-        let (id, assignment) = Assignment::from_airr(&header, line)?;
-        calls.insert(id, assignment);
-    }
     let mut lines = truth_text.lines();
     let header: Vec<&str> = lines
         .next()
@@ -435,19 +463,37 @@ fn run_evaluate(args: &Args) -> Result<(), Box<dyn Error>> {
         .split('\t')
         .collect();
     let mut evaluation = Evaluation::default();
-    let mut missing = 0;
+    let mut paired = Paired::default();
+    let mut missing = [0usize; 2];
+    let unassigned = Assignment::default();
     for line in lines.filter(|l| !l.is_empty()) {
         let truth = Truth::from_tsv(&header, line).map_err(|e| format!("{truth_path}: {e}"))?;
-        let call = calls.get(&truth.id).cloned().unwrap_or_else(|| {
-            missing += 1;
-            Assignment::default()
-        });
+        let lookup = |calls: &HashMap<String, Assignment>, missing: &mut usize| {
+            calls.get(&truth.id).cloned().unwrap_or_else(|| {
+                *missing += 1;
+                unassigned.clone()
+            })
+        };
+        let call = lookup(&calls, &mut missing[0]);
         evaluation.add(&truth, &call);
+        if let Some(other) = &other {
+            paired.add(&truth, &call, &lookup(other, &mut missing[1]));
+        }
     }
-    if missing > 0 {
-        eprintln!("vdj-assign: {missing} simulated reads have no row in {calls_path}; counted as unassigned");
+    for (path, missing) in [Some(calls_path), args.other.as_deref()]
+        .into_iter()
+        .zip(missing)
+    {
+        if let (Some(path), 1..) = (path, missing) {
+            eprintln!(
+                "vdj-assign: {missing} simulated reads have no row in {path}; counted as unassigned"
+            );
+        }
     }
     println!("{evaluation}");
+    if let Some(other_path) = &args.other {
+        println!("\nfirst: {calls_path}\nsecond: {other_path}\n{paired}");
+    }
     Ok(())
 }
 

@@ -13,13 +13,15 @@
 //! Both calls also exist in batch form ([`Aligner::score_batch`],
 //! [`Aligner::align_batch`]) over independent [`AlignJob`]s. The default
 //! implementations loop over the single-job calls; [`InterSequenceGotoh`]
-//! overrides them with an AVX2 kernel that aligns 16 jobs at once.
+//! overrides them with an inter-sequence SIMD kernel that aligns 16 or 32
+//! jobs at once on AVX-512, AVX2, NEON or portable lanes ([`Backend`]).
 
 mod gotoh;
 mod inter_seq;
+mod lanes;
 
 pub use gotoh::{BandedGotoh, GotohWorkspace};
-pub use inter_seq::{InterSequenceGotoh, InterSequenceWorkspace, LANES};
+pub use inter_seq::{Backend, InterSequenceGotoh, InterSequenceWorkspace};
 
 use crate::band::Band;
 use crate::scoring::{GapCosts, Score, SubstitutionProfile};

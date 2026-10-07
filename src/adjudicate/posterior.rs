@@ -29,7 +29,7 @@
 //!
 //! **Domain.** As in the Viterbi DAG, the first segment keeps its start and
 //! the last segment its end: V and J are extended to the read's ends on
-//! purpose ([`crate::refine::extend_outer`]). Between neighbours, every pair
+//! purpose ([`crate::flank::extend_outer`]). Between neighbours, every pair
 //! of cuts `x ≤ y` is summed, the domain the Viterbi DAG maximises over.
 //! Each segmentation is counted once by taking *canonical* cuts
 //! ([`crate::clip::ClipIndex::matches`]): an entry cut on the first retained
@@ -67,7 +67,7 @@
 //! [`OVERLAP_SPREAD`], would leave the `f64` range, and the read then gets no
 //! marginals.
 
-use super::dag::order_key;
+use super::lattice::{Group, KINDS, Lattice, Node};
 use super::model::{Grammar, PathModel};
 use super::{CallPath, PlacementDag};
 use crate::germline::SegmentKind;
@@ -90,10 +90,6 @@ const MAX_D: u8 = 3;
 
 /// Scores whose weight `exp(λk)` is tabulated (`|k| ≤ TABLE_RANGE`).
 const TABLE_RANGE: Score = 1024;
-
-/// Segment kinds, one array per kind in [`PosteriorScratch::running`] and
-/// [`PosteriorScratch::suffix`].
-const KINDS: usize = SegmentKind::ALL.len();
 
 /// How [`PlacementDag`] turns scores into probabilities.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -253,82 +249,44 @@ impl Weights {
     }
 }
 
-/// One placement in DAG order (query start, then end).
+/// Log-scales of one slot: its values are `e^{scale} · values`.
 #[derive(Clone, Copy, Debug)]
-struct Node {
-    placement: usize,
-    kind: SegmentKind,
-    q_start: u32,
-    /// `q_end − q_start`; cut offsets run over `0..=len`.
-    len: u32,
-    /// Start of the node's dense cut weights in `entry_w` / `exit_w`.
-    cuts: usize,
-    /// The node's canonical entry offsets (ascending) in `entries`.
-    entries: (usize, usize),
-    /// The node's slots in `slots`.
-    slots: (usize, usize),
-    /// `c_out − c_in`: entry and exit weights are centred separately, so a
-    /// span's weight is `entry_w · exit_w · e^{shift}`.
-    shift: f64,
-}
-
-impl Node {
-    fn q_end(&self) -> u32 {
-        self.q_start + self.len
-    }
-
-    /// As in the Viterbi DAG: an earlier kind, or the same kind starting earlier.
-    fn precedes(&self, other: &Node) -> bool {
-        (self.kind.index(), self.q_start) < (other.kind.index(), other.q_start)
-    }
-
-    fn width(&self) -> usize {
-        self.len as usize + 1
-    }
-}
-
-/// The paths through one node with one `(D count, first kind)`: forward
-/// mass per entry, backward mass per entry, each `e^{scale} · values`.
-#[derive(Clone, Copy, Debug)]
-struct Slot {
-    d_used: u8,
-    first: SegmentKind,
-    /// Start of the slot's `width` values in `forward` / `backward`;
-    /// `KINDS · values` starts its per-kind arrays in `running` / `suffix`.
-    values: usize,
-    forward_scale: f64,
+struct Scales {
+    forward: f64,
     /// Scale of the slot's exit mass; `−∞` when no path leaves it.
-    exit_scale: f64,
-    backward_scale: f64,
+    exit: f64,
+    backward: f64,
 }
 
-impl Slot {
-    /// The slot's array for `kind` in `running` / `suffix`.
-    fn per_kind(&self, kind: SegmentKind, width: usize) -> std::ops::Range<usize> {
-        let start = KINDS * self.values + kind.index() * width;
-        start..start + width
-    }
+impl Scales {
+    const EMPTY: Self = Self {
+        forward: f64::NEG_INFINITY,
+        exit: f64::NEG_INFINITY,
+        backward: f64::NEG_INFINITY,
+    };
 }
 
 /// Per-thread buffers for [`PlacementDag::posterior`].
 #[derive(Debug, Default)]
 pub struct PosteriorScratch {
     weights: Option<Weights>,
-    order: Vec<usize>,
-    nodes: Vec<Node>,
+    lattice: Lattice,
+    /// Per node: `c_out − c_in`. Entry and exit weights are centred
+    /// separately, so a span's weight is `entry_w · exit_w · e^{shift}`.
+    shift: Vec<f64>,
+    /// Per slot.
+    scales: Vec<Scales>,
     /// `e^{λ(centre − entry prefix)}` at canonical entries, else 0.
     entry_w: Vec<f64>,
     /// `e^{λ(exit prefix − centre)}` at canonical exits, else 0.
     exit_w: Vec<f64>,
-    entries: Vec<u32>,
-    slots: Vec<Slot>,
+    /// Per slot value: forward mass per entry, backward mass per entry.
     forward: Vec<f64>,
     backward: Vec<f64>,
     /// Per slot and successor kind: `R(z) = Σ_{x ≤ z} X(x) · e^{−λιx}`.
     running: Vec<f64>,
     /// Per slot and predecessor kind: `S(o) = Σ_{o' ≥ o} B(o') · e^{λιo'}`.
     suffix: Vec<f64>,
-    groups: Vec<(u8, SegmentKind)>,
     work: Vec<f64>,
     tails: Vec<f64>,
     /// Per Match column: query position, entry and exit prefix scores, and
@@ -360,48 +318,24 @@ fn normalise(values: &mut [f64]) -> f64 {
     max.ln()
 }
 
-/// Slots of `predecessors` whose paths continue into the group
-/// `(d_used, first)` of a node of kind `kind`.
-fn incoming<'s, G: Grammar>(
-    s: &'s PosteriorScratch,
-    grammar: &'s G,
-    predecessors: &'s [Node],
+/// Slots of the `successors` of kind `kind` that continue `group` and have
+/// completions.
+fn outgoing<'a>(
+    lattice: &'a Lattice,
+    scales: &'a [Scales],
+    successors: &'a [Node],
     kind: SegmentKind,
-    d_used: u8,
-    first: SegmentKind,
-) -> impl Iterator<Item = (Node, Slot)> + 's {
-    let d_before = d_used.checked_sub(u8::from(kind == SegmentKind::D));
-    predecessors.iter().flat_map(move |b| {
-        s.slots[b.slots.0..b.slots.1]
-            .iter()
-            .filter(move |u| {
-                u.first == first
-                    && Some(u.d_used) == d_before
-                    && u.exit_scale > f64::NEG_INFINITY
-                    && grammar.can_follow(b.kind, kind, u.d_used)
-            })
-            .map(move |u| (*b, *u))
-    })
-}
-
-/// The slot of each node of kind `kind` in `successors` that continues the
-/// paths of `slot`, when it has completions.
-fn outgoing<'s>(
-    s: &'s PosteriorScratch,
-    successors: &'s [Node],
-    kind: SegmentKind,
-    slot: &'s Slot,
-) -> impl Iterator<Item = (Node, Slot)> + 's {
-    let d_next = slot.d_used + u8::from(kind == SegmentKind::D);
+    group: Group,
+) -> impl Iterator<Item = (Node, usize)> + 'a {
+    let next = group.then(kind);
     successors
         .iter()
         .filter(move |e| e.kind == kind)
         .filter_map(move |e| {
-            s.slots[e.slots.0..e.slots.1]
-                .iter()
-                .find(|u| u.d_used == d_next && u.first == slot.first)
-                .filter(|u| u.backward_scale > f64::NEG_INFINITY)
-                .map(|u| (*e, *u))
+            lattice
+                .slot_of(e, next)
+                .filter(|&u| scales[u].backward > f64::NEG_INFINITY)
+                .map(|u| (*e, u))
         })
 }
 
@@ -451,16 +385,15 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
         if self.placements.is_empty() || !self.layout(s) {
             return None;
         }
-        s.slots.clear();
+        s.scales.clear();
         s.forward.clear();
         s.backward.clear();
         s.running.clear();
         s.suffix.clear();
         let mut log_z: Vec<f64> = Vec::new();
-        for e in 0..s.nodes.len() {
+        for e in 0..s.lattice.nodes.len() {
             self.gather(s, e);
-            let (first, end) = s.nodes[e].slots;
-            for t in first..end {
+            for t in s.lattice.nodes[e].slots() {
                 if let Some((d, mass)) = self.emit(s, e, t) {
                     if log_z.len() <= d {
                         log_z.resize(d + 1, f64::NEG_INFINITY);
@@ -473,37 +406,37 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
         if !log_partition.is_finite() {
             return None;
         }
-        for b in (0..s.nodes.len()).rev() {
-            let (first, end) = s.nodes[b].slots;
-            for t in first..end {
+        for b in (0..s.lattice.nodes.len()).rev() {
+            for t in s.lattice.nodes[b].slots() {
                 self.pull(s, b, t);
             }
         }
         Some(self.collect(s, &log_z, log_partition))
     }
 
-    /// Nodes in DAG order with dense canonical-cut weights. `false` when a
+    /// The lattice with dense canonical-cut weights. `false` when a
     /// placement's usable entries or exits span more than [`MAX_SPREAD`] nats,
     /// or an overlap more than [`OVERLAP_SPREAD`].
     fn layout(&self, s: &mut PosteriorScratch) -> bool {
         let placements = self.placements;
         let grammar = &self.dag.grammar;
         let lambda0 = self.w.lambda;
-        s.order.clear();
-        s.order.extend(0..placements.len());
-        s.order.sort_by_key(|&i| order_key(&placements[i], i));
-        s.nodes.clear();
-        s.entry_w.clear();
-        s.exit_w.clear();
-        s.entry_nats.clear();
-        s.exit_nats.clear();
-        s.entries.clear();
+        s.lattice.layout(placements);
+        let cells = s.lattice.cells();
+        for (weights, fill) in [(&mut s.entry_w, 0.0), (&mut s.exit_w, 0.0)]
+            .into_iter()
+            .chain([(&mut s.entry_nats, f64::NAN), (&mut s.exit_nats, f64::NAN)])
+        {
+            weights.clear();
+            weights.resize(cells, fill);
+        }
+        s.shift.clear();
         let any_d = |f: &dyn Fn(u8) -> bool| (0..=MAX_D).any(f);
-        for &i in &s.order {
-            let p = &placements[i];
+        for node in &s.lattice.nodes {
+            let p = &placements[node.placement];
             let steps = &self.steps[p.kind.index()];
             let EvidenceScale { lambda, mu } = steps.scale;
-            let (q_start, len) = (p.q_start(), p.q_end() - p.q_start());
+            let (q_start, len, cuts) = (node.q_start, node.len, node.cuts);
             // Cuts a path can use: entries past the start only when a kind
             // can precede this one, exits before the end only when one can
             // follow it. Only those set the centres and the spread.
@@ -551,12 +484,6 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
             let centre = |lo: f64, hi: f64| if lo <= hi { 0.5 * (lo + hi) } else { 0.0 };
             let (c_in, c_out) = (centre(in_lo, in_hi), centre(out_lo, out_hi));
 
-            let cuts = s.entry_w.len();
-            s.entry_w.resize(cuts + len as usize + 1, 0.0);
-            s.exit_w.resize(cuts + len as usize + 1, 0.0);
-            s.entry_nats.resize(cuts + len as usize + 1, f64::NAN);
-            s.exit_nats.resize(cuts + len as usize + 1, f64::NAN);
-            let first_entry = s.entries.len();
             // Running products along the alignment, `before` = e^{c_in − entry
             // nats} and `inv` = e^{entry nats − c_out}, reseeded exactly
             // wherever a used cut finds them out of range.
@@ -590,18 +517,8 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
                     s.exit_w[cuts + o as usize + 1] = inv * substitution(exit - entry, true);
                     s.exit_nats[cuts + o as usize + 1] = through;
                 }
-                s.entries.push(o);
             }
-            s.nodes.push(Node {
-                placement: i,
-                kind: p.kind,
-                q_start,
-                len,
-                cuts,
-                entries: (first_entry, s.entries.len()),
-                slots: (0, 0),
-                shift: c_out - c_in,
-            });
+            s.shift.push(c_out - c_in);
         }
         self.overlaps_in_range(s)
     }
@@ -621,8 +538,9 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
                 });
             (max - min).max(0.0)
         };
-        for (k, e) in s.nodes.iter().enumerate() {
-            for b in &s.nodes[..k] {
+        let nodes = &s.lattice.nodes;
+        for (k, e) in nodes.iter().enumerate() {
+            for b in &nodes[..k] {
                 let follows = (0..=MAX_D).any(|d| grammar.can_follow(b.kind, e.kind, d));
                 if !(b.precedes(e) && follows && b.q_end() > e.q_start && e.q_end() > b.q_start) {
                     continue;
@@ -637,74 +555,44 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
         true
     }
 
-    /// Forward: create node `e`'s slots and their entry masses `F(e, ·)`
-    /// from path starts and from every predecessor's exits.
+    /// Forward: open node `e`'s slots and compute their entry masses
+    /// `F(e, ·)` from path starts and from every predecessor's exits.
     fn gather(&self, s: &mut PosteriorScratch, e: usize) {
         let grammar = &self.dag.grammar;
-        let node = s.nodes[e];
+        let node = s.lattice.nodes[e];
         let width = node.width();
-        let predecessors = s.nodes.partition_point(|b| b.precedes(&node));
         let start = grammar
             .can_start(node.kind)
-            .then_some((u8::from(node.kind == SegmentKind::D), node.kind))
+            .then(|| Group::start(node.kind))
             .filter(|_| s.entry_w[node.cuts] > 0.0);
+        let scales = &s.scales;
+        let slots = s
+            .lattice
+            .open(e, grammar, start, |u| scales[u].exit > f64::NEG_INFINITY);
+        s.scales.resize(s.lattice.slots.len(), Scales::EMPTY);
+        let values = s.lattice.values();
+        s.forward.resize(values, 0.0);
+        s.backward.resize(values, 0.0);
+        s.running.resize(KINDS * values, 0.0);
+        s.suffix.resize(KINDS * values, 0.0);
 
-        s.groups.clear();
-        s.groups.extend(start);
-        for b in &s.nodes[..predecessors] {
-            for u in &s.slots[b.slots.0..b.slots.1] {
-                let group = (u.d_used + u8::from(node.kind == SegmentKind::D), u.first);
-                if u.exit_scale > f64::NEG_INFINITY
-                    && grammar.can_follow(b.kind, node.kind, u.d_used)
-                    && !s.groups.contains(&group)
-                {
-                    s.groups.push(group);
-                }
-            }
-        }
-        let first_slot = s.slots.len();
-        for &(d_used, first) in &s.groups {
-            let values = s.forward.len();
-            s.forward.resize(values + width, 0.0);
-            s.backward.resize(values + width, 0.0);
-            s.running.resize(KINDS * (values + width), 0.0);
-            s.suffix.resize(KINDS * (values + width), 0.0);
-            s.slots.push(Slot {
-                d_used,
-                first,
-                values,
-                forward_scale: f64::NEG_INFINITY,
-                exit_scale: f64::NEG_INFINITY,
-                backward_scale: f64::NEG_INFINITY,
-            });
-        }
-        s.nodes[e].slots = (first_slot, s.slots.len());
-
-        for t in first_slot..s.slots.len() {
-            let Slot {
-                d_used,
-                first,
-                values,
-                ..
-            } = s.slots[t];
-            let starts_here = start == Some((d_used, first));
-            // A predecessor ending before this node reaches it across an N/P
-            // gap; its weight joins the log scale, so a long, costly gap
-            // cannot underflow when every path crosses it.
-            let gap = |b: &Node| {
-                let iota = self.dag.model.junction_per_base(b.kind, node.kind);
-                self.w.lambda * f64::from(iota * node.q_start.saturating_sub(b.q_end()) as Score)
-            };
-            let reference = incoming(
-                s,
-                grammar,
-                &s.nodes[..predecessors],
-                node.kind,
-                d_used,
-                first,
-            )
-            .map(|(b, u)| u.exit_scale + gap(&b))
-            .fold(if starts_here { 0.0 } else { f64::NEG_INFINITY }, f64::max);
+        // A predecessor ending before this node reaches it across an N/P
+        // gap; its weight joins the log scale, so a long, costly gap cannot
+        // underflow when every path crosses it. 0 for an overlapping one.
+        let gap = |b: &Node| {
+            let iota = self.dag.model.junction_per_base(b.kind, node.kind);
+            self.w.lambda * f64::from(iota * node.q_start.saturating_sub(b.q_end()) as Score)
+        };
+        for t in slots {
+            let slot = s.lattice.slots[t];
+            let starts_here = start == Some(slot.group);
+            let scales = &s.scales;
+            let live = |u: usize| scales[u].exit > f64::NEG_INFINITY;
+            let reference = s
+                .lattice
+                .incoming(e, grammar, slot.group, &live)
+                .map(|(b, u)| scales[u].exit + gap(&b))
+                .fold(if starts_here { 0.0 } else { f64::NEG_INFINITY }, f64::max);
 
             let mut tails = std::mem::take(&mut s.tails);
             tails.clear();
@@ -715,18 +603,10 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
             if starts_here {
                 f[0] = (-reference).exp();
             }
-            let entries = &s.entries[node.entries.0..node.entries.1];
-            for (b, u) in incoming(
-                s,
-                grammar,
-                &s.nodes[..predecessors],
-                node.kind,
-                d_used,
-                first,
-            ) {
-                // `gap(b)` is 0 for a predecessor that overlaps this node.
-                let factor = (u.exit_scale + gap(&b) - reference).exp();
-                let r = &s.running[u.per_kind(node.kind, b.width())];
+            let entries = s.lattice.entries(&node);
+            for (b, u) in s.lattice.incoming(e, grammar, slot.group, &live) {
+                let factor = (scales[u].exit + gap(&b) - reference).exp();
+                let r = &s.running[s.lattice.slots[u].per_kind(node.kind, b.width())];
                 // Entries inside b: exits up to the entry (none before b's
                 // start, which a predecessor of another kind may have).
                 for &o in entries {
@@ -762,8 +642,8 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
                 }
             }
             let scale = normalise(&mut f);
-            s.forward[values..values + width].copy_from_slice(&f);
-            s.slots[t].forward_scale = reference + scale;
+            s.forward[slot.values..slot.values + width].copy_from_slice(&f);
+            s.scales[t].forward = reference + scale;
             s.work = f;
             s.tails = tails;
         }
@@ -773,9 +653,11 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
     /// running sums per successor kind, and the slot's path-end mass
     /// `(D count, ln mass)` if paths may end here.
     fn emit(&self, s: &mut PosteriorScratch, e: usize, t: usize) -> Option<(usize, f64)> {
-        let node = s.nodes[e];
-        let slot = s.slots[t];
-        if slot.forward_scale == f64::NEG_INFINITY {
+        let node = s.lattice.nodes[e];
+        let slot = s.lattice.slots[t];
+        let Group { d_used, first } = slot.group;
+        let forward_scale = s.scales[t].forward;
+        if forward_scale == f64::NEG_INFINITY {
             return None;
         }
         let width = node.width();
@@ -783,7 +665,7 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
         let bonus = self.w.of(self
             .dag
             .model
-            .segment_bonus(&self.placements[node.placement], slot.d_used));
+            .segment_bonus(&self.placements[node.placement], d_used));
         let mut x = std::mem::take(&mut s.work);
         x.clear();
         let mut acc = 0.0;
@@ -802,13 +684,13 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
                 0.0
             };
         }
-        let exit_scale = slot.forward_scale + entered + normalise(&mut x) + node.shift;
-        s.slots[t].exit_scale = exit_scale;
+        let exit_scale = forward_scale + entered + normalise(&mut x) + s.shift[e];
+        s.scales[t].exit = exit_scale;
         let mut end = None;
         if exit_scale > f64::NEG_INFINITY {
             let mut done: Option<(Score, usize)> = None;
             for kind in SegmentKind::ALL {
-                if !self.dag.grammar.can_follow(node.kind, kind, slot.d_used) {
+                if !self.dag.grammar.can_follow(node.kind, kind, d_used) {
                     continue;
                 }
                 let iota = self.dag.model.junction_per_base(node.kind, kind);
@@ -830,12 +712,10 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
                     }
                 }
             }
-            if self.dag.grammar.can_end(slot.first, node.kind) && x[width - 1] > 0.0 {
-                let bonus = self
-                    .w
-                    .of(self.dag.model.end(slot.first, node.kind, slot.d_used));
+            if self.dag.grammar.can_end(first, node.kind) && x[width - 1] > 0.0 {
+                let bonus = self.w.of(self.dag.model.end(first, node.kind, d_used));
                 end = Some((
-                    usize::from(slot.d_used),
+                    usize::from(d_used),
                     exit_scale + (x[width - 1] * bonus).ln(),
                 ));
             }
@@ -848,15 +728,16 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
     /// and every successor's entries, then its suffix sums per predecessor kind.
     fn pull(&self, s: &mut PosteriorScratch, b: usize, t: usize) {
         let (grammar, model) = (&self.dag.grammar, &self.dag.model);
-        let node = s.nodes[b];
-        let slot = s.slots[t];
-        if slot.exit_scale == f64::NEG_INFINITY {
+        let node = s.lattice.nodes[b];
+        let slot = s.lattice.slots[t];
+        let Group { d_used, first } = slot.group;
+        if s.scales[t].exit == f64::NEG_INFINITY {
             return;
         }
         let width = node.width();
-        let successors = s.nodes.partition_point(|e| !node.precedes(e));
-        let can_end = grammar.can_end(slot.first, node.kind);
-        let follows = |kind: SegmentKind| grammar.can_follow(node.kind, kind, slot.d_used);
+        let successors = &s.lattice.nodes[s.lattice.successors(b)..];
+        let can_end = grammar.can_end(first, node.kind);
+        let follows = |kind: SegmentKind| grammar.can_follow(node.kind, kind, d_used);
         // As in the forward pass, an N/P gap to a successor that starts after
         // this node's end joins the log scale.
         let gap = |e: &Node| {
@@ -865,8 +746,8 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
         };
         let mut reference = if can_end { 0.0 } else { f64::NEG_INFINITY };
         for kind in SegmentKind::ALL.into_iter().filter(|&k| follows(k)) {
-            for (e, u) in outgoing(s, &s.nodes[successors..], kind, &slot) {
-                reference = reference.max(u.backward_scale + gap(&e));
+            for (e, u) in outgoing(&s.lattice, &s.scales, successors, kind, slot.group) {
+                reference = reference.max(s.scales[u].backward + gap(&e));
             }
         }
         if reference == f64::NEG_INFINITY {
@@ -878,18 +759,18 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
         inner.clear();
         inner.resize(width, 0.0);
         if can_end {
-            inner[width - 1] =
-                self.w.of(model.end(slot.first, node.kind, slot.d_used)) * (-reference).exp();
+            inner[width - 1] = self.w.of(model.end(first, node.kind, d_used)) * (-reference).exp();
         }
         let mut tails = std::mem::take(&mut s.tails);
         for kind in SegmentKind::ALL.into_iter().filter(|&k| follows(k)) {
             let iota = model.junction_per_base(node.kind, kind);
             tails.clear();
             tails.resize(width, 0.0);
-            for (e, u) in outgoing(s, &s.nodes[successors..], kind, &slot) {
-                let factor = (u.backward_scale + gap(&e) - reference).exp();
-                let backward = &s.backward[u.values..u.values + e.width()];
-                for &o in &s.entries[e.entries.0..e.entries.1] {
+            for (e, u) in outgoing(&s.lattice, &s.scales, successors, kind, slot.group) {
+                let successor = s.lattice.slots[u];
+                let factor = (s.scales[u].backward + gap(&e) - reference).exp();
+                let backward = &s.backward[successor.values..successor.values + e.width()];
+                for &o in s.lattice.entries(&e) {
                     let y = e.q_start + o;
                     if y >= node.q_end() {
                         break;
@@ -901,7 +782,7 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
                 }
                 let beyond = node.q_end().saturating_sub(e.q_start) as usize;
                 if beyond < e.width() {
-                    let suffix = &s.suffix[u.per_kind(node.kind, e.width())];
+                    let suffix = &s.suffix[successor.per_kind(node.kind, e.width())];
                     tails[width - 1] += factor * suffix[beyond];
                 }
             }
@@ -919,7 +800,7 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
         let min = self.dag.min_bases(node.kind) as usize;
         let bonus = self
             .w
-            .of(model.segment_bonus(&self.placements[node.placement], slot.d_used));
+            .of(model.segment_bonus(&self.placements[node.placement], d_used));
         let mut acc = 0.0;
         for o in (0..width).rev() {
             acc += s.exit_w[node.cuts + o] * bonus * inner[o];
@@ -936,13 +817,13 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
             };
         }
         let scale = normalise(out);
-        s.slots[t].backward_scale = reference + left + scale + node.shift;
+        s.scales[t].backward = reference + left + scale + s.shift[b];
         s.work = inner;
 
         // Suffix sums for predecessors of each kind that can precede this slot.
         let mut done: Option<(Score, usize)> = None;
         for kind in SegmentKind::ALL {
-            if !(0..=slot.d_used).any(|d| grammar.can_follow(kind, node.kind, d)) {
+            if !(0..=d_used).any(|d| grammar.can_follow(kind, node.kind, d)) {
                 continue;
             }
             let iota = model.junction_per_base(kind, node.kind);
@@ -967,13 +848,14 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
 
     fn collect(&self, s: &PosteriorScratch, log_z: &[f64], log_partition: f64) -> Marginals {
         let mut placement = vec![0.0; self.placements.len()];
-        for node in &s.nodes {
-            for slot in &s.slots[node.slots.0..node.slots.1] {
-                let scale = slot.forward_scale + slot.backward_scale;
+        for node in &s.lattice.nodes {
+            for t in node.slots() {
+                let scale = s.scales[t].forward + s.scales[t].backward;
                 if scale == f64::NEG_INFINITY {
                     continue;
                 }
-                let range = slot.values..slot.values + node.width();
+                let values = s.lattice.slots[t].values;
+                let range = values..values + node.width();
                 let mass: f64 = s.forward[range.clone()]
                     .iter()
                     .zip(&s.backward[range])
@@ -1213,7 +1095,7 @@ mod tests {
         let profile = SubstitutionProfile::build(&scoring, &reference);
         let mut ops = vec![Op::Match; 5];
         ops.push(Op::Ins);
-        ops.extend(std::iter::repeat(Op::Match).take(7));
+        ops.extend(std::iter::repeat_n(Op::Match, 7));
         let (mut q, mut r, mut score) = (21usize, 0usize, 0);
         for &op in &ops {
             match op {
@@ -1313,15 +1195,7 @@ mod tests {
     /// are carried relative to each cut, so nothing overflows.
     #[test]
     fn strong_junction_costs_stay_in_range() {
-        let mut x = 7u64;
-        let query: Vec<u8> = (0..340)
-            .map(|_| {
-                x = x
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                ((x >> 33) & 3) as u8
-            })
-            .collect();
+        let query = crate::sim::Rng::new(7).codes(340);
         let mutate = |range: std::ops::Range<usize>, every: usize| -> Vec<u8> {
             range
                 .enumerate()
@@ -1357,15 +1231,7 @@ mod tests {
     /// is below the `f64` range as a factor; it must go into the log scale.
     #[test]
     fn long_costly_gaps_keep_their_mass() {
-        let mut x = 11u64;
-        let query: Vec<u8> = (0..360)
-            .map(|_| {
-                x = x
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                ((x >> 33) & 3) as u8
-            })
-            .collect();
+        let query = crate::sim::Rng::new(11).codes(360);
         let placements = vec![
             placement(SegmentKind::V, &query, &query[..30], 0),
             placement(SegmentKind::J, &query, &query[330..], 330),
@@ -1391,15 +1257,7 @@ mod tests {
     /// wrong ones.
     #[test]
     fn overlaps_beyond_the_f64_range_are_refused() {
-        let mut x = 5u64;
-        let query: Vec<u8> = (0..700)
-            .map(|_| {
-                x = x
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                ((x >> 33) & 3) as u8
-            })
-            .collect();
+        let query = crate::sim::Rng::new(5).codes(700);
         let placements = vec![
             placement(SegmentKind::V, &query, &query[..600], 0),
             placement(SegmentKind::J, &query, &query[60..], 60),

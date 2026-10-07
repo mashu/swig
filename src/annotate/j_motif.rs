@@ -5,7 +5,7 @@
 //! genes end ~10 codons after it) and an open reading frame through FR4.
 //! The work per allele is one translation plus a scan of ~15 codons per frame.
 
-use crate::translate::{translate_frames, STOP};
+use crate::translate::{STOP, translate_frames};
 
 const STOP_PENALTY: i32 = 15;
 const PRIOR_WEIGHT: i32 = 6;
@@ -69,9 +69,7 @@ pub fn find_j(codes: &[u8], tail_prior: Option<u32>, frames: &mut [Vec<u8>; 3]) 
                 score,
                 confident: glycine1 && glycine3 && stops == 0,
             };
-            if best.map_or(true, |b| {
-                (hit.score, hit.confident) > (b.score, b.confident)
-            }) {
+            if best.is_none_or(|b| (hit.score, hit.confident) > (b.score, b.confident)) {
                 best = Some(hit);
             }
         }

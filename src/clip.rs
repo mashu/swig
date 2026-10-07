@@ -234,7 +234,7 @@ impl ClipIndex {
     }
 
     /// `(op, query_pos, ref_pos)` of the columns of `span`.
-    pub fn columns(&self, span: &ClipSpan) -> impl Iterator<Item = (Op, u32, u32)> + '_ {
+    pub fn columns(&self, span: &ClipSpan) -> impl Iterator<Item = (Op, u32, u32)> + use<'_> {
         (span.first_col as usize..=span.last_col as usize).map(move |k| {
             let Column { op, q, r } = self.columns[k];
             (op, q, r)

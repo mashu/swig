@@ -1,33 +1,13 @@
-//! Post-adjudication refinement of the winning path only.
+//! Outer-flank extension of local alignments.
 //!
-//! The note's target architecture refines boundaries on the winning path
-//! alone (clip-rescore or a short banded re-alignment). Refiners receive the
-//! oriented query, may append new placements (e.g. a re-aligned segment) and
-//! rewrite the path.
-//!
-//! [`extend_outer`] also lives here: it stitches the co-linear V prefix or J
-//! suffix back onto a local alignment and adds its substitution score, so a
-//! V (J) alignment reaches the germline's 5′ (3′) end or the read's end,
-//! whichever comes first. The flank carries allele evidence that a local
-//! alignment would drop (a mismatch-rich 5′ end of V), and ranking on the
-//! extended score uses it.
+//! [`extend_outer`] stitches the co-linear V prefix or J suffix back onto a
+//! local alignment and adds its substitution score, so a V (J) alignment
+//! reaches the germline's 5′ (3′) end or the read's end, whichever comes
+//! first. The flank carries allele evidence that a local alignment would drop
+//! (a mismatch-rich 5′ end of V), and ranking on the extended score uses it.
 
-use crate::adjudicate::CallPath;
 use crate::align::{Alignment, Op};
-use crate::placement::Placement;
 use crate::scoring::SubstitutionProfile;
-
-pub trait Refiner: Send + Sync {
-    fn refine(&self, query: &[u8], placements: &mut Vec<Placement>, path: &mut CallPath);
-}
-
-/// Leave the adjudicated path unchanged.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NoRefine;
-
-impl Refiner for NoRefine {
-    fn refine(&self, _: &[u8], _: &mut Vec<Placement>, _: &mut CallPath) {}
-}
 
 /// Which unaligned flank of a local alignment to stitch back on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

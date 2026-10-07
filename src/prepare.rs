@@ -11,7 +11,7 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
-use crate::annotate::{annotate, AlleleAnnotation, AnnotateOptions, DatabaseAnnotation};
+use crate::annotate::{AlleleAnnotation, AnnotateOptions, DatabaseAnnotation, annotate};
 use crate::germline::{GermlineError, GermlineSet, MergedDuplicate, SegmentKind};
 
 fn label(annotations: &[AlleleAnnotation], id: u32) -> Option<String> {

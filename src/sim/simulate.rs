@@ -517,7 +517,7 @@ mod tests {
                 .regions
                 .iter()
                 .zip(&read.origins)
-                .filter(|(&r, &o)| r == Region::V && o != NO_ORIGIN)
+                .filter(|&(&r, &o)| r == Region::V && o != NO_ORIGIN)
                 .map(|(_, &o)| o)
                 .collect();
             assert!(v_origins.windows(2).all(|w| w[0] < w[1]));

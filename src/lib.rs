@@ -41,6 +41,7 @@ pub mod config;
 pub mod evidence;
 pub mod family_bound;
 pub mod fasta;
+pub mod flank;
 pub mod germline;
 pub mod index;
 pub mod orient;
@@ -50,7 +51,6 @@ pub mod prepare;
 pub mod profiles;
 pub mod read_regions;
 pub mod reads;
-pub mod refine;
 pub mod report;
 pub mod retrieve;
 pub mod scoring;
@@ -58,6 +58,8 @@ pub mod seed;
 pub mod segment;
 pub mod sim;
 pub mod stats;
+#[cfg(test)]
+mod testing;
 pub mod translate;
 pub mod window;
 
@@ -83,7 +85,6 @@ pub mod prelude {
     pub use crate::pipeline::{AlleleCatalog, Assigner, AssignerOptions, Call, VdjAssigner};
     pub use crate::profiles::CallingProfile;
     pub use crate::reads::{ReadFormat, ReadReader, ReadRecord};
-    pub use crate::refine::{NoRefine, Refiner};
     pub use crate::report::{AirrRecord, SupportModels};
     pub use crate::retrieve::{Candidate, ExhaustiveRetriever, Retriever};
     pub use crate::scoring::{AffineScoring, HotspotScoring};

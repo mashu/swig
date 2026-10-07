@@ -1,69 +1,101 @@
 //! Sibling upper bounds: skip DP for alleles of the same gene that cannot
 //! enter the top-N local scores.
 //!
-//! After the representative allele \(R\) of a gene is scored, every same-length
-//! sibling \(A\) satisfies
-//! \[
-//! S^*(A) \le S^*(R) + \Delta(R,A)
-//! \]
-//! where \(\Delta\) is the sum over reference positions of
-//! \(\max_q\bigl(s(A\[j\],q) - s(R\[j\],q)\bigr)\), taken from the substitution
-//! profiles. The proof maps the optimal path of \(A\) onto \(R\) at the same
-//! coordinates (valid when \(|A| = |R|\)); gap columns are unchanged and each
-//! substitution column gains at most that per-position maximum.
+//! After the representative allele `R` of a gene is scored in band `B`,
+//! every same-length sibling `A` aligned in the *same* band satisfies
 //!
-//! Alleles of different length are not bounded and are always scored.
+//! ```text
+//! S*_B(A) ≤ S*_B(R) + Δ(R, A),   Δ(R, A) = Σ_j max(0, max_q (s_A(q, j) − s_R(q, j)))
+//! ```
+//!
+//! with `s_X(q, j)` the profile score of query code `q` at position `j`. The
+//! proof maps the optimal path of `A` onto `R` cell for cell: the path stays
+//! inside `B` and inside `R`'s matrix (`|A| = |R|`), gap columns score
+//! alike, and each substitution column gains at most that per-position
+//! maximum. A sibling in another band (another gene frame, or another
+//! offset in the frame) or of another length is not bounded and is always
+//! scored.
+//!
+//! `Δ` depends only on the two profiles, so it is computed once per
+//! same-length allele pair of each gene when the stage is built.
 
 use crate::alphabet::ALPHABET_SIZE;
-use crate::germline::{AlleleId, GeneId, GermlineSet};
+use crate::germline::{AlleleId, GeneId};
 use crate::scoring::{Score, SubstitutionProfile};
 use crate::segment::PreparedSegment;
 
-/// Precomputed per-gene allele lists for family-delta pruning.
+/// `Δ(R, A)` of every same-length allele pair within each gene.
 #[derive(Clone, Debug, Default)]
 pub struct FamilyBoundTable {
     /// Gene of each allele id.
     allele_gene: Vec<GeneId>,
-    /// Alleles of each gene, in allele-id order.
-    gene_alleles: Vec<Vec<AlleleId>>,
+    /// Position of each allele in its gene's allele list.
+    rank: Vec<u32>,
+    /// Per gene: `delta[r · n + a]` for representative rank `r` and sibling
+    /// rank `a` (`n` alleles in the gene), `None` across lengths.
+    delta: Vec<Vec<Option<Score>>>,
 }
 
 impl FamilyBoundTable {
-    pub fn build(set: &GermlineSet) -> Self {
+    pub fn build(segment: &PreparedSegment) -> Self {
+        let set = segment.set();
         let allele_gene: Vec<GeneId> = set.alleles().iter().map(|a| a.gene).collect();
-        let mut gene_alleles = vec![Vec::new(); set.gene_count()];
-        for (id, gene) in allele_gene.iter().copied().enumerate() {
-            gene_alleles[gene as usize].push(id as AlleleId);
+        let mut members: Vec<Vec<AlleleId>> = vec![Vec::new(); set.gene_count()];
+        let mut rank = vec![0; allele_gene.len()];
+        for (id, &gene) in allele_gene.iter().enumerate() {
+            let list = &mut members[gene as usize];
+            rank[id] = u32::try_from(list.len()).expect("allele count fits u32");
+            list.push(AlleleId::try_from(id).expect("allele count fits u32"));
         }
+        let delta = members
+            .iter()
+            .map(|alleles| {
+                alleles
+                    .iter()
+                    .flat_map(|&r| {
+                        alleles
+                            .iter()
+                            .map(move |&a| sibling_delta(segment.profile(r), segment.profile(a)))
+                    })
+                    .collect()
+            })
+            .collect();
         Self {
             allele_gene,
-            gene_alleles,
+            rank,
+            delta,
         }
     }
 
+    #[inline]
     pub fn gene(&self, allele: AlleleId) -> GeneId {
         self.allele_gene[allele as usize]
     }
 
-    pub fn alleles_of(&self, gene: GeneId) -> &[AlleleId] {
-        &self.gene_alleles[gene as usize]
-    }
-
-    /// Upper bound on the sibling's local score given the representative's.
-    /// `None` when the alleles differ in length (bound does not apply).
+    /// Upper bound on the sibling's local score given the representative's,
+    /// both aligned in the same band. `None` when the alleles belong to
+    /// different genes or differ in length (the bound does not apply).
     pub fn upper_bound(
         &self,
-        segment: &PreparedSegment,
         representative: AlleleId,
         sibling: AlleleId,
         representative_score: Score,
     ) -> Option<Score> {
-        let delta = sibling_delta(segment.profile(representative), segment.profile(sibling))?;
-        Some(representative_score.saturating_add(delta))
+        let gene = self.gene(representative);
+        if gene != self.gene(sibling) {
+            return None;
+        }
+        let deltas = &self.delta[gene as usize];
+        let n = deltas.len().isqrt();
+        let (r, a) = (
+            self.rank[representative as usize] as usize,
+            self.rank[sibling as usize] as usize,
+        );
+        deltas[r * n + a].map(|delta| representative_score.saturating_add(delta))
     }
 }
 
-/// \(\Delta(R,A) = \sum_j \max\bigl(0,\ \max_q (s_A(q,j) - s_R(q,j))\bigr)\).
+/// `Δ(R, A) = Σ_j max(0, max_q (s_A(q, j) − s_R(q, j)))`.
 ///
 /// `None` when the profiles have different lengths.
 pub fn sibling_delta(
@@ -73,18 +105,20 @@ pub fn sibling_delta(
     if representative.len() != sibling.len() {
         return None;
     }
-    let mut delta = 0;
-    for j in 0..representative.len() {
-        let mut best = 0;
-        for code in 0..ALPHABET_SIZE {
-            let gain = sibling.at(code as u8, j) - representative.at(code as u8, j);
-            if gain > best {
-                best = gain;
-            }
+    let gain = |code: u8| {
+        sibling
+            .row(code)
+            .iter()
+            .zip(representative.row(code))
+            .map(|(a, r)| a - r)
+    };
+    let mut best = vec![0; representative.len()];
+    for code in 0..ALPHABET_SIZE as u8 {
+        for (slot, g) in best.iter_mut().zip(gain(code)) {
+            *slot = (*slot).max(g);
         }
-        delta += best;
     }
-    Some(delta)
+    Some(best.iter().sum())
 }
 
 #[cfg(test)]
@@ -93,93 +127,94 @@ mod tests {
     use crate::align::{Aligner, BandedGotoh};
     use crate::alphabet::encode;
     use crate::band::Band;
-    use crate::germline::SegmentKind;
-    use crate::scoring::{AffineScoring, GapCosts};
+    use crate::germline::{GermlineSet, SegmentKind};
+    use crate::scoring::AffineScoring;
 
-    fn profiles(a: &[u8], b: &[u8]) -> (SubstitutionProfile, SubstitutionProfile) {
-        let scoring = AffineScoring::new(2, -3, -9, -1);
-        (
-            SubstitutionProfile::build(&scoring, &encode(a)),
-            SubstitutionProfile::build(&scoring, &encode(b)),
-        )
+    const SCORING: AffineScoring = AffineScoring::new(2, -3, -9, -1);
+
+    fn profile(sequence: &[u8]) -> SubstitutionProfile {
+        SubstitutionProfile::build(&SCORING, &encode(sequence))
     }
 
-    fn score_against(query: &[u8], reference: &[u8]) -> Score {
-        let scoring = AffineScoring::new(2, -3, -9, -1);
-        let profile = SubstitutionProfile::build(&scoring, reference);
-        let mut ws = Default::default();
+    fn score_against(query: &[u8], reference: &[u8], band: Band) -> Score {
+        let profile = SubstitutionProfile::build(&SCORING, reference);
         BandedGotoh
-            .score(query, &profile, GapCosts::new(-9, -1), Band::Full, &mut ws)
-            .map(|hit| hit.score)
-            .unwrap_or(0)
+            .score(query, &profile, SCORING.gaps, band, &mut Default::default())
+            .map_or(0, |hit| hit.score)
     }
 
     #[test]
-    fn identical_alleles_have_zero_delta() {
-        let (r, a) = profiles(b"ACGTACGT", b"ACGTACGT");
-        assert_eq!(sibling_delta(&r, &a), Some(0));
+    fn deltas_count_profile_gains() {
+        let delta = |a: &[u8], b: &[u8]| sibling_delta(&profile(a), &profile(b));
+        assert_eq!(delta(b"ACGTACGT", b"ACGTACGT"), Some(0));
+        assert_eq!(delta(b"ACGTACGT", b"AGGTACGT"), Some(5)); // 2 − (−3)
+        assert_eq!(delta(b"ACGTACGT", b"ACGTACG"), None);
     }
 
     #[test]
-    fn one_snp_costs_match_minus_mismatch() {
-        let (r, a) = profiles(b"ACGTACGT", b"AGGTACGT");
-        assert_eq!(sibling_delta(&r, &a), Some(5)); // 2 - (-3)
-    }
-
-    #[test]
-    fn different_lengths_are_unbounded() {
-        let (r, a) = profiles(b"ACGTACGT", b"ACGTACG");
-        assert_eq!(sibling_delta(&r, &a), None);
-    }
-
-    #[test]
-    fn table_groups_alleles_by_gene() {
+    fn table_bounds_same_gene_same_length_pairs_only() {
         let mut set = GermlineSet::new(SegmentKind::V);
         set.push("IGHV1-1*01", b"ACGTACGTACGTACGTACGTACGT", None)
             .unwrap();
-        set.push("IGHV1-1*02", b"AGGTACGTACGTACGTACGTACGT", None)
-            .unwrap();
         set.push("IGHV1-2*01", b"TTTTACGTACGTACGTACGTACGT", None)
             .unwrap();
-        let table = FamilyBoundTable::build(&set);
-        assert_eq!(table.alleles_of(0), &[0, 1]);
-        assert_eq!(table.alleles_of(1), &[2]);
-        let scoring = AffineScoring::new(2, -3, -9, -1);
-        let segment = PreparedSegment::new(set, &scoring, scoring.gaps);
-        assert_eq!(table.upper_bound(&segment, 0, 1, 100), Some(105));
-        // Same length, three SNPs in the prefix (position 3 is T in both):
-        // bound is available; the stage only applies it inside one gene.
-        assert_eq!(table.upper_bound(&segment, 0, 2, 100), Some(115));
+        set.push("IGHV1-1*02", b"AGGTACGTACGTACGTACGTACGT", None)
+            .unwrap();
+        set.push("IGHV1-1*03", b"ACGTACGTACGTACGTACGTACG", None)
+            .unwrap();
+        let segment = PreparedSegment::new(set, &SCORING, SCORING.gaps);
+        let table = FamilyBoundTable::build(&segment);
+        assert_eq!(table.upper_bound(0, 2, 100), Some(105));
+        assert_eq!(table.upper_bound(2, 0, 100), Some(105));
+        assert_eq!(table.upper_bound(0, 0, 100), Some(100));
+        // Another gene, another length.
+        assert_eq!(table.upper_bound(0, 1, 100), None);
+        assert_eq!(table.upper_bound(0, 3, 100), None);
     }
 
+    /// The bound holds for every query and every band both alleles share.
     #[test]
     fn bound_never_underestimates_local_score() {
-        // Same length; two substitutions (positions 20 and 23).
-        let rep = encode(b"CAGGTCACCTTGAAGGAGTCTGGTCC");
-        let sib = encode(b"CAGGTCACCTTGAAGGAGTCCGGCCC");
-        let (rep_profile, sib_profile) = {
-            let scoring = AffineScoring::new(2, -3, -9, -1);
-            (
-                SubstitutionProfile::build(&scoring, &rep),
-                SubstitutionProfile::build(&scoring, &sib),
-            )
-        };
-        let delta = sibling_delta(&rep_profile, &sib_profile).unwrap();
-        assert_eq!(delta, 10);
-
-        // Queries close to the sibling, the representative, and a decoy.
-        let queries = [
-            sib.clone(),
-            rep.clone(),
-            encode(b"CAGGTCACCTTGAAGGAGTCTGGTCA"),
-            encode(b"NNNNNCACCTTGAAGGAGTCTGGTCC"),
-        ];
-        for query in &queries {
-            let s_rep = score_against(query, &rep);
-            let s_sib = score_against(query, &sib);
+        let rep = encode(b"CAGGTCACCTTGAAGGAGTCTGGTCCTGCCTGGTGAAACCCACACAGACC");
+        let mut sib = rep.clone();
+        sib[20] = 1;
+        sib[23] = 1;
+        sib[41] = 3;
+        let delta = sibling_delta(
+            &SubstitutionProfile::build(&SCORING, &rep),
+            &SubstitutionProfile::build(&SCORING, &sib),
+        )
+        .unwrap();
+        let mut words = crate::testing::rng(3);
+        let mut next = || words() as usize;
+        for _ in 0..300 {
+            // A mutated, shifted, indel-carrying copy of either allele.
+            let source = if next() % 2 == 0 { &rep } else { &sib };
+            let mut query: Vec<u8> = (0..next() % 12).map(|_| (next() % 4) as u8).collect();
+            let lead = query.len() as i32;
+            query.extend(source.iter().map(|&c| {
+                if next() % 8 == 0 {
+                    (next() % 5) as u8
+                } else {
+                    c
+                }
+            }));
+            if next() % 2 == 0 {
+                let at = next() % query.len();
+                query.insert(at, (next() % 4) as u8);
+            }
+            let band = match next() % 3 {
+                0 => Band::Full,
+                1 => Band::around(lead, 2),
+                _ => Band::around(lead + (next() % 7) as i32 - 3, 8),
+            };
+            let (s_rep, s_sib) = (
+                score_against(&query, &rep, band),
+                score_against(&query, &sib, band),
+            );
             assert!(
                 s_sib <= s_rep + delta,
-                "query score sibling {s_sib} > rep {s_rep} + delta {delta}"
+                "{band:?}: sibling {s_sib} > {s_rep} + {delta}"
             );
         }
     }

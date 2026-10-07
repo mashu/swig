@@ -5,7 +5,7 @@ use std::fmt;
 use std::io::{self, Write};
 
 use crate::alphabet;
-use crate::fasta::{parse_fasta, FastaError};
+use crate::fasta::{FastaError, parse_fasta};
 
 /// Gene segment type. The derive order (V < D < J) is genomic order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -184,6 +184,8 @@ pub struct GermlineSet {
     alleles: Vec<Allele>,
     genes: Vec<String>,
     gene_ids: HashMap<String, GeneId>,
+    /// Summed allele lengths (the search space of E-values).
+    total_len: usize,
 }
 
 fn parse_position(name: &str, key: &str, value: &str) -> Result<u32, GermlineError> {
@@ -203,6 +205,19 @@ impl GermlineSet {
             alleles: Vec::new(),
             genes: Vec::new(),
             gene_ids: HashMap::new(),
+            total_len: 0,
+        }
+    }
+
+    /// Allele label of a FASTA id. IMGT reference headers read
+    /// `accession|allele|species|functionality|…`, so a `|`-separated id
+    /// gives its first field that names an allele (`GENE*NN`), else its
+    /// first field.
+    pub fn allele_label(id: &str) -> &str {
+        let mut fields = id.split('|');
+        match id.split('|').find(|field| field.contains('*')) {
+            Some(allele) => allele,
+            None => fields.next().unwrap_or(id),
         }
     }
 
@@ -242,6 +257,7 @@ impl GermlineSet {
                 next_gene
             });
         let id = AlleleId::try_from(self.alleles.len()).expect("allele count fits u32");
+        self.total_len += codes.len();
         self.alleles.push(Allele {
             name: name.to_string(),
             gene,
@@ -258,7 +274,7 @@ impl GermlineSet {
     pub fn from_fasta(kind: SegmentKind, text: &str) -> Result<Self, GermlineError> {
         let mut set = Self::new(kind);
         for record in parse_fasta(text)? {
-            let name = record.id();
+            let name = Self::allele_label(record.id());
             let position = |key: &str| {
                 record
                     .attribute(key)
@@ -400,6 +416,11 @@ impl GermlineSet {
         &self.alleles[id as usize]
     }
 
+    /// Summed length of all alleles.
+    pub fn total_len(&self) -> usize {
+        self.total_len
+    }
+
     pub fn gene_count(&self) -> usize {
         self.genes.len()
     }
@@ -422,6 +443,17 @@ mod tests {
         assert_eq!(set.allele(0).gene, set.allele(1).gene);
         assert_eq!(set.allele(1).anchor, Some(1));
         assert_eq!(set.gene_name(set.allele(2).gene), "IGHV3-23");
+    }
+
+    #[test]
+    fn reads_allele_names_from_imgt_headers() {
+        let text = ">M99641|IGHV1-18*01|Homo_sapiens|F|V-REGION|188..483|296 nt|1| | |\nACGT\n\
+                    >X|IGHV1-18*02|Homo_sapiens|F|\nACGA\n>plain*01 anchor=1\nACGG\n>A|B\nTTTT\n";
+        let set = GermlineSet::from_fasta(SegmentKind::V, text).unwrap();
+        let names: Vec<&str> = set.alleles().iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["IGHV1-18*01", "IGHV1-18*02", "plain*01", "A"]);
+        assert_eq!(set.gene_count(), 3);
+        assert_eq!(set.allele(2).anchor, Some(1));
     }
 
     #[test]

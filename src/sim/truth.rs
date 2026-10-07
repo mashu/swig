@@ -173,7 +173,7 @@ impl Truth {
                     s.span.start.to_string(),
                     s.span.end.to_string(),
                 ]),
-                None => fields.extend(std::iter::repeat(String::new()).take(4)),
+                None => fields.extend(std::iter::repeat_n(String::new(), 4)),
             }
         }
         fields.push(self.junction.clone().unwrap_or_default());

@@ -9,38 +9,16 @@ use std::collections::HashSet;
 use vdj_assign::adjudicate::{Adjudicator, DagScratch, PathScore};
 use vdj_assign::placement::Placement;
 use vdj_assign::prelude::*;
+use vdj_assign::sim::Rng;
 
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-
-    fn range(&mut self, lo: usize, hi: usize) -> usize {
-        lo + self.below(hi - lo + 1)
-    }
-
-    fn bases(&mut self, len: usize) -> String {
-        (0..len).map(|_| char::from(b"ACGT"[self.below(4)])).collect()
-    }
+/// Random ASCII bases as a string.
+fn bases(rng: &mut Rng, len: usize) -> String {
+    String::from_utf8(rng.bases(len)).expect("ASCII bases")
 }
 
+/// A different base than `base`.
 fn substitute(base: char, rng: &mut Rng) -> char {
-    loop {
-        let b = char::from(b"ACGT"[rng.below(4)]);
-        if b != base {
-            return b;
-        }
-    }
+    char::from(rng.substitute(base as u8))
 }
 
 struct Db {
@@ -55,10 +33,10 @@ const J_ANCHOR: usize = 15;
 
 impl Db {
     fn new() -> Self {
-        let mut rng = Rng(2024);
+        let mut rng = Rng::new(2024);
         let mut v = Vec::new();
         for g in 1..=6 {
-            let first = rng.bases(V_LEN);
+            let first = bases(&mut rng, V_LEN);
             let mut second: Vec<char> = first.chars().collect();
             for p in [50, 150, 250] {
                 second[p] = substitute(second[p], &mut rng);
@@ -66,8 +44,12 @@ impl Db {
             v.push((format!("IGHV{g}-1*01"), first));
             v.push((format!("IGHV{g}-1*02"), second.into_iter().collect()));
         }
-        let d = (1..=8).map(|g| (format!("IGHD{g}-1*01"), rng.bases(13 + g))).collect();
-        let j = (1..=4).map(|g| (format!("IGHJ{g}*01"), rng.bases(48))).collect();
+        let d = (1..=8)
+            .map(|g| (format!("IGHD{g}-1*01"), bases(&mut rng, 13 + g)))
+            .collect();
+        let j = (1..=4)
+            .map(|g| (format!("IGHJ{g}*01"), bases(&mut rng, 48)))
+            .collect();
         Self { v, d, j }
     }
 
@@ -101,28 +83,41 @@ struct Sim {
 fn simulate(db: &Db, rng: &mut Rng, d_choice: &[usize], shm_rate: f64) -> Sim {
     let (v_name, v_seq) = &db.v[rng.below(db.v.len())];
     let (j_name, j_seq) = &db.j[rng.below(db.j.len())];
-    let v_part: String = v_seq[10..V_LEN - rng.range(0, 3)]
+    let v_part: String = v_seq[10..V_LEN - rng.range(0, 3) as usize]
         .chars()
-        .map(|b| if (rng.below(10_000) as f64) < shm_rate * 10_000.0 { substitute(b, rng) } else { b })
+        .map(|b| {
+            if (rng.below(10_000) as f64) < shm_rate * 10_000.0 {
+                substitute(b, rng)
+            } else {
+                b
+            }
+        })
         .collect();
     let mut query = v_part;
     let mut d_names = Vec::new();
     for &d in d_choice {
         let (d_name, d_seq) = &db.d[d];
-        let (left, right) = (rng.range(0, 2), rng.range(0, 2));
-        let n_len = rng.range(3, 6);
-        query += &rng.bases(n_len);
+        let (left, right) = (rng.range(0, 2) as usize, rng.range(0, 2) as usize);
+        let n_len = rng.range(3, 6) as usize;
+        query += &bases(rng, n_len);
         query += &d_seq[left..d_seq.len() - right];
         d_names.push(d_name.clone());
     }
-    let n_len = rng.range(3, 6);
-    query += &rng.bases(n_len);
-    query += &j_seq[rng.range(0, 3)..];
-    Sim { query, v: v_name.clone(), d: d_names, j: j_name.clone() }
+    let n_len = rng.range(3, 6) as usize;
+    query += &bases(rng, n_len);
+    query += &j_seq[rng.range(0, 3) as usize..];
+    Sim {
+        query,
+        v: v_name.clone(),
+        d: d_names,
+        j: j_name.clone(),
+    }
 }
 
 fn first_label(report: &Option<vdj_assign::report::SegmentReport>) -> Option<String> {
-    report.as_ref().map(|r| r.call.split(',').next().unwrap().to_string())
+    report
+        .as_ref()
+        .map(|r| r.call.split(',').next().unwrap().to_string())
 }
 
 fn gene(label: &str) -> &str {
@@ -152,37 +147,58 @@ fn reverse_complement(seq: &str) -> String {
 fn calls_vdj_alleles_on_clean_rearrangements() {
     let db = Db::new();
     let assigner = db.assigner(&EngineConfig::default());
-    let mut rng = Rng(1);
+    let mut rng = Rng::new(1);
     let (mut d_correct, trials) = (0, 60);
     for _ in 0..trials {
         let d = rng.below(db.d.len());
         let sim = simulate(&db, &mut rng, &[d], 0.0);
         let rec = record(&assigner, &sim.query);
         assert!(!rec.rev_comp);
-        assert_eq!(first_label(&rec.v).as_deref(), Some(sim.v.as_str()), "V allele for {}", sim.query);
-        assert_eq!(first_label(&rec.j).as_deref(), Some(sim.j.as_str()), "J allele");
+        assert_eq!(
+            first_label(&rec.v).as_deref(),
+            Some(sim.v.as_str()),
+            "V allele for {}",
+            sim.query
+        );
+        assert_eq!(
+            first_label(&rec.j).as_deref(),
+            Some(sim.j.as_str()),
+            "J allele"
+        );
         if first_label(&rec.d).as_deref() == Some(sim.d[0].as_str()) {
             d_correct += 1;
         }
         assert!(rec.d2.is_none(), "default grammar allows one D");
     }
-    assert!(d_correct * 100 >= trials * 95, "D accuracy {d_correct}/{trials}");
+    assert!(
+        d_correct * 100 >= trials * 95,
+        "D accuracy {d_correct}/{trials}"
+    );
 }
 
 #[test]
 fn reverse_complement_reads_are_reoriented() {
     let db = Db::new();
     let assigner = db.assigner(&EngineConfig::default());
-    let mut rng = Rng(7);
+    let mut rng = Rng::new(7);
     for _ in 0..20 {
         let d = rng.below(8);
         let sim = simulate(&db, &mut rng, &[d], 0.0);
         let forward = record(&assigner, &sim.query);
         let reverse = record(&assigner, &reverse_complement(&sim.query));
         assert!(reverse.rev_comp);
-        assert_eq!(forward.v.as_ref().map(|s| &s.call), reverse.v.as_ref().map(|s| &s.call));
-        assert_eq!(forward.j.as_ref().map(|s| &s.call), reverse.j.as_ref().map(|s| &s.call));
-        assert_eq!(forward.v.as_ref().map(|s| s.cigar.clone()), reverse.v.as_ref().map(|s| s.cigar.clone()));
+        assert_eq!(
+            forward.v.as_ref().map(|s| &s.call),
+            reverse.v.as_ref().map(|s| &s.call)
+        );
+        assert_eq!(
+            forward.j.as_ref().map(|s| &s.call),
+            reverse.j.as_ref().map(|s| &s.call)
+        );
+        assert_eq!(
+            forward.v.as_ref().map(|s| s.cigar.clone()),
+            reverse.v.as_ref().map(|s| s.cigar.clone())
+        );
     }
 }
 
@@ -190,7 +206,7 @@ fn reverse_complement_reads_are_reoriented() {
 fn hypermutated_reads_keep_their_v_gene() {
     let db = Db::new();
     let assigner = db.assigner(&EngineConfig::default());
-    let mut rng = Rng(99);
+    let mut rng = Rng::new(99);
     for _ in 0..40 {
         let d = rng.below(8);
         let sim = simulate(&db, &mut rng, &[d], 0.08);
@@ -205,7 +221,7 @@ fn hypermutated_reads_keep_their_v_gene() {
 fn junctions_without_d_do_not_invent_one() {
     let db = Db::new();
     let assigner = db.assigner(&EngineConfig::default());
-    let mut rng = Rng(3);
+    let mut rng = Rng::new(3);
     let trials = 40;
     let with_d = (0..trials)
         .filter(|_| {
@@ -215,15 +231,21 @@ fn junctions_without_d_do_not_invent_one() {
             rec.d.is_some()
         })
         .count();
-    assert!(with_d * 10 <= trials, "{with_d}/{trials} D-free junctions received a D");
+    assert!(
+        with_d * 10 <= trials,
+        "{with_d}/{trials} D-free junctions received a D"
+    );
 }
 
 #[test]
 fn tandem_d_is_a_first_class_path() {
     let db = Db::new();
-    let tandem = db.assigner(&EngineConfig { grammar: VdjGrammar::TANDEM_D, ..EngineConfig::default() });
+    let tandem = db.assigner(&EngineConfig {
+        grammar: VdjGrammar::TANDEM_D,
+        ..EngineConfig::default()
+    });
     let single = db.assigner(&EngineConfig::default());
-    let mut rng = Rng(5);
+    let mut rng = Rng::new(5);
     let mut both_correct = 0;
     let trials = 30;
     for _ in 0..trials {
@@ -238,15 +260,23 @@ fn tandem_d_is_a_first_class_path() {
         assert!(record(&single, &sim.query).d2.is_none());
         assert!(rec.np3.is_some(), "VDDJ reports three N/P regions");
     }
-    assert!(both_correct * 100 >= trials * 90, "tandem D {both_correct}/{trials}");
+    assert!(
+        both_correct * 100 >= trials * 90,
+        "tandem D {both_correct}/{trials}"
+    );
 }
 
 #[test]
 fn residual_adjudicator_is_a_drop_in_replacement() {
     let db = Db::new();
-    let config = EngineConfig { posterior: false, ..EngineConfig::default() };
-    let residual = db.assigner(&config).with_adjudicator(ResidualAdjudicator::default());
-    let mut rng = Rng(11);
+    let config = EngineConfig {
+        posterior: false,
+        ..EngineConfig::default()
+    };
+    let residual = db
+        .assigner(&config)
+        .with_adjudicator(ResidualAdjudicator::default());
+    let mut rng = Rng::new(11);
     for _ in 0..20 {
         let d = rng.below(8);
         let sim = simulate(&db, &mut rng, &[d], 0.0);
@@ -259,8 +289,11 @@ fn residual_adjudicator_is_a_drop_in_replacement() {
 #[test]
 fn called_segments_never_share_query_bases() {
     let db = Db::new();
-    let assigner = db.assigner(&EngineConfig { grammar: VdjGrammar::TANDEM_D, ..EngineConfig::default() });
-    let mut rng = Rng(13);
+    let assigner = db.assigner(&EngineConfig {
+        grammar: VdjGrammar::TANDEM_D,
+        ..EngineConfig::default()
+    });
+    let mut rng = Rng::new(13);
     let mut ws = assigner.workspace();
     for _ in 0..50 {
         let n_d = rng.below(3);
@@ -279,12 +312,16 @@ fn called_segments_never_share_query_bases() {
 fn batch_matches_sequential() {
     let db = Db::new();
     let assigner = db.assigner(&EngineConfig::default());
-    let mut rng = Rng(17);
+    let mut rng = Rng::new(17);
     let queries: Vec<Vec<u8>> = (0..300)
         .map(|_| {
             let d = rng.below(8);
             let sim = simulate(&db, &mut rng, &[d], 0.02);
-            let q = if rng.below(2) == 0 { sim.query } else { reverse_complement(&sim.query) };
+            let q = if rng.below(2) == 0 {
+                sim.query
+            } else {
+                reverse_complement(&sim.query)
+            };
             encode(q.as_bytes())
         })
         .collect();
@@ -322,7 +359,13 @@ impl Brute<'_> {
     }
 
     /// Best rest of a path whose current segment is `b`, entered at `entry`.
-    fn best_from(&mut self, b: usize, entry: u32, d_used: u8, first: SegmentKind) -> Option<PathScore> {
+    fn best_from(
+        &mut self,
+        b: usize,
+        entry: u32,
+        d_used: u8,
+        first: SegmentKind,
+    ) -> Option<PathScore> {
         let key = (b, entry, d_used, first);
         if let Some(known) = self.memo.get(&key) {
             return *known;
@@ -332,15 +375,22 @@ impl Brute<'_> {
         let bonus = model.segment_bonus(pb, d_used);
         let mut best: Option<PathScore> = None;
         let mut consider = |candidate: PathScore| {
-            if best.map_or(true, |current| candidate > current) {
+            if best.is_none_or(|current| candidate > current) {
                 best = Some(candidate);
             }
         };
-        if grammar.can_end(first, pb.kind) {
-            if let Some(span) = pb.clip.span(entry, pb.q_end()).filter(|s| s.q_len() >= self.min(pb.kind)) {
-                let score = span.score + bonus + model.end(first, pb.kind, d_used);
-                consider(PathScore { score, d_count: d_used, support: pb.score() });
-            }
+        if grammar.can_end(first, pb.kind)
+            && let Some(span) = pb
+                .clip
+                .span(entry, pb.q_end())
+                .filter(|s| s.q_len() >= self.min(pb.kind))
+        {
+            let score = span.score + bonus + model.end(first, pb.kind, d_used);
+            consider(PathScore {
+                score,
+                d_count: d_used,
+                support: pb.score(),
+            });
         }
         for e in 0..self.placements.len() {
             let pe = &self.placements[e];
@@ -354,14 +404,19 @@ impl Brute<'_> {
             let (_, exits) = cuts(pb);
             let (entries, _) = cuts(pe);
             for x in exits.into_iter().filter(|&x| x > entry) {
-                let Some(span) = pb.clip.span(entry, x).filter(|s| s.q_len() >= self.min(pb.kind)) else {
+                let Some(span) = pb
+                    .clip
+                    .span(entry, x)
+                    .filter(|s| s.q_len() >= self.min(pb.kind))
+                else {
                     continue;
                 };
                 for &y in entries.iter().filter(|&&y| y >= x) {
                     let Some(next) = pe.clip.entry(y) else {
                         continue;
                     };
-                    let junction = model.junction(pb.kind, pe.kind, next.q.saturating_sub(span.q_hi));
+                    let junction =
+                        model.junction(pb.kind, pe.kind, next.q.saturating_sub(span.q_hi));
                     let Some(rest) = self.best_from(e, y, d_next, first) else {
                         continue;
                     };
@@ -379,9 +434,19 @@ impl Brute<'_> {
 }
 
 /// The DAG's best path score and the exhaustive one on `placements`.
-fn dag_and_brute(dag: &PlacementDag, placements: &[Placement], scratch: &mut DagScratch) -> (Option<PathScore>, Option<PathScore>) {
-    let fast = dag.adjudicate(0, placements, scratch).map(|path| path.score);
-    let mut brute = Brute { dag, placements, memo: Default::default() };
+fn dag_and_brute(
+    dag: &PlacementDag,
+    placements: &[Placement],
+    scratch: &mut DagScratch,
+) -> (Option<PathScore>, Option<PathScore>) {
+    let fast = dag
+        .adjudicate(0, placements, scratch)
+        .map(|path| path.score);
+    let mut brute = Brute {
+        dag,
+        placements,
+        memo: Default::default(),
+    };
     let exhaustive = (0..placements.len())
         .filter(|&s| dag.grammar.can_start(placements[s].kind))
         .filter_map(|s| {
@@ -401,7 +466,9 @@ fn dag_equals_brute_force_on_hypermutated_igsim_reads() {
     use vdj_assign::sim::{SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
     let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 11);
     let config = EngineConfig::default();
-    let assigner = DefaultAssigner::from_config(&config, db.v.clone(), Some(db.d.clone()), db.j.clone()).unwrap();
+    let assigner =
+        DefaultAssigner::from_config(&config, db.v.clone(), Some(db.d.clone()), db.j.clone())
+            .unwrap();
     let base = config.objective.resolve(Some(&db.d), &config.d.scoring);
     let sim = Simulator::new(&db.v, Some(&db.d), &db.j, SimParams::hard()).unwrap();
     let mut ws = assigner.workspace();
@@ -413,10 +480,18 @@ fn dag_equals_brute_force_on_hypermutated_igsim_reads() {
         placements.extend(top_by_kind(&call.placements, SegmentKind::D, 6));
         placements.extend(top_by_kind(&call.placements, SegmentKind::J, 3));
         for iota in [0, -1] {
-            let model = EngineeringObjective { insertion_per_base: iota, ..base };
+            let model = EngineeringObjective {
+                insertion_per_base: iota,
+                ..base
+            };
             let dag = PlacementDag::new(VdjGrammar::VDJ, model, config.min_retained);
             let (fast, exhaustive) = dag_and_brute(&dag, &placements, &mut scratch);
-            assert_eq!(fast, exhaustive, "read {} at iota {iota}", read.sequence.len());
+            assert_eq!(
+                fast,
+                exhaustive,
+                "read {} at iota {iota}",
+                read.sequence.len()
+            );
             // Count reads whose optimum enters some placement beyond the overlap.
             if let Some(path) = dag.adjudicate(0, &placements, &mut scratch) {
                 beyond += usize::from(path.segments.windows(2).any(|w| {
@@ -426,11 +501,18 @@ fn dag_equals_brute_force_on_hypermutated_igsim_reads() {
             }
         }
     }
-    assert!(beyond > 0, "the reads should exercise entries beyond the overlap");
+    assert!(
+        beyond > 0,
+        "the reads should exercise entries beyond the overlap"
+    );
 }
 
 fn top_by_kind(placements: &[Placement], kind: SegmentKind, n: usize) -> Vec<Placement> {
-    let mut chosen: Vec<Placement> = placements.iter().filter(|p| p.kind == kind).cloned().collect();
+    let mut chosen: Vec<Placement> = placements
+        .iter()
+        .filter(|p| p.kind == kind)
+        .cloned()
+        .collect();
     chosen.sort_by_key(|p| std::cmp::Reverse(p.score()));
     chosen.truncate(n);
     chosen
@@ -439,14 +521,20 @@ fn top_by_kind(placements: &[Placement], kind: SegmentKind, n: usize) -> Vec<Pla
 #[test]
 fn dag_equals_brute_force_over_all_paths_and_cuts() {
     let db = Db::new();
-    let assigner = db.assigner(&EngineConfig { grammar: VdjGrammar::TANDEM_D, ..EngineConfig::default() });
+    let assigner = db.assigner(&EngineConfig {
+        grammar: VdjGrammar::TANDEM_D,
+        ..EngineConfig::default()
+    });
     let config = EngineConfig::default();
     let model = EngineeringObjective {
         insertion_per_base: -1,
-        ..config.objective.resolve(Some(&Db::set(SegmentKind::D, &db.d, None)), &config.d.scoring)
+        ..config.objective.resolve(
+            Some(&Db::set(SegmentKind::D, &db.d, None)),
+            &config.d.scoring,
+        )
     };
     let dag = PlacementDag::new(VdjGrammar::TANDEM_D, model, [10, 3, 6]);
-    let mut rng = Rng(23);
+    let mut rng = Rng::new(23);
     let mut ws = assigner.workspace();
     let mut scratch = DagScratch::default();
     let mut distinct_topologies = HashSet::new();
@@ -459,7 +547,11 @@ fn dag_equals_brute_force_over_all_paths_and_cuts() {
         placements.extend(top_by_kind(&call.placements, SegmentKind::J, 3));
 
         let fast = dag.adjudicate(call.query.len(), &placements, &mut scratch);
-        let mut brute = Brute { dag: &dag, placements: &placements, memo: Default::default() };
+        let mut brute = Brute {
+            dag: &dag,
+            placements: &placements,
+            memo: Default::default(),
+        };
         let exhaustive = (0..placements.len())
             .filter(|&s| dag.grammar.can_start(placements[s].kind))
             .filter_map(|s| {
@@ -469,27 +561,44 @@ fn dag_equals_brute_force_over_all_paths_and_cuts() {
             .max();
         assert_eq!(fast.as_ref().map(|path| path.score), exhaustive);
         if let Some(path) = fast {
-            let kinds: Vec<SegmentKind> = path.segments.iter().map(|s| placements[s.placement].kind).collect();
+            let kinds: Vec<SegmentKind> = path
+                .segments
+                .iter()
+                .map(|s| placements[s.placement].kind)
+                .collect();
             distinct_topologies.insert(kinds);
             let clip_sum: i32 = path.segments.iter().map(|s| s.span.score).sum();
-            assert!(clip_sum >= path.score.score - 24, "path score is built from clip scores");
+            assert!(
+                clip_sum >= path.score.score - 24,
+                "path score is built from clip scores"
+            );
         }
     }
-    assert!(distinct_topologies.len() >= 3, "test should exercise VJ, VDJ and VDDJ paths");
+    assert!(
+        distinct_topologies.len() >= 3,
+        "test should exercise VJ, VDJ and VDDJ paths"
+    );
 }
 
 #[test]
 fn simd_batched_pipeline_equals_scalar_per_read() {
     let db = Db::new();
-    let config = EngineConfig { grammar: VdjGrammar::TANDEM_D, ..EngineConfig::default() };
+    let config = EngineConfig {
+        grammar: VdjGrammar::TANDEM_D,
+        ..EngineConfig::default()
+    };
     let simd = db.assigner(&config);
     let scalar = db.assigner(&config).with_aligner(BandedGotoh);
-    let mut rng = Rng(29);
+    let mut rng = Rng::new(29);
     let queries: Vec<Vec<u8>> = (0..400)
         .map(|_| {
             let ds: Vec<usize> = (0..rng.below(3)).map(|_| rng.below(8)).collect();
             let sim = simulate(&db, &mut rng, &ds, 0.05);
-            let q = if rng.below(2) == 0 { sim.query } else { reverse_complement(&sim.query) };
+            let q = if rng.below(2) == 0 {
+                sim.query
+            } else {
+                reverse_complement(&sim.query)
+            };
             encode(q.as_bytes())
         })
         .collect();

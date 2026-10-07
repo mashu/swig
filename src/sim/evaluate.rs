@@ -28,7 +28,7 @@
 use std::fmt;
 use std::ops::Range;
 
-use super::truth::{Slot, Truth};
+use super::truth::{Slot, TrueSegment, Truth};
 use crate::germline::GermlineSet;
 use crate::report::{AirrRecord, SegmentReport};
 
@@ -126,6 +126,13 @@ impl Assignment {
     }
 }
 
+/// Whether the primary allele of `call` is germline-equivalent to `truth`.
+fn primary_equivalent(truth: &TrueSegment, call: &SegmentCall) -> bool {
+    call.names
+        .first()
+        .is_some_and(|p| truth.equivalent.contains(p))
+}
+
 /// Per-segment tallies.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SegmentStats {
@@ -175,12 +182,7 @@ impl SegmentStats {
         Self::rate(self.called, self.reads)
     }
 
-    fn add(
-        &mut self,
-        truth: Option<&super::truth::TrueSegment>,
-        call: Option<&SegmentCall>,
-        oriented: bool,
-    ) {
+    fn add(&mut self, truth: Option<&TrueSegment>, call: Option<&SegmentCall>, oriented: bool) {
         let Some(truth) = truth else {
             self.spurious += usize::from(call.is_some());
             return;
@@ -196,7 +198,7 @@ impl SegmentStats {
             return;
         }
         self.exact += usize::from(*primary == truth.allele);
-        self.equivalent += usize::from(truth.equivalent.contains(primary));
+        self.equivalent += usize::from(primary_equivalent(truth, call));
         self.truth_listed += usize::from(call.names.contains(&truth.allele));
         self.gene += usize::from(truth.equivalent.iter().any(|e| gene(e) == gene(primary)));
         if let Some(span) = &call.span {
@@ -350,9 +352,7 @@ impl Evaluation {
         let called_d = call.segment(Slot::D);
         presence.called += usize::from(called_d.is_some());
         if let (Some(called), Some(true_d)) = (called_d, truth.segment(Slot::D)) {
-            let primary = called.names.first();
-            presence.correct +=
-                usize::from(oriented && primary.is_some_and(|p| true_d.equivalent.contains(p)));
+            presence.correct += usize::from(oriented && primary_equivalent(true_d, called));
         }
 
         if let Some(junction) = &truth.junction {
@@ -466,7 +466,11 @@ impl fmt::Display for Evaluation {
                 s.exact_rate(),
                 pct(s.truth_listed, s.reads),
                 s.gene_rate(),
-                if s.called == 0 { f64::NAN } else { s.names as f64 / s.called as f64 },
+                if s.called == 0 {
+                    f64::NAN
+                } else {
+                    s.names as f64 / s.called as f64
+                },
                 s.spurious,
                 mean(s.start_error),
                 mean(s.end_error),
@@ -535,5 +539,191 @@ impl fmt::Display for Evaluation {
             write!(f, " {:>22.5}", c.brier())?;
         }
         Ok(())
+    }
+}
+
+/// One yes/no metric of two callers on the same reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PairedOutcome {
+    pub both: usize,
+    /// Reads only the first caller gets right.
+    pub first_only: usize,
+    /// Reads only the second caller gets right.
+    pub second_only: usize,
+    pub neither: usize,
+}
+
+impl PairedOutcome {
+    pub fn add(&mut self, first: bool, second: bool) {
+        *match (first, second) {
+            (true, true) => &mut self.both,
+            (true, false) => &mut self.first_only,
+            (false, true) => &mut self.second_only,
+            (false, false) => &mut self.neither,
+        } += 1;
+    }
+
+    pub fn reads(&self) -> usize {
+        self.both + self.first_only + self.second_only + self.neither
+    }
+
+    /// Accuracy of the first and the second caller, in percent.
+    pub fn rates(&self) -> (f64, f64) {
+        let n = self.reads();
+        (
+            SegmentStats::rate(self.both + self.first_only, n),
+            SegmentStats::rate(self.both + self.second_only, n),
+        )
+    }
+
+    /// Accuracy difference, second − first, in percentage points.
+    pub fn difference(&self) -> f64 {
+        let (first, second) = self.rates();
+        second - first
+    }
+
+    /// Half-width of the 95 % confidence interval of [`Self::difference`]
+    /// (Wald interval for paired proportions), in percentage points. Only
+    /// the discordant reads carry information about the difference.
+    pub fn half_width(&self) -> f64 {
+        let n = self.reads() as f64;
+        let (b, c) = (self.first_only as f64, self.second_only as f64);
+        let d = (c - b) / n;
+        100.0 * 1.96 * (((b + c) / n - d * d).max(0.0) / n).sqrt()
+    }
+
+    /// Two-sided exact McNemar test: the probability of discordant counts at
+    /// least this unequal if both callers were equally accurate.
+    pub fn p_value(&self) -> f64 {
+        let n = self.first_only + self.second_only;
+        let k = self.first_only.min(self.second_only);
+        if n == 0 {
+            return 1.0;
+        }
+        // P(X ≤ k) for X ~ Binomial(n, 1/2), summed in log space.
+        let ln_half = -(n as f64) * std::f64::consts::LN_2;
+        let (mut ln_choose, mut tail) = (0.0f64, f64::NEG_INFINITY);
+        for i in 0..=k {
+            if i > 0 {
+                ln_choose += ((n - i + 1) as f64).ln() - (i as f64).ln();
+            }
+            let term = ln_choose + ln_half;
+            let (hi, lo) = (tail.max(term), tail.min(term));
+            tail = hi + (lo - hi).exp().ln_1p();
+        }
+        (2.0 * tail.exp()).min(1.0)
+    }
+}
+
+/// Two callers compared read by read on the same simulated reads: allele
+/// equivalence of V, D and J (reads with that segment), no D call on reads
+/// without one (D allele accuracy alone rewards calling D everywhere), and
+/// junction exactness (reads with a templated junction).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Paired {
+    pub v: PairedOutcome,
+    pub d: PairedOutcome,
+    pub no_d: PairedOutcome,
+    pub j: PairedOutcome,
+    pub junction: PairedOutcome,
+}
+
+impl Paired {
+    pub fn add(&mut self, truth: &Truth, first: &Assignment, second: &Assignment) {
+        let correct = |call: &Assignment, slot: Slot, truth_segment: &TrueSegment| {
+            call.rev_comp == truth.reverse_complemented
+                && call
+                    .segment(slot)
+                    .is_some_and(|c| primary_equivalent(truth_segment, c))
+        };
+        for (slot, outcome) in [
+            (Slot::V, &mut self.v),
+            (Slot::D, &mut self.d),
+            (Slot::J, &mut self.j),
+        ] {
+            if let Some(segment) = truth.segment(slot) {
+                outcome.add(
+                    correct(first, slot, segment),
+                    correct(second, slot, segment),
+                );
+            }
+        }
+        if truth.segment(Slot::D).is_none() {
+            let silent = |call: &Assignment| call.segment(Slot::D).is_none();
+            self.no_d.add(silent(first), silent(second));
+        }
+        if let Some(junction) = &truth.junction {
+            let exact = |call: &Assignment| {
+                call.rev_comp == truth.reverse_complemented
+                    && call.junction.as_deref() == Some(junction.as_str())
+            };
+            self.junction.add(exact(first), exact(second));
+        }
+    }
+}
+
+impl fmt::Display for Paired {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "metric       reads   first%  second%   Δ pp   ±95% CI   first only  second only  McNemar p"
+        )?;
+        for (label, o) in [
+            ("V allele", &self.v),
+            ("D allele", &self.d),
+            ("no D call", &self.no_d),
+            ("J allele", &self.j),
+            ("junction", &self.junction),
+        ] {
+            let (first, second) = o.rates();
+            write!(
+                f,
+                "\n{label:<10}{:>8} {:>8.2} {:>8.2} {:>+7.2} {:>9.2} {:>12} {:>12} {:>10.2e}",
+                o.reads(),
+                first,
+                second,
+                o.difference(),
+                o.half_width(),
+                o.first_only,
+                o.second_only,
+                o.p_value()
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outcome(first_only: usize, second_only: usize, both: usize) -> PairedOutcome {
+        PairedOutcome {
+            both,
+            first_only,
+            second_only,
+            neither: 0,
+        }
+    }
+
+    #[test]
+    fn mcnemar_is_the_exact_binomial_tail() {
+        // 2 vs 8 discordant: P(X ≤ 2) = (1 + 10 + 45) / 1024, doubled.
+        let p = outcome(2, 8, 90).p_value();
+        assert!((p - 2.0 * 56.0 / 1024.0).abs() < 1e-12, "{p}");
+        assert_eq!(outcome(0, 0, 100).p_value(), 1.0);
+        assert_eq!(outcome(5, 5, 0).p_value(), 1.0);
+        // Large and lopsided stays finite and tiny.
+        let p = outcome(10, 400, 5000).p_value();
+        assert!(p > 0.0 && p < 1e-90, "{p}");
+    }
+
+    #[test]
+    fn paired_difference_and_interval() {
+        let o = outcome(10, 30, 960);
+        assert_eq!(o.rates(), (97.0, 99.0));
+        assert!((o.difference() - 2.0).abs() < 1e-12);
+        // sqrt((40/1000 − 0.02²) / 1000) · 1.96 = 1.233 pp.
+        assert!((o.half_width() - 1.2334).abs() < 1e-3, "{}", o.half_width());
     }
 }

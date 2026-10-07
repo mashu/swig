@@ -36,11 +36,11 @@ mod v_motif;
 use std::collections::HashMap;
 use std::io::{self, Write};
 
-pub use j_motif::{find_j, JHit};
+pub use j_motif::{JHit, find_j};
 pub use transfer::{
-    kmers, shared, transfer, transfer_aligned, RelativeIndex, MIN_SHARED_FRACTION, MIN_SHARED_KMERS,
+    MIN_SHARED_FRACTION, MIN_SHARED_KMERS, RelativeIndex, kmers, shared, transfer, transfer_aligned,
 };
-pub use v_motif::{find_v, VHit, VSearch};
+pub use v_motif::{VHit, VSearch, find_v};
 
 use crate::align::GotohWorkspace;
 use crate::germline::{GermlineSet, RegionStarts};
