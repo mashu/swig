@@ -815,6 +815,66 @@ mod tests {
         }
     }
 
+    /// Degenerate shapes: empty sides, all-N queries, one-row queries,
+    /// one-diagonal bands and bands that miss the matrix entirely.
+    #[test]
+    fn degenerate_jobs_match_the_scalar_kernel() {
+        let scoring = AffineScoring::new(2, -3, -5, -1);
+        let reference: Vec<u8> = (0..40).map(|i| (i * 7 % 4) as u8).collect();
+        let profiles = [
+            SubstitutionProfile::build(&scoring, &reference),
+            SubstitutionProfile::build(&scoring, &reference[..1]),
+            SubstitutionProfile::build(&scoring, &[]),
+            SubstitutionProfile::build(&HotspotScoring::for_shm(scoring), &reference),
+        ];
+        let queries: [Vec<u8>; 5] = [
+            reference.clone(),
+            Vec::new(),
+            vec![N; 30],
+            reference[5..6].to_vec(),
+            [vec![N; 10], reference[..20].to_vec()].concat(),
+        ];
+        let bands = [
+            Band::Full,
+            Band::Diagonals { lo: 0, hi: 0 },
+            Band::Diagonals { lo: 10, hi: 10 },
+            Band::Diagonals { lo: 500, hi: 520 },
+            Band::Diagonals { lo: -520, hi: -500 },
+            Band::Diagonals { lo: -3, hi: 3 },
+        ];
+        let mut jobs = Vec::new();
+        for query in &queries {
+            for profile in &profiles {
+                for &band in &bands {
+                    jobs.push(AlignJob {
+                        query,
+                        profile,
+                        gaps: scoring.gaps,
+                        band,
+                    });
+                }
+            }
+        }
+        let (mut hits, mut alignments) = (Vec::new(), Vec::new());
+        let mut ws = InterSequenceWorkspace::default();
+        InterSequenceGotoh::new().score_batch(&jobs, &mut ws, &mut hits);
+        InterSequenceGotoh::new().align_batch(&jobs, &mut ws, &mut alignments);
+        let mut scalar = GotohWorkspace::default();
+        for (k, job) in jobs.iter().enumerate() {
+            let (query, profile, gaps, band) = (job.query, job.profile, job.gaps, job.band);
+            assert_eq!(
+                hits[k],
+                BandedGotoh.score(query, profile, gaps, band, &mut scalar),
+                "job {k}"
+            );
+            assert_eq!(
+                alignments[k],
+                BandedGotoh.align(query, profile, gaps, band, &mut scalar),
+                "job {k}"
+            );
+        }
+    }
+
     #[test]
     fn oversized_scores_fall_back_to_scalar() {
         let scoring = AffineScoring::new(100, -3, -5, -1);

@@ -214,5 +214,18 @@ mod tests {
         let mut w = vec![10..20, 0..5, 18..30, 5..7];
         merge_windows(&mut w);
         assert_eq!(w, vec![0..7, 10..30]);
+        let mut empty: Vec<Range<usize>> = Vec::new();
+        merge_windows(&mut empty);
+        assert!(empty.is_empty());
+        let mut nested = vec![0..100, 10..20, 30..40];
+        merge_windows(&mut nested);
+        assert_eq!(nested, vec![0..100]);
+    }
+
+    #[test]
+    fn j_window_without_v_or_past_the_read() {
+        let window = DownstreamWindow { reclaim: 12 };
+        assert_eq!(window.window(80, &[]), 0..80);
+        assert_eq!(window.window(0, &[]), 0..0);
     }
 }
