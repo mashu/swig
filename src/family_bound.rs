@@ -7,7 +7,7 @@
 //! S^*(A) \le S^*(R) + \Delta(R,A)
 //! \]
 //! where \(\Delta\) is the sum over reference positions of
-//! \(\max_q\bigl(s(A[j],q) - s(R[j],q)\bigr)\), taken from the substitution
+//! \(\max_q\bigl(s(A\[j\],q) - s(R\[j\],q)\bigr)\), taken from the substitution
 //! profiles. The proof maps the optimal path of \(A\) onto \(R\) at the same
 //! coordinates (valid when \(|A| = |R|\)); gap columns are unchanged and each
 //! substitution column gains at most that per-position maximum.

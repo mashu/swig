@@ -212,7 +212,8 @@ Each change was measured on the same reads before it was kept.
       region; a placement now counts only if it overlaps the call's region
       (tightened in item 17). The event is "the reported names include the
       read's allele, up to germline equivalence", which is what §4 scores.
-15. **Closed-syncmer seeds** (`seed.rs`). See §8.
+15. **Closed-syncmer seeds** (`seed.rs`), adopted here and reverted in
+    item 18. See §8.
 16. **3′-partial V alleles got a wrong anchor** (`annotate/mod.rs`). Found
     through the IgBLAST comparison (§8), whose junctions disagreed with the
     truth on 4.5 % of reads. IMGT 3′-partial alleles end inside or before
@@ -268,6 +269,64 @@ Each change was measured on the same reads before it was kept.
       "whole-read J changes no call" no longer held; the item 11 account of
       the old oracle was wrong. All are corrected below with measurements of
       this code.
+18. **Gene margin from sampling noise; every k-mer; short seeds by count**
+    (`retrieve/budget.rs`, `retrieve/seed_vote.rs`). The V gene budget kept
+    genes within `max(8 votes, 5 % of the leader)`; 8 votes are two 9-mer
+    seeds whatever the read. A seed count `n` fluctuates by about `√n`, so
+    two genes near the leader's `L` votes (4 per seed) differ by chance by
+    about `√(2·4·L)`. The margin is now `z` such standard deviations:
+    relative to the leader, but proportionally wider for weakly supported,
+    mutated reads. The 7-mer trigger (16 votes, i.e. 4 seeds) became a seed
+    count: 7-mers vote while the leader holds fewer than 25 nine-mer seeds,
+    where the count's relative error `1/√n` exceeds 20 %. Measured jointly
+    with the seed sampling on human IGH (hard and mid presets, fixed 20 and
+    30 % SHM with two seeds each, 200-nt 3′ fragments) and the synthetic
+    database, V gene in %:
+
+    | Setting | Hard | 30 % SHM | Mean of 7 conditions |
+    |---|---|---|---|
+    | previous release: closed syncmers, fixed margin, 4-seed trigger | 98.36 | 75.70 | 85.16 |
+    | the same after the seed audit's new order (444d966) | 98.06 | 75.37 | 85.24 |
+    | closed syncmers, proportional margin 10 / 30 % of `L`, 7-mers always | 98.06 / 98.40 | 70.88 / 75.98 | 83.44 / 85.25 |
+    | every k-mer, `z = 1` / `1.5` / `2` / `3`, 7-mers always* | 98.38–98.40 | 82.44–84.72 | 87.29–88.19 |
+    | **every k-mer, `z = 2`, 25-seed trigger (default)** | **98.50** | **84.65** | **88.12** |
+    | closed syncmers, `z = 2`, 25-seed trigger | 98.48 | 80.25 | 87.05 |
+    | open syncmers (`w = 2`), `z = 2`, 7-mers always | 98.38 | 80.27 | 86.95 |
+    | every k-mer, `z = 2`, 7-mers always | 98.40 | 84.70 | 88.17 |
+
+    \*At 30 % SHM, 7-mers always equals the 25-seed trigger (84.70 vs
+    84.65); on the hard preset it is 0.1 point lower. Against the previous
+    release the default gains 0.14 points of V gene on the hard preset, 9.0
+    at 30 % SHM and 3.0 on the mean of seven conditions.
+
+    With closed syncmers a proportional margin must reach 50 % of `L` to
+    match the fixed one at 30 % SHM (4-seed trigger: 72.47 at 30 %, 76.19
+    at 50 %, against 75.37); with every k-mer 15–30 % already matches it,
+    but even 50 % stays below `z = 2` (83.98 against 84.70, 7-mers always).
+    Above `z = 2` the 16-gene cap binds: `z = 3` adds at most 0.1 point
+    (synthetic, 30 % SHM), and a cap of 32 adds one point there only.
+    Accuracy saturates between 25 and 50 seeds; always adding 7-mers is no
+    better and costs 13 % more instructions per read than the 25-seed
+    trigger on the hard preset (0.3 % at 30 % SHM, where the trigger fires
+    on most reads anyway).
+
+    *Sampling reversed.* Under the noise-based margin, closed syncmers
+    trail every k-mer by 1.1 points of mean V gene (4.4 at 30 % SHM) for
+    0.4 % fewer instructions on the hard preset, and open syncmers' edge
+    (item 15, §8) disappears: the syncmers' parity with every k-mer, and
+    open syncmers' lead, came from how sparser seeds interacted with the
+    fixed margin and trigger. Every k-mer is the default; `SeedSampling`
+    stays as an option. Minimisers were not re-measured under the new
+    margin.
+
+    Cost against the previous defaults: +4.1 % instructions per read on the
+    hard preset, +6.1 % at 30 % SHM. Position accuracy: mean V start/end
+    error on the hard preset is 0.55 / 0.93 bases (0.55–0.59 / 0.88–1.02
+    across every setting swept). On the hard preset D, J and D-free false
+    positives did not change; at 30 % SHM D and J rose by 0.7–1.3 points
+    and D-free false positives by 1.3–2.3 (more reads reach a V call). V
+    calibration improved (hard ECE 1.31 → 1.13 % against the previous
+    release).
 
 ## 4. Results
 
@@ -276,8 +335,8 @@ Human IGH, 5000 reads per preset, germline-equivalent accuracy in %:
 | Preset | Orientation | V | V gene | D | J | Junction | Random reads called |
 |---|---|---|---|---|---|---|---|
 | easy | 99.94 → 100 | 99.54 → 99.84 | 99.92 → 99.98 | 98.78 → 99.29 | 99.90 → 99.94 | 99.94 → 100 | 30.5 → 0 |
-| mid | 100 → 100 | 97.76 → 97.92 | 99.84 → 99.82 | 91.96 → 93.00 | 98.84 → 98.80 | 99.93 → 99.97 | 30.2 → 0 |
-| hard | 99.98 → 99.98 | 89.74 → 89.86 | 98.44 → 98.36 | 81.72 → 83.58 | 92.70 → 93.32 | 98.39 → 99.50 | 31.2 → 0 |
+| mid | 100 → 100 | 97.76 → 97.94 | 99.84 → 99.84 | 91.96 → 93.00 | 98.84 → 98.80 | 99.93 → 99.97 | 30.2 → 0 |
+| hard | 99.98 → 99.98 | 89.74 → 89.96 | 98.44 → 98.50 | 81.72 → 83.58 | 92.70 → 93.32 | 98.39 → 99.55 | 31.2 → 0 |
 
 Junctions "after" are scored with the corrected anchors (item 16), which
 remove the reads of 3′-partial alleles from the denominator (hard: 2416 →
@@ -286,15 +345,16 @@ remove the reads of 3′-partial alleles from the denominator (hard: 2416 →
 Throughput is 849 → ~1900 reads/s per thread without posteriors and ~1300
 with them, and ~3600 → ~7300 / ~5400 reads/s on 4 threads (a busier
 container than the earlier ~2200 / ~9000; in instructions the exact DAG
-costs 3 % and posteriors 18 %).
+costs 3 % and posteriors 18 %). Item 18 adds 4 % of instructions on the
+hard preset; wall clock moved within the container's noise.
 
 Calibration on real IGH (ECE %, easy / mid / hard), with the event of items
 14 and 17:
 
 | | V | D | J | D presence |
 |---|---|---|---|---|
-| ECE | 0.04 / 0.31 / 1.31 | 0.49 / 1.29 / 1.16 | 0.07 / 0.30 / 0.69 | 0.20 / 1.98 / 1.24 |
-| Brier | 0.001 / 0.009 / 0.045 | 0.002 / 0.040 / 0.072 | 0.000 / 0.006 / 0.031 | 0.003 / 0.026 / 0.024 |
+| ECE | 0.04 / 0.29 / 1.13 | 0.49 / 1.29 / 1.16 | 0.07 / 0.30 / 0.69 | 0.20 / 1.98 / 1.24 |
+| Brier | 0.001 / 0.009 / 0.043 | 0.002 / 0.040 / 0.072 | 0.000 / 0.006 / 0.031 | 0.003 / 0.026 / 0.024 |
 
 On the synthetic database, V and J ECE stay ≤ 1 % and D ≤ 2.5 %; D presence
 is the weakest (5.0 % mid, 3.2 % hard), because the synthetic D genes are
@@ -321,13 +381,14 @@ allele's distinguishing positions.
 These are listed honestly, for the paper's limitations section and for future
 work.
 
-1. **V gene at extreme SHM: −0.2 pp on the hard preset** against the start.
-   Gene-frame votes are unions over alleles, and at 15–25 % SHM the gene budget
-   sometimes ranks a sibling gene above the true one. Search errors went from
-   0.1 % to 0.4 % of reads. A base budget of 5 genes instead of 3 recovers
-   it (98.44 %) at about 10 % of throughput, so the default stays at 3 and the
-   budget is the knob. Votes normalised by frame size are the alternative to
-   try.
+1. **V at extreme SHM.** The hard-preset V gene shortfall against the
+   starting code (98.44 %; the previous release had 98.36 %) is gone: the
+   noise-based margin (item 18) gives 98.50 %. At a fixed 30 % SHM, V gene
+   is 85.2 % and V allele 53.8 %; 3.3 % of reads are misoriented and 3.9 %
+   get no V or J call. The V posterior is overconfident
+   there (ECE 16 %): when retrieval misses the true gene, no candidate can
+   carry its mass. The 16-gene cap binds at that divergence; raising it
+   helped only the synthetic database.
 2. **D presence on D-free junctions.** 12–24 % of reads with no D receive one,
    because a 9-nt chance match is indistinguishable from a 9-nt D remnant.
    `P_D` sets the trade-off, and the prior odds are the single knob.
@@ -423,7 +484,8 @@ calibration error was unchanged.
 | `max_occurrences` | 256 | 64–1024 | flat | 256 |
 | Band padding | 8 | 4, 12 | flat (speed only) | 8 |
 | Budget base genes | 3 | 2, 4, 5, 8 | hard V −0.20 / +0.10 / +0.20 / +0.20 pp; slower | 3 (knob) |
-| Budget margin | 5 % / 8 votes | 2–10 %; 4–16 | ≤ 0.07 pp | 5 % / 8 |
+| Budget margin | 5 % / 8 votes | 2–10 %; 4–16 | ≤ 0.07 pp on the presets; 4–9 pp of V gene at 30 % SHM (item 18) | `z·√(2·4·L)`, `z = 2` |
+| 7-mer trigger | 16 votes (4 seeds) | 4–50 seeds, always | presets flat; +4.8 pp V gene at 30 % SHM from 4 to 25 seeds (item 18) | 25 seeds |
 | `min_d_match` | 4 | 3, 5, 6 | D −0.03 to −0.92 pp | 4 (optimum) |
 | `P_D` | 11 (derived) | 5–17 | D accuracy vs D-free false positives (mid: 94.2 % / 61 % at 5, 93.2 % / 23 % at 11, 87.2 % / 0 % at 17) | 11 |
 
@@ -445,30 +507,52 @@ Two results matter for the paper:
 ## 8. Seed sampling, the J/D interplay, and IgBLAST
 
 **Would minimisers or syncmers lose sensitivity?** Seeds are sampled alike in
-the gene-frame index and in the read (`seed::SeedSampling`). Closed syncmers
-(a k-mer is kept when its smallest `s`-mer, `s = k − 4`, is first or last)
-depend on the k-mer alone. A seed shared by read and germline is therefore
-kept in both or neither, and any `k + 4` unmutated bases contain one (13 for
-the 9-mer index, 11 for the 7-mer fallback). Minimisers lack this property:
-whether a k-mer is kept depends on its neighbours, so a mutation can unselect
-a shared seed on one side only. Measured against every k-mer on human IGH:
+the gene-frame index and in the read (`seed::SeedSampling`). The literature's
+recommendations, read from the primary sources:
 
-| Condition | every k-mer | closed syncmers (40 %) |
-|---|---|---|
-| presets, three 5000-read hard samples, synthetic database | — | V and V gene within ±0.08 pp |
-| fixed SHM 15 % (V / gene) | 100.00 / 96.25 | 100.00 / 96.60 |
-| fixed SHM 20 % | 99.95 / 94.50 | 99.95 / 95.10 |
-| fixed SHM 25 % | 98.70 / 87.00 | 98.85 / 87.40 |
-| fixed SHM 30 % | 93.05 / 74.90 | 93.45 / 76.35 |
-| 3′ fragments covering 30–80 V bases | — | within ±0.4 pp, both signs |
-| instructions, 1000 hard reads | 6.09 × 10⁹ | 5.95 × 10⁹ (−2.4 %) |
+- Edgar (2021, PeerJ 9:e10805): closed syncmers (a k-mer is kept when the
+  first smallest of its `s`-mers is its first or last one) beat minimisers
+  at any density they can reach; open syncmers with an offset beat
+  minimisers at lower densities. Closed syncmers are context-free (a seed
+  shared by read and germline is kept in both or neither) and have a
+  *window guarantee*: any `w = k − s` consecutive k-mers hold one, so every
+  unmutated stretch of `k + w − 1` bases yields a shared seed (12 for
+  9-mers at `w = 4`; on IGHV, 0 seedless 12-base windows).
+- Shaw & Yu (2022, Bioinformatics 38:4659, Theorem 8): among open
+  syncmers, the smallest `s`-mer in the middle maximises conservation. Open
+  syncmers keep context-freedom but lose the window guarantee (5 % of
+  12-base IGHV windows seedless at `w = 2`, 24 % at `w = 4`).
+- Dutta et al. (2022) and strobealign (Sahlin 2022) use other shapes for
+  long or short DNA reads; minimisers keep the window guarantee but are not
+  context-free (9–11 % of unmutated k-mers selected on one side only).
 
-So no sensitivity is lost; at high SHM the sparser seeds are marginally
-better, because fewer chance seeds dilute the true gene's votes. Minimisers
-(w = 4) and open syncmers gave the same accuracy within noise, so closed
-syncmers were chosen for their guarantee, not for a measured gain. The gain
-is small because V retrieval is 5.5 % of a run (voting, sorting and
-clustering became about 60 % cheaper); alignment and adjudication dominate.
+Our closed syncmers matched Edgar's definition and tie rule; an audit found
+the order fixed poly-A s-mers as smallest, spaced shapes ranked the raw
+sequence instead of the key, `w` was clamped silently, and the docs stated a
+loose window bound (13 bases). All are fixed and tested (`seed.rs`). On a
+spaced shape, selection by key keeps read and germline consistent but has no
+window guarantee (neighbouring keys share no s-mers); the default shapes are
+contiguous.
+
+With the old fixed gene margin, closed syncmers (`w = 4`, 40 % of k-mers)
+matched every k-mer on the presets and edged it at high SHM (fixed 30 % SHM,
+V gene 76.35 vs 74.90 %), for 2.3 % fewer instructions, so they became the
+default (item 15); open syncmers (`w = 2`) measured better still. That
+parity was fragile: the audit's new order alone, which changes which 40 % of
+k-mers are kept, moved closed syncmers on the hard preset from 98.36 to
+98.06 % V gene (V ECE 1.31 → 1.58 %) while every k-mer stayed at 98.24 %,
+and it came from how sparser seeds interacted with the fixed margin and vote
+trigger. Under the
+noise-based margin (item 18) every k-mer is better: mean V gene over seven
+conditions 88.12 vs 87.05 % (closed `w = 4`) and 86.95 % (open `w = 2`,
+7-mers always), 84.65 vs 80.25 % at 30 % SHM, equal on the presets, for
+0.4 % more instructions on the hard preset. Every k-mer is the default
+again; the sampled schemes remain options. The window guarantee does not
+affect boundaries: seeds only choose candidates and the alignment band
+(cluster ± 8 diagonals), and mean V boundary errors were 0.55–0.59 /
+0.88–1.02 bases on the hard preset for every scheme. It could matter only
+for an indel longer than 8 bases with no shared seed beyond it, which the
+simulator does not produce.
 
 **Does searching J downstream of V let a misplaced J eat the D?** The J is
 searched in `[min V end − 12, read end)`, every allele unbanded, before the D.
@@ -492,7 +576,7 @@ IGH, 5000 reads, D remnant ≥ 8 nt:
 
 | | mid | hard |
 |---|---|---|
-| D correct | 97.08 % | 87.50 % |
+| D correct | 97.08 % | 87.52 % |
 | wrong D, a correct placement existed (adjudication) | 2.66 % | 10.22 % |
 | wrong D, not found | 0.23 % | 1.77 % |
 | true D outside the D windows | 0.00 % | 0.00 % |
@@ -518,17 +602,17 @@ errors that remain are wrong alleles (§5.9).
 germline as BLAST databases, `-organism human -ig_seqtype Ig -outfmt 19`,
 scored by `vdj-assign evaluate`:
 
-| Preset | Tool | V | V gene | D | J | Junction | D called on D-free reads | Reads/s, 4 threads |
+| Preset | Tool | V | V gene | D | J | Junction | D called on D-free reads | Reads/s, 4 threads (previous V retrieval) |
 |---|---|---|---|---|---|---|---|---|
 | easy | vdj_assign | 99.88 | 100.00 | 99.29 | 99.84 | 100.00 | 0 % | 5200 |
 | easy | IgBLAST | 99.12 | 99.78 | 98.86 | 99.86 | 99.77 | 0 % | 67 |
 | mid | vdj_assign | 97.88 | 99.72 | 93.35 | 98.74 | 99.97 | 23 % | 5100 |
 | mid | IgBLAST | 97.18 | 99.62 | 93.73 | 98.60 | 99.72 | 43 % | 66 |
-| hard | vdj_assign | 89.26 | 98.58 | 83.00 | 92.80 | 99.69 | 16 % | 5200 |
+| hard | vdj_assign | 89.44 | 98.84 | 83.00 | 92.80 | 99.69 | 16 % | 5200 |
 | hard | IgBLAST | 89.16 | 98.90 | 81.75 | 91.84 | 98.07 | 30 % | 71 |
 
 IgBLAST's higher mid D accuracy comes with twice the D calls on D-free
-junctions, and its V gene is 0.3 pp better on the hard preset. Two setup
+junctions, and its V gene is 0.06 pp better on the hard preset. Two setup
 issues had to be fixed for a fair junction comparison. IgBLAST takes J
 anchors from its auxiliary file, which lacks three of this database's J
 alleles, so it reported no junction for 18 % of reads; the entries were

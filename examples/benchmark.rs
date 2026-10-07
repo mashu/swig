@@ -69,6 +69,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Some(base) = value("--budget-base") {
         config.v.budget.base = base.parse()?;
     }
+    if let Some(max) = value("--budget-max") {
+        config.v.budget.max = max.parse()?;
+    }
+    // V gene margin: a gene is kept while its votes are within z standard
+    // deviations of the leader's (AmbiguityBudget).
+    if let Some(z) = value("--margin-z") {
+        config.v.budget.z = z.parse()?;
+    }
     if let Some(limit) = value("--max-alleles") {
         config.v.seeds.max_alleles = limit.parse()?;
     }
@@ -83,8 +91,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Some(sampling) = value("--sampling") {
         // all | closed:W | open:W | min:W
         use vdj_assign::seed::SeedSampling;
-        let (kind, w) = sampling.split_once(':').unwrap_or((sampling.as_str(), "0"));
-        let w: u8 = w.parse()?;
+        let (kind, w) = match sampling.split_once(':') {
+            Some((kind, w)) => (kind, w.parse::<u8>()?),
+            None if sampling == "all" => ("all", 0),
+            None => {
+                return Err(
+                    format!("--sampling {sampling} needs a window, e.g. {sampling}:4").into(),
+                )
+            }
+        };
         config.v.seeds.sampling = match kind {
             "all" => SeedSampling::All,
             "closed" => SeedSampling::ClosedSyncmer { w },
@@ -93,8 +108,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             other => return Err(format!("unknown sampling '{other}'").into()),
         };
     }
-    if let Some(votes) = value("--weak-votes") {
-        config.v.seeds.weak_votes = votes.parse()?;
+    if let Some(seeds) = value("--weak-seeds") {
+        config.v.seeds.weak_seeds = seeds.parse()?;
     }
     if let Some(reclaim) = value("--j-reclaim") {
         // How far before the earliest V end J is searched (huge = whole read).
@@ -129,10 +144,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             (fallback > 0).then(|| vdj_assign::seed::SeedShape::contiguous(fallback));
     }
     if let Some(v) = list("--budget") {
+        if v.len() != 3 {
+            return Err("--budget expects base,max,z".into());
+        }
         config.v.budget.base = v[0].parse()?;
         config.v.budget.max = v[1].parse()?;
-        config.v.budget.relative = v[2].parse()?;
-        config.v.budget.absolute = v[3].parse()?;
+        config.v.budget.z = v[2].parse()?;
     }
     if let Some(run) = value("--min-d-run") {
         config.d.min_exact_run = run.parse()?;

@@ -19,7 +19,7 @@ Zero dependencies, Rust ≥ 1.75, edition 2021.
 
 ```sh
 cargo build --release                          # always run the release build
-cargo test                                     # 74 unit, 9 annotation, 11 synthetic, 7 simulated-accuracy tests
+cargo test                                     # 78 unit, 9 annotation, 11 synthetic, 7 simulated-accuracy tests
 
 target/release/vdj-assign --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta \
     [--profile r|truth|igblast|sensitive-d] [--threads N] [--tandem-d] \
@@ -276,7 +276,7 @@ no runtime type checks.
 |---|---|---|
 | `Aligner` (+ `score_batch`, `align_batch`) | `InterSequenceGotoh` (AVX2, scalar fallback) | `BandedGotoh`; batch methods default to single-job loops |
 | `Retriever` | V: `UngappedPrefilter<SeedVoteRetriever>` (prefilter off); J: `ExhaustiveRetriever`; D: `LmerMaskRetriever` | `SeedVoteRetriever` alone |
-| `CandidateBudget` | `AmbiguityBudget{3, 16, 5 %, 8}` | `FixedBudget` |
+| `CandidateBudget` | `AmbiguityBudget{3, 16, z = 2}` | `FixedBudget` |
 | `SubstitutionModel` | `AffineScoring` | `HotspotScoring` (position-specific; the kernel's profile path) |
 | `DWindowPolicy` | `WithAnchorWindow<ExpandedResidual>` | `ResidualWindow`, `ExpandedResidual` |
 | `Admission` | `AnyOf<ExactRunFloor, Option<DistributedEvidence>>` (distributed-D off by default) | `AdmitAll`, `AllOf`, any `Option<A>` |
@@ -313,7 +313,10 @@ reverse-complemented, 450–650 nt) against a human IGH germline set of
 Rows after the first seven were measured later in a busier container
 (±10 %); in instructions the exact DAG costs 3 % and the posterior pass 18 %
 of a hard-preset run. Four threads give ~7300 reads/s without posteriors and
-~5400 with them. Calls are identical across the pure-speed steps; the steps
+~5400 with them. The noise-based V gene margin with every k-mer as a seed
+(more accurate at high SHM, see *V seeds and gene margin*) then added 4 % of
+instructions per read on the hard preset and 6 % at 30 % SHM; wall-clock
+differences were within the container's noise. Calls are identical across the pure-speed steps; the steps
 that changed calls are listed in [docs/ASSESSMENT.md](docs/ASSESSMENT.md)
 with their accuracy effect.
 
@@ -322,16 +325,35 @@ with their accuracy effect.
 **Nucleotides and k-mers as integers.** Rolling 2-bit k-mer keys in `u64`, with
 N resetting the window. Spaced seeds are data (a mask), not code.
 
-**Closed-syncmer seeds.** A k-mer is a seed when the smallest of its s-mers
-(`s = k − 4`, ordered by a hash) is its first or last one: 40 % of k-mers,
-chosen the same way in the germline index and in the read. The choice depends
-only on the k-mer, so a shared seed survives any mutation outside it, and any
-5 consecutive k-mers hold a seed, so every unmutated 13-base stretch yields one.
-On human IGH they matched every-k-mer seeding within ±0.08 pp at the IgSim
-presets and within ±0.4 pp on reads covering only 30–80 V bases, and lost
-nothing at 15–30 % SHM (+0.0 to +0.6 pp V, +0.35 to +1.45 pp V gene), with
-60 % fewer votes to sort (`SeedSampling`; minimisers and open syncmers are
-options).
+**V seeds and gene margin.** Every 9-mer of the read votes for the gene
+frames that hold it (weight 4), and 7-mers too (weight 1) while the leader
+holds fewer than 25 nine-mer seeds, where a count's Poisson relative error
+`1/√n` exceeds 20 %. A gene is kept while its votes are within
+`z·√(2·4·L)` of the leader's `L`, two standard deviations (`z = 2`) of the
+difference between two seed counts near the leader's: relative to the leader,
+but proportionally wider where counts are small (mutated reads). Measured
+jointly on human IGH (hard and mid presets, fixed 20 and 30 % SHM, 200-nt
+3′ fragments) and the synthetic database, against the previous release
+(fixed margin of 8 votes or 5 %, 16-vote trigger, closed syncmers): mean V
+gene over the seven conditions 85.2 → 88.1 %, 30 % SHM 75.7 → 84.7 %, hard
+preset 98.36 → 98.50 %. A proportional margin (10–30 % of `L`) loses 4–9
+points at 30 % SHM; z above 2 adds at most 0.1 point (the 16-gene cap binds).
+
+Sampled seeds (`SeedSampling`) remain available and correct: closed syncmers
+(Edgar 2021; the smallest `s`-mer of the seed's key, `s = k − w`, first or
+last) are context-free, so a seed shared by read and germline is kept in both
+or neither, and have a *window guarantee*: any `w` consecutive k-mers hold
+one on a contiguous shape, so every unmutated stretch of `k + w − 1` bases
+(12 for 9-mers, `w = 4`) yields a shared seed (0 seedless 12-base windows on
+IGHV). Open syncmers (the smallest `s`-mer in the middle, Shaw & Yu 2022) are
+context-free without that guarantee (5 % of 12-base IGHV windows seedless at
+`w = 2`); minimisers have the guarantee but are not context-free. Under the
+noise-based margin every k-mer beats closed and open syncmers (minimisers
+were not re-measured): closed syncmers (`w = 4`, 40 % of k-mers) are 1.1
+points of mean V gene behind (4.4 at 30 % SHM) for 0.4 % fewer instructions
+on the hard preset (and slightly more at 30 % SHM). Their earlier parity came
+from the fixed margin and was fragile: a different hash order alone moved
+them 0.3 points on the hard preset.
 
 **Strand from a k-mer bitset.** A presence bitset over all 4¹¹ k-mers of the V
 and J germline (512 KiB). One pass computes forward and reverse-complement
@@ -506,15 +528,15 @@ preset, germline-equivalent accuracy in %, before → after the redesign:
 | Preset (IgSim) | Orientation | V | V gene | D | J | Junction | Random reads called |
 |---|---|---|---|---|---|---|---|
 | easy (no SHM) | 99.94 → **100** | 99.54 → **99.84** | 99.92 → **99.98** | 98.78 → **99.29** | 99.90 → **99.94** | 99.94 → **100** | 30.5 → **0** |
-| mid (IgM-like) | 100 → 100 | 97.76 → **97.92** | 99.84 → 99.82 | 91.96 → **93.00** | 98.84 → 98.80 | 99.93 → **99.97** | 30.2 → **0** |
-| hard (IgG-like) | 99.98 → **100** | 89.74 → **89.86** | 98.44 → 98.36 | 81.72 → **83.58** | 92.70 → **93.32** | 98.39 → **99.50** | 31.2 → **0** |
+| mid (IgM-like) | 100 → 100 | 97.76 → **97.94** | 99.84 → 99.84 | 91.96 → **93.00** | 98.84 → 98.80 | 99.93 → **99.97** | 30.2 → **0** |
+| hard (IgG-like) | 99.98 → 99.98 | 89.74 → **89.96** | 98.44 → **98.50** | 81.72 → **83.58** | 92.70 → **93.32** | 98.39 → **99.55** | 31.2 → **0** |
 
 Junctions "after" use the corrected anchors of 3′-partial V alleles, which
 leave those alleles' reads without a templated junction (hard: 2416 → 2214
 scored reads); with the old annotation the same calls scored 98.47 %.
 
 The synthetic database (`SyntheticSpec::default()`, seed 1) gives, after:
-easy V/D/J 99.98/99.82/99.98, mid 99.54/87.88/98.92, hard 97.06/79.67/94.06,
+easy V/D/J 99.98/99.82/99.98, mid 99.54/87.90/98.92, hard 97.18/79.69/94.06,
 and junctions ≥ 99.8 %.
 
 **Against IgBLAST 1.22** (Bioconda build, defaults, `-organism human` with
@@ -527,11 +549,13 @@ strand, 5000 per preset, scored by `vdj-assign evaluate`):
 | easy | IgBLAST | 99.12 | 99.78 | 98.86 | **99.86** | 99.77 | 0 % | 67 reads/s |
 | mid | vdj_assign | **97.88** | **99.72** | 93.35 | **98.74** | **99.97** | **23 %** | **5100 reads/s** |
 | mid | IgBLAST | 97.18 | 99.62 | **93.73** | 98.60 | 99.72 | 43 % | 66 reads/s |
-| hard | vdj_assign | **89.26** | 98.58 | **83.00** | **92.80** | **99.69** | **16 %** | **5200 reads/s** |
+| hard | vdj_assign | **89.44** | 98.84 | **83.00** | **92.80** | **99.69** | **16 %** | **5200 reads/s** |
 | hard | IgBLAST | 89.16 | **98.90** | 81.75 | 91.84 | 98.07 | 30 % | 71 reads/s |
 
 IgBLAST's higher mid-preset D accuracy comes with twice the D calls on D-free
-junctions. Throughput is wall clock for the whole command, posteriors on.
+junctions. Throughput is wall clock for the whole command, posteriors on,
+measured with the previous V retrieval defaults (the current ones use 4 % more
+instructions).
 IgBLAST takes J anchors from its auxiliary file, which lacks three of this
 database's J alleles; the comparison adds them (frame and CDR3 end from
 `vdj-assign prepare`, which agrees with the file on all 13 shared alleles).
@@ -560,8 +584,8 @@ has a simulated D" for D presence:
 | Preset | V | D | J | D presence |
 |---|---|---|---|---|
 | easy | 0.04 / 0.0008 | 0.49 / 0.0015 | 0.07 / 0.0000 | 0.20 / 0.0029 |
-| mid | 0.31 / 0.0090 | 1.29 / 0.040 | 0.30 / 0.0059 | 1.98 / 0.026 |
-| hard | 1.31 / 0.045 | 1.16 / 0.072 | 0.69 / 0.031 | 1.24 / 0.024 |
+| mid | 0.29 / 0.0088 | 1.29 / 0.040 | 0.30 / 0.0059 | 1.98 / 0.026 |
+| hard | 1.13 / 0.043 | 1.16 / 0.072 | 0.69 / 0.031 | 1.24 / 0.024 |
 
 With one fixed λ instead of each read's divergence, and only co-optimal
 placements pooled, mid-preset ECEs were 4.6 / 7.7 / 3.9 / 2.1.
@@ -643,10 +667,12 @@ Each is a named field you can change.
    instead of the note's 12-relaxed-to-10 rule. A sweep of constant costs put
    the relaxed rule on the same precision/recall curve as a single constant.
 2. **Tandem D.** A second D pays its own `P_D` plus 12 (`tandem_d_penalty`).
-3. **Retrieval.** V keeps 3 genes and walks up to 16 while gene votes stay
-   within `max(8, 5 %)` of the leader; every allele of a kept gene is a
-   candidate. J is exhaustive. D uses the lossless L-mer prefilter instead of
-   the note's k = 5/3 seeds.
+3. **Retrieval.** Every 9-mer votes, and 7-mers too while the leader holds
+   fewer than 25 seeds. V keeps 3 genes and walks up to 16 while gene votes
+   stay within two standard deviations of the leader's (`z·√(2·4·L)` votes
+   for a leader with `L`; the note used a fixed 8 or 5 %); every allele of a
+   kept gene is a candidate. J is exhaustive. D uses the lossless L-mer
+   prefilter instead of the note's k = 5/3 seeds.
 4. **Keep.** V and J trace until the top 3 alignments that pass the E-value
    gate (plus ties); D keeps up to 32 admissible alignments.
 5. **Windows.** D windows reclaim 12 bases into V and J (the note's rescue of
