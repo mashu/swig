@@ -616,12 +616,14 @@ impl PairedOutcome {
 }
 
 /// Two callers compared read by read on the same simulated reads: allele
-/// equivalence of V, D and J (reads with that segment) and junction
-/// exactness (reads with a templated junction).
+/// equivalence of V, D and J (reads with that segment), no D call on reads
+/// without one (D allele accuracy alone rewards calling D everywhere), and
+/// junction exactness (reads with a templated junction).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Paired {
     pub v: PairedOutcome,
     pub d: PairedOutcome,
+    pub no_d: PairedOutcome,
     pub j: PairedOutcome,
     pub junction: PairedOutcome,
 }
@@ -646,6 +648,10 @@ impl Paired {
                 );
             }
         }
+        if truth.segment(Slot::D).is_none() {
+            let silent = |call: &Assignment| call.segment(Slot::D).is_none();
+            self.no_d.add(silent(first), silent(second));
+        }
         if let Some(junction) = &truth.junction {
             let exact = |call: &Assignment| {
                 call.rev_comp == truth.reverse_complemented
@@ -665,6 +671,7 @@ impl fmt::Display for Paired {
         for (label, o) in [
             ("V allele", &self.v),
             ("D allele", &self.d),
+            ("no D call", &self.no_d),
             ("J allele", &self.j),
             ("junction", &self.junction),
         ] {
