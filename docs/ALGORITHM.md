@@ -41,7 +41,7 @@ both hypotheses.
 
 V and J alignments are extended co-linearly, without gaps, to the germline's
 outer end (V 5′, J 3′) or the read's end, whichever comes first
-(`refine::extend_outer`). This makes the alignment end-to-end on its outer
+(`flank::extend_outer`). This makes the alignment end-to-end on its outer
 side, where the germline must begin (V) or end (J). The substitution scores of
 the extension, mismatches included, count towards the ranking.
 
@@ -357,9 +357,11 @@ removes. The 12-base reclaim keeps this rare. With 24 bases, D accuracy was
 
 ## 6. Implementation
 
-- **Inter-sequence SIMD.** Each AVX2 16-bit lane runs the scalar Gotoh
+- **Inter-sequence SIMD.** Each 16-bit lane runs the scalar Gotoh
   recurrence for a different job. Traceback codes are bit-identical to the
-  scalar kernel's, so the same traceback walk serves both.
+  scalar kernel's, so the same traceback walk serves both. The kernel is
+  written once over a lane abstraction and compiled for AVX-512BW (32
+  lanes), AVX2, NEON and portable lanes (16), chosen at run time.
   - Banded jobs use band-relative coordinates.
   - With uniform profiles, a cell's substitution is a code comparison;
     otherwise the five profile rows are selected by mask, which is exact for
@@ -367,9 +369,10 @@ removes. The 12-base reclaim keeps this rare. With 24 bases, D accuracy was
 - **Stage-wise batching.** Each stage runs over a chunk of 64 reads, giving
   one score batch and a few traceback waves per stage, while every decision
   stays per read. A read's result does not depend on its chunk (tested).
-- **Exactness.** The scalar kernel equals a textbook Gotoh; the SIMD kernel
-  equals the scalar kernel (scores, end cells, tracebacks); the batched
-  pipeline equals the per-read scalar pipeline.
+- **Exactness.** The scalar kernel equals a textbook Gotoh; every SIMD
+  backend equals the scalar kernel (scores, end cells, tracebacks); the
+  batched pipeline equals the per-read scalar pipeline, and output is
+  byte-identical across backends and across x86-64 and AArch64.
 
 ## 7. Evaluation protocol
 
@@ -394,6 +397,13 @@ Metrics (`sim/evaluate.rs`):
   A segment's event is "the reported names include the read's allele, up to
   germline equivalence" (§4a); D presence's is "the read has a simulated D",
   however short.
+
+**Comparisons** (`sim::Paired`). Two callers or settings are compared on the
+same reads, at least 20,000 per preset: for each metric, the accuracy
+difference with its 95 % interval (paired Wald) and an exact two-sided
+McNemar test on the discordant reads. D allele accuracy is always reported
+with the fraction of D-free reads left without a D call, since either can
+be raised at the other's expense.
 
 **D error attribution** (`examples/d_errors.rs`). Every wrong or missing D
 call is attributed to where it arose: the true D lies outside the D windows

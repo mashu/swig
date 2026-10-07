@@ -7,7 +7,9 @@ objective (see [docs/ALGORITHM.md](docs/ALGORITHM.md)) instead of tuned patches.
 Every component is a replaceable, statically dispatched trait, and every
 search shortcut is either lossless or measured on simulated repertoires.
 
-Zero dependencies, Rust ≥ 1.75, edition 2021.
+Zero dependencies, Rust ≥ 1.89, edition 2024. The alignment kernel runs on
+AVX-512BW, AVX2, NEON or portable SIMD lanes, chosen at run time; output is
+byte-identical across them and across x86-64 and AArch64.
 
 - [docs/ALGORITHM.md](docs/ALGORITHM.md): the model, the search and its
   guarantees, structured for a methods section.
@@ -19,12 +21,13 @@ Zero dependencies, Rust ≥ 1.75, edition 2021.
 
 ```sh
 cargo build --release                          # always run the release build
-cargo test                                     # 74 unit, 9 annotation, 11 synthetic, 7 simulated-accuracy tests
+cargo test --release                           # 78 unit, 9 annotation, 2 robustness, 11 synthetic, 7 simulated-accuracy tests
+cargo test --release -- --ignored              # + accuracy at scale: 20,000 reads per preset
 
 target/release/vdj-assign --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta \
     [--profile r|truth|igblast|sensitive-d] [--threads N] [--tandem-d] \
     [--chain heavy|light] [--forward-only] [--no-anchor-window] [--no-posterior] [--residual] \
-    reads.fastq > calls.tsv
+    [--simd avx512|avx2|neon|portable|scalar] reads.fastq > calls.tsv
 
 zcat reads.fastq.gz | target/release/vdj-assign --v V.fasta --d D.fasta --j J.fasta - > calls.tsv
 
@@ -36,6 +39,8 @@ target/release/vdj-assign simulate --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta 
     --preset hard --reads 10000 --seed 1 --out sim          # sim.fasta + sim.truth.tsv
 target/release/vdj-assign --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta sim.fasta > calls.tsv
 target/release/vdj-assign evaluate --truth sim.truth.tsv calls.tsv   # works for IgBLAST etc. too
+# two callers (or settings) on the same reads: paired differences, 95 % CIs, exact McNemar tests
+target/release/vdj-assign evaluate --truth sim.truth.tsv calls.tsv other.tsv
 
 # accuracy and throughput on simulated reads (synthetic database unless --v/--d/--j are given)
 cargo run --release --example benchmark -- [--v V.fasta --d D.fasta --j J.fasta] \
@@ -58,7 +63,9 @@ The CLI rejects:
 
 A debug build prints a warning, because it is 10–50× slower.
 
-Germline databases are FASTA. No IMGT reference is needed: anchors and V
+Germline databases are FASTA; IMGT reference headers
+(`accession|allele|species|…`) are read as the allele name. No IMGT
+annotation is needed: anchors and V
 region boundaries are taken from the headers where present and detected
 otherwise, on every start, in milliseconds (see *Germline annotation* below).
 Identical sequences are merged and reported under all their names. Anchors
@@ -227,12 +234,12 @@ stages are the methods `stage_orient`, `stage_v`, `stage_j`, `stage_d` and
 | `seed`, `index`, `retrieve/frames` | Rolling k-mers, CSR k-mer index over gene frames (alleles of a gene in one coordinate system) |
 | `retrieve/seed_vote`, `retrieve/budget` | Radix-sorted diagonal votes per frame, gene budget, candidate bands |
 | `retrieve/exhaustive`, `retrieve/lmer_mask`, `retrieve/ungapped` | J: every allele; D: lossless L-mer bitsets; optional ungapped pre-ranking |
-| `band`, `align/gotoh`, `align/inter_seq` | Diagonal bands; scalar banded Gotoh; AVX2 inter-sequence Gotoh (16 jobs per register) |
+| `band`, `align/gotoh`, `align/inter_seq`, `align/lanes` | Diagonal bands; scalar banded Gotoh; inter-sequence Gotoh written once over a SIMD lane trait (AVX-512BW 32 lanes; AVX2, NEON, portable 16) |
 | `segment`, `family_bound` | One search stage: score → sibling upper bounds → traceback waves → acceptance and E-value gates → outer extension |
 | `clip`, `evidence`, `placement` | O(1) clip-and-rescore at any cut; exact-run / identity evidence |
 | `window`, `admission` | Where J and D are searched; D evidence gates |
-| `adjudicate/{dag,model,residual}` | Semi-Markov Viterbi over placements; grammar and log-odds path model; residual baseline |
-| `refine` | Outer-flank extension; `Refiner` extension point |
+| `adjudicate/{lattice,dag,posterior,model,residual}` | The placement lattice; Viterbi and forward–backward over it; grammar and log-odds path model; residual baseline |
+| `flank` | Outer-flank extension of V and J alignments |
 | `pipeline`, `config`, `profiles` | Stage-wise composition, declarative configuration, calling profiles |
 | `report`, `batch` | AIRR output, parallel batches |
 | `sim/{random,params,simulate,synthetic,evaluate}` | IgSim port, synthetic germlines, accuracy evaluation |
@@ -267,14 +274,14 @@ The full description, with the guarantee of each search step, is in
 
 ## Extension points
 
-Every component is a trait. `Assigner<A, RV, RJ, RD, W, Adm, Adj, Rf>` is generic
+Every component is a trait. `Assigner<A, RV, RJ, RD, W, Adm, Adj>` is generic
 over all of them, and the defaults form `DefaultAssigner`. Swapping one changes
 the type, and the whole pipeline monomorphises. There are no trait objects and
 no runtime type checks.
 
 | Trait | Default | Alternatives shipped |
 |---|---|---|
-| `Aligner` (+ `score_batch`, `align_batch`) | `InterSequenceGotoh` (AVX2, scalar fallback) | `BandedGotoh`; batch methods default to single-job loops |
+| `Aligner` (+ `score_batch`, `align_batch`) | `InterSequenceGotoh` (best `Backend` of the CPU) | `BandedGotoh`; batch methods default to single-job loops |
 | `Retriever` | V: `UngappedPrefilter<SeedVoteRetriever>` (prefilter off); J: `ExhaustiveRetriever`; D: `LmerMaskRetriever` | `SeedVoteRetriever` alone |
 | `CandidateBudget` | `AmbiguityBudget{3, 16, 5 %, 8}` | `FixedBudget` |
 | `SubstitutionModel` | `AffineScoring` | `HotspotScoring` (position-specific; the kernel's profile path) |
@@ -282,7 +289,6 @@ no runtime type checks.
 | `Admission` | `AnyOf<ExactRunFloor, Option<DistributedEvidence>>` (distributed-D off by default) | `AdmitAll`, `AllOf`, any `Option<A>` |
 | `Adjudicator` | `PlacementDag<VdjGrammar, EngineeringObjective>` | `ResidualAdjudicator` |
 | `Grammar`, `PathModel` | `VdjGrammar::{VDJ, TANDEM_D, VJ}`, `EngineeringObjective` | your own path grammar / objective |
-| `Refiner` | `NoRefine` | extension point |
 | `VdjAssigner` (+ `assign_many`) | chunk-staged `Assigner` | default `assign_many` loops `assign` |
 
 ```rust
@@ -311,8 +317,12 @@ reverse-complemented, 450–650 nt) against a human IGH germline set of
 | + posterior decoding, on by default (`--no-posterior` skips it) | ~1300 |
 
 Rows after the first seven were measured later in a busier container
-(±10 %); in instructions the exact DAG costs 3 % and the posterior pass 18 %
-of a hard-preset run. Four threads give ~7300 reads/s without posteriors and
+(±10 %); in instructions the exact DAG costs 3 % and the posterior pass 30 %
+of a hard-preset run (it also keeps every admissible D in the lattice).
+
+On the IMGT human IGH reference, 20,000 hard reads, one thread, by kernel
+backend (identical calls): AVX-512BW 2403, AVX2 2103, portable 1621, scalar
+810 reads/s; four threads give ~8200 reads/s with posteriors. Four threads give ~7300 reads/s without posteriors and
 ~5400 with them. Calls are identical across the pure-speed steps; the steps
 that changed calls are listed in [docs/ASSESSMENT.md](docs/ASSESSMENT.md)
 with their accuracy effect.
@@ -401,7 +411,7 @@ sums the per-position maximum profile gain. Siblings whose bound cannot reach
 the current top-N cutoff are not scored.
 
 **Inter-sequence SIMD (`align/inter_seq`).**
-- Each 16-bit AVX2 lane holds the same cell of a *different* job. Every lane
+- Each 16-bit lane holds the same cell of a *different* job. Every lane
   runs the ordinary recurrence, so traceback codes are the scalar ones and the
   scalar traceback walk is reused verbatim.
 - Diagonal bands use band-relative coordinates, so all lanes walk the same
@@ -415,7 +425,14 @@ the current top-N cutoff are not scored.
 - Out-of-band and out-of-matrix cells read as H = 0, I = D = −∞, exactly like
   the scalar kernel. Saturating i16 arithmetic, with a per-job admission check;
   jobs that could approach the sentinel fall back to the scalar kernel.
-- Runtime AVX2 detection, with a scalar fallback on other CPUs.
+- **One kernel, every CPU.** The recurrence is written once over
+  `align::lanes::Lanes<L>`, a register of `L` lanes with an associated mask
+  type (vector masks on AVX2/NEON/portable, `k` registers on AVX-512), and
+  compiled per backend inside a `#[target_feature]` entry point:
+  AVX-512BW (32 lanes, opt-in with `--simd avx512` because 512-bit
+  instructions lower the clock on many CPUs), AVX2 (16), NEON (16 in two
+  registers) and portable Rust arrays (16) that the compiler vectorises for
+  the target's baseline SIMD. `Backend::detect` chooses at run time.
 
 **Stage-wise batching across reads.** A read has only a few V, J and D
 candidates, too few to fill 16 lanes. So every stage runs over a chunk of 64
@@ -500,6 +517,16 @@ expose both, so other callers can be scored on identical reads.
 - boundary errors, D presence by remnant length, junction exactness;
 - a random-read negative control.
 
+`sim::Paired` compares two callers read by read on the same truth: for V, D
+and J allele equivalence, D-free reads left without a D call, and junction
+exactness, it reports both accuracies, their difference with a 95 %
+interval, and an exact McNemar p-value from the reads only one caller gets
+right. D allele accuracy alone rewards calling D everywhere, so the D-free
+column belongs next to it. On 20,000 reads per preset, for example, the
+residual adjudicator gains +0.4–0.6 pp of D accuracy (p < 10⁻⁴) only by
+giving 21–25 pp more D-free reads a D; see
+[docs/ASSESSMENT.md §9.5](docs/ASSESSMENT.md) for the full table.
+
 Human IGH (541 V / 90 D / 16 J; a local copy, not shipped), 5000 reads per
 preset, germline-equivalent accuracy in %, before → after the redesign:
 
@@ -516,6 +543,16 @@ scored reads); with the old annotation the same calls scored 98.47 %.
 The synthetic database (`SyntheticSpec::default()`, seed 1) gives, after:
 easy V/D/J 99.98/99.82/99.98, mid 99.54/87.88/98.92, hard 97.06/79.67/94.06,
 and junctions ≥ 99.8 %.
+
+At 20,000 reads per preset on the public IMGT human IGH reference (the one
+shipped in the `airrship` PyPI package: 415 V / 37 D / 13 J after merging
+identical sequences, ORFs and pseudogenes included; 95 % intervals ≤ ±0.5 pp):
+
+| Preset | V | V gene | D | J | Junction | D-free reads given a D | Random reads called |
+|---|---|---|---|---|---|---|---|
+| easy | 99.88 | 100.00 | 99.69 | 99.94 | 100.00 | 0.0 % | 0.04 % |
+| mid | 98.61 | 99.97 | 93.11 | 99.11 | 99.97 | 24.5 % | 0.04 % |
+| hard | 93.07 | 99.42 | 85.92 | 94.25 | 99.62 | 16.0 % | 0.04 % |
 
 **Against IgBLAST 1.22** (Bioconda build, defaults, `-organism human` with
 the same germline as BLAST databases; the same simulated reads, all forward
@@ -597,7 +634,10 @@ window; searching J over the whole read lets 0.05 % fall outside.
 - **Kernel exactness:**
   - The scalar kernel equals a textbook Gotoh across three gap regimes.
   - Every traceback rescores to its reported score.
-  - The AVX2 kernel equals the scalar kernel on 160 random mixed batches. Its
+  - Every backend this CPU runs (AVX-512, AVX2, NEON, portable) equals the
+    scalar kernel on 160 random mixed batches of up to five registers, and on
+    degenerate jobs (empty sides, all-N queries, one-row queries, bands that
+    miss the matrix). Its
     scores, end cells and complete tracebacks are compared over full and
     banded layouts, N bases, indels, four scoring schemes, and hotspot profiles
     mixed into half of the batches. Both the uniform and the profile path are
@@ -607,7 +647,15 @@ window; searching J over the whole read lets 0.05 % fall outside.
 - **Simulated accuracy (`tests/simulated.rs`):** IgSim presets on the
   synthetic database, half reverse-complemented. Accuracy floors sit ~1.5 points
   below the measured values for orientation, V/D/J allele and gene, junctions
-  and long D remnants. Random reads must receive no call.
+  and long D remnants. Random reads must receive no call. `accuracy_at_scale`
+  (ignored by default; `--ignored`) runs 20,000 reads per preset with floors
+  ~3 standard errors under the measured rates: 500-read samples have 95 %
+  intervals of ±1–4 pp and hide most regressions.
+- **Robustness (`tests/robustness.rs`):** empty, 1-base, all-N, IUPAC,
+  low-complexity, 20 kb, chimeric reads and every prefix and suffix of a read
+  through every profile, with AIRR-record invariants.
+- **Cross-architecture:** the suite passes on x86-64 and on AArch64 (CI runs
+  both), and AArch64 output equals x86-64 output byte for byte.
 - **Synthetic calling (`tests/synthetic.rs`):** D genes, D-free junctions,
   tandem VDDJ, hypermutated V, reverse complements, residual adjudicator.
 - **Batch consistency:** chunk-batched parallel output equals per-read
@@ -690,8 +738,6 @@ Each is a named field you can change.
   calibrated p-values.
 - **Segment type is not checked from FASTA.** FASTA carries no segment type, so
   the CLI cannot detect a D file passed as `--j`.
-- **SIMD targets.** The kernel is AVX2 only. Other CPUs, including ARM/NEON,
-  use the exact scalar path.
 - **Compressed input.** Gzip must be piped through `zcat`; there is no built-in
   decompression.
 - **FR3 length rule.** The CDR2/FR3 boundary uses the FR3 length (38 codons
@@ -718,8 +764,8 @@ In order of expected value; reasons and measurements are in
    or maximum-posterior-marginal calls, so the call and its posterior agree.
 2. **D prior from the D search's statistics** (Karlin–Altschul `K·m·n` and a
    D-inclusion rate), checked by D-presence calibration.
-3. **Wider SIMD.** An AVX-512BW kernel (32 lanes) and a NEON port (8 lanes) of
-   the same design.
+3. ~~**Wider SIMD.**~~ Done: AVX-512BW, NEON and portable backends of one
+   kernel. Next on that line: 8-bit lanes for D jobs (32 per AVX2 register).
 4. **Allele rescoring along the gene frame.** Score siblings along their
    representative's traceback and run DP only where bounds straddle the cutoff.
 5. **Annotation.** A per-database FR3 length learned from header-annotated

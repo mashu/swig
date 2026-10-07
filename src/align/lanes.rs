@@ -12,9 +12,9 @@
 //!
 //! | Backend | Lanes | Registers per vector |
 //! |---|---|---|
-//! | [`Avx512`] (x86-64 AVX-512BW) | 32 | one `zmm`, masks in `k` registers |
-//! | [`Avx2`] (x86-64 AVX2) | 16 | one `ymm` |
-//! | [`Neon`] (AArch64) | 16 | two `q` registers |
+//! | `Avx512` (x86-64 AVX-512BW) | 32 | one `zmm`, masks in `k` registers |
+//! | `Avx2` (x86-64 AVX2) | 16 | one `ymm` |
+//! | `Neon` (AArch64) | 16 | two `q` registers |
 //! | [`Portable`] (any target) | 16 | plain arrays; the compiler vectorises them for the target's baseline SIMD (SSE2, NEON, WebAssembly `simd128`, …) |
 //!
 //! # Safety

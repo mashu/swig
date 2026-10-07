@@ -366,18 +366,18 @@ work.
    codon-length indels and no allele-frequency skew, so hotspot-aware scoring
    cannot be judged on it. Validation on real data with an independent caller
    (IgBLAST, partis) is still needed.
-8. **SIMD portability.** AVX2 only; AVX-512 hardware runs at half width, and
-   ARM falls back to scalar.
+8. ~~**SIMD portability.**~~ Resolved (§9.4): one kernel over a lane
+   abstraction runs AVX-512BW, AVX2, NEON and portable lanes.
 9. **D errors are mostly the wrong allele, not a missing D.** With a remnant
    of ≥ 8 nt (§8), 2.7 % (mid) and 10.2 % (hard) of reads get a wrong D
    allele although a placement of the right one was found; the search loses
    0.2 % and 1.8 %. These are model errors: short, mutated D remnants that
    another allele explains as well or better.
-10. **Posterior cost.** The forward–backward pass is 18 % of instructions
-    but ~30 % of single-thread wall clock (dependent floating-point
-    multiply–adds and per-slot normalisation). A single-precision pass
-    with the same scaling, or skipping slots whose mass is negligible,
-    would cut it.
+10. **Posterior cost.** Measured again in §9.6: posteriors cost 30 % of all
+    instructions (10.1 G vs 7.0 G on 2000 hard reads), not 18 %, because
+    they also keep every admissible D in the lattice. No slot is negligible
+    (every admissible D scores ≥ 8 against `P_D` 11), so pruning would be
+    an approximation; a single-precision pass is the remaining option.
 11. **Anchors without a relative.** Seven V alleles of the human IGH set
     (pseudogenes and ORFs) keep a low-confidence motif anchor. One of them,
     IGHV1-38-4\*01 (Cys104 → Tyr), is placed on a TGT in another frame;
@@ -395,7 +395,8 @@ In order of expected value:
 3. ~~**Sensitivity analysis**~~ — done (§7).
 4. **Cross-tool benchmark.** IgBLAST done (§8). partis and Swig remain, at
    several SHM levels, with precision/recall curves for D.
-5. **AVX-512BW (32 lanes) and NEON (8 lanes)** kernels of the same design.
+5. ~~**AVX-512BW (32 lanes) and NEON**~~ — done (§9.4), with a portable
+   backend for every other target.
 6. **Allele rescoring along the gene frame.** Trace one representative per
    frame, rescore siblings along its path, and run DP only where bounds
    straddle the top-N cutoff. Most of the remaining V time is siblings of the
@@ -535,3 +536,168 @@ alleles, so it reported no junction for 18 % of reads; the entries were
 added, with frames and CDR3 ends from `vdj-assign prepare`, which agrees
 with the file on all 13 shared alleles. The remaining disagreements exposed
 item 16 on our side.
+
+## 9. Engineering review (edition 2024, Rust 1.97)
+
+A line-by-line review of the whole crate for soundness, duplication, dead
+abstractions and portability, with every claim re-measured at a scale where
+the comparisons are statistically meaningful.
+
+### 9.1 How it was checked
+
+- **20,000 reads per preset**, not 2000–5000. At 5000 reads a 93 % rate has
+  a 95 % interval of ±0.7 pp, so most sub-point differences in §§3–8 were
+  within noise. Every comparison below is **paired** (both configurations
+  on the same reads) and tested with an exact McNemar test on the reads only
+  one of them gets right (`vdj-assign evaluate --truth T a.tsv b.tsv`,
+  `sim::Paired`).
+- **Real germline**: the IMGT human IGH reference shipped in the `airrship`
+  PyPI package (424 V including ORFs and pseudogenes, 44 D, 13 J; 415 / 37 /
+  13 after merging identical sequences), read directly from IMGT headers.
+- **Regression oracle**: after every refactoring step, the AIRR output of
+  60,000 reads (20,000 per preset) was compared byte for byte with the
+  output of the starting commit. Every refactoring below left it identical.
+- **Debug build** (overflow checks and the clip-index rescoring assertion)
+  over 40,000 real-germline reads with the tandem-D grammar; **callgrind**
+  instruction counts for speed; **qemu** for AArch64.
+
+### 9.2 Defects found and fixed
+
+1. **Sibling bounds were applied across bands.** `S*(A) ≤ S*(R) + Δ(R, A)`
+   maps A's optimal path onto R cell for cell, so it holds only when both
+   were aligned in the same band. The V stage applied it whenever lengths
+   matched, including siblings in another gene frame or at another frame
+   offset, whose bands differ. It now bounds same-band siblings only; Δ is
+   precomputed per same-length allele pair (it was recomputed per read), and
+   each sibling finds its representative's score in O(1) (it scanned every
+   representative of the chunk). A property test checks the bound for random
+   queries and every band both alleles share.
+2. **The D keep floor ignored its configuration.** `lossless_min_score`
+   ended in `floor.max(keep.min_score.min(floor))`, which is always `floor`,
+   and its doc described the opposite rule. It is now the configured floor
+   raised to the lowest score an admissible hit can have.
+3. **IMGT headers broke gene grouping.** The allele name was the first
+   whitespace token, i.e. the whole `accession|allele|species|…` string, so
+   every IMGT allele became its own gene (gene frames, the gene budget and
+   sibling bounds silently disabled) and calls could not be evaluated
+   (0 % "accuracy" by name). The name is now the field that names an allele;
+   raw IMGT files give byte-identical calls to cleaned ones.
+4. **An unsound extension point.** `Refiner` ran after the posterior
+   marginals were computed, so any refiner that rewrote the path would have
+   reported probabilities of a different call; its only implementation was a
+   no-op. Removed (one fewer type parameter on `Assigner`); the outer-flank
+   extension it shared a module with is now `flank`.
+5. **Wrong documentation**: Karlin–Altschul statistics were described as
+   reporting-only (they gate every call); a BMI2 `pext` seed path that does
+   not exist; `HotspotScoring` described as part of the J profile; the cut
+   recursion as O(log n) (it is O(1) amortised); the posterior cost (§9.6).
+
+No crash, overflow or assertion failure was found: degenerate reads (empty,
+1 base, all-N, IUPAC, low-complexity, 20 kb, chimeric, every prefix and
+suffix of a read) pass every profile (`tests/robustness.rs`), and the 25
+functional IMGT alleles the annotator leaves without an anchor are exactly
+the ones IMGT flags "partial in 3′".
+
+### 9.3 Design
+
+| Before | After |
+|---|---|
+| `dag.rs` and `posterior.rs` each with their own node order, layout, slot groups and incoming/outgoing iterators | one `adjudicate/lattice.rs`; each pass keeps only its arithmetic (−262 lines) |
+| AVX2 intrinsics in one function; every other CPU scalar | one kernel over `align::lanes::Lanes<L>` (§9.4) |
+| five hand-copied `with_*` builders | one field-moving macro |
+| three examples with their own option parsing and database setup | `examples/common` |
+| six private random generators in tests | `sim::Rng` everywhere |
+| stage 1 retrieved V again after a non-decisive orientation | the chosen strand's candidates are kept |
+| database length summed per reported segment | stored once in `GermlineSet` |
+| traceback buffers zero-filled per group | grow-only (−2.2 % instructions) |
+
+### 9.4 Portability
+
+The inter-sequence kernel is written once, generic over `Lanes<L>` — a
+register of `L` 16-bit lanes with an associated mask type, so AVX-512's `k`
+registers and AVX2/NEON vector masks both map one-to-one onto
+instructions — and compiled per backend inside a `#[target_feature]` entry
+point. `Backend::detect` picks one at run time; `--simd` overrides it.
+
+| Backend | Lanes | Single thread, 20,000 hard reads | Calls |
+|---|---|---|---|
+| AVX-512BW (`--simd avx512`) | 32 | 2403 reads/s | identical |
+| AVX2 (default on x86-64) | 16 | 2103 reads/s | identical |
+| NEON (default on AArch64) | 16 (two `q` registers) | — (tested under qemu) | identical to x86-64 |
+| portable (any target; compiler-vectorised) | 16 | 1621 reads/s | identical |
+| scalar | 1 | 810 reads/s | identical |
+
+Every backend equals the scalar kernel cell for cell on random batches up to
+five registers wide and on degenerate jobs; the full test suite passes on
+x86-64 and on AArch64; AArch64 output equals x86-64 output byte for byte.
+AVX-512 is opt-in: +14 % on one thread but ~+4 % on four (within noise in
+this container), and 512-bit instructions lower the clock on many CPUs. The
+generic kernel costs the same instructions as the hand-written AVX2 one.
+
+### 9.5 Results at 20,000 reads, and what the ablations really show
+
+Human IGH (IMGT, `airrship`), 20,000 reads per preset, half
+reverse-complemented, germline-equivalent accuracy in %:
+
+| Preset | Oriented | V | V gene | D | J | Junction | D-free reads given a D | Random reads called |
+|---|---|---|---|---|---|---|---|---|
+| easy | 100.00 | 99.88 | 100.00 | 99.69 | 99.94 | 100.00 | 0.0 % | 0.04 % |
+| mid | 100.00 | 98.61 | 99.97 | 93.11 | 99.11 | 99.97 | 24.5 % | 0.04 % |
+| hard | 99.98 | 93.07 | 99.42 | 85.92 | 94.25 | 99.62 | 16.0 % | 0.04 % |
+
+Calibration (ECE %, V / D / J / D presence): easy 0.05 / 0.31 / 0.05 /
+0.15, mid 0.09 / 1.02 / 0.16 / 2.23, hard 0.49 / 0.99 / 0.35 / 0.99. On the
+synthetic database D-presence ECE is 7.3 % (mid) and 4.1 % (hard) at this
+sample size, the clearest sign that the D prior needs §5.2's statistics.
+
+Paired against the default on the same 20,000 reads (Δ in pp, exact
+McNemar p; "no D" is D-free reads left without a D call):
+
+| Change | Preset | D allele | no D | V | J | Junction |
+|---|---|---|---|---|---|---|
+| residual adjudicator | mid | +0.37 (p 7e−5) | −24.8 (p 5e−79) | −0.02 | −0.02 | 0 |
+| | hard | +0.62 (p 3e−8) | −21.2 (p 1e−56) | 0 | −0.05 | −0.01 |
+| `sensitive-d` | mid | +0.77 (p 4e−44) | −18.4 (p 2e−62) | 0 | 0 | 0 |
+| | hard | +1.01 (p 3e−58) | −14.1 (p 1e−44) | 0 | 0 | 0 |
+| `igblast` profile | hard | +0.26 (p 0.10) | −75.4 | −0.16 (p 9e−6) | −0.64 (p 7e−25) | −0.40 (p 6e−11) |
+| `truth` profile | hard | −0.60 (p 1e−4) | — | −0.17 (p 2e−6) | −0.07 (p 1e−4) | −0.30 (p 1e−8) |
+| no anchor D window | mid | +0.05 (p 0.013) | −0.36 (p 0.13) | 0 | 0 | 0 |
+| | hard | −0.01 (p 1.0) | −0.19 (p 0.5) | 0 | 0 | 0 |
+| tandem-D grammar | hard | +0.01 (p 0.69) | — | 0 | 0 | 0 |
+
+Read with both columns, every gain in D accuracy is bought with D calls on
+D-free reads: the residual baseline's +0.4–0.6 pp is not a better model but
+a more liberal D threshold, and `sensitive-d` sits on the same curve. The
+default is the only configuration that does not trade one for the other
+blindly; where on the curve to sit is the prior odds of a D (§5.2). The
+anchor D window and the tandem grammar change nothing measurable on IgSim
+reads (and the anchor window costs nothing measurable either); both stay as
+cheap insurance for reads the simulator does not produce.
+
+### 9.6 Where the time goes
+
+Callgrind, 2000 hard reads, one thread (10.1 G instructions, including
+database preparation):
+
+| Stage | Share |
+|---|---|
+| V (retrieval, scoring, traceback) | 21 % |
+| J (every allele right of V) | 15 % |
+| D (prefilter, alignment) | 14 % |
+| adjudication: Viterbi + posterior | 35 % (posterior alone 30 % of the run) |
+| database preparation, I/O, reporting | the rest |
+
+Remaining opportunities, in order of expected gain: (1) 8-bit lanes for D
+jobs — D scores fit in `i8`, so AVX2 would run 32 D jobs per register;
+(2) a single-precision posterior pass; (3) banded J from J seeds when the V
+is unmutated (exhaustive J is the safe default under SHM); (4) overlapping
+input parsing with assignment; (5) allele rescoring along the gene frame
+(plan item 6).
+
+### 9.7 Roadmap status
+
+Of the roadmap in the README, the wider-SIMD item is done (AVX-512BW, NEON
+and a portable backend). Calls from the per-read model, a D prior from the D
+search's own statistics, allele rescoring along the gene frame, annotation
+priors and C-segment assignment remain open; §9.5 shows the D prior is the
+one with the clearest measured need.

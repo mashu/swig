@@ -1,21 +1,22 @@
 //! Sibling upper bounds: skip DP for alleles of the same gene that cannot
 //! enter the top-N local scores.
 //!
-//! After the representative allele \(R\) of a gene is scored in band \(B\),
-//! every same-length sibling \(A\) aligned in the *same* band satisfies
-//! \[
-//! S^*_B(A) \le S^*_B(R) + \Delta(R,A)
-//! \]
-//! where \(\Delta\) is the sum over reference positions of
-//! \(\max\bigl(0, \max_q (s(A[j],q) - s(R[j],q))\bigr)\), taken from the
-//! substitution profiles. The proof maps the optimal path of \(A\) onto \(R\)
-//! cell for cell: the path stays inside \(B\) and inside \(R\)'s matrix
-//! (\(|A| = |R|\)), gap columns score alike, and each substitution column
-//! gains at most that per-position maximum. A sibling in another band (another
-//! gene frame, or another offset in the frame) or of another length is not
-//! bounded and is always scored.
+//! After the representative allele `R` of a gene is scored in band `B`,
+//! every same-length sibling `A` aligned in the *same* band satisfies
 //!
-//! \(\Delta\) depends only on the two profiles, so it is computed once per
+//! ```text
+//! S*_B(A) ≤ S*_B(R) + Δ(R, A),   Δ(R, A) = Σ_j max(0, max_q (s_A(q, j) − s_R(q, j)))
+//! ```
+//!
+//! with `s_X(q, j)` the profile score of query code `q` at position `j`. The
+//! proof maps the optimal path of `A` onto `R` cell for cell: the path stays
+//! inside `B` and inside `R`'s matrix (`|A| = |R|`), gap columns score
+//! alike, and each substitution column gains at most that per-position
+//! maximum. A sibling in another band (another gene frame, or another
+//! offset in the frame) or of another length is not bounded and is always
+//! scored.
+//!
+//! `Δ` depends only on the two profiles, so it is computed once per
 //! same-length allele pair of each gene when the stage is built.
 
 use crate::alphabet::ALPHABET_SIZE;
@@ -23,7 +24,7 @@ use crate::germline::{AlleleId, GeneId};
 use crate::scoring::{Score, SubstitutionProfile};
 use crate::segment::PreparedSegment;
 
-/// \(\Delta(R, A)\) of every same-length allele pair within each gene.
+/// `Δ(R, A)` of every same-length allele pair within each gene.
 #[derive(Clone, Debug, Default)]
 pub struct FamilyBoundTable {
     /// Gene of each allele id.
@@ -94,7 +95,7 @@ impl FamilyBoundTable {
     }
 }
 
-/// \(\Delta(R,A) = \sum_j \max\bigl(0,\ \max_q (s_A(q,j) - s_R(q,j))\bigr)\).
+/// `Δ(R, A) = Σ_j max(0, max_q (s_A(q, j) − s_R(q, j)))`.
 ///
 /// `None` when the profiles have different lengths.
 pub fn sibling_delta(
