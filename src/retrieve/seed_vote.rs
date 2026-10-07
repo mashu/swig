@@ -373,7 +373,9 @@ impl<B: CandidateBudget> Retriever for SeedVoteRetriever<B> {
         });
         ranked.clear();
         ranked.extend(gene_order.iter().map(|&g| gene_votes[g as usize]));
-        let keep = self.budget.genes_to_keep(ranked);
+        let keep = self
+            .budget
+            .genes_to_keep(ranked, u32::from(self.params.primary_weight));
         const KEPT: u32 = u32::MAX;
         for &g in &gene_order[..keep] {
             gene_votes[g as usize] = KEPT;

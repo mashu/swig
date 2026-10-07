@@ -72,13 +72,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Some(max) = value("--budget-max") {
         config.v.budget.max = max.parse()?;
     }
-    // V gene margin: a gene is kept while its votes are within
-    // max(absolute, relative · leader) of the leader's.
-    if let Some(relative) = value("--margin-rel") {
-        config.v.budget.relative = relative.parse()?;
-    }
-    if let Some(absolute) = value("--margin-abs") {
-        config.v.budget.absolute = absolute.parse()?;
+    // V gene margin: a gene is kept while its votes are within z standard
+    // deviations of the leader's (AmbiguityBudget).
+    if let Some(z) = value("--margin-z") {
+        config.v.budget.z = z.parse()?;
     }
     if let Some(limit) = value("--max-alleles") {
         config.v.seeds.max_alleles = limit.parse()?;
@@ -147,10 +144,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             (fallback > 0).then(|| vdj_assign::seed::SeedShape::contiguous(fallback));
     }
     if let Some(v) = list("--budget") {
+        // base,max,z
         config.v.budget.base = v[0].parse()?;
         config.v.budget.max = v[1].parse()?;
-        config.v.budget.relative = v[2].parse()?;
-        config.v.budget.absolute = v[3].parse()?;
+        config.v.budget.z = v[2].parse()?;
     }
     if let Some(run) = value("--min-d-run") {
         config.d.min_exact_run = run.parse()?;
