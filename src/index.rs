@@ -22,7 +22,7 @@
 use std::fmt;
 
 use crate::germline::GermlineSet;
-use crate::seed::{SeedSampling, SeedShape};
+use crate::seed::{SamplingError, SeedSampling, SeedShape};
 
 const POSITION_BITS: u32 = 12;
 /// Largest germline position representable in a posting.
@@ -58,6 +58,7 @@ impl Posting {
 pub enum IndexError {
     SequenceTooLong { allele: String, len: usize },
     TooManyAlleles(usize),
+    Sampling(SamplingError),
 }
 
 impl fmt::Display for IndexError {
@@ -68,6 +69,7 @@ impl fmt::Display for IndexError {
                 "allele '{allele}' is {len} nt; seed postings support at most {} nt",
                 MAX_POSITION + 1
             ),
+            Self::Sampling(error) => write!(f, "seed sampling: {error}"),
             Self::TooManyAlleles(n) => write!(
                 f,
                 "{n} alleles exceed the posting limit of {}",
@@ -134,6 +136,7 @@ impl KmerIndex {
         shape: SeedShape,
         sampling: SeedSampling,
     ) -> Result<Self, IndexError> {
+        sampling.check(&shape).map_err(IndexError::Sampling)?;
         let mut pairs: Vec<(u64, Posting)> = Vec::new();
         let (mut seeds, mut ranks) = (Vec::new(), Vec::new());
         for sequence in sequences {

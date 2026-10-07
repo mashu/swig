@@ -97,6 +97,11 @@ impl SeedShape {
         self.span
     }
 
+    /// Whether every position of the span is a care position.
+    pub fn is_contiguous(&self) -> bool {
+        self.contiguous
+    }
+
     /// Number of care positions.
     pub fn weight(&self) -> usize {
         self.shifts.len()
@@ -135,35 +140,109 @@ impl SeedShape {
 /// and to the query, so a seed both share is kept in both or in neither
 /// (exactly so for the context-free syncmers; minimisers depend on
 /// neighbouring k-mers). Densities are for random sequence.
+///
+/// Syncmers rank the `w + 1` s-mers (`s = k − w`, `k` the shape's weight) of
+/// a seed's key by a fixed random order and keep the seed when the first
+/// smallest one sits where required (Edgar 2021). A *window guarantee* holds
+/// when any `w` consecutive k-mers contain a seed: then every unmutated
+/// stretch of `k + w − 1` bases shared by read and germline yields a seed
+/// both sides hold.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SeedSampling {
     /// Every k-mer.
     #[default]
     All,
-    /// Closed syncmers: k-mers whose smallest s-mer (`s = k − w`, ordered by
-    /// a hash) is first or last. Density `2/(w + 1)`. Any `w + 1`
-    /// consecutive k-mers contain one (the smallest s-mer they hold is first
-    /// in, or last in, one of them), so every unmutated stretch of `k + w`
-    /// bases yields a seed that the germline index holds too.
+    /// Closed syncmers: the smallest s-mer is first or last. Density about
+    /// `2/(w + 1)`. Context-free, with the window guarantee: of the `2w`
+    /// s-mers that `w` consecutive k-mers hold, the first smallest is first
+    /// in, or last in, one of them.
     ClosedSyncmer { w: u8 },
-    /// Open syncmers: the smallest s-mer sits in the middle. Density `1/(w + 1)`.
+    /// Open syncmers: the smallest s-mer is at the middle position `w / 2`,
+    /// the offset that maximises conservation (Shaw & Yu 2022). Density
+    /// `1/(w + 1)`. Context-free, but without a window guarantee: gaps
+    /// between seeds can be long, most of all on low-complexity sequence.
     OpenSyncmer { w: u8 },
-    /// Minimisers: the smallest k-mer (by hash) of every `w` consecutive
-    /// k-mers. Density about `2/(w + 1)`.
+    /// Minimisers: the smallest k-mer (by the same order) of every `w`
+    /// consecutive k-mers. Density about `2/(w + 1)`, with the window
+    /// guarantee, but not context-free: a mutation near a shared k-mer can
+    /// unselect it on one side only.
     Minimizer { w: u8 },
 }
 
-/// SplitMix64 finaliser: a fixed random order on keys.
+/// Why a sampling cannot be used with a seed shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SamplingError {
+    /// Syncmers need `1 ≤ w < k`: an s-mer of at least one base.
+    SyncmerWindow { w: u8, k: usize },
+    /// Minimisers need a window of at least one k-mer.
+    EmptyWindow,
+}
+
+impl fmt::Display for SamplingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SyncmerWindow { w, k } => {
+                write!(f, "syncmer w = {w} needs 1 <= w < k = {k}")
+            }
+            Self::EmptyWindow => write!(f, "minimiser w must be at least 1"),
+        }
+    }
+}
+
+impl std::error::Error for SamplingError {}
+
+/// SplitMix64: a fixed random order on keys. The golden-ratio increment
+/// keeps the all-zero key (poly-A) from being its own image, which the bare
+/// finaliser would make the smallest of all.
 #[inline]
 fn order(x: u64) -> u64 {
+    let x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
     let x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     let x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     x ^ (x >> 31)
 }
 
+/// Position (0-based, the first if tied) of the smallest s-mer
+/// (`s = k − w`) in a `k`-base key, oldest base in the high bits.
+#[inline]
+fn smallest_smer(key: u64, k: usize, w: usize) -> usize {
+    let mask = (1u64 << (2 * (k - w))) - 1;
+    let mut at = 0;
+    let mut best = u64::MAX;
+    for j in 0..=w {
+        let rank = order((key >> (2 * (w - j))) & mask);
+        if rank < best {
+            (at, best) = (j, rank);
+        }
+    }
+    at
+}
+
 impl SeedSampling {
-    /// Seeds of `codes` under `shape` (contiguous shapes for syncmers);
-    /// `ranks` is scratch.
+    /// Whether this sampling is defined for seeds of `shape`.
+    pub fn check(&self, shape: &SeedShape) -> Result<(), SamplingError> {
+        let k = shape.weight();
+        match *self {
+            Self::All => Ok(()),
+            Self::ClosedSyncmer { w } | Self::OpenSyncmer { w } => {
+                if w == 0 || usize::from(w) >= k {
+                    Err(SamplingError::SyncmerWindow { w, k })
+                } else {
+                    Ok(())
+                }
+            }
+            Self::Minimizer { w } => {
+                if w == 0 {
+                    Err(SamplingError::EmptyWindow)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    /// Seeds of `codes` under `shape`; `ranks` is scratch. Panics if
+    /// [`SeedSampling::check`] fails (index construction checks first).
     pub fn seeds(
         &self,
         shape: &SeedShape,
@@ -171,12 +250,30 @@ impl SeedSampling {
         out: &mut Vec<(usize, u64)>,
         ranks: &mut Vec<u64>,
     ) {
+        if let Err(error) = self.check(shape) {
+            panic!("{error}");
+        }
         out.clear();
-        let k = shape.span();
+        let k = shape.weight();
         match *self {
             Self::All => out.extend(shape.kmers(codes)),
             Self::ClosedSyncmer { w } | Self::OpenSyncmer { w } => {
-                let w = usize::from(w).min(k - 1);
+                let w = usize::from(w);
+                let wanted = |at: usize| match self {
+                    Self::ClosedSyncmer { .. } => at == 0 || at == w,
+                    _ => at == w / 2,
+                };
+                if !shape.is_contiguous() {
+                    // The s-mers of the key itself, so that two seeds with
+                    // one key are kept alike whatever their don't-care bases.
+                    out.extend(
+                        shape
+                            .kmers(codes)
+                            .filter(|&(_, key)| wanted(smallest_smer(key, k, w))),
+                    );
+                    return;
+                }
+                // Contiguous: the same definition with each s-mer hashed once.
                 let s = k - w;
                 // Rank of the s-mer starting at each position, hashed once.
                 ranks.clear();
@@ -196,10 +293,6 @@ impl SeedSampling {
                 }
                 // The k-mer at `pos` holds the s-mers at `pos ..= pos + w`;
                 // keep it when the first smallest one sits where required.
-                let wanted = |at: usize| match self {
-                    Self::ClosedSyncmer { .. } => at == 0 || at == w,
-                    _ => at == w / 2,
-                };
                 out.extend(shape.kmers(codes).filter(|&(pos, _)| {
                     let inner = &ranks[pos..=pos + w];
                     let mut at = 0;
@@ -212,7 +305,7 @@ impl SeedSampling {
                 }));
             }
             Self::Minimizer { w } => {
-                let w = usize::from(w).max(1);
+                let w = usize::from(w);
                 let kmers: Vec<(usize, u64)> = shape.kmers(codes).collect();
                 let mut start = 0;
                 while start < kmers.len() {
@@ -328,30 +421,130 @@ mod tests {
     }
 
     #[test]
-    fn closed_syncmers_are_context_free_dense_and_windowed() {
-        let shape = SeedShape::contiguous(9);
+    fn syncmers_are_context_free_dense_and_windowed() {
         let (mut seeds, mut ranks) = (Vec::new(), Vec::new());
-        for w in [2u8, 4, 6] {
-            let sampling = SeedSampling::ClosedSyncmer { w };
-            let codes = random_codes(20_000, u64::from(w));
-            sampling.seeds(&shape, &codes, &mut seeds, &mut ranks);
-            let kmers = codes.len() - 8;
-            let density = seeds.len() as f64 / kmers as f64;
-            let expected = 2.0 / (f64::from(w) + 1.0);
-            assert!(
-                (density / expected - 1.0).abs() < 0.1,
-                "w {w}: density {density}"
-            );
-            // Every w + 1 consecutive k-mers contain a syncmer.
-            let gap = seeds.windows(2).map(|p| p[1].0 - p[0].0).max().unwrap();
-            assert!(gap <= usize::from(w) + 1, "w {w}: gap {gap}");
-            // Context-free: each selected k-mer is selected on its own.
-            let (mut alone, mut alone_ranks) = (Vec::new(), Vec::new());
-            for &(pos, key) in seeds.iter().take(200) {
-                sampling.seeds(&shape, &codes[pos..pos + 9], &mut alone, &mut alone_ranks);
-                assert_eq!(alone, vec![(0, key)]);
+        let (mut alone, mut alone_ranks) = (Vec::new(), Vec::new());
+        for k in [7usize, 9] {
+            let shape = SeedShape::contiguous(k);
+            for w in [2u8, 4, 6] {
+                let codes = random_codes(20_000, 31 * k as u64 + u64::from(w));
+                let kmers = codes.len() + 1 - k;
+                for (sampling, expected) in [
+                    (
+                        SeedSampling::ClosedSyncmer { w },
+                        2.0 / (f64::from(w) + 1.0),
+                    ),
+                    (SeedSampling::OpenSyncmer { w }, 1.0 / (f64::from(w) + 1.0)),
+                ] {
+                    sampling.seeds(&shape, &codes, &mut seeds, &mut ranks);
+                    let density = seeds.len() as f64 / kmers as f64;
+                    // 4^s ≫ k is needed for the nominal density (k 7, w 6: s 1).
+                    if 4f64.powi(k as i32 - i32::from(w)) > 4.0 * k as f64 {
+                        assert!(
+                            (density / expected - 1.0).abs() < 0.1,
+                            "{sampling:?} k {k}: density {density}"
+                        );
+                    }
+                    if let SeedSampling::ClosedSyncmer { .. } = sampling {
+                        // Any w consecutive k-mers contain a closed syncmer.
+                        let gap = seeds.windows(2).map(|p| p[1].0 - p[0].0).max().unwrap();
+                        assert!(gap <= usize::from(w), "k {k} w {w}: gap {gap}");
+                    }
+                    // Context-free both ways: a k-mer is a seed in context
+                    // exactly when it is a seed on its own.
+                    let mut selected = seeds.iter().map(|&(pos, _)| pos).peekable();
+                    for pos in 0..kmers.min(3_000) {
+                        sampling.seeds(&shape, &codes[pos..pos + k], &mut alone, &mut alone_ranks);
+                        let in_context = selected.next_if_eq(&pos).is_some();
+                        assert_eq!(!alone.is_empty(), in_context, "{sampling:?} k {k} at {pos}");
+                    }
+                }
             }
         }
+    }
+
+    /// The window bound is tight: every 12-base string holds a closed
+    /// (9, 5)-syncmer, and some 11-base strings hold none.
+    #[test]
+    fn closed_syncmer_window_bound_is_tight() {
+        let (k, w) = (9usize, 4u8);
+        let shape = SeedShape::contiguous(k);
+        let sampling = SeedSampling::ClosedSyncmer { w };
+        let (mut seeds, mut ranks) = (Vec::new(), Vec::new());
+        let mut x = 99u64;
+        let (mut empty_short, mut empty_full) = (0, 0);
+        for _ in 0..200_000 {
+            x = order(x);
+            let codes: Vec<u8> = (0..k + usize::from(w) - 1)
+                .map(|i| ((x >> (2 * i)) & 3) as u8)
+                .collect();
+            sampling.seeds(&shape, &codes, &mut seeds, &mut ranks);
+            empty_full += usize::from(seeds.is_empty());
+            sampling.seeds(&shape, &codes[..codes.len() - 1], &mut seeds, &mut ranks);
+            empty_short += usize::from(seeds.is_empty());
+        }
+        assert_eq!(empty_full, 0);
+        assert!(empty_short > 0);
+    }
+
+    /// Spaced shapes rank the s-mers of the key, so two seeds with one key
+    /// are kept alike; on contiguous shapes the rolling ranks agree with it.
+    #[test]
+    fn syncmers_of_spaced_shapes_follow_the_key() {
+        let (mut seeds, mut ranks) = (Vec::new(), Vec::new());
+        let spaced = SeedShape::from_pattern("11011011101").unwrap();
+        let codes = random_codes(20_000, 5);
+        for sampling in [
+            SeedSampling::ClosedSyncmer { w: 3 },
+            SeedSampling::OpenSyncmer { w: 2 },
+        ] {
+            sampling.seeds(&spaced, &codes, &mut seeds, &mut ranks);
+            let kept: std::collections::HashSet<u64> = seeds.iter().map(|&(_, key)| key).collect();
+            for (_, key) in spaced.kmers(&codes) {
+                let at = smallest_smer(
+                    key,
+                    spaced.weight(),
+                    match sampling {
+                        SeedSampling::ClosedSyncmer { w } | SeedSampling::OpenSyncmer { w } => {
+                            usize::from(w)
+                        }
+                        _ => unreachable!(),
+                    },
+                );
+                let wanted = match sampling {
+                    SeedSampling::ClosedSyncmer { w } => at == 0 || at == usize::from(w),
+                    SeedSampling::OpenSyncmer { w } => at == usize::from(w) / 2,
+                    _ => unreachable!(),
+                };
+                assert_eq!(kept.contains(&key), wanted, "{sampling:?}");
+            }
+        }
+        let shape = SeedShape::contiguous(9);
+        let sampling = SeedSampling::ClosedSyncmer { w: 4 };
+        sampling.seeds(&shape, &codes, &mut seeds, &mut ranks);
+        let by_key: Vec<(usize, u64)> = shape
+            .kmers(&codes)
+            .filter(|&(_, key)| matches!(smallest_smer(key, 9, 4), 0 | 4))
+            .collect();
+        assert_eq!(seeds, by_key);
+    }
+
+    #[test]
+    fn invalid_windows_are_rejected() {
+        let shape = SeedShape::contiguous(9);
+        assert_eq!(
+            SeedSampling::ClosedSyncmer { w: 9 }.check(&shape),
+            Err(SamplingError::SyncmerWindow { w: 9, k: 9 })
+        );
+        assert!(SeedSampling::OpenSyncmer { w: 0 }.check(&shape).is_err());
+        assert_eq!(
+            SeedSampling::Minimizer { w: 0 }.check(&shape),
+            Err(SamplingError::EmptyWindow)
+        );
+        assert!(SeedSampling::ClosedSyncmer { w: 8 }.check(&shape).is_ok());
+        // A spaced shape's k is its weight.
+        let spaced = SeedShape::from_pattern("1101").unwrap();
+        assert!(SeedSampling::ClosedSyncmer { w: 3 }.check(&spaced).is_err());
     }
 
     #[test]

@@ -69,6 +69,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Some(base) = value("--budget-base") {
         config.v.budget.base = base.parse()?;
     }
+    if let Some(max) = value("--budget-max") {
+        config.v.budget.max = max.parse()?;
+    }
+    // V gene margin: a gene is kept while its votes are within
+    // max(absolute, relative · leader) of the leader's.
+    if let Some(relative) = value("--margin-rel") {
+        config.v.budget.relative = relative.parse()?;
+    }
+    if let Some(absolute) = value("--margin-abs") {
+        config.v.budget.absolute = absolute.parse()?;
+    }
     if let Some(limit) = value("--max-alleles") {
         config.v.seeds.max_alleles = limit.parse()?;
     }
@@ -83,8 +94,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Some(sampling) = value("--sampling") {
         // all | closed:W | open:W | min:W
         use vdj_assign::seed::SeedSampling;
-        let (kind, w) = sampling.split_once(':').unwrap_or((sampling.as_str(), "0"));
-        let w: u8 = w.parse()?;
+        let (kind, w) = match sampling.split_once(':') {
+            Some((kind, w)) => (kind, w.parse::<u8>()?),
+            None if sampling == "all" => ("all", 0),
+            None => {
+                return Err(
+                    format!("--sampling {sampling} needs a window, e.g. {sampling}:4").into(),
+                )
+            }
+        };
         config.v.seeds.sampling = match kind {
             "all" => SeedSampling::All,
             "closed" => SeedSampling::ClosedSyncmer { w },
