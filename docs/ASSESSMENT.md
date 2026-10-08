@@ -108,7 +108,10 @@ Each change was measured on the same reads before it was kept.
    positions, so `P_D = (ln(N·L) − ln odds)/λ`: 11 for human IGH, which is the
    note's constant recovered from first principles, and 6 for TRB. A per-read
    `L` was tried and traced the same curve, so the simpler constant per
-   database was kept.
+   database was kept. It is now kept unrounded (`P*_D` = 10.55 for human
+   IGH): the fixed scale charges `⌊P*_D⌋`, which decides `S > P*_D` exactly
+   on integer scores, the posterior `P*_D` itself, and the per-read call
+   reads it at the read's scale (§9.8).
 5. **Gene frames + radix-sorted votes** (`retrieve/frames.rs`,
    `retrieve/seed_vote.rs`). Postings and votes now scale with genes. Joining a
    frame requires position-consistent seeds: a first version let an allele
@@ -389,8 +392,10 @@ work.
    there (ECE 16 %): when retrieval misses the true gene, no candidate can
    carry its mass. The 16-gene cap binds at that divergence; raising it
    helped only the synthetic database.
-2. **D presence on D-free junctions.** 12–24 % of reads with no D receive one,
-   because a 9-nt chance match is indistinguishable from a 9-nt D remnant.
+2. **D presence on D-free junctions.** 13–26 % of reads with no D receive one
+   (19 % on human mid reads, 4 pp fewer since calls use the per-read model,
+   §9.8), because a 9-nt chance match is indistinguishable from a 9-nt D
+   remnant.
    `P_D` sets the trade-off, and the prior odds are the single knob.
    Precision/recall curves, not one number, belong in the paper; the
    reported `d_presence_posterior` now carries this uncertainty per read.
@@ -401,17 +406,15 @@ work.
    the 22 % false-positive rate on mid). Even prior odds understate IgSim's
    99 % D inclusion, and the two errors roughly cancel there. Both terms
    should be estimated, not assumed.
-3. **Calls and posteriors use different evidence scales.** The Viterbi call
-   reads scores at the fixed λ, the posterior at the read's divergence, so
-   the posterior's mode can disagree with the call (a short exact D against
-   a longer one with a mismatch on an unmutated read). Measured on 4000
-   reads per preset: taking D presence *and* allele from the posterior
-   (maximum marginal) gains 0.2–0.8 pp of D accuracy but raises the D-free
-   false-positive rate by 13–16 pp, so total D errors do not fall (mid 287
-   vs 271, hard 681 vs 685). Keeping the Viterbi presence decision and
-   taking only the allele from the posterior gains 0.1–0.3 pp at an
-   unchanged false-positive rate; it is not adopted because the reported
-   alignment would then need a second, conditioned Viterbi pass.
+3. ~~**Calls and posteriors use different evidence scales.**~~ Resolved
+   (§9.8): one integer model at the read's divergence drives both, so the
+   call is a mode of its posterior. What remains is the gap between a mode
+   and a marginal. Taking D presence from the posterior gives a D to a
+   third of D-free reads (−35 pp on 20,000 reads), so presence stays the
+   call's. Taking only the D allele from it, with a conditioned Viterbi pass
+   for the reported alignment, is now a switch (`--d-allele max-marginal`):
+   on top of per-read calls it gains +0.25 pp on human hard reads and is
+   within noise elsewhere, so it is off by default.
 4. **One alignment per D allele and window.** A D's optimal local alignment
    in its window is not always its optimal clipped alignment at the chosen
    cuts; the 12-base reclaim keeps this rare. It is the one remaining
@@ -449,9 +452,9 @@ work.
 
 In order of expected value:
 
-1. ~~**Posterior decoding**~~ — done (§3, item 12). Next on that line:
-   calls from the per-read model (limitation 3) and a D prior from the D
-   search's own statistics (limitation 2).
+1. ~~**Posterior decoding**~~ — done (§3, item 12), and calls from the
+   per-read model (§9.8). Next on that line: a D prior from the D search's
+   own statistics (limitation 2), at the per-read scale.
 2. ~~**Two cuts per overlap with N/P between**~~ — done (§3, item 11).
 3. ~~**Sensitivity analysis**~~ — done (§7).
 4. **Cross-tool benchmark.** IgBLAST done (§8). partis and Swig remain, at
@@ -786,7 +789,88 @@ input parsing with assignment; (5) allele rescoring along the gene frame
 ### 9.7 Roadmap status
 
 Of the roadmap in the README, the wider-SIMD item is done (AVX-512BW, NEON
-and a portable backend). Calls from the per-read model, a D prior from the D
-search's own statistics, allele rescoring along the gene frame, annotation
-priors and C-segment assignment remain open; §9.5 shows the D prior is the
-one with the clearest measured need.
+and a portable backend), and so are calls from the per-read model (§9.8). A
+D prior from the D search's own statistics, allele rescoring along the gene
+frame, annotation priors and C-segment assignment remain open; §9.5 and §9.8
+show the D prior is the one with the clearest measured need.
+
+### 9.8 Calls from the per-read model
+
+The Viterbi call used the fixed `(2, −3)` scores and the posterior the
+read's own log-odds, so the reported probabilities belonged to a model that
+had not made the call. Now one integer model at the read's divergence `p̂`
+drives both (ALGORITHM §4, *Values*): substitution columns `s·u_r + v_r`
+(each kind's affine log-odds map quantised whole, 1/2¹⁶ nat), gaps and priors
+as multiples of `u0 = round(2¹⁶·λ)`, and a D cost of `P*_D/m` matched D
+columns. The fixed scale is the exact special case at 11.2 %, and stays as
+`--calls fixed`. `p̂` is estimated before adjudication from the V and J
+columns no path contests, so the call is one Viterbi pass. Exhaustive oracles
+check the integer DAG (800 optima on mid and hard IgSim placements, 135 of
+640 off the fixed path) and that its key is the maximum of the posterior's
+`e^{units/F}`.
+
+The fixed scale had hidden a second D penalty: it undervalues an exact
+match at low divergence (2λ = 1.27 nats against `ln 4(1 − p̂)` = 1.38), so
+an exact 5-mer tied `P_D` = 10 and lost on the "fewer D" rule. Read at the
+read's scale, a constant D cost in nats lets those 5-mers in (a prototype
+gave 12–22 pp more D-free reads a D); the cost `c_D(p̂)` keeps the fixed
+scale's exact-run classes at every `p̂` instead.
+
+Default (per-read call) against main, paired on 20,000 reads per preset (Δ
+pp, exact McNemar p; D split by the true remnant's length, of which 1–3 nt
+is below `min_d_match` = 4 and cannot be found):
+
+| Set | V | D allele | D 1–3 nt | D 4–7 nt | D 8+ nt | no D | J | Junction |
+|---|---|---|---|---|---|---|---|---|
+| igh.easy | 0 | −0.01 (1.0) | — | +1.45 (1.0) | −0.01 (0.69) | −0.96 (0.5) | 0 | 0 |
+| igh.mid | 0 (1.0) | −0.12 (0.10) | −6.51 (2e−8) | +0.48 (0.46) | +0.05 (0.31) | **+4.29** (2e−10) | +0.01 (0.61) | −0.01 (1.0) |
+| igh.hard | +0.01 (0.75) | −0.01 (1.0) | −0.48 (0.63) | +0.07 (1.0) | +0.01 (1.0) | 0 (1.0) | +0.02 (0.45) | +0.01 (1.0) |
+| syn.easy | +0.01 (1.0) | −0.01 (1.0) | — | — | −0.01 (1.0) | 0 | −0.01 (1.0) | 0 |
+| syn.mid | 0 | −0.39 (4e−5) | −7.34 (1e−18) | +1.02 (0.024) | −0.09 (0.13) | **+3.99** (2e−15) | **+0.07** (0.003) | 0 |
+| syn.hard | +0.02 (0.45) | −0.33 (1e−5) | −2.52 (1e−6) | −0.47 (0.12) | −0.12 (0.09) | +0.31 (0.44) | 0 (1.0) | +0.03 (0.5) |
+
+(igh.easy's no-D change is 2 of 209 reads.) Calibration, main → default:
+
+| Set | D presence Brier (paired t) | D presence ECE % | D allele ECE % | D allele Brier t |
+|---|---|---|---|---|
+| igh.easy | 0.00065 → 0.00035 (−6.2) | 0.15 → 0.10 | 0.31 → 0.32 | −1.1 |
+| igh.mid | 0.02810 → 0.02462 (−13.3) | 2.23 → 1.36 | 1.02 → 0.66 | −3.6 |
+| igh.hard | 0.02261 → 0.02168 (−5.3) | 0.99 → 0.47 | 0.98 → 0.87 | +1.3 |
+| syn.easy | 0.00062 → 0.00029 (−6.4) | 0.16 → 0.12 | 0.58 → 0.59 | +0.8 |
+| syn.mid | 0.05266 → 0.04547 (−23.7) | 4.89 → 3.27 | 2.43 → 1.67 | −4.5 |
+| syn.hard | 0.04353 → 0.04079 (−12.8) | 2.99 → 1.82 | 1.68 → 1.50 | −1.9 |
+
+V and J ECE move by at most 0.05 (human hard V 0.33 → 0.37, J 0.35 → 0.37).
+
+The steps separately, each paired against the one before:
+
+- *Unrounded `P*_D` in the posterior* (the call uses `⌊P*_D⌋`, which equals
+  the old rounding on both databases): calls identical; D-presence Brier t
+  −6.9 / −15.2 / −7.6 (human easy / mid / hard), −6.9 / −26.3 / −18.0
+  (synthetic).
+- *`p̂` before adjudication* (fixed-scale call): calls identical; D-presence
+  Brier +0.00003 to +0.00011 (t +1.1 to +4.7), V / D / J ECE within 0.04.
+- *Per-read call*: the tables above.
+
+Why it is the default: no D-free read set gets more D calls (two sets get
+4 pp fewer), D-presence Brier improves on every set, V, J and junction lose
+nothing, and D allele accuracy on remnants of 4 nt or more is within noise
+on every set. The overall D allele drop on the synthetic database (−0.39
+and −0.33 pp) is significant only in the 1–3 nt stratum, remnants that
+`min_d_match` = 4 makes undetectable, so a call counted correct there rests
+on chance matches; the per-read call simply calls fewer of them. The one
+doubtful number: on syn.hard the strata of 4 nt and more lose 29 reads
+together (p 0.016), not significant at 0.01 but not clearly zero.
+
+**Max-marginal D allele** (`--d-allele max-marginal`), paired against the
+per-read call: D allele +0.05 (p 0.12), **+0.25** (6e−5), +0.04 (0.24),
++0.14 (0.017) on human mid / hard and synthetic mid / hard, all of it on
+remnants of 8 nt or more; no D-free read changes; D allele Brier +0.00004 to
++0.00035 (t ≤ 2.2). On the fixed-scale call it gains +0.20 (p 7e−4) and
++0.27 (p 2e−4) on human mid and hard: the per-read call is already the mode
+of the same posterior, which leaves less to gain. Significant on one set
+only, it stays off by default.
+
+Instructions on 2000 hard reads: main 10.550 G; per-read call (default)
+10.659 G (+1.0 %); fixed-scale call 10.605 G; per-read call with
+max-marginal D 10.713 G (+1.5 %).

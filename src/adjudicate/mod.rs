@@ -28,7 +28,7 @@ mod residual;
 mod units;
 
 pub use dag::{DagScratch, PlacementDag};
-pub use decode::{DAlleleDecoding, Topology, Within, max_marginal_d};
+pub use decode::{DAlleleDecoding, Topology, Within};
 pub use model::{EngineeringObjective, Grammar, PathModel, VdjGrammar};
 pub use posterior::{MAX_SPREAD, Marginals, OVERLAP_SPREAD, PosteriorScratch};
 pub use residual::{ResidualAdjudicator, ResidualScratch};

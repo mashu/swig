@@ -547,7 +547,8 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         let d_presence = self.model.d_presence();
         match (self.calls, &self.evidence) {
             (CallModel::PerRead, Some(evidence)) => ReadModel::at(evidence, p, d_presence),
-            // Without an evidence model the fixed scores are not read as nats.
+            // One unit per score unit, λ nats each (1 when the scores have no
+            // log-odds λ; nothing then reads them as nats).
             (_, evidence) => ReadModel::fixed(evidence.map_or(1.0, |e| e.lambda), d_presence),
         }
     }

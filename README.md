@@ -238,7 +238,7 @@ stages are the methods `stage_orient`, `stage_v`, `stage_j`, `stage_d` and
 | `segment`, `family_bound` | One search stage: score → sibling upper bounds → traceback waves → acceptance and E-value gates → outer extension |
 | `clip`, `evidence`, `placement` | O(1) clip-and-rescore at any cut; exact-run / identity evidence |
 | `window`, `admission` | Where J and D are searched; D evidence gates |
-| `adjudicate/{lattice,dag,posterior,model,residual}` | The placement lattice; Viterbi and forward–backward over it; grammar and log-odds path model; residual baseline |
+| `adjudicate/{lattice,dag,posterior,units,model,decode,residual}` | The placement lattice; Viterbi and forward–backward over it; the per-read model in integer units both read; grammar and log-odds path model; max-marginal D decoding; residual baseline |
 | `flank` | Outer-flank extension of V and J alignments |
 | `pipeline`, `config`, `profiles` | Stage-wise composition, declarative configuration, calling profiles |
 | `report`, `batch` | AIRR output, parallel batches |
@@ -259,18 +259,27 @@ The full description, with the guarantee of each search step, is in
   exits at `x`, the later enters at `y ≥ x`, and the bases between are N/P).
   Ties go to fewer D, then to more germline support (the summed unclipped
   scores).
+- **Calls come from the read's own model.** Each path is valued at the read's
+  divergence `p̂`, estimated before adjudication from the V and J columns no
+  path contests: a match is worth `ln 4(1−p̂)` nats, a mismatch `ln(4p̂/3)`, a
+  D costs `P_D/2` matched D columns. Values are integers (1/2¹⁶ nat), so the
+  maximum is exact, and the posterior reads the same integers: the call is a
+  mode of the reported distribution. `--calls fixed` keeps the fixed scores,
+  of which the per-read model at 11.2 % divergence is an exact multiple.
 - **`P_D` is derived, not tuned.** A D is one of `N` genes at one of `L`
   junction positions. Including it pays off when `λ·S_D > ln(N·L) − ln(prior
-  odds)`, which gives 11 for human IGH (32 genes, L = 25, even odds) and 6
-  for TRB.
+  odds)`, which gives `P*_D` = 10.55 for human IGH (32 genes, L = 25, even
+  odds) and 6.17 for TRB, kept unrounded; on integer scores the fixed scale
+  charges `⌊P*_D⌋`, which decides `S > P*_D` exactly.
 - **Significance.** A V or J hit is kept at E ≤ 1 against its database and
   window. A read is called only when its path contains an *anchor*, a V or J
   hit at E ≤ 10⁻³, so random sequence receives no call.
 - **Posterior probabilities.** Read as a distribution, `P(path, cuts) ∝
-  exp(nats)`, the objective gives calibrated probabilities by forward–backward
-  over the same DAG. Alignment evidence is read as log-odds at the read's own
-  divergence (a match is worth `ln 4(1−p̂)` nats, a mismatch `ln(4p̂/3)`); the
-  priors stay at their derivation λ.
+  exp(nats)`, the same model gives calibrated probabilities by
+  forward–backward over the same DAG; the other priors stay at their
+  derivation λ. `--d-allele max-marginal` reports the D allele of largest
+  posterior marginal instead of the call's (off by default: it gains only on
+  heavily mutated reads).
 
 ## Extension points
 
@@ -483,8 +492,11 @@ admissible D (+1 % of instructions).
 of any sub-alignment between two query cuts in O(1), with exact affine gap
 accounting at the new edges.
 
-**One lattice, two semirings.** Viterbi (max-plus) and forward–backward
-(sum-product) run the same recursion over the same lattice: one slot per
+**One lattice, two semirings, one model.** Viterbi (max-plus) and
+forward–backward (sum-product) run the same recursion over the same lattice
+and read the same per-read integer values (each kind's affine
+log-odds map `s·u_r + v_r` quantised whole, priors as multiples of `u0`), so
+the call is exactly a mode of the posterior: one slot per
 placement, D count and first segment, with a value per canonical entry cut.
 Placements are visited by segment kind, then read start, so a D can precede
 a J whose alignment starts before it; only the cuts order them.
@@ -647,8 +659,10 @@ window; searching J over the whole read lets 0.05 % fall outside.
   does the same with N/P costs of −4 and −8 per base across a 300-base V,
   `long_costly_gaps_keep_their_mass` across a 300-base gap that every path
   crosses, and `overlaps_beyond_the_f64_range_are_refused` checks that a
-  540-base overlap gets no posteriors; `posteriors_are_calibrated` bounds V/J
-  calibration error on IgM- and IgG-like reads.
+  540-base overlap gets no posteriors; `per_read_call_is_a_mode_of_the_posterior`
+  checks that with one integer model the marginals are those of `e^{units/F}`
+  and the Viterbi key their exhaustive maximum; `posteriors_are_calibrated`
+  bounds V/J calibration error on IgM- and IgG-like reads.
 - **DAG optimality:** `dag_equals_brute_force_over_all_paths_and_cuts` and
   `dag_equals_brute_force_on_hypermutated_igsim_reads` enumerate every
   VJ/VDJ/VDDJ path and every pair of canonical exit and entry cuts, with and
@@ -658,6 +672,11 @@ window; searching J over the whole read lets 0.05 % fall outside.
   (`two_cuts_leave_a_shared_mismatch_stretch_to_n`), an entry beyond the
   overlap (`entries_beyond_the_overlap_are_tried`), and a D before a J whose
   alignment starts earlier (`a_d_can_precede_a_j_that_starts_earlier`).
+  `per_read_dag_equals_exhaustive_enumeration` repeats the enumeration in the
+  per-read model's integer units at five divergences (800 optima, 135 of 640
+  not the fixed-scale path; at 11.2 % the fixed path exactly), and
+  `conditioned_dag_equals_exhaustive_enumeration` checks the masked,
+  topology-restricted pass behind max-marginal D decoding.
 - **Kernel exactness:**
   - The scalar kernel equals a textbook Gotoh across three gap regimes.
   - Every traceback rescores to its reported score.
@@ -700,15 +719,16 @@ The default is `r`. `r_optimized` is accepted as an alias.
 
 | Profile | V tuple | D tuple | J tuple | `min_d_match` | `P_D` (human IGH) |
 |---|---|---|---|---|---|
-| `r` (default) | (2,−3,−9,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 4 | derived, even odds: 11 |
-| `sensitive-d` | (2,−3,−9,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 4 | derived, odds 2: 9 |
+| `r` (default) | (2,−3,−9,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 4 | derived, even odds: 10.55 |
+| `sensitive-d` | (2,−3,−9,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 4 | derived, odds 2: 9.45 |
 | `truth` | (2,−3,−5,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 6 | 0 |
 | `igblast` | (2,−3,−5,−1) | (2,−4,−11,−1) | (2,−4,−13,−1) | 5 | 0 |
 
 Every profile gates V and J hits by E-value (accept 1, anchor 10⁻³) and
 stitches the co-linear V prefix and J suffix back onto the local alignment
-before ranking. A with-D path must strictly beat the no-D path; ties go to
-fewer D segments, then to more germline support.
+before ranking, and calls each read with its own model. A with-D path must
+strictly beat the no-D path; ties go to fewer D segments, then to more
+germline support.
 
 ## Assumptions and deviations from the method note
 
@@ -757,9 +777,10 @@ Each is a named field you can change.
   its window is not always its optimal *clipped* alignment at the chosen cut.
   The 12-base reclaim keeps this rare; see the assessment.
 - **Posteriors are conditional on the candidates.** An allele that retrieval
-  or the keep policy dropped gets no mass, and the call and the posterior use
-  different evidence scales (fixed vs per-read), so a reported posterior can
-  fall below 0.5. D-presence calibration is the weakest (ECE up to 2 %),
+  or the keep policy dropped gets no mass. The call is a mode of the
+  posterior over paths and cuts, not the allele of largest marginal, so a
+  reported posterior can still fall below 0.5. D-presence calibration is the
+  weakest (ECE up to 1.4 % on human IGH, 3.3 % on the synthetic database),
   because the D prior counts genes × positions (see ALGORITHM.md §8).
 - **E-values** use exact *ungapped* λ and K and the total database length.
   Gapped scores are slightly higher (anti-conservative); near-identical alleles
@@ -789,10 +810,17 @@ Each is a named field you can change.
 In order of expected value; reasons and measurements are in
 [docs/ASSESSMENT.md](docs/ASSESSMENT.md).
 
-1. **Calls from the per-read model.** Viterbi with per-read evidence weights,
-   or maximum-posterior-marginal calls, so the call and its posterior agree.
+1. ~~**Calls from the per-read model.**~~ Done: one integer model at the
+   read's divergence drives the Viterbi call and forward–backward, so the
+   call is a mode of its posterior. Paired on 20,000 reads per preset:
+   4.0–4.3 pp more D-free reads left without a D on mid sets, D-presence
+   Brier better on every set (t −5 to −24), D allele within noise for
+   remnants of 4 nt or more (the overall −0.3–0.4 pp on the synthetic
+   database lies in 1–3 nt remnants, below `min_d_match`). Max-marginal D
+   alleles are a switch (+0.25 pp on hard reads only). See ASSESSMENT §9.8.
 2. **D prior from the D search's statistics** (Karlin–Altschul `K·m·n` and a
-   D-inclusion rate), checked by D-presence calibration.
+   D-inclusion rate), checked by D-presence calibration. It should replace
+   `P*_D` in the per-read D cost and keep its dependence on `p̂`.
 3. ~~**Wider SIMD.**~~ Done: AVX-512BW, NEON and portable backends of one
    kernel. Next on that line: 8-bit lanes for D jobs (32 per AVX2 register).
 4. **Allele rescoring along the gene frame.** Score siblings along their

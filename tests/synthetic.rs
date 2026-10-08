@@ -758,10 +758,10 @@ fn max_marginal_d_keeps_the_topology_and_raises_the_d_mass() {
         assigner(DAlleleDecoding::Map),
         assigner(DAlleleDecoding::MaxMarginal),
     );
-    let sim = Simulator::new(&db.v, Some(&db.d), &db.j, SimParams::mid()).unwrap();
+    let sim = Simulator::new(&db.v, Some(&db.d), &db.j, SimParams::hard()).unwrap();
     let (mut ws, mut ws2) = (map.workspace(), decoded.workspace());
     let mut changed = 0;
-    for read in sim.reads(400, 9).unwrap() {
+    for read in sim.reads(600, 9).unwrap() {
         let query = encode(&read.sequence);
         let (a, b) = (
             map.assign(&query, &mut ws),
@@ -800,7 +800,7 @@ fn max_marginal_d_keeps_the_topology_and_raises_the_d_mass() {
             changed += 1;
         }
     }
-    assert!(changed > 0, "some D calls should change");
+    assert!(changed > 0, "some D calls should change ({changed})");
 }
 
 fn top_by_kind(placements: &[Placement], kind: SegmentKind, n: usize) -> Vec<Placement> {

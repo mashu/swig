@@ -80,9 +80,14 @@ The non-alignment terms are log prior odds in score units:
   `L` junction positions. Its prior is spread over `N·L` alternatives. A MAP
   decision includes the best D when
   `λ·S_D > ln(N·L) − ln π_D`, where `π_D` is the prior odds of a D against
-  none. Hence `P_D = ⌈(ln(N·L) − ln π_D) / λ⌉` (`config::DPrior::Derived`).
-  This is 11 for human IGH (N = 32, L = 25, π_D = 1) and 6 for TRB (N = 2).
-  The legacy profiles set `P_D = 0`.
+  none. Hence `P*_D = (ln(N·L) − ln π_D) / λ` (`config::DPrior::Derived`),
+  kept unrounded: 10.55 for human IGH (N = 32, L = 25, π_D = 1), 10.45 and
+  10.34 for the human and synthetic databases of the 20,000-read
+  measurements (30 and 28 genes), 6.17 for TRB (N = 2). For integer scores
+  `S > P*_D ⟺ S > ⌊P*_D⌋`, so the fixed scale charges `P_D = ⌊P*_D⌋` (10 for
+  all three heavy-chain sets); rounding to nearest is not faithful when the
+  fraction is ≥ ½. The posterior uses `P*_D` itself, and the per-read call
+  reads it at the read's scale (§4). The legacy profiles set `P_D = 0`.
 - **`tandem`**: the prior odds of a second D (DJ → DDJ), on top of its own `P_D`.
 - **`pair_bonus`**: the prior odds of a complete V…J rearrangement against a
   partial read. It is 0 by default: on full-length reads the J's own clip
@@ -90,7 +95,8 @@ The non-alignment terms are log prior odds in score units:
 
 The adjudicator returns the path maximising, lexicographically:
 
-1. `score`;
+1. its value: by default the read's own log-odds (§4, *Values*), with
+   `--calls fixed` the score above;
 2. fewer D segments ("with-D must strictly beat no-D");
 3. *support*, the sum of the placements' unclipped scores.
 
@@ -98,8 +104,10 @@ Key 3 separates paths that explain the read equally well. A typical case is
 two alleles of different 3′ length at a junction where one base can belong to
 either side. The allele with more support admits more cuts that reach the same
 score, so it has the larger likelihood summed over cuts. Co-optimal alleles
-(equal clipped score on the called interval) are all reported, the
-best-supported first.
+(equal value on the called interval: an equal clipped score, and under a
+per-read call equal matches and mismatches too) are all reported, the
+best-supported first. The reported `path_score` is the fixed-scale score
+above, whichever model chose the path.
 
 ### 2.4 Significance
 
@@ -181,7 +189,53 @@ after it, so a J alignment reaching back over the D (the "J eats D"
 configuration) excluded the path V → D → J with that J. The brute-force
 oracles had the same restriction; sorting by kind removes it.
 
-Ties: complete paths compare by `PathScore` (score, then fewer D, then
+**Values: the read's own model** (`adjudicate/units.rs`). The default call
+(`CallModel::PerRead`) maximises each path at the read's own divergence `p̂`,
+in the model §4a's posterior reads, so the call is a mode of the reported
+distribution. Every term is an integer in units of `1/F` nats, `F = 2¹⁶`:
+
+```text
+column(kind, s)  = s·u_r + v_r     u_r = round(F·λ_r(p̂)),  v_r = round(F·μ_r(p̂))   (0 for s = 0)
+gap, ι, tandem, pair bonus scoring k:   k·u0,   u0 = round(F·λ)
+D cost  c_D(p̂)   = (P*_D / m)·ln 4(1 − p̂)  =  ⌊P*_D·(m·u_D + v_D)/m⌋ units
+```
+
+with `(λ_r, μ_r)` the per-column log-odds of §4a and `m` the D match score.
+Each kind's affine map is quantised as a whole, so at `p̂ = δ` (`λ_r = λ`,
+`μ_r = 0`) every value is the fixed score times `u0`: the fixed scale
+(`CallModel::FixedScale`, `--calls fixed`: one unit per score unit, D cost
+`⌊P*_D⌋`) is an exact special case. A clip is still worth
+`exit(x) − entry(y)`, its prefix values accumulated along the columns
+(canonical cuts never split a gap run), so the recursion, its ties and
+Theorem 1 carry over to integers unchanged, and every tie is exact.
+
+- *Divergence.* `p̂` is estimated before adjudication from the columns no
+  path contests: the best V's match columns before every D and J placement
+  and the best J's after every V and D placement, `N` excluded, as
+  `(k + ½)/(n + 1)` (the Jeffreys predictive rate), from all columns of the
+  two placements when fewer than 50 remain, clamped to `[10⁻⁴, 0.5]`. One
+  Viterbi pass follows. The junction's bases are not among those columns,
+  so a D cost conditioned on `p̂` does not use them twice.
+- *D cost.* `P*_D` is derived as prior odds, but the call uses it as a
+  threshold against chance D hits in random N/P sequence, whose null
+  distribution does not depend on `p̂` and is dominated by exact runs. A cost
+  constant in nats would make specificity depend on divergence: an exact
+  5-mer is worth `5·ln 4(1 − p̂) = 6.93` nats at low `p̂`, above
+  `λ·P*_D = 6.62`, while the fixed scale rejects it (10 < 10.45). Read as
+  `P*_D/m` matched D columns, the cost keeps the fixed scale's admitted
+  exact-run classes at every `p̂`: runs of `⌊P*_D/m⌋ = 5` bases lose and runs
+  of 6 win, by `min(f, 1 − f)·ln 4(1 − p̂)` with `f` the fraction of `P*_D/m`
+  (0.22 and 0.17 here). The design prototypes measured the alternative: with
+  the constant cost `λ·P_D` (6.34 nats) the per-read call gave 12–22 pp more
+  D-free reads a D, most of them exact 5-mers.
+- *D floor.* For a per-read call the floor `P_D + 1` bounds nothing: 8
+  matches and 2 mismatches score 10 but are worth 6.40 nats at `p̂ = 0.3`,
+  above `c_D = 5.38`. Every admissible D is kept, as with posteriors.
+- *Co-optimal names* are the placements of equal clipped score *and* equal
+  matches and mismatches on the called interval, which makes
+  `λ_r·S_sub + μ_r·n + λ·S_gap` equal at every divergence.
+
+Ties: complete paths compare by `PathScore` (value, then fewer D, then
 germline support), so a path with a D must strictly beat the best path
 without one. Among equal keys: a node keeps its earliest entry, so a junction
 base that scores the same on either side goes to the later segment; for that
@@ -204,7 +258,18 @@ paths, placements and pairs of canonical cuts. Checks:
   stretch to N beats every single cut; an entry in the middle of J's
   alignment, past V's end, beats every entry inside the overlap; and
   V → D → J beats V → J when the J's alignment starts one base before the D
-  (it fails when nodes are sorted by read start alone).
+  (it fails when nodes are sorted by read start alone);
+- the per-read model (`per_read_dag_equals_exhaustive_enumeration`): the
+  same memoised oracle valued in integer units, on the placements of 80 mid
+  and hard IgSim reads under the tandem grammar at `ι ∈ {0, −1}`, at the
+  read's own `p̂` and at 10⁻³, 0.02 and 0.3 (640 optima, 135 of them not the
+  fixed-scale path), and at `δ` with an integer `P_D`, where the path is the
+  fixed call's and its key the fixed score times `u0`; every traced path
+  re-scores to its key;
+- two constructed per-read cases: an exact 7-mer D (score 14) against a
+  10-mer with a mismatch (15), where the fixed scale takes the 10-mer and the
+  read's model at `p̂ = 1.2 %` the 7-mer (9.6 against 8.3 nats); and a D at
+  the fixed floor that wins at `p̂ = 0.3`.
 
 The exhaustive test on synthetic reads alone separates neither restricted
 search from the exact one: its reads never put mismatches right after a
@@ -220,25 +285,29 @@ P(path, cuts | read) = exp(nats(path, cuts)) / Z,     Z = Σ_{path, cuts} exp(na
 ```
 
 over every grammatical path and every pair of canonical cuts between
-neighbours: the domain §4 maximises over. Read at the fixed λ, the Viterbi
-path of §4 is its mode. Forward–backward over the same DAG gives the marginal
-probability of every placement and of every D count.
+neighbours: the domain §4 maximises over. Under the default per-read call
+both passes read one integer model (§4, *Values*), `nats = units/F`, so the
+Viterbi path of §4 is its mode. Forward–backward over the same DAG gives the
+marginal probability of every placement and of every D count.
 
 **Evidence at the read's divergence.** `(2, −3)` is log-odds only at 11.2 %
 divergence: a fixed λ makes unmutated reads underconfident (a SNP between
 alleles is worth `ln(3(1−p)/p) = 8.0` nats at `p = 0.1 %`, not 3.2) and
-heavily mutated ones overconfident. Let `p̂` be the fraction of mismatched
-substitution columns in the called V and J, `N` columns excluded (with half a
-pseudo-mismatch, clamped to `[10⁻⁴, 0.5]`). A substitution column scoring
+heavily mutated ones overconfident. Let `p̂` be the read's divergence,
+estimated before adjudication from the uncontested V and J columns (§4,
+*Values*). A substitution column scoring
 `s ≠ 0` is worth `λ_r·s + μ_r` nats, with `(λ_r, μ_r)` chosen so that a match
 is worth `ln 4(1 − p̂)` and a mismatch `ln(4p̂/3)`: the log-odds of
 "templated at divergence `p̂`" against "uniform random". An `N` column
 (`s = 0`) is worth 0, as it is to the scoring: it supports neither
 hypothesis. Gaps stay at the prior λ, because `p̂` measures substitutions, not
-indels. Each segment kind uses its own match/mismatch scores. The priors
-(`P_D`, pair bonus, tandem, `ι`) stay at the λ they were derived with. At
-`p̂ = 11.2 %`, `λ_r = λ` and `μ_r = 0`. The map is affine per column, so clip
-scores stay separable in their cuts.
+indels. Each segment kind uses its own match/mismatch scores. The prior
+terms (pair bonus, tandem, `ι`) stay at the λ they were derived with, and a D
+costs `c_D(p̂)` (§4). At `p̂ = 11.2 %`, `λ_r = λ` and `μ_r = 0`. The map is
+affine per column, so clip scores stay separable in their cuts. With
+`--calls fixed` the call keeps the fixed scores while the posterior reads
+this evidence unquantised with the D cost `λ·P*_D`; its mode can then differ
+from the call.
 
 **Domain.** The first segment keeps its start and the last its end, as in §4
 (V and J are extended to the read's ends on purpose). Between neighbours every
@@ -301,6 +370,24 @@ scores exactly this event. Under the tandem grammar a path can hold two such
 D placements, so the sum is clamped to 1 and is then an upper bound.
 `d_presence_posterior = 1 − P(no D)`.
 
+**Max-marginal D allele** (`adjudicate/decode.rs`, `--d-allele
+max-marginal`, off by default). The call is the single best explanation;
+its D allele need not be the most probable one. Under 0/1 loss on the D
+allele the Bayes act is `a* = argmax_a Σ_{D placements p ∋ a} P(p on the
+path)`. D presence stays the Viterbi decision (the presence marginal sums
+the look-elsewhere mass of every chance hit), so only a call with exactly one
+D is decoded, and a tie within a relative 10⁻⁹ keeps the call's allele.
+When `a*` differs, the reported path is re-traced by the same DAG under the
+call's model, on the lattice masked to the V and J placements and the D
+placements of `a*`, with the grammar restricted to the call's first and last
+kind and D count (`Within`). An exhaustive oracle checks this conditioned
+pass for every D placement of 40 hypermutated reads. On top of the per-read
+call it changes 0.3–1.1 % of rows and gains D allele accuracy significantly
+only on human hard reads (+0.25 pp, p 6·10⁻⁵; syn.hard +0.14, p 0.017; mid
+sets within noise), with D-free reads untouched; on the fixed-scale call it
+gains +0.20 and +0.27 pp (mid, hard). It needs posteriors, so
+`--no-posterior` and `--residual` report the call's allele.
+
 **Theorem 2.** The marginals equal exhaustive summation over all grammatical
 paths and canonical cut pairs (unit tests in `adjudicate/posterior.rs`):
 
@@ -318,8 +405,14 @@ paths and canonical cut pairs (unit tests in `adjudicate/posterior.rs`):
 - a D before a J whose alignment starts one base earlier, under VDJ and
   VDDJ grammars.
 
-The same tests check that the Viterbi score is the best path score, and a
-540-base V/J overlap is refused (`None`) instead of giving marginals above 1.
+The same tests check that the Viterbi key is the brute-force maximum and that
+the traced path re-scores to it, and a 540-base V/J overlap is refused
+(`None`) instead of giving marginals above 1. With one integer model for both
+passes (`per_read_call_is_a_mode_of_the_posterior`), the marginals equal the
+exhaustive sums of `e^{units/F}` and the Viterbi key their maximum, on the
+three junction fixtures under VJ, VDJ and VDDJ grammars, with and without an
+N/P cost, at `p̂` = 0.5 %, `δ` and 30 %: the call is a mode of the reported
+posterior.
 
 ## 5. Search
 
@@ -437,11 +530,15 @@ this objective can do better.
 
 ## 8. Open problems
 
-1. **Calls from the per-read model.** The Viterbi call uses fixed scores and
-   the posterior uses evidence at the read's divergence, so the posterior's
-   mode can differ from the call (at low SHM a short exact D can beat a longer
-   one with a mismatch). Viterbi with real-valued per-read weights, or
-   maximum-posterior-marginal calls, would make them agree.
+1. **The D threshold on the read's scale.** Calls come from the per-read
+   model (§4), but its D cost `c_D(p̂)` converts `P*_D` so that the fixed
+   scale's exact-run classes survive; it is a level-preserving threshold,
+   not a derived prior. Item 2 should replace `P*_D` by search statistics at
+   the per-read scale (where λ = 1 nat), keeping the dependence on `p̂`.
+   One `p̂` per read also assumes uniform mutation: a D-region rate differing
+   from V and J is untested, and the plug-in `p̂` under-weights D remnants
+   with two mismatches on unmutated reads against the Beta-binomial
+   predictive (by up to `ln 3`).
 2. **D prior from the D search's own statistics.** `P_D = ln(N·L) − ln odds`
    counts genes × read positions. A local search actually tries every allele,
    allele offset and read position, so the chance-match burden is closer to

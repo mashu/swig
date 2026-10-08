@@ -68,11 +68,11 @@ pub const UNITS_PER_NAT: f64 = 65536.0;
 pub enum CallModel {
     /// The read's own model ([`ReadModel::at`]): the same integers as the
     /// posterior, so the call is a mode of the reported distribution.
+    #[default]
     PerRead,
     /// The fixed scores ([`ReadModel::fixed`]). The posterior still reads
     /// evidence at the read's divergence ([`EvidenceModel::nats`]), so the
     /// call need not be its mode.
-    #[default]
     FixedScale,
 }
 

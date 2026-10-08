@@ -14,11 +14,13 @@ pub enum CallingProfile {
     /// Legacy human-IGH tuples. V gap-open −5, `min_d_match` 6, no D-presence cost.
     TruthOptimized,
     /// Default. V gap-open −9, `min_d_match` 4, `P_D` derived from the D
-    /// database at even prior odds (11 for human IGH).
+    /// database at even prior odds (`P*_D` = 10.55 for the 32 genes of human
+    /// IGH, 10 on the fixed scale).
     ROptimized,
     /// IgBLAST-agreement: D `(2,−4,−11,−1)`, J `(2,−4,−13,−1)`, `min_d_match` 5.
     IgBlastAgreement,
-    /// R-optimized scoring with D twice as likely a priori (`P_D` 9 for human IGH).
+    /// R-optimized scoring with D twice as likely a priori (`P*_D` = 9.45 for
+    /// human IGH).
     SensitiveD,
 }
 
