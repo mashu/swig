@@ -7,9 +7,15 @@
 //! ```text
 //! FR1  = [frame start, Cys23 + 4 codons)      CDR1 = [Cys23 + 4, Trp41 − 2)
 //! FR2  = [Trp41 − 2, Trp41 + 15)              CDR2 = [Trp41 + 15, FR3 start)
-//! FR3  = [Cys104 − (L − 1), Cys104 + 1)       L = 38 codons heavy, 36 light
+//! FR3  = [Cys104 − (L − 1), Cys104 + 1)       L = FR3 codons (below)
 //! CDR3 = [Cys104 + 1, J Trp/Phe118)           FR4  = [J Trp/Phe118, J end)
 //! ```
+//!
+//! The CDR2/FR3 boundary has no conserved residue. An FR3 start that is not
+//! given comes from the nearest relative whose FR3 start is given, else from
+//! the FR3 length the database's given starts imply for the allele's
+//! Trp41 → Cys104 spacing ([`Fr3Model`]), else from the chain default
+//! (38 codons heavy, 36 light; wrong for some TR and IGL families).
 //!
 //! Sources, in order of trust (a given value is never overridden):
 //!
@@ -32,6 +38,7 @@
 //! alignment for the rare transferred allele — milliseconds for thousands of
 //! alleles, and nothing is added to per-read work.
 
+mod fr3;
 mod given;
 mod j_motif;
 mod transfer;
@@ -40,6 +47,7 @@ mod v_motif;
 use std::collections::HashMap;
 use std::io::{self, Write};
 
+pub use fr3::Fr3Model;
 pub use given::ImgtGaps;
 pub use j_motif::{JHit, find_j};
 pub use transfer::{
@@ -175,6 +183,11 @@ pub struct DatabaseAnnotation {
     pub j: Vec<AlleleAnnotation>,
     /// Whether the V set's IMGT gap columns were read.
     pub imgt_gaps: ImgtGaps,
+    /// FR3 lengths learned from the alleles whose FR3 start is given.
+    pub fr3_model: Option<Fr3Model>,
+    /// Most V allele names are TR or IGL ones: loci whose FR3 length IMGT
+    /// varies by gene family, so one chain default is wrong for some.
+    pub fr3_varies: bool,
 }
 
 fn mode(values: impl Iterator<Item = u32>) -> Option<u32> {
@@ -197,6 +210,12 @@ fn mode_with_share(values: impl Iterator<Item = u32>) -> (Option<u32>, f64) {
         })
 }
 
+/// A probability for a note, rounded down to two decimals so that only a
+/// certain choice reads `1.00`.
+fn probability(p: f64) -> String {
+    format!("{:.2}", (p * 100.0).floor() / 100.0)
+}
+
 fn residue_at(codes: &[u8], anchor: u32) -> u8 {
     let a = anchor as usize;
     codes
@@ -204,15 +223,95 @@ fn residue_at(codes: &[u8], anchor: u32) -> u8 {
         .map_or(b'?', |c| codon(c[0], c[1], c[2]))
 }
 
-/// Region starts implied by a V hit (IMGT definitions, see module docs).
-fn regions_from_hit(hit: &VHit, chain: Option<ChainType>) -> RegionStarts {
+/// Region starts implied by a V hit (IMGT definitions, see module docs),
+/// with the FR3 start `fr3`.
+fn regions_from_hit(hit: &VHit, fr3: Fr3Start) -> RegionStarts {
+    let fr3 = match fr3 {
+        Fr3Start::Codons(codons) => hit.anchor().checked_sub(3 * (codons - 1)),
+        Fr3Start::At(position) => Some(position),
+        Fr3Start::Unknown => None,
+    };
     RegionStarts {
         fr1: Some(hit.frame as u32),
         cdr1: hit.cys23_nt().map(|c| c + 12),
         fr2: hit.trp41_nt().and_then(|w| w.checked_sub(6)),
         cdr2: hit.trp41_nt().map(|w| w + 45),
-        fr3: chain.and_then(|c| hit.anchor().checked_sub(3 * (c.fr3_codons() - 1))),
+        fr3,
     }
+}
+
+/// A derived FR3 start: an FR3 length before Cys104, or a position.
+#[derive(Clone, Copy, Debug)]
+enum Fr3Start {
+    Codons(u32),
+    At(u32),
+    Unknown,
+}
+
+/// Where the FR3 start of an allele without a given one came from.
+#[derive(Clone, Copy, Debug)]
+enum Fr3Choice {
+    /// The nearest relative with a given FR3 start (allele index).
+    Relative(usize),
+    /// The database model's most probable length and its posterior.
+    Model { codons: u32, p: f64 },
+    /// The model admits no FR3 length for the allele's spacing.
+    OutsideModel,
+    /// No model: the chain default.
+    ChainDefault,
+}
+
+/// The FR3 length for `hit` when its FR3 start is not given: the database
+/// model's most probable length for the Trp41 → Cys104 spacing, else the
+/// chain default.
+fn fr3_length(
+    hit: &VHit,
+    chain: Option<ChainType>,
+    model: Option<&Fr3Model>,
+) -> (Fr3Start, Fr3Choice) {
+    let default = chain.map_or(Fr3Start::Unknown, |c| Fr3Start::Codons(c.fr3_codons()));
+    let Some(model) = model else {
+        return (default, Fr3Choice::ChainDefault);
+    };
+    let spacing = hit.trp41.and_then(|w| hit.cys104.checked_sub(w));
+    match model.length_for(spacing.map(|d| d as u32)) {
+        Some((codons, p)) => (Fr3Start::Codons(codons), Fr3Choice::Model { codons, p }),
+        None => (default, Fr3Choice::OutsideModel),
+    }
+}
+
+/// [`merge_regions`] with the regions of `hit` and the first FR3 start the
+/// merge keeps of `relative` and [`fr3_length`]. Returns the merged starts
+/// and, when the FR3 start was not given but derived and kept, its source.
+#[allow(clippy::too_many_arguments)]
+fn merge_hit(
+    given: &[RegionSlot; 5],
+    hit: &VHit,
+    relative: Option<(u32, usize)>,
+    chain: Option<ChainType>,
+    model: Option<&Fr3Model>,
+    anchor: Option<u32>,
+    len: usize,
+    annotation: &mut AlleleAnnotation,
+) -> (RegionStarts, Option<Fr3Choice>) {
+    let open = given[4] == RegionSlot::Unknown;
+    if let Some((fr3, donor)) = relative.filter(|_| open) {
+        let mut trial = annotation.clone();
+        let merged = merge_regions(
+            given,
+            regions_from_hit(hit, Fr3Start::At(fr3)),
+            anchor,
+            len,
+            &mut trial,
+        );
+        if merged.fr3 == Some(fr3) {
+            *annotation = trial;
+            return (merged, Some(Fr3Choice::Relative(donor)));
+        }
+    }
+    let (fr3, choice) = fr3_length(hit, chain, model);
+    let merged = merge_regions(given, regions_from_hit(hit, fr3), anchor, len, annotation);
+    (merged, (open && merged.fr3.is_some()).then_some(choice))
 }
 
 /// Given values (header, then IMGT gaps) win; derived values fill the
@@ -269,6 +368,15 @@ fn merge_regions(
     merged
 }
 
+/// A start transferred from a relative is as uncertain as the relative's
+/// own (a CDR1 from an ambiguous Cys23, an FR3 from a doubtful length);
+/// given starts never are.
+fn inherit_uncertain(annotation: &mut AlleleAnnotation, given: &[RegionSlot; 5], donor: [bool; 5]) {
+    for ((flag, slot), inherited) in annotation.uncertain.iter_mut().zip(given).zip(donor) {
+        *flag |= inherited && slot.known().is_none();
+    }
+}
+
 /// Positions carried over from the nearest eligible relative.
 struct Relative {
     donor: usize,
@@ -321,6 +429,112 @@ fn relatives<'a>(index: &'a mut Option<RelativeIndex>, set: &GermlineSet) -> &'a
     index.get_or_insert_with(|| {
         RelativeIndex::build(set.alleles().iter().map(|a| a.codes.as_slice()))
     })
+}
+
+/// Least posterior of a model FR3 length that is not marked uncertain. The
+/// model assumes CDR2 and FR3 lengths independent across the labelled
+/// alleles, which fails for a family with no label: human TRGV1–8 get
+/// posteriors of 0.58–0.92 for a wrong length when only TRGV9–11 are
+/// annotated. On 13 loci with 10 % of alleles annotated, one model value in
+/// nine with a posterior of 0.8–0.95 was wrong, and none above.
+const FR3_CONFIDENT: f64 = 0.95;
+
+/// Writes the provenance note and uncertainty of a derived FR3 start, after
+/// the merge and only for the value kept.
+struct Fr3Notes<'a> {
+    set: &'a GermlineSet,
+    model: Option<&'a Fr3Model>,
+    /// The chain default is used in a locus whose FR3 length varies by family.
+    default_doubtful: bool,
+}
+
+impl Fr3Notes<'_> {
+    fn record(&self, annotation: &mut AlleleAnnotation, choice: Option<Fr3Choice>) {
+        let Some(choice) = choice else { return };
+        let (note, uncertain) = match choice {
+            Fr3Choice::Relative(donor) => (
+                Some(format!("FR3 start from {}", self.set.alleles()[donor].name)),
+                false,
+            ),
+            Fr3Choice::Model { codons, p } => (
+                Some(format!(
+                    "FR3 length {codons} codons from the database model (n={}, p={})",
+                    self.model.map_or(0, Fr3Model::labels),
+                    probability(p)
+                )),
+                p < FR3_CONFIDENT,
+            ),
+            Fr3Choice::OutsideModel => (
+                Some("FR3 length outside the database model; chain default".into()),
+                true,
+            ),
+            Fr3Choice::ChainDefault => (None, self.default_doubtful),
+        };
+        annotation.notes.extend(note);
+        annotation.uncertain[4] |= uncertain;
+    }
+}
+
+/// For every trusted allele (`hits`) whose FR3 start is open, the FR3 start
+/// of its nearest relative with a given FR3 start and an anchor, and that
+/// relative: the relative's Cys104 → FR3 distance when the two share a
+/// Trp41 → Cys104 spacing, else its FR3 start mapped by alignment. The FR3
+/// start is a homologous position, so an indel between the two falls in
+/// the region their alignment puts it in. Kept when it lies in frame before
+/// the anchor and makes an FR3 of IMGT length.
+fn fr3_from_relatives(
+    set: &GermlineSet,
+    given: &[Given],
+    anchors: &[Option<u32>],
+    hits: &[Option<VHit>],
+    index: &mut Option<RelativeIndex>,
+    workspace: &mut GotohWorkspace,
+) -> Vec<Option<(u32, usize)>> {
+    let fr3_of = |i: usize| given[i].regions[4].known().filter(|_| anchors[i].is_some());
+    let eligible: Vec<bool> = (0..set.len()).map(|i| fr3_of(i).is_some()).collect();
+    let mut found = vec![None; set.len()];
+    if !eligible.contains(&true) {
+        return found;
+    }
+    let spacing = |i: usize| {
+        let trp41 = hits[i]?.trp41_nt()?;
+        anchors[i]?.checked_sub(trp41)
+    };
+    for (target, slot) in found.iter_mut().enumerate() {
+        let Some(anchor) = anchors[target].filter(|_| hits[target].is_some()) else {
+            continue;
+        };
+        if given[target].regions[4] != RegionSlot::Unknown {
+            continue;
+        }
+        let Some(donor) = relatives(index, set).nearest(target, &eligible) else {
+            continue;
+        };
+        let donor_fr3 = fr3_of(donor).expect("eligible donor");
+        let donor_anchor = anchors[donor].expect("eligible donor");
+        let fr3 = if spacing(target).is_some() && spacing(target) == spacing(donor) {
+            donor_anchor
+                .checked_sub(donor_fr3)
+                .and_then(|d| anchor.checked_sub(d))
+        } else {
+            let alleles = set.alleles();
+            transfer(
+                &alleles[target].codes,
+                &alleles[donor].codes,
+                &[Some(donor_fr3)],
+                workspace,
+            )
+            .and_then(|mapped| mapped[0])
+        };
+        *slot = fr3
+            .filter(|&f| {
+                anchor
+                    .checked_sub(f)
+                    .is_some_and(|d| d.is_multiple_of(3) && Fr3Model::admits(d / 3 + 1))
+            })
+            .map(|f| (f, donor));
+    }
+    found
 }
 
 fn annotate_j(
@@ -509,6 +723,37 @@ pub fn annotate(
         _ => None,
     });
 
+    // FR3 and CDR2 lengths of the alleles whose FR3 start is given.
+    let fr3_varies = 2 * v
+        .alleles()
+        .iter()
+        .filter(|a| a.name.starts_with("TR") || a.name.starts_with("IGL"))
+        .count()
+        > v.len();
+    let fr3_model = Fr3Model::learn((0..v.len()).filter_map(|i| {
+        let fr3 = given[i].regions[4].known()?;
+        let hit = hits[i].filter(|_| result[i].source.trusted());
+        let anchor = given[i].anchor.or(hit.map(|h| h.anchor()))?;
+        let codons = anchor.checked_sub(fr3).filter(|d| d.is_multiple_of(3))? / 3 + 1;
+        let cdr2 = given[i].regions[3]
+            .known()
+            .or(hit.and_then(|h| h.trp41_nt()).map(|w| w + 45));
+        let cdr2_codons = cdr2
+            .and_then(|c| fr3.checked_sub(c))
+            .filter(|d| d.is_multiple_of(3))
+            .map(|d| d / 3);
+        Some((codons, cdr2_codons))
+    }));
+    // The Trp41 search covers every FR3 length the chain or the model admits.
+    let fr3_range = match (chain.map(ChainType::fr3_codons), fr3_model.as_ref()) {
+        (Some(l), Some(model)) => {
+            let (lo, hi) = model.observed();
+            Some((l.min(lo), l.max(hi)))
+        }
+        (Some(l), None) => Some((l, l)),
+        (None, model) => model.map(Fr3Model::observed),
+    };
+
     // Database consensus from pass 1: the 3′ tail after Cys104, the frame of
     // full-length alleles and the codon index of their Cys23.
     let trusted: Vec<VHit> = (0..v.len())
@@ -549,7 +794,7 @@ pub fn annotate(
             fixed_anchor: given[index].anchor,
             tail_prior: tail.filter(|_| !was_confident || tail_share >= 0.5),
             cys23_prior,
-            fr3_codons: chain.map(ChainType::fr3_codons),
+            fr3_codons: fr3_range,
         };
         let refined = find_v(&allele.codes, search, &mut frames);
         match (&result[index].source, refined) {
@@ -570,11 +815,32 @@ pub fn annotate(
     }
     // Final anchors and regions for trusted alleles.
     let len_of = |set: &GermlineSet, i: usize| set.alleles()[i].codes.len();
-    let mut anchors: Vec<Option<u32>> = Vec::with_capacity(v.len());
+    let trusted_hits: Vec<Option<VHit>> = (0..v.len())
+        .map(|i| hits[i].filter(|_| result[i].source.trusted()))
+        .collect();
+    let mut anchors: Vec<Option<u32>> = given
+        .iter()
+        .zip(&trusted_hits)
+        .map(|(given, hit)| given.anchor.or(hit.map(|h| h.anchor())))
+        .collect();
+    let mut relative_index = None;
+    let fr3_relatives = fr3_from_relatives(
+        v,
+        &given,
+        &anchors,
+        &trusted_hits,
+        &mut relative_index,
+        &mut workspace,
+    );
+    let fr3_notes = Fr3Notes {
+        set: v,
+        model: fr3_model.as_ref(),
+        default_doubtful: fr3_model.is_none() && fr3_varies,
+    };
     let mut regions: Vec<RegionStarts> = Vec::with_capacity(v.len());
     for (index, given) in given.iter().enumerate() {
-        let trusted_hit = hits[index].filter(|_| result[index].source.trusted());
-        let anchor = given.anchor.or(trusted_hit.map(|h| h.anchor()));
+        let trusted_hit = trusted_hits[index];
+        let anchor = anchors[index];
         let merged = match (anchor, trusted_hit) {
             (Some(anchor), Some(hit)) => {
                 let annotation = &mut result[index];
@@ -585,24 +851,27 @@ pub fn annotate(
                     ));
                     annotation.uncertain[1] = true;
                 }
-                merge_regions(
+                let (merged, choice) = merge_hit(
                     &given.regions,
-                    regions_from_hit(&hit, chain),
+                    &hit,
+                    fr3_relatives[index],
+                    chain,
+                    fr3_model.as_ref(),
                     Some(anchor),
                     len_of(v, index),
                     annotation,
-                )
+                );
+                fr3_notes.record(annotation, choice);
+                merged
             }
             _ => given.known(),
         };
-        anchors.push(anchor);
         regions.push(merged);
     }
 
     // V pass 3: an ambiguous Cys23 in an allele the positional prior could
     // not reach (5′-truncated, other frame) is taken from the most similar
     // unambiguous allele, if it lands on a Cys codon in this allele's frame.
-    let mut relative_index = None;
     let unambiguous: Vec<bool> = (0..v.len())
         .map(|i| {
             result[i].source.trusted()
@@ -691,6 +960,7 @@ pub fn annotate(
                 let derived = RegionStarts::from_values([
                     mapped[1], mapped[2], mapped[3], mapped[4], mapped[5],
                 ]);
+                let donor_uncertain = result[donor].uncertain;
                 let annotation = &mut result[index];
                 let residue = residue_at(&v.alleles()[index].codes, anchor);
                 if residue != b'C' {
@@ -705,6 +975,7 @@ pub fn annotate(
                     len,
                     annotation,
                 );
+                inherit_uncertain(annotation, &given[index].regions, donor_uncertain);
                 result[index].source = AnchorSource::Transfer {
                     from: v.alleles()[donor].name.clone(),
                 };
@@ -723,6 +994,7 @@ pub fn annotate(
                     r.mapped[4],
                     r.mapped[5],
                 ]);
+                let donor_uncertain = result[r.donor].uncertain;
                 let annotation = &mut result[index];
                 annotation.notes.push(format!(
                     "3′-partial: the anchor codon of {} maps past the 3′ end",
@@ -730,6 +1002,7 @@ pub fn annotate(
                 ));
                 regions[index] =
                     merge_regions(&given[index].regions, derived, None, len, annotation);
+                inherit_uncertain(annotation, &given[index].regions, donor_uncertain);
             }
             relative => {
                 if let Some(hit) = hits[index] {
@@ -741,13 +1014,18 @@ pub fn annotate(
                         ),
                         None => "weak motifs; no similar annotated allele".into(),
                     });
-                    regions[index] = merge_regions(
+                    let (merged, choice) = merge_hit(
                         &given[index].regions,
-                        regions_from_hit(&hit, chain),
+                        &hit,
+                        None,
+                        chain,
+                        fr3_model.as_ref(),
                         Some(hit.anchor()),
                         len,
                         annotation,
                     );
+                    regions[index] = merged;
+                    fr3_notes.record(annotation, choice);
                     result[index].source = AnchorSource::LowConfidence;
                     anchors[index] = Some(hit.anchor());
                 }
@@ -778,6 +1056,8 @@ pub fn annotate(
         v: result,
         j: j_annotations,
         imgt_gaps,
+        fr3_model,
+        fr3_varies,
     }
 }
 
@@ -818,7 +1098,18 @@ impl DatabaseAnnotation {
                     &format!("; gaps of {gapped} V alleles ignored, not IMGT numbering ({reason})");
             }
         }
+        if let Some(model) = &self.fr3_model {
+            text += &format!("; FR3 lengths learned from {} alleles", model.labels());
+        }
         text
+    }
+
+    /// No V allele has a given FR3 start, and the names are those of a
+    /// locus (TR, IGL) whose FR3 length varies by gene family: one chain
+    /// default places some FR3 starts wrong, and every such start is
+    /// marked uncertain.
+    pub fn fr3_warning(&self) -> bool {
+        self.fr3_model.is_none() && self.fr3_varies && self.chain.is_some()
     }
 
     /// Alleles whose anchor is not from a header, IMGT gaps, motif or consensus.

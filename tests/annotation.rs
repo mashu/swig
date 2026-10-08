@@ -496,17 +496,19 @@ fn middle_gaps(positions: std::ops::RangeInclusive<usize>, n: usize) -> Vec<usiz
 
 /// IMGT-gapped text of a full-length synthetic gene: FR1 on IMGT codons
 /// 1–26 (heavy lacks 10), CDR1 on 27–38, FR2 on 39–55, CDR2 on 56–65 and
-/// FR3 on 66–104 (heavy lacks 73; light 73, 81 and 82), CDR gaps in the
-/// middle, then the 3′ tail.
+/// FR3 on 66–104 (a 38-codon FR3 lacks 73, a 36-codon one 73, 81 and 82),
+/// CDR gaps in the middle, then the 3′ tail.
 fn imgt_gapped(gene: &SyntheticV, chain: ChainType) -> Vec<u8> {
     let [fr1, cdr1, fr2, cdr2, fr3] = gene.starts.map(|s| s as usize);
     assert_eq!(fr1, 0, "full-length gene");
     let s = &gene.sequence;
     let end = gene.anchor as usize + 3;
-    let (fr1_gaps, fr3_gaps): (&[usize], &[usize]) = match chain {
-        ChainType::Heavy => (&[10], &[73]),
-        ChainType::Light => (&[], &[73, 81, 82]),
+    let fr1_gaps: &[usize] = match chain {
+        ChainType::Heavy => &[10],
+        ChainType::Light => &[],
     };
+    // 36–39 codons on the 39 positions 66–104.
+    let fr3_gaps = &[73, 81, 82][..39 - (end - fr3) / 3];
     let mut out = Vec::new();
     place(&mut out, &s[..cdr1], 1..=26, fr1_gaps);
     let cdr1_gaps = middle_gaps(27..=38, (fr2 - cdr1) / 3);
@@ -681,4 +683,369 @@ fn non_imgt_gapped_alignment_is_ignored() {
         assert_eq!(annotation.source, want_annotation.source);
         assert_eq!(annotation.notes, want_annotation.notes);
     }
+}
+
+/// A TR-like V gene family: IMGT regions with Cys23 at `fr1[cys23]`, Trp41
+/// at `fr2[2]` and Cys104 last in `fr3`, and fixed CDR lengths.
+struct Template {
+    fr1: &'static [u8],
+    cys23: usize,
+    cdr1: usize,
+    fr2: &'static [u8],
+    cdr2: usize,
+    fr3: &'static [u8],
+    tail: &'static [u8],
+}
+
+/// TRBV5-1-like (FR3 37 codons) and TRBV7-2-like (38) families.
+const TRB_37: Template = Template {
+    fr1: b"KAGVTQTPRYLIKTRGQQVTLSCSPI",
+    cys23: 22,
+    cdr1: 5,
+    fr2: b"VSWYQQTPGQGLQFLFE",
+    cdr2: 6,
+    fr3: b"RNKGNFPGRFSGRQFSNSRSEMNVSTLELGDSALYLC",
+    tail: b"ASSL",
+};
+const TRB_38: Template = Template {
+    fr1: b"GAGVSQSPSNKVTEKGKDVELRCDPI",
+    cys23: 22,
+    cdr1: 5,
+    fr2: b"LYWYRQSLGQGLEFLIY",
+    cdr2: 6,
+    fr3: b"PDKSGLPSDRFSAERTGGSVSTLTIQRTQQEDSAVYLC",
+    tail: b"ASSL",
+};
+/// TRAV1-2-like (FR3 34 codons, CDR2 7) and TRAV2-like (32, CDR2 4) families.
+const TRA_34: Template = Template {
+    fr1: b"GQNIDQPTEMTATEGAIVQINCTYQT",
+    cys23: 21,
+    cdr1: 6,
+    fr2: b"LFWYQQKPGEAPTFLSY",
+    cdr2: 7,
+    fr3: b"LEKGRFSSFLSRSKGYSYLLLKELQMKDSASYLC",
+    tail: b"AVR",
+};
+const TRA_32: Template = Template {
+    fr1: b"KDQVFQPSTVASSEGAVVEIFCNHSV",
+    cys23: 21,
+    cdr1: 6,
+    fr2: b"LYWYKQEPGEGPQLLSY",
+    cdr2: 4,
+    fr3: b"NGRFTVFLNKSAKHLSLHIVPSQPGDSAVYFC",
+    tail: b"AVR",
+};
+
+/// A gene of family `t`: framework residues mutated, CDRs random without
+/// Cys or Trp, the first `truncate` bases removed.
+fn from_template(t: &Template, rng: &mut Rng, truncate: usize) -> SyntheticV {
+    let no_decoy = |residues: Vec<u8>| -> Vec<u8> {
+        residues
+            .into_iter()
+            .map(|a| if a == b'C' || a == b'W' { b'S' } else { a })
+            .collect()
+    };
+    let fr1 = mutate(t.fr1, &[t.cys23, t.cys23 - 1], rng);
+    let fr2 = mutate(t.fr2, &[2, 5, 7, 8], rng);
+    let last = t.fr3.len() - 1;
+    let fr3 = mutate(t.fr3, &[last, last - 1, last - 2], rng);
+    let mut protein = fr1.clone();
+    protein.extend(no_decoy(random_residues(t.cdr1, rng)));
+    let fr2_start = protein.len();
+    protein.extend(&fr2);
+    let cdr2_start = protein.len();
+    protein.extend(no_decoy(random_residues(t.cdr2, rng)));
+    let fr3_start = protein.len();
+    protein.extend(&fr3);
+    let cys104 = protein.len() - 1;
+    protein.extend(t.tail);
+    let mut sequence = back_translate(&protein, rng);
+    sequence.extend(b"GA");
+    let shift = |codon_index: usize| (3 * codon_index - truncate) as u32;
+    SyntheticV {
+        sequence: sequence[truncate..].to_vec(),
+        anchor: shift(cys104),
+        starts: [
+            ((3 - truncate) % 3) as u32,
+            shift(t.cys23 + 4),
+            shift(fr2_start),
+            shift(cdr2_start),
+            shift(fr3_start),
+        ],
+    }
+}
+
+/// A FASTA record that gives the anchor and every region start of `gene`.
+fn annotated_record(name: &str, gene: &SyntheticV) -> String {
+    let [fr1, cdr1, fr2, cdr2, fr3] = gene.starts;
+    let header = format!(
+        " anchor={} fr1={fr1} cdr1={cdr1} fr2={fr2} cdr2={cdr2} fr3={fr3}",
+        gene.anchor
+    );
+    record(name, &header, &gene.sequence)
+}
+
+/// `genes` V genes of `locus`, alternating between the two families; the
+/// first `annotated` of each family give their regions in the header.
+fn tr_database(
+    locus: &str,
+    families: [&Template; 2],
+    genes: usize,
+    annotated: usize,
+    rng: &mut Rng,
+) -> (String, Vec<SyntheticV>) {
+    let mut text = String::new();
+    let mut truth = Vec::new();
+    for g in 0..genes {
+        let gene = from_template(families[g % 2], rng, 0);
+        let name = format!("{locus}{g}*01");
+        text += &if g / 2 < annotated {
+            annotated_record(&name, &gene)
+        } else {
+            record(&name, "", &gene.sequence)
+        };
+        truth.push(gene);
+    }
+    (text, truth)
+}
+
+/// TR loci have one FR3 length per gene family (TRB 37/38, TRA 34/32),
+/// none the light-chain default of 36 codons. Three header-annotated
+/// alleles per family teach the database's FR3 model, and every other start
+/// is exact. Without them the database raises `fr3_warning`, and every FR3
+/// start (from the chain default) is marked uncertain.
+#[test]
+fn tr_fr3_lengths_are_learned_from_a_few_annotated_alleles() {
+    for (locus, families, seed) in [
+        ("TRBV", [&TRB_37, &TRB_38], 11),
+        ("TRAV", [&TRA_34, &TRA_32], 12),
+    ] {
+        for annotated in [3, 0] {
+            let mut rng = Rng::new(seed);
+            let (text, truth) = tr_database(locus, families, 60, annotated, &mut rng);
+            let mut v = GermlineSet::from_fasta(SegmentKind::V, &text).unwrap();
+            let mut j = j_set(ChainType::Light, &mut rng);
+            let report = annotate(&mut v, Some(&mut j), AnnotateOptions::default());
+            assert_eq!(report.chain, Some(ChainType::Light), "{locus}");
+            assert_eq!(report.fr3_model.is_some(), annotated > 0, "{locus}");
+            assert_eq!(report.fr3_warning(), annotated == 0, "{locus}");
+            for (id, (allele, gene)) in v.alleles().iter().zip(&truth).enumerate() {
+                let name = &allele.name;
+                assert_eq!(allele.anchor, Some(gene.anchor), "{name}");
+                if annotated > 0 {
+                    let notes = &report.v[id].notes;
+                    assert_eq!(
+                        allele.regions.values(),
+                        gene.starts.map(Some),
+                        "{name} {notes:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        allele.regions.values()[..4],
+                        gene.starts.map(Some)[..4],
+                        "{name}"
+                    );
+                    assert!(report.v[id].uncertain[4], "{name}");
+                }
+            }
+        }
+    }
+}
+
+/// An allele whose CDR2 lost a codon relative to its annotated *01: its
+/// Trp41 → Cys104 spacing suggests a 37-codon FR3, but the alignment to *01
+/// puts the deletion in CDR2, so the FR3 start (a homologous position)
+/// keeps the 38-codon FR3.
+#[test]
+fn fr3_start_follows_the_annotated_relative_across_a_cdr2_indel() {
+    let mut rng = Rng::new(12);
+    let (mut text, truth) = tr_database("TRBV", [&TRB_37, &TRB_38], 60, 3, &mut rng);
+    let source = &truth[1]; // TRB_38 family, header-annotated
+    let cdr2 = source.starts[3] as usize;
+    let mut deleted = source.sequence[..cdr2 + 3].to_vec();
+    deleted.extend_from_slice(&source.sequence[cdr2 + 6..]);
+    text += &record("TRBV1*02", "", &deleted);
+    let mut v = GermlineSet::from_fasta(SegmentKind::V, &text).unwrap();
+    let options = AnnotateOptions {
+        chain: Some(ChainType::Light),
+    };
+    let report = annotate(&mut v, None, options);
+    let allele = v.alleles().last().unwrap();
+    let annotation = report.v.last().unwrap();
+    assert_eq!(allele.anchor, Some(source.anchor - 3));
+    assert_eq!(
+        allele.regions.fr3,
+        Some(source.starts[4] - 3),
+        "{annotation:?}"
+    );
+    assert!(
+        annotation
+            .notes
+            .iter()
+            .any(|n| n == "FR3 start from TRBV1*01"),
+        "{annotation:?}"
+    );
+    assert!(!annotation.uncertain[4]);
+}
+
+/// `gene` with `residues` (a codon each) inserted at its FR3 start.
+fn lengthen_fr3(gene: &SyntheticV, codons: &[u8]) -> SyntheticV {
+    let at = gene.starts[4] as usize;
+    let mut sequence = gene.sequence[..at].to_vec();
+    sequence.extend_from_slice(codons);
+    sequence.extend_from_slice(&gene.sequence[at..]);
+    SyntheticV {
+        sequence,
+        anchor: gene.anchor + codons.len() as u32,
+        starts: gene.starts,
+    }
+}
+
+/// Point mutations at every `step`-th base outside the conserved codons.
+fn point_mutated(gene: &SyntheticV, step: usize) -> Vec<u8> {
+    let cys23 = gene.starts[1] as usize - 12;
+    let keep = [cys23, gene.starts[2] as usize + 6, gene.anchor as usize];
+    let mut sequence = gene.sequence.clone();
+    for i in (step / 2..sequence.len()).step_by(step) {
+        if keep.iter().all(|&k| !(k..k + 3).contains(&i)) && i % 3 == 2 {
+            sequence[i] = if sequence[i] == b'C' { b'T' } else { b'C' };
+        }
+    }
+    sequence
+}
+
+/// The common case of an IMGT-gapped set extended with ungapped novel
+/// alleles. The light set mixes 36- and 38-codon FR3 families (as lambda
+/// does); appended alleles take their FR3 start from the nearest gapped
+/// relative: by the shared Cys104 → FR3 distance for a point-mutated copy,
+/// by alignment for one with a CDR2 deletion.
+#[test]
+fn appended_ungapped_alleles_take_fr3_from_gapped_relatives() {
+    let mut rng = Rng::new(33);
+    let genes: Vec<SyntheticV> = (0..40)
+        .map(|g| {
+            let gene = synthetic_v(ChainType::Light, &mut rng, 0);
+            if g % 2 == 0 {
+                lengthen_fr3(&gene, b"GGCAGC")
+            } else {
+                gene
+            }
+        })
+        .collect();
+    let mut text = String::new();
+    for (g, gene) in genes.iter().enumerate() {
+        text += &record(
+            &format!("V{g}*01"),
+            "",
+            &imgt_gapped(gene, ChainType::Light),
+        );
+    }
+    // V0*02, V1*02: point-mutated copies; V2*02: a CDR2 codon deleted.
+    let mut appended = Vec::new();
+    for g in [0, 1] {
+        text += &record(&format!("V{g}*02"), "", &point_mutated(&genes[g], 15));
+        appended.push((format!("V{g}*02"), genes[g].anchor, genes[g].starts[4], g));
+    }
+    let source = &genes[2];
+    let cdr2 = source.starts[3] as usize;
+    let mut deleted = source.sequence[..cdr2].to_vec();
+    deleted.extend_from_slice(&source.sequence[cdr2 + 3..]);
+    text += &record("V2*02", "", &deleted);
+    appended.push(("V2*02".into(), source.anchor - 3, source.starts[4] - 3, 2));
+
+    let mut v = GermlineSet::from_fasta(SegmentKind::V, &text).unwrap();
+    let mut j = j_set(ChainType::Light, &mut rng);
+    let report = annotate(&mut v, Some(&mut j), AnnotateOptions::default());
+    assert!(report.summary().contains("IMGT numbering read from 40"));
+    for (name, anchor, fr3, donor) in appended {
+        let id = v.alleles().iter().position(|a| a.name == name).unwrap();
+        let (allele, annotation) = (&v.alleles()[id], &report.v[id]);
+        assert_eq!(allele.anchor, Some(anchor), "{name}");
+        assert_eq!(allele.regions.fr3, Some(fr3), "{name} {annotation:?}");
+        let note = format!("FR3 start from V{donor}*01");
+        assert!(annotation.notes.contains(&note), "{name} {annotation:?}");
+        assert!(!annotation.uncertain[4], "{name}");
+    }
+}
+
+/// One header with an outlier FR3 length (30 codons) widens the database's
+/// Trp41 search window, but no allele's anchor or frame moves.
+#[test]
+fn an_outlier_fr3_label_does_not_move_anchors() {
+    let mut rng = Rng::new(34);
+    let (_, genes, _, _) = database(ChainType::Heavy, 200, &mut rng);
+    let text = |outlier: bool| {
+        let mut text = String::new();
+        for (g, gene) in genes.iter().enumerate() {
+            let name = format!("V{g}*01");
+            text += &match g {
+                0 if outlier => {
+                    let fr3 = gene.anchor - 3 * 29;
+                    record(
+                        &name,
+                        &format!(" anchor={} fr3={fr3}", gene.anchor),
+                        &gene.sequence,
+                    )
+                }
+                _ if g % 10 == 0 => annotated_record(&name, gene),
+                _ => record(&name, "", &gene.sequence),
+            };
+        }
+        text
+    };
+    let mut anchors = Vec::new();
+    for outlier in [false, true] {
+        let mut v = GermlineSet::from_fasta(SegmentKind::V, &text(outlier)).unwrap();
+        let report = annotate(&mut v, None, AnnotateOptions::default());
+        let model = report.fr3_model.as_ref().unwrap();
+        assert_eq!(model.observed(), (if outlier { 30 } else { 38 }, 38));
+        anchors.push(v.alleles().iter().map(|a| a.anchor).collect::<Vec<_>>());
+    }
+    assert_eq!(anchors[0], anchors[1]);
+    let expected: Vec<Option<u32>> = genes.iter().map(|g| Some(g.anchor)).collect();
+    assert_eq!(anchors[0], expected);
+}
+
+/// TR databases with headers on one allele per family and 5′-truncated
+/// alleles: every wrong region start is marked uncertain.
+#[test]
+fn every_tr_error_is_flagged_with_a_few_annotated_alleles() {
+    let mut flagged = [0; 5];
+    for (locus, families) in [("TRBV", [&TRB_37, &TRB_38]), ("TRAV", [&TRA_34, &TRA_32])] {
+        for seed in 200..210 {
+            let mut rng = Rng::new(seed);
+            let mut text = String::new();
+            let mut truth = Vec::new();
+            for g in 0..80 {
+                let truncate = if g % 7 == 3 { 1 + rng.below(2) } else { 0 };
+                let gene = from_template(families[g % 2], &mut rng, truncate);
+                let name = format!("{locus}{g}*01");
+                text += &if g < 2 {
+                    annotated_record(&name, &gene)
+                } else {
+                    record(&name, "", &gene.sequence)
+                };
+                truth.push(gene);
+            }
+            let mut v = GermlineSet::from_fasta(SegmentKind::V, &text).unwrap();
+            let mut j = j_set(ChainType::Light, &mut rng);
+            let report = annotate(&mut v, Some(&mut j), AnnotateOptions::default());
+            for (id, (allele, gene)) in v.alleles().iter().zip(&truth).enumerate() {
+                let name = &allele.name;
+                assert_eq!(allele.anchor, Some(gene.anchor), "{seed} {name}");
+                let got = allele.regions.values();
+                for (field, want) in gene.starts.into_iter().enumerate() {
+                    if got[field] != Some(want) {
+                        assert!(
+                            report.v[id].uncertain[field],
+                            "seed {seed} {name}: silent error in start {field}: {:?}",
+                            report.v[id]
+                        );
+                        flagged[field] += 1;
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("flagged TR errors per start (FR1, CDR1, FR2, CDR2, FR3): {flagged:?}");
 }

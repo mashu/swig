@@ -230,6 +230,11 @@ fn load_database(args: &Args) -> Result<PreparedDatabase, Box<dyn Error>> {
         started.elapsed().as_secs_f64() * 1e3,
         database.summary()
     );
+    if database.annotation.fr3_warning() {
+        eprintln!(
+            "vdj-assign: warning: no V allele gives its FR3 start, and this locus' FR3 length varies by gene family; FR3 starts use one chain default and are marked uncertain. Add fr3= (and anchor=) to a few alleles per family, or use an IMGT-gapped V set"
+        );
+    }
     if database.annotation.uncertain() > 0 {
         eprintln!(
             "vdj-assign: {} alleles have transferred, low-confidence or missing anchors; see `vdj-assign prepare` annotation.tsv",
