@@ -92,6 +92,9 @@ pub struct FamilyBoundTable {
     diffs: Vec<(u32, u32)>,
     /// Frame positions, ascending within each pair's range.
     diff_positions: Vec<u32>,
+    /// Per allele: its position among its frame's members ordered by
+    /// `Σ_A Δ(·, A)` over the members, then by id.
+    medoid_rank: Vec<u32>,
 }
 
 impl FamilyBoundTable {
@@ -159,6 +162,20 @@ impl FamilyBoundTable {
                 }
             }
         }
+        // Medoid order: the member whose Δ to the others sums least first.
+        let mut medoid_rank = vec![0; placement.len()];
+        let mut order = Vec::new();
+        for (list, &(first, n)) in members.iter().zip(&frames) {
+            order.clear();
+            order.extend(list.iter().enumerate().map(|(r, &allele)| {
+                let row = &delta[first + r * n..first + (r + 1) * n];
+                (row.iter().map(|&d| i64::from(d)).sum::<i64>(), allele)
+            }));
+            order.sort_unstable();
+            for (position, &(_, allele)) in (0..).zip(&order) {
+                medoid_rank[allele as usize] = position;
+            }
+        }
         Self {
             placement,
             rank,
@@ -166,7 +183,15 @@ impl FamilyBoundTable {
             delta,
             diffs,
             diff_positions,
+            medoid_rank,
         }
+    }
+
+    /// Position of `allele` in its frame's medoid order: the members by
+    /// `Σ_A Δ(·, A)` over the frame, then by id. The lower, the tighter the
+    /// bounds the allele gives its frame-mates as their representative.
+    pub fn medoid_rank(&self, allele: AlleleId) -> u32 {
+        self.medoid_rank[allele as usize]
     }
 
     /// Entry of the ordered pair in `delta` and `diffs`; `None` across frames.
@@ -523,6 +548,19 @@ mod tests {
         let split = FamilyBoundTable::from_placement(&segment, placement);
         assert_eq!(split.delta(0, 3), None);
         assert_eq!(split.delta(3, 3), Some(0));
+    }
+
+    /// The allele between two others comes first in the medoid order: its
+    /// Δ to each is one SNP's, theirs to each other two SNPs'.
+    #[test]
+    fn medoid_order_puts_the_central_allele_first() {
+        let alleles: [(&[u8], u32); 3] =
+            [(b"AGGTACGTAC", 0), (b"ACGTACGTAC", 0), (b"ACGTACCTAC", 0)];
+        let segment = frame_segment(&alleles, &SCORING);
+        let table = frame_table(&segment, &alleles);
+        assert_eq!(table.medoid_rank(1), 0);
+        // The outer two tie, so the lower id comes first.
+        assert_eq!((table.medoid_rank(0), table.medoid_rank(2)), (1, 2));
     }
 
     /// The one-pass table equals the definition on random pairs with

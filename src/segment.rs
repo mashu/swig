@@ -223,8 +223,8 @@ pub struct BatchScratch {
     early: Vec<(usize, u32)>,
     /// Per request: where its next traceback wave starts, or [`DONE`].
     cursors: Vec<usize>,
-    /// Per candidate: its frame's representative for the sibling bounds,
-    /// the frame's strongest candidate (a gene leader is its frame's).
+    /// Per candidate: its frame's representative for the sibling bounds
+    /// (see [`SegmentStage::rank_with_bounds`]).
     representatives: Vec<u32>,
     /// Per gene or frame: the strongest candidate found so far.
     group_best: Vec<u32>,
@@ -485,7 +485,8 @@ impl<R: Retriever> SegmentStage<R> {
         );
         let set = self.segment.set();
         let gene = |allele| set.allele(allele).gene as usize;
-        strongest_per_group(candidates, set.gene_count(), gene, leaders, best);
+        let strength = |c: &Candidate| (c.votes, std::cmp::Reverse(c.allele));
+        strongest_per_group(candidates, set.gene_count(), gene, strength, leaders, best);
     }
 
     /// Fill `batch.ranked[r]` with request `r`'s candidates ranked by local
@@ -561,15 +562,16 @@ impl<R: Retriever> SegmentStage<R> {
         }
     }
 
-    /// Family-delta ranking (see [`crate::family_bound`]). Each frame's
-    /// strongest candidate (most votes, then lowest id) is its siblings'
-    /// representative `R`; a gene's leader is its frame's, so the
-    /// representatives are the gene leaders plus one per further frame.
-    /// They serve the bounds only: ties keep the stage's [`TieOrder`].
+    /// Family-delta ranking (see [`crate::family_bound`]). Each frame
+    /// present in a request has one representative `R` for its siblings:
+    /// its strongest candidate by votes, then by the frame's medoid order
+    /// ([`FamilyBoundTable::medoid_rank`]), then by lowest id. They serve
+    /// the bounds only; ties keep the stage's [`TieOrder`], whatever was
+    /// scored first.
     ///
     /// 1. Score the representatives. A score below the floor still bounds.
-    ///    The strongest one (most votes, then lowest id) is aligned instead:
-    ///    it is most often the best and traced anyway.
+    ///    The strongest one is aligned instead: it is most often the best
+    ///    and traced anyway.
     /// 2. Align each request's best-scoring representatives (every tie) too.
     ///    Their paths and the strongest's bound siblings from below, and
     ///    traceback reuses the alignments.
@@ -609,23 +611,28 @@ impl<R: Retriever> SegmentStage<R> {
             if self.needs_scores(request) {
                 let slots = batch.slots(index);
                 let frame = |allele| table.frame(allele) as usize;
+                let strength = |c: &Candidate| {
+                    let medoid = table.medoid_rank(c.allele);
+                    (c.votes, std::cmp::Reverse((medoid, c.allele)))
+                };
                 strongest_per_group(
                     request.candidates,
                     table.frame_count(),
                     frame,
+                    strength,
                     &mut batch.representatives[slots.clone()],
                     &mut batch.group_best,
                 );
                 let representatives = (0..)
                     .zip(&batch.representatives[slots])
-                    .filter(|&(c, &leader)| c == leader)
+                    .filter(|&(c, &representative)| c == representative)
                     .map(|(c, _)| c);
-                let strength = |&c: &u32| {
-                    let candidate = &request.candidates[c as usize];
-                    (candidate.votes, std::cmp::Reverse(candidate.allele))
-                };
                 let strongest = cut
-                    .then(|| representatives.clone().max_by_key(strength))
+                    .then(|| {
+                        representatives
+                            .clone()
+                            .max_by_key(|&c| strength(&request.candidates[c as usize]))
+                    })
                     .flatten();
                 for c in representatives {
                     if Some(c) == strongest {
@@ -998,20 +1005,20 @@ fn nth_largest(values: &mut [Score], n: usize) -> Option<Score> {
     Some(nth)
 }
 
-/// For each candidate, the strongest candidate of its group (most votes,
-/// then lowest allele id) as a candidate index. `best` is per-group scratch,
-/// all [`NONE`] on entry and on return.
-fn strongest_per_group(
+/// For each candidate, the strongest candidate of its group (the largest
+/// `strength`; unique per candidate) as a candidate index. `best` is
+/// per-group scratch, all [`NONE`] on entry and on return.
+fn strongest_per_group<K: Ord>(
     candidates: &[Candidate],
     groups: usize,
     group: impl Fn(AlleleId) -> usize,
+    strength: impl Fn(&Candidate) -> K,
     out: &mut [u32],
     best: &mut Vec<u32>,
 ) {
     if best.len() < groups {
         best.resize(groups, NONE);
     }
-    let strength = |c: &Candidate| (c.votes, std::cmp::Reverse(c.allele));
     for (index, candidate) in (0..).zip(candidates) {
         let slot = &mut best[group(candidate.allele)];
         if *slot == NONE || strength(candidate) > strength(&candidates[*slot as usize]) {
