@@ -162,9 +162,10 @@ pub enum DPrior {
     /// expects `E(S) = K·m·n_D·e^{−λS}` chance hits scoring `S` or more. A
     /// present D scores above the threshold almost surely, so the best hit
     /// is more likely a D than chance when `π·1 > (1 − π)·E(S)`, i.e. when
-    /// `S > P*_D`. `Derived` is the same rule with `K·m·n_D` undercounted as
-    /// `N·L` (genes × positions; every allele and allele offset is tried)
-    /// and `π = ½`. The two errors offset: at even odds the search's count
+    /// `S > P*_D`. `Derived` is the same rule with `K·m·n_D` replaced by
+    /// `N·L`, genes × positions, which undercounts a search that tries every
+    /// allele and allele offset, and with `π = ½`. The two errors offset:
+    /// at even odds the search's count
     /// puts `P*_D` at 14.2 for human IGH, and a measured `π` (0.9–0.99)
     /// lowers it by 3.5–7.3. Against a brute-force count of chance hits
     /// (random windows, one best hit per allele) `K·m·n_D·e^{−λS}` is high
@@ -181,7 +182,7 @@ impl DPrior {
     };
 
     /// [`DPrior::Search`] over the default 25 read positions at D-presence
-    /// rate `presence`.
+    /// rate `presence`, in (0, 1).
     pub const fn search(presence: f64) -> Self {
         Self::Search {
             window: 25,
