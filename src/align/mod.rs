@@ -95,7 +95,11 @@ pub struct AlignJob<'a> {
 ///
 /// Implementations must return `None` when the best local score is not positive,
 /// and alignments that begin and end with [`Op::Match`] columns (true for any
-/// optimal local alignment; [`crate::clip`] relies on it).
+/// optimal local alignment; [`crate::clip`] relies on it). An alignment's
+/// score is the score-only optimum of the same problem,
+/// `align(job).score == score(job).score` (both `None` together):
+/// [`crate::segment`] ranks a candidate it aligned instead of scoring by that
+/// score.
 pub trait Aligner {
     /// Per-thread scratch memory, reused across calls.
     type Workspace: Default + Send;

@@ -164,7 +164,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         .filter(|a| !a.is_empty())
     {
         match ablation {
-            "family-delta" => config.v.family_delta = false,
+            "family-delta" => {
+                config.v.family_delta = false;
+                config.j.family_delta = false;
+            }
             "anchor-window" => config.anchor_window = false,
             "distributed-d" => config.d.distributed = None,
             "posterior" => config.posterior = false,

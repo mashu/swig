@@ -180,6 +180,71 @@ fn posteriors_are_calibrated() {
     }
 }
 
+/// Sibling bounds (`family_delta`, V and J) are lossless under every stage
+/// configuration they interact with: banding, the ungapped prefilter, `top`,
+/// `cap`, the band width and V acceptance. Calls with and without them are
+/// identical, down to every placement and posterior.
+#[test]
+fn family_bounds_agree_with_full_scoring_under_config_variants() {
+    use vdj_assign::retrieve::UngappedParams;
+    use vdj_assign::segment::HitAcceptance;
+
+    let setup = Setup::new();
+    let sim = Simulator::new(
+        &setup.db.v,
+        Some(&setup.db.d),
+        &setup.db.j,
+        SimParams::hard().with_reverse_complement(0.5),
+    )
+    .expect("simulator");
+    let queries: Vec<Vec<u8>> = sim
+        .reads(300, 21)
+        .expect("reads")
+        .iter()
+        .map(|read| encode(&read.sequence))
+        .collect();
+    type Variant = (&'static str, fn(&mut EngineConfig));
+    let variants: [Variant; 12] = [
+        ("default", |_| {}),
+        ("unbanded", |c| c.v.seeds.unbanded = true),
+        ("ungapped", |c| {
+            c.v.ungapped = Some(UngappedParams::default())
+        }),
+        ("V top 1", |c| c.v.keep.top = 1),
+        ("V top 2", |c| c.v.keep.top = 2),
+        ("V top 5", |c| c.v.keep.top = 5),
+        ("V cap 3", |c| c.v.keep.cap = 3),
+        ("band_max 3", |c| {
+            c.v.seeds.band_max = 3;
+            c.v.seeds.band_pad = 0;
+        }),
+        ("J top 1", |c| c.j.keep.top = 1),
+        ("J top 5", |c| c.j.keep.top = 5),
+        ("J cap 3", |c| c.j.keep.cap = 3),
+        ("V acceptance", |c| {
+            c.v.accept = HitAcceptance {
+                min_subst: 60,
+                min_identity: 0.93,
+            }
+        }),
+    ];
+    for (name, apply) in variants {
+        let calls = |family_delta: bool| -> Vec<String> {
+            let mut config = EngineConfig::default();
+            apply(&mut config);
+            config.v.family_delta = family_delta;
+            config.j.family_delta = family_delta;
+            assign_all(&setup.assigner(&config), &queries, 0)
+                .iter()
+                .map(|call| format!("{call:?}"))
+                .collect()
+        };
+        let (bounded, full) = (calls(true), calls(false));
+        let differ = bounded.iter().zip(&full).filter(|(a, b)| a != b).count();
+        assert_eq!(differ, 0, "{name}: {differ} of {} calls differ", full.len());
+    }
+}
+
 #[test]
 fn random_reads_receive_no_call() {
     let setup = Setup::new();

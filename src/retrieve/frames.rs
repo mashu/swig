@@ -110,6 +110,11 @@ impl GeneFrames {
         &self.members[frame as usize]
     }
 
+    /// Frame of `allele`.
+    pub fn frame(&self, allele: AlleleId) -> u32 {
+        self.allele_frame[allele as usize].0
+    }
+
     /// `frame position = allele position + offset`.
     pub fn offset(&self, allele: AlleleId) -> u32 {
         self.allele_frame[allele as usize].1

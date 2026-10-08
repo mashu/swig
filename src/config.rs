@@ -14,6 +14,7 @@ use crate::adjudicate::{
 };
 use crate::admission::{AnyOf, DistributedEvidence, ExactRunFloor};
 use crate::align::{Backend, InterSequenceGotoh};
+use crate::family_bound::FamilyBoundTable;
 use crate::flank::OuterExtend;
 use crate::germline::{GermlineSet, SegmentKind};
 use crate::index::IndexError;
@@ -26,7 +27,7 @@ use crate::retrieve::{
 use crate::scoring::{AffineScoring, Score};
 use crate::seed::SeedShape;
 use crate::segment::{
-    EvalueGates, HitAcceptance, KeepPolicy, PreparedSegment, SegmentStage, Significance,
+    EvalueGates, HitAcceptance, KeepPolicy, PreparedSegment, SegmentStage, Significance, TieOrder,
 };
 use crate::stats::KarlinAltschul;
 use crate::window::{DownstreamWindow, ExpandedResidual, WithAnchorWindow};
@@ -47,8 +48,8 @@ pub struct VSegmentConfig {
     pub accept: HitAcceptance,
     /// E-value gates (`None` = no significance floor and no anchoring).
     pub evalue: Option<EvalueGates>,
-    /// Skip score-only DP for same-gene siblings that cannot enter the top-N,
-    /// using a sound upper bound from the gene's representative.
+    /// Skip DP for same-frame siblings that cannot enter the top-N or whose
+    /// score their bounds pin (see [`crate::family_bound`]); lossless.
     pub family_delta: bool,
 }
 
@@ -61,6 +62,8 @@ pub struct JSegmentConfig {
     /// E-value gates (`None` = no significance floor and no anchoring).
     pub evalue: Option<EvalueGates>,
     pub window: DownstreamWindow,
+    /// Sibling bounds as for V, each gene one frame; lossless.
+    pub family_delta: bool,
 }
 
 /// D: L-mer prefilter, unbanded DP inside junction windows, admission gates.
@@ -257,6 +260,7 @@ impl Default for JSegmentConfig {
             accept: HitAcceptance::PERMISSIVE,
             evalue: Some(EvalueGates::default()),
             window: DownstreamWindow::default(),
+            family_delta: true,
         }
     }
 }
@@ -382,14 +386,18 @@ fn v_stage(
         &config.scoring,
         config.scoring.gaps,
     ));
-    let retriever = UngappedPrefilter::new(seeds, Arc::clone(&segment), config.ungapped);
+    // Bounds are sound for bands shifted through the frames the bands come from.
     let family_delta = config
         .family_delta
-        .then(|| crate::family_bound::FamilyBoundTable::build(&segment));
+        .then(|| FamilyBoundTable::with_frames(&segment, seeds.frames()));
+    let retriever = UngappedPrefilter::new(seeds, Arc::clone(&segment), config.ungapped);
     let mut stage = SegmentStage::new(segment, retriever, config.keep);
     stage.accept = config.accept;
     stage.significance = significance;
     stage.outer = OuterExtend::Prefix;
+    // The order the V stage has always produced: gene leaders were scored,
+    // and so ranked, before their siblings.
+    stage.ties = TieOrder::GeneLeadersFirst;
     stage.family_delta = family_delta;
     Ok(stage)
 }
@@ -400,10 +408,17 @@ fn j_stage(set: GermlineSet, config: &JSegmentConfig) -> SegmentStage<Exhaustive
         .evalue
         .and_then(|gates| Significance::new(&set, &config.scoring, gates));
     let segment = PreparedSegment::new(set, &config.scoring, config.scoring.gaps);
+    // J bands are unbanded, which any placement of the alleles bounds.
+    let family_delta = config
+        .family_delta
+        .then(|| FamilyBoundTable::build(&segment));
     let mut stage = SegmentStage::new(Arc::new(segment), retriever, config.keep);
     stage.accept = config.accept;
     stage.significance = significance;
     stage.outer = OuterExtend::Suffix;
+    // Ties in retrieval (allele id) order, as J has always ranked them.
+    stage.ties = TieOrder::Retrieval;
+    stage.family_delta = family_delta;
     stage
 }
 
