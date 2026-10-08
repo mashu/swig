@@ -15,21 +15,24 @@
 //! [`PlacementDag`] also reads the objective as a distribution over paths and
 //! cuts, `P ∝ exp(nats)`, and returns posterior [`Marginals`] of the
 //! placements and of the D count by forward–backward over the same DAG, with
-//! alignment evidence rescored at the read's own divergence.
+//! alignment evidence rescored at the read's own divergence. Both passes read
+//! one [`ReadModel`]: under [`CallModel::PerRead`] the call is a mode of the
+//! reported posterior.
 
 mod dag;
 mod lattice;
 mod model;
 mod posterior;
 mod residual;
+mod units;
 
 pub use dag::{DagScratch, PlacementDag};
 pub use model::{EngineeringObjective, Grammar, PathModel, VdjGrammar};
-pub use posterior::{
-    EvidenceScale, MAX_SPREAD, Marginals, OVERLAP_SPREAD, PosteriorModel, PosteriorScratch,
-    divergence,
-};
+pub use posterior::{MAX_SPREAD, Marginals, OVERLAP_SPREAD, PosteriorScratch};
 pub use residual::{ResidualAdjudicator, ResidualScratch};
+pub use units::{
+    CallModel, EvidenceModel, EvidenceScale, PathNats, ReadModel, UNITS_PER_NAT, Units, divergence,
+};
 
 use std::cmp::Ordering;
 
@@ -39,7 +42,7 @@ use crate::scoring::Score;
 
 /// Path objective with its tie rules built in, compared lexicographically:
 ///
-/// 1. `score` — the objective;
+/// 1. `score` — the objective, in fixed scores or in a [`ReadModel`]'s units;
 /// 2. fewer D segments ("with-D must strictly beat no-D");
 /// 3. `support` — the summed *unclipped* scores of the path's placements.
 ///
@@ -49,13 +52,13 @@ use crate::scoring::Score;
 /// allele with more support admits more cuts that reach the same score, so
 /// it has the larger likelihood summed over cuts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PathScore {
-    pub score: Score,
+pub struct PathScore<S = Score> {
+    pub score: S,
     pub d_count: u8,
     pub support: Score,
 }
 
-impl Ord for PathScore {
+impl<S: Ord> Ord for PathScore<S> {
     fn cmp(&self, other: &Self) -> Ordering {
         self.score
             .cmp(&other.score)
@@ -64,7 +67,7 @@ impl Ord for PathScore {
     }
 }
 
-impl PartialOrd for PathScore {
+impl<S: Ord> PartialOrd for PathScore<S> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
@@ -82,11 +85,15 @@ pub struct CalledSegment {
     pub span: ClipSpan,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CallPath {
     /// Segments in query order.
     pub segments: Vec<CalledSegment>,
+    /// The path's fixed-scale objective, whichever model chose it.
     pub score: PathScore,
+    /// The read's divergence `p̂` ([`divergence`]): the posterior reads
+    /// alignment evidence at it, and so does a [`CallModel::PerRead`] call.
+    pub divergence: f64,
 }
 
 pub trait Adjudicator: Send + Sync {

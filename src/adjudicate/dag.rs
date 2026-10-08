@@ -19,8 +19,17 @@
 //! the first retained base, an exit right after the last, so every distinct
 //! clipped span is one `(entry, exit)` pair.
 //!
+//! **Values.** Every term of a path is read in one [`ReadModel`]'s integer
+//! units: the fixed scores themselves ([`ReadModel::fixed`]), or the read's
+//! own log-odds at its divergence ([`ReadModel::at`], the units the posterior
+//! reads too). A clip's value is then `exit(x) − entry(y)` for prefix values
+//! accumulated once per node along its columns: a substitution column adds
+//! [`ReadModel::column`], the gap run before it [`ReadModel::prior`] of its
+//! score. Canonical cuts never split a gap run, so this is exact, as for
+//! scores ([`crate::clip`]).
+//!
 //! **Slots.** Each slot of the lattice holds, per entry cut, the best key
-//! (score, then germline support) of a path prefix entering there. The
+//! (value, then germline support) of a path prefix entering there. The
 //! recursion is the max-plus twin of the posterior's sum-product
 //! ([`super::posterior`]):
 //!
@@ -30,17 +39,18 @@
 //! best     = max_b X(b, end of b) + end(g, b)
 //! ```
 //!
-//! **Trick — separable scores → running maxima.** A clipped span scores
-//! `exit(x).prefix − entry(y).prefix` (see [`crate::clip`]), the model adds a
-//! cut-independent bonus, and the N/P score is linear in the inserted length.
+//! **Trick — separable values → running maxima.** A clipped span is worth
+//! `exit(x) − entry(y)`, the model adds a cut-independent bonus, and the N/P
+//! value is linear in the inserted length.
 //! So the inner maximum over entries is a running maximum along the node, and
 //! the maximum over exits `x ≤ y'` another, read in O(1) per entry. On an edge
 //! `b → e`, every entry of `e` at or beyond `b`'s end sees the same best exit,
 //! so it is added once to a running maximum over `e`'s entries: an edge costs
 //! `O(overlap + 1)`, a read `O(Σ_nodes len + Σ_edges (overlap + 1))`.
 //!
-//! Ties: final paths compare by [`PathScore`] (score, then fewer D, then
-//! germline support), so a with-D path must strictly beat the best no-D path.
+//! Ties: final paths compare by [`PathScore`] (value, then fewer D, then
+//! germline support, the summed unclipped fixed scores), so a with-D path must
+//! strictly beat the best no-D path. Integer values make every tie exact.
 //! Among equal keys: a node keeps its earliest entry, so a junction base that
 //! scores the same on either side goes to the later segment; for that entry,
 //! the predecessor's latest exit; and across predecessors, a path start, then
@@ -48,7 +58,8 @@
 
 use super::lattice::{Group, KINDS, Lattice};
 use super::model::{Grammar, PathModel, VdjGrammar};
-use super::posterior::{Marginals, PosteriorModel, PosteriorScratch, divergence};
+use super::posterior::{Marginals, PosteriorScratch};
+use super::units::{CallModel, EvidenceModel, PathNats, ReadModel, Units, divergence};
 use super::{Adjudicator, CallPath, CalledSegment, EngineeringObjective, PathScore};
 use crate::germline::SegmentKind;
 use crate::placement::Placement;
@@ -63,25 +74,25 @@ pub struct PlacementDag<G = VdjGrammar, M = EngineeringObjective> {
     pub model: M,
     /// Minimum query bases a clipped segment must keep, indexed by [`SegmentKind::index`].
     pub min_retained: [u32; 3],
-    /// When set, [`Adjudicator::marginals`] returns posterior marginals
-    /// (see [`PlacementDag::posterior`]).
-    pub posterior: Option<PosteriorModel>,
+    /// How alignments read as log-odds at a read's divergence. Without it
+    /// everything stays on the fixed scale and there are no posteriors.
+    pub evidence: Option<EvidenceModel>,
+    /// The model the call maximises.
+    pub calls: CallModel,
+    /// Whether [`Adjudicator::marginals`] returns posterior marginals (see
+    /// [`PlacementDag::posterior`]); needs `evidence`.
+    pub posterior: bool,
 }
 
 impl Default for PlacementDag {
     fn default() -> Self {
-        Self {
-            grammar: VdjGrammar::VDJ,
-            model: EngineeringObjective::default(),
-            min_retained: [10, 3, 6],
-            posterior: None,
-        }
+        Self::new(VdjGrammar::VDJ, EngineeringObjective::default(), [10, 3, 6])
     }
 }
 
-/// Score, then germline support (the summed unclipped scores of the path's
+/// Value, then germline support (the summed unclipped scores of the path's
 /// placements), compared lexicographically.
-type Key = (Score, Score);
+type Key = (Units, Score);
 
 /// A best value with where it came from.
 #[derive(Clone, Copy, Debug)]
@@ -97,7 +108,7 @@ struct Cell {
 
 impl Cell {
     #[inline]
-    fn shift(self, by: Score) -> Self {
+    fn shift(self, by: Units) -> Self {
         Self {
             key: (self.key.0 + by, self.key.1),
             ..self
@@ -140,9 +151,9 @@ fn prefer(best: &mut Option<Cell>, candidate: Cell) {
 #[derive(Debug, Default)]
 pub struct DagScratch {
     lattice: Lattice,
-    /// Prefix score at each canonical entry / exit cut (`None` elsewhere).
-    entry: Vec<Option<Score>>,
-    exit: Vec<Option<Score>>,
+    /// Prefix value at each canonical entry / exit cut (`None` elsewhere).
+    entry: Vec<Option<Units>>,
+    exit: Vec<Option<Units>>,
     /// Per slot: whether any path leaves it.
     open: Vec<bool>,
     /// Per slot value: best path prefix entering at each offset.
@@ -156,19 +167,16 @@ pub struct DagScratch {
 }
 
 impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
+    /// A DAG on the fixed scale, without posteriors.
     pub fn new(grammar: G, model: M, min_retained: [u32; 3]) -> Self {
         Self {
             grammar,
             model,
             min_retained,
-            posterior: None,
+            evidence: None,
+            calls: CallModel::FixedScale,
+            posterior: false,
         }
-    }
-
-    /// Also compute posterior marginals under `model`.
-    pub fn with_posterior(mut self, model: PosteriorModel) -> Self {
-        self.posterior = Some(model);
-        self
     }
 
     #[inline]
@@ -176,18 +184,26 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         self.min_retained[kind.index()].max(1)
     }
 
-    /// The lattice with the prefix score of every canonical cut.
-    fn layout(&self, placements: &[Placement], s: &mut DagScratch) {
+    /// The lattice with the prefix value of every canonical cut under `read`.
+    fn layout(&self, placements: &[Placement], read: &ReadModel, s: &mut DagScratch) {
         s.lattice.layout(placements);
         s.entry.clear();
         s.entry.resize(s.lattice.cells(), None);
         s.exit.clear();
         s.exit.resize(s.lattice.cells(), None);
         for node in &s.lattice.nodes {
+            // (exit prefix score, exit prefix value) of the previous column.
+            let mut previous: Option<(Score, Units)> = None;
             for (q, entry, exit) in placements[node.placement].clip.matches() {
+                let before = match previous {
+                    None => read.prior(entry),
+                    Some((score, value)) => value + read.prior(entry - score),
+                };
+                let through = before + read.column(node.kind, exit - entry);
                 let o = (q - node.q_start) as usize;
-                s.entry[node.cuts + o] = Some(entry);
-                s.exit[node.cuts + o + 1] = Some(exit);
+                s.entry[node.cuts + o] = Some(before);
+                s.exit[node.cuts + o + 1] = Some(through);
+                previous = Some((exit, through));
             }
         }
         s.open.clear();
@@ -198,7 +214,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
 
     /// Open node `e`'s slots and fill their entry values from path starts
     /// and from every predecessor's running exit maxima.
-    fn gather(&self, s: &mut DagScratch, e: usize) {
+    fn gather(&self, read: &ReadModel, s: &mut DagScratch, e: usize) {
         let grammar = &self.grammar;
         let node = s.lattice.nodes[e];
         let width = node.width();
@@ -232,7 +248,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
             s.tails.clear();
             s.tails.resize(KINDS * width, None);
             for (b, u) in s.lattice.incoming(e, grammar, slot.group, &live) {
-                let iota = self.model.junction_per_base(b.kind, node.kind);
+                let iota = read.prior(self.model.junction_per_base(b.kind, node.kind));
                 let running = &s.running[s.lattice.slots[u].per_kind(node.kind, b.width())];
                 // Entries inside b: the best exit at or before the entry. A
                 // predecessor of another kind may start after this node
@@ -247,7 +263,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
                     };
                     if let Some(cell) = running[z as usize] {
                         let candidate = Cell {
-                            key: (cell.key.0 + iota * z as Score, cell.key.1),
+                            key: (cell.key.0 + iota * Units::from(z), cell.key.1),
                             slot: u as u32,
                             at: cell.at,
                         };
@@ -259,7 +275,8 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
                 if let (true, Some(cell)) = (beyond < width, running[b.len as usize]) {
                     let candidate = Cell {
                         key: (
-                            cell.key.0 + iota * (node.q_start as Score - b.q_start as Score),
+                            cell.key.0
+                                + iota * (Units::from(node.q_start) - Units::from(b.q_start)),
                             cell.key.1,
                         ),
                         slot: u as u32,
@@ -273,14 +290,14 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
                 if tail.iter().all(Option::is_none) {
                     continue;
                 }
-                let iota = self.model.junction_per_base(kind, node.kind);
+                let iota = read.prior(self.model.junction_per_base(kind, node.kind));
                 let mut best: Option<Cell> = None;
                 for (o, cell) in tail.iter().enumerate() {
                     if let Some(cell) = *cell {
                         prefer(&mut best, cell);
                     }
                     if let (Some(cell), true) = (best, s.entry[node.cuts + o].is_some()) {
-                        prefer(&mut forward[o], cell.shift(iota * o as Score));
+                        prefer(&mut forward[o], cell.shift(iota * o as Units));
                     }
                 }
             }
@@ -292,9 +309,10 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
     fn emit(
         &self,
         placements: &[Placement],
+        read: &ReadModel,
         s: &mut DagScratch,
         t: usize,
-    ) -> Option<(PathScore, Cell)> {
+    ) -> Option<(PathScore<Units>, Cell)> {
         let slot = s.lattice.slots[t];
         let Group { d_used, first } = slot.group;
         let node = s.lattice.nodes[slot.node as usize];
@@ -302,11 +320,11 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         let placement = &placements[node.placement];
         let min = self.min_bases(node.kind) as usize;
         let presence = if node.kind == SegmentKind::D {
-            self.model.d_presence_score()
+            read.d_cost()
         } else {
             0
         };
-        let bonus = self.model.segment_bonus(placement, d_used) - presence;
+        let bonus = read.prior(self.model.segment_bonus(placement, d_used)) - presence;
         let support = placement.score();
 
         // Running best of F(y) − entry(y) over entries, read min bases later.
@@ -351,7 +369,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
             if !self.grammar.can_follow(node.kind, kind, d_used) {
                 continue;
             }
-            let iota = self.model.junction_per_base(node.kind, kind);
+            let iota = read.prior(self.model.junction_per_base(node.kind, kind));
             let range = slot.per_kind(kind, width);
             let mut best: Option<Cell> = None;
             for o in 0..width {
@@ -360,7 +378,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
                     improve(
                         &mut best,
                         Cell {
-                            key: (cell.key.0 - iota * o as Score, cell.key.1),
+                            key: (cell.key.0 - iota * o as Units, cell.key.1),
                             slot: 0,
                             at: o as u32,
                         },
@@ -373,7 +391,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         let end = s.exits[slot.values + width - 1]?;
         self.grammar.can_end(first, node.kind).then(|| {
             let score = PathScore {
-                score: end.key.0 + self.model.end(first, node.kind, d_used),
+                score: end.key.0 + read.prior(self.model.end(first, node.kind, d_used)),
                 d_count: d_used,
                 support: end.key.1,
             };
@@ -421,6 +439,78 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
     }
 }
 
+impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
+    /// The best path under `read`, with its key.
+    pub fn viterbi(
+        &self,
+        placements: &[Placement],
+        read: &ReadModel,
+        s: &mut DagScratch,
+    ) -> Option<(PathScore<Units>, Vec<CalledSegment>)> {
+        self.layout(placements, read, s);
+        let mut best: Option<(PathScore<Units>, Cell)> = None;
+        for e in 0..s.lattice.nodes.len() {
+            self.gather(read, s, e);
+            for t in s.lattice.nodes[e].slots() {
+                if let Some((score, cell)) = self.emit(placements, read, s, t)
+                    && best.is_none_or(|(current, _)| score > current)
+                {
+                    best = Some((score, cell));
+                }
+            }
+        }
+        let (score, end) = best?;
+        Some((score, self.trace(placements, s, end)))
+    }
+
+    /// The fixed-scale objective of a path's `segments` (non-empty, D cost
+    /// `⌊P*_D⌋`), with its D count and germline support.
+    pub fn path_score(&self, placements: &[Placement], segments: &[CalledSegment]) -> PathScore {
+        let kind = |segment: &CalledSegment| placements[segment.placement].kind;
+        let (first, last) = (kind(&segments[0]), kind(&segments[segments.len() - 1]));
+        let (mut score, mut d_count, mut support) = (0, 0u8, 0);
+        for (k, segment) in segments.iter().enumerate() {
+            let placement = &placements[segment.placement];
+            if placement.kind == SegmentKind::D {
+                d_count += 1;
+                score -= self.model.d_presence_score();
+            }
+            score += segment.span.score + self.model.segment_bonus(placement, d_count);
+            support += placement.score();
+            if let Some(before) = k.checked_sub(1).map(|b| &segments[b]) {
+                score +=
+                    self.model
+                        .junction(kind(before), placement.kind, segment.entry - before.exit);
+            }
+        }
+        PathScore {
+            score: score + self.model.end(first, last, d_count),
+            d_count,
+            support,
+        }
+    }
+
+    /// The model a call at divergence `p` maximises.
+    fn read_model(&self, p: f64) -> ReadModel {
+        let d_presence = self.model.d_presence();
+        match (self.calls, &self.evidence) {
+            (CallModel::PerRead, Some(evidence)) => ReadModel::at(evidence, p, d_presence),
+            // Without an evidence model the fixed scores are not read as nats.
+            (_, evidence) => ReadModel::fixed(evidence.map_or(1.0, |e| e.lambda), d_presence),
+        }
+    }
+
+    /// The posterior's model at divergence `p`: the call's own under
+    /// [`CallModel::PerRead`].
+    fn nats(&self, p: f64) -> Option<PathNats> {
+        let evidence = self.evidence.as_ref()?;
+        Some(match self.calls {
+            CallModel::PerRead => self.read_model(p).nats(),
+            CallModel::FixedScale => evidence.nats(p, self.model.d_presence()),
+        })
+    }
+}
+
 impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
     type Scratch = DagScratch;
 
@@ -430,23 +520,16 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
         placements: &[Placement],
         scratch: &mut DagScratch,
     ) -> Option<CallPath> {
-        let s = scratch;
-        self.layout(placements, s);
-        let mut best: Option<(PathScore, Cell)> = None;
-        for e in 0..s.lattice.nodes.len() {
-            self.gather(s, e);
-            for t in s.lattice.nodes[e].slots() {
-                if let Some((score, cell)) = self.emit(placements, s, t)
-                    && best.is_none_or(|(current, _)| score > current)
-                {
-                    best = Some((score, cell));
-                }
-            }
+        let fixed = ReadModel::fixed(1.0, self.model.d_presence());
+        let (_, mut segments) = self.viterbi(placements, &fixed, scratch)?;
+        let divergence = divergence(placements, &segments);
+        if self.calls == CallModel::PerRead && self.evidence.is_some() {
+            (_, segments) = self.viterbi(placements, &self.read_model(divergence), scratch)?;
         }
-        let (score, end) = best?;
         Some(CallPath {
-            segments: self.trace(placements, s, end),
-            score,
+            score: self.path_score(placements, &segments),
+            segments,
+            divergence,
         })
     }
 
@@ -456,9 +539,8 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
         path: &CallPath,
         scratch: &mut DagScratch,
     ) -> Option<Marginals> {
-        let model = self.posterior?;
-        let evidence = model.evidence(divergence(placements, path));
-        self.posterior(placements, model.lambda, &evidence, &mut scratch.posterior)
+        let nats = self.nats(path.divergence).filter(|_| self.posterior)?;
+        self.posterior(placements, &nats, &mut scratch.posterior)
     }
 }
 

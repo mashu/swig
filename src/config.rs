@@ -9,7 +9,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use crate::adjudicate::{EngineeringObjective, PlacementDag, PosteriorModel, VdjGrammar};
+use crate::adjudicate::{CallModel, EngineeringObjective, EvidenceModel, PlacementDag, VdjGrammar};
 use crate::admission::{AnyOf, DistributedEvidence, ExactRunFloor};
 use crate::align::{Backend, InterSequenceGotoh};
 use crate::flank::OuterExtend;
@@ -192,6 +192,9 @@ pub struct EngineConfig {
     pub objective: ObjectiveConfig,
     /// Minimum retained query bases after clipping, per [`SegmentKind::index`].
     pub min_retained: [u32; 3],
+    /// The model the DAG's call maximises: each read's own (the model its
+    /// posteriors come from) or the fixed scores.
+    pub calls: CallModel,
     /// Report posterior probabilities (forward–backward over the placement
     /// DAG, priors at the V scoring's λ, alignment evidence at each read's
     /// divergence): per called segment and for D presence. With posteriors,
@@ -282,6 +285,7 @@ impl Default for EngineConfig {
             objective: ObjectiveConfig::default(),
             // A clipped V or J keeps at least one base, a D `min_d_match`.
             min_retained: [1, 4, 1],
+            calls: CallModel::default(),
             posterior: true,
             simd: None,
             options: AssignerOptions::default(),
@@ -456,26 +460,27 @@ impl Assigner {
         };
         let strand = StrandIndex::build([&v, &j], StrandIndex::K);
         let objective = config.objective.resolve(d.as_ref(), &config.d.scoring);
-        let mut adjudicator = PlacementDag::new(grammar, objective, config.min_retained);
-        if config.posterior
-            && let Some(ka) = KarlinAltschul::ungapped(&config.v.scoring)
-        {
-            let substitution = |s: &AffineScoring| (s.matched, s.mismatch);
-            adjudicator = adjudicator.with_posterior(PosteriorModel {
-                lambda: ka.lambda,
-                substitution: [
-                    substitution(&config.v.scoring),
-                    substitution(&config.d.scoring),
-                    substitution(&config.j.scoring),
-                ],
-            });
-        }
+        let substitution = |s: &AffineScoring| (s.matched, s.mismatch);
+        let evidence = KarlinAltschul::ungapped(&config.v.scoring).map(|ka| EvidenceModel {
+            lambda: ka.lambda,
+            substitution: [
+                substitution(&config.v.scoring),
+                substitution(&config.d.scoring),
+                substitution(&config.j.scoring),
+            ],
+        });
+        let adjudicator = PlacementDag {
+            evidence,
+            calls: config.calls,
+            posterior: config.posterior && evidence.is_some(),
+            ..PlacementDag::new(grammar, objective, config.min_retained)
+        };
         Ok(Assigner {
             v: v_stage(v, &config.v)?,
             j: j_stage(j, &config.j),
             // Only an adjudicator that computes posteriors needs the Ds below
             // the objective's floor.
-            d: d.map(|set| d_stage(set, &config.d, &objective, adjudicator.posterior.is_some())),
+            d: d.map(|set| d_stage(set, &config.d, &objective, adjudicator.posterior)),
             strand,
             j_window: config.j.window,
             aligner: match config.simd {

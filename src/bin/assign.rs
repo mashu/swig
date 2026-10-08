@@ -62,6 +62,8 @@ options:
   --forward-only       do not try the reverse complement
   --no-anchor-window   do not add the conserved-anchor D window
   --no-posterior       skip posterior probabilities (*_posterior columns; ~30 % faster)
+  --calls MODEL        the model the call maximises: per-read (each read's own, the
+                       model its posteriors come from) | fixed (the (2, -3) scores)
   --simd NAME          alignment kernel: avx512 | avx2 | neon | portable | scalar
                        (default: the fastest this CPU supports, avx512 excepted)
   --residual           ordinary commit-V/J-then-D adjudication instead of the DAG
@@ -101,6 +103,7 @@ struct Args {
     profile: Option<String>,
     threads: Option<String>,
     simd: Option<String>,
+    calls: Option<String>,
     chain: Option<String>,
     tandem_d: bool,
     forward_only: bool,
@@ -159,6 +162,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--profile" if assign => set_once(&mut args.profile, "--profile", value("--profile")?)?,
             "--threads" if assign => set_once(&mut args.threads, "--threads", value("--threads")?)?,
             "--simd" if assign => set_once(&mut args.simd, "--simd", value("--simd")?)?,
+            "--calls" if assign => set_once(&mut args.calls, "--calls", value("--calls")?)?,
             "--tandem-d" if assign => args.tandem_d = true,
             "--forward-only" if assign => args.forward_only = true,
             "--no-anchor-window" if assign => args.no_anchor_window = true,
@@ -354,6 +358,13 @@ fn run_assign(args: &Args) -> Result<(), Box<dyn Error>> {
         .transpose()?;
     // The residual adjudicator computes no posteriors.
     config.posterior = !args.no_posterior && !args.residual;
+    if let Some(name) = args.calls.as_deref() {
+        config.calls = match name {
+            "per-read" => CallModel::PerRead,
+            "fixed" => CallModel::FixedScale,
+            _ => return Err(format!("unknown --calls '{name}'").into()),
+        };
+    }
     let support: SupportModels = [
         KarlinAltschul::ungapped(&config.v.scoring),
         KarlinAltschul::ungapped(&config.d.scoring),

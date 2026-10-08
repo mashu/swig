@@ -4,9 +4,11 @@
 //! alleles (SNPs at 50/150/250), 8 D genes of 14–21 nt, 4 J genes of 48 nt.
 //! Queries are simulated rearrangements with trimming and random N regions.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use vdj_assign::adjudicate::{Adjudicator, DagScratch, PathScore};
+use vdj_assign::adjudicate::{
+    Adjudicator, DagScratch, EvidenceModel, PathScore, ReadModel, Units, divergence,
+};
 use vdj_assign::placement::Placement;
 use vdj_assign::prelude::*;
 use vdj_assign::sim::Rng;
@@ -340,12 +342,13 @@ fn batch_matches_sequential() {
 
 /// Exhaustive search of the segmentation model: every grammatical path, and
 /// for every transition every canonical exit cut `x` and every canonical
-/// entry cut `y ≥ x` of the next placement, with no shortcut. Memoised on
-/// `(placement, entry, D count, first)`.
+/// entry cut `y ≥ x` of the next placement, with no shortcut, valued term by
+/// term under `read`. Memoised on `(placement, entry, D count, first)`.
 struct Brute<'a> {
     dag: &'a PlacementDag,
     placements: &'a [Placement],
-    memo: std::collections::HashMap<(usize, u32, u8, SegmentKind), Option<PathScore>>,
+    read: ReadModel,
+    memo: HashMap<(usize, u32, u8, SegmentKind), Option<PathScore<Units>>>,
 }
 
 /// Canonical entry and exit cuts of a placement (one per Match column).
@@ -353,9 +356,43 @@ fn cuts(p: &Placement) -> (Vec<u32>, Vec<u32>) {
     p.clip.matches().map(|(q, ..)| (q, q + 1)).unzip()
 }
 
-impl Brute<'_> {
+impl<'a> Brute<'a> {
+    fn new(dag: &'a PlacementDag, placements: &'a [Placement], read: ReadModel) -> Self {
+        Self {
+            dag,
+            placements,
+            read,
+            memo: HashMap::new(),
+        }
+    }
+
     fn min(&self, kind: SegmentKind) -> u32 {
         self.dag.min_retained[kind.index()].max(1)
+    }
+
+    /// `p`'s alignment on `[entry, exit)`: its substitution columns and the
+    /// gap runs between them.
+    fn clip(&self, p: &Placement, entry: u32, exit: u32) -> Units {
+        let mut value = 0;
+        let mut last: Option<i32> = None;
+        for (_, before, after) in p.clip.matches().filter(|(q, ..)| (entry..exit).contains(q)) {
+            if let Some(previous) = last {
+                value += self.read.prior(before - previous);
+            }
+            value += self.read.column(p.kind, after - before);
+            last = Some(after);
+        }
+        value
+    }
+
+    /// The cut-independent terms of `p` as a segment with `d_used` D so far.
+    fn bonus(&self, p: &Placement, d_used: u8) -> Units {
+        let presence = if p.kind == SegmentKind::D {
+            self.read.d_cost()
+        } else {
+            0
+        };
+        self.read.prior(self.dag.model.segment_bonus(p, d_used)) - presence
     }
 
     /// Best rest of a path whose current segment is `b`, entered at `entry`.
@@ -365,29 +402,30 @@ impl Brute<'_> {
         entry: u32,
         d_used: u8,
         first: SegmentKind,
-    ) -> Option<PathScore> {
+    ) -> Option<PathScore<Units>> {
         let key = (b, entry, d_used, first);
         if let Some(known) = self.memo.get(&key) {
             return *known;
         }
         let (grammar, model) = (&self.dag.grammar, &self.dag.model);
         let pb = &self.placements[b];
-        let bonus = model.segment_bonus(pb, d_used);
-        let mut best: Option<PathScore> = None;
-        let mut consider = |candidate: PathScore| {
+        let bonus = self.bonus(pb, d_used);
+        let mut best: Option<PathScore<Units>> = None;
+        let mut consider = |candidate: PathScore<Units>| {
             if best.is_none_or(|current| candidate > current) {
                 best = Some(candidate);
             }
         };
         if grammar.can_end(first, pb.kind)
-            && let Some(span) = pb
+            && pb
                 .clip
                 .span(entry, pb.q_end())
-                .filter(|s| s.q_len() >= self.min(pb.kind))
+                .is_some_and(|s| s.q_len() >= self.min(pb.kind))
         {
-            let score = span.score + bonus + model.end(first, pb.kind, d_used);
             consider(PathScore {
-                score,
+                score: self.clip(pb, entry, pb.q_end())
+                    + bonus
+                    + self.read.prior(model.end(first, pb.kind, d_used)),
                 d_count: d_used,
                 support: pb.score(),
             });
@@ -411,17 +449,18 @@ impl Brute<'_> {
                 else {
                     continue;
                 };
+                let here = self.clip(pb, entry, x) + bonus;
                 for &y in entries.iter().filter(|&&y| y >= x) {
                     let Some(next) = pe.clip.entry(y) else {
                         continue;
                     };
-                    let junction =
-                        model.junction(pb.kind, pe.kind, next.q.saturating_sub(span.q_hi));
+                    let inserted = next.q.saturating_sub(span.q_hi);
+                    let junction = self.read.prior(model.junction(pb.kind, pe.kind, inserted));
                     let Some(rest) = self.best_from(e, y, d_next, first) else {
                         continue;
                     };
                     consider(PathScore {
-                        score: span.score + bonus + junction + rest.score,
+                        score: here + junction + rest.score,
                         d_count: rest.d_count,
                         support: pb.score() + rest.support,
                     });
@@ -431,30 +470,58 @@ impl Brute<'_> {
         self.memo.insert(key, best);
         best
     }
+
+    /// The best path over every start.
+    fn best(&mut self) -> Option<PathScore<Units>> {
+        (0..self.placements.len())
+            .filter(|&s| self.dag.grammar.can_start(self.placements[s].kind))
+            .filter_map(|s| {
+                let p = &self.placements[s];
+                self.best_from(s, p.q_start(), u8::from(p.kind == SegmentKind::D), p.kind)
+            })
+            .max()
+    }
+
+    /// A called path's value, term by term.
+    fn rescore(&self, segments: &[CalledSegment]) -> Units {
+        let kind = |s: &CalledSegment| self.placements[s.placement].kind;
+        let mut d_used = 0;
+        let mut value = 0;
+        for (k, segment) in segments.iter().enumerate() {
+            let p = &self.placements[segment.placement];
+            d_used += u8::from(p.kind == SegmentKind::D);
+            value += self.clip(p, segment.entry, segment.exit) + self.bonus(p, d_used);
+            if let Some(before) = k.checked_sub(1).map(|k| &segments[k]) {
+                let inserted = segment.entry - before.exit;
+                value += self
+                    .read
+                    .prior(self.dag.model.junction(kind(before), p.kind, inserted));
+            }
+        }
+        let (first, last) = (kind(&segments[0]), kind(&segments[segments.len() - 1]));
+        value + self.read.prior(self.dag.model.end(first, last, d_used))
+    }
 }
 
-/// The DAG's best path score and the exhaustive one on `placements`.
+/// The fixed scale of `dag`'s model: scores are units.
+fn fixed(dag: &PlacementDag) -> ReadModel {
+    ReadModel::fixed(1.0, dag.model.d_presence)
+}
+
+/// The DAG's best key and the exhaustive one on `placements` under `read`;
+/// the DAG's traced path re-scores to its key.
 fn dag_and_brute(
     dag: &PlacementDag,
     placements: &[Placement],
+    read: ReadModel,
     scratch: &mut DagScratch,
-) -> (Option<PathScore>, Option<PathScore>) {
-    let fast = dag
-        .adjudicate(0, placements, scratch)
-        .map(|path| path.score);
-    let mut brute = Brute {
-        dag,
-        placements,
-        memo: Default::default(),
-    };
-    let exhaustive = (0..placements.len())
-        .filter(|&s| dag.grammar.can_start(placements[s].kind))
-        .filter_map(|s| {
-            let p = &placements[s];
-            brute.best_from(s, p.q_start(), u8::from(p.kind == SegmentKind::D), p.kind)
-        })
-        .max();
-    (fast, exhaustive)
+) -> (Option<PathScore<Units>>, Option<PathScore<Units>>) {
+    let fast = dag.viterbi(placements, &read, scratch);
+    let mut brute = Brute::new(dag, placements, read);
+    if let Some((key, segments)) = &fast {
+        assert_eq!(brute.rescore(segments), key.score, "traced path re-scored");
+    }
+    (fast.map(|(key, _)| key), brute.best())
 }
 
 /// IgSim reads mutate V, D and J, so an alignment can carry mismatches right
@@ -485,7 +552,7 @@ fn dag_equals_brute_force_on_hypermutated_igsim_reads() {
                 ..base
             };
             let dag = PlacementDag::new(VdjGrammar::VDJ, model, config.min_retained);
-            let (fast, exhaustive) = dag_and_brute(&dag, &placements, &mut scratch);
+            let (fast, exhaustive) = dag_and_brute(&dag, &placements, fixed(&dag), &mut scratch);
             assert_eq!(
                 fast,
                 exhaustive,
@@ -504,6 +571,93 @@ fn dag_equals_brute_force_on_hypermutated_igsim_reads() {
     assert!(
         beyond > 0,
         "the reads should exercise entries beyond the overlap"
+    );
+}
+
+/// The per-read model in integer units is an exact max-plus problem: on the
+/// pipeline's placements for mid and hypermutated IgSim reads, under a tandem
+/// grammar with and without a per-base N/P cost, the DAG's key equals the
+/// exhaustive maximum at the read's own divergence and across the range, and
+/// its traced path re-scores to it. At the log-odds divergence δ0 (with an
+/// integer `P_D`) every value is the fixed score times `u0`, so the path is
+/// the fixed-scale call's.
+#[test]
+fn per_read_dag_equals_exhaustive_enumeration() {
+    use vdj_assign::sim::{SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
+    let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 11);
+    let config = EngineConfig::default();
+    let assigner =
+        DefaultAssigner::from_config(&config, db.v.clone(), Some(db.d.clone()), db.j.clone())
+            .unwrap();
+    let base = config.objective.resolve(Some(&db.d), &config.d.scoring);
+    let lambda = KarlinAltschul::ungapped(&config.v.scoring).unwrap().lambda;
+    let substitution = |s: &AffineScoring| (s.matched, s.mismatch);
+    let evidence = EvidenceModel {
+        lambda,
+        substitution: [&config.v.scoring, &config.d.scoring, &config.j.scoring].map(substitution),
+    };
+    let delta0 = evidence.log_odds_divergence(SegmentKind::D);
+    let mut ws = assigner.workspace();
+    let mut scratch = DagScratch::default();
+    let (mut checked, mut differs) = (0, 0);
+    for preset in [SimParams::hard(), SimParams::mid()] {
+        let sim = Simulator::new(&db.v, Some(&db.d), &db.j, preset).unwrap();
+        for read in sim.reads(40, 5).unwrap() {
+            let call = assigner.assign(&encode(&read.sequence), &mut ws);
+            let mut placements = top_by_kind(&call.placements, SegmentKind::V, 3);
+            placements.extend(top_by_kind(&call.placements, SegmentKind::D, 6));
+            placements.extend(top_by_kind(&call.placements, SegmentKind::J, 3));
+            for iota in [0, -1] {
+                let objective = EngineeringObjective {
+                    insertion_per_base: iota,
+                    ..base
+                };
+                let dag = PlacementDag::new(VdjGrammar::TANDEM_D, objective, config.min_retained);
+                let Some((fixed_key, fixed_path)) =
+                    dag.viterbi(&placements, &fixed(&dag), &mut scratch)
+                else {
+                    continue;
+                };
+                let own = divergence(&placements, &fixed_path);
+                for p in [own, 1e-3, 0.02, 0.3] {
+                    let model = ReadModel::at(&evidence, p, objective.d_presence);
+                    let (fast, exhaustive) = dag_and_brute(&dag, &placements, model, &mut scratch);
+                    assert_eq!(fast, exhaustive, "p {p}, iota {iota}");
+                    let (_, path) = dag.viterbi(&placements, &model, &mut scratch).unwrap();
+                    differs += usize::from(path != fixed_path);
+                    checked += 1;
+                }
+                // At δ0 the per-read model is the fixed one times u0.
+                let integer = PlacementDag::new(
+                    VdjGrammar::TANDEM_D,
+                    EngineeringObjective {
+                        d_presence: objective.d_presence.floor(),
+                        ..objective
+                    },
+                    config.min_retained,
+                );
+                let model = ReadModel::at(&evidence, delta0, integer.model.d_presence);
+                let (fast, exhaustive) = dag_and_brute(&integer, &placements, model, &mut scratch);
+                assert_eq!(fast, exhaustive, "δ0, iota {iota}");
+                let (key, path) = integer.viterbi(&placements, &model, &mut scratch).unwrap();
+                assert_eq!(path, fixed_path, "the fixed-scale path at δ0");
+                assert_eq!(
+                    (key.score, key.d_count, key.support),
+                    (
+                        Units::from(fixed_key.score) * model.prior(1),
+                        fixed_key.d_count,
+                        fixed_key.support
+                    )
+                );
+                checked += 1;
+            }
+        }
+    }
+    // The per-read optimum is often not the fixed-scale one, so the test
+    // discriminates.
+    assert!(
+        checked >= 600 && differs >= 50,
+        "{checked} optima, {differs} differ"
     );
 }
 
@@ -546,21 +700,19 @@ fn dag_equals_brute_force_over_all_paths_and_cuts() {
         placements.extend(top_by_kind(&call.placements, SegmentKind::D, 6));
         placements.extend(top_by_kind(&call.placements, SegmentKind::J, 3));
 
-        let fast = dag.adjudicate(call.query.len(), &placements, &mut scratch);
-        let mut brute = Brute {
-            dag: &dag,
-            placements: &placements,
-            memo: Default::default(),
-        };
-        let exhaustive = (0..placements.len())
-            .filter(|&s| dag.grammar.can_start(placements[s].kind))
-            .filter_map(|s| {
-                let p = &placements[s];
-                brute.best_from(s, p.q_start(), u8::from(p.kind == SegmentKind::D), p.kind)
-            })
-            .max();
-        assert_eq!(fast.as_ref().map(|path| path.score), exhaustive);
-        if let Some(path) = fast {
+        let (fast, exhaustive) = dag_and_brute(&dag, &placements, fixed(&dag), &mut scratch);
+        assert_eq!(fast, exhaustive);
+        if let Some(path) = dag.adjudicate(call.query.len(), &placements, &mut scratch) {
+            // On the fixed scale the reported path score is the DAG's key.
+            let key = fast.expect("a path");
+            assert_eq!(
+                (
+                    Units::from(path.score.score),
+                    path.score.d_count,
+                    path.score.support
+                ),
+                (key.score, key.d_count, key.support)
+            );
             let kinds: Vec<SegmentKind> = path
                 .segments
                 .iter()

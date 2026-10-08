@@ -5,7 +5,7 @@
 //! failure mode, which makes it a useful regression reference for the DAG.
 //! The V×J step uses the exact optimal cut when V and J overlap.
 
-use super::{Adjudicator, CallPath, CalledSegment, PathScore};
+use super::{Adjudicator, CallPath, CalledSegment, PathScore, divergence};
 use crate::clip::ClipSpan;
 use crate::germline::SegmentKind;
 use crate::placement::Placement;
@@ -173,6 +173,7 @@ impl Adjudicator for ResidualAdjudicator {
             .map(Pick::segment)
             .collect();
         Some(CallPath {
+            divergence: divergence(placements, &segments),
             segments,
             score: PathScore {
                 score: flank_score + d_score,

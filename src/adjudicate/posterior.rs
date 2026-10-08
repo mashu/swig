@@ -15,17 +15,15 @@
 //!
 //! **Evidence at the read's own divergence.** `(2, −3)` scores are log-odds
 //! only at 11.2 % divergence, so one λ would make unmutated reads
-//! underconfident and heavily mutated ones overconfident. The prior terms
-//! (`P_D`, pair bonus, N/P) stay at the λ they were derived with, but the
-//! alignment evidence is rescored as log-odds at the read's divergence `p̂`
-//! ([`divergence`]): a match is worth `ln 4(1 − p̂)` nats and a mismatch
-//! `ln(4p̂/3)` ([`EvidenceScale::at_divergence`]). For a match/mismatch
-//! scoring that is an affine map of each substitution column's score,
-//! `λ_r·s + μ_r`, which keeps every clip score separable. A column scoring 0
-//! (an `N`) is worth 0 either way, and gaps keep the prior λ: `p̂` says
-//! nothing about indel rates. At `p̂ = 11.2 %` it is the fixed-λ model. The posterior's mode can then differ from the
-//! Viterbi call, which stays on the fixed scores; the reported probability
-//! is that of the reported call under the per-read model.
+//! underconfident and heavily mutated ones overconfident. The alignment
+//! evidence is therefore read as log-odds at the read's divergence `p̂`, and
+//! the prior terms at the λ they were derived with ([`super::units`]). The
+//! weights come from a [`PathNats`]: the call's own [`ReadModel`] in nats
+//! under [`CallModel::PerRead`], whose Viterbi path is then a mode of this
+//! distribution; under [`CallModel::FixedScale`] the evidence unquantised and
+//! the D cost `λ·P*_D` ([`super::EvidenceModel::nats`]), while the call stays
+//! on the fixed scores, so the reported probability is that of a call made
+//! under another model.
 //!
 //! **Domain.** As in the Viterbi DAG, the first segment keeps its start and
 //! the last segment its end: V and J are extended to the read's ends on
@@ -67,9 +65,12 @@
 //! [`OVERLAP_SPREAD`], would leave the `f64` range, and the read then gets no
 //! marginals.
 
+use super::PlacementDag;
 use super::lattice::{Group, KINDS, Lattice, Node};
 use super::model::{Grammar, PathModel};
-use super::{CallPath, PlacementDag};
+#[cfg(doc)]
+use super::units::{CallModel, ReadModel};
+use super::units::{EvidenceScale, PathNats};
 use crate::germline::SegmentKind;
 use crate::placement::Placement;
 use crate::scoring::Score;
@@ -90,74 +91,6 @@ const MAX_D: u8 = 3;
 
 /// Scores whose weight `exp(λk)` is tabulated (`|k| ≤ TABLE_RANGE`).
 const TABLE_RANGE: Score = 1024;
-
-/// How [`PlacementDag`] turns scores into probabilities.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PosteriorModel {
-    /// Nats per unit of the path model's prior terms (`P_D`, pair bonus, N/P).
-    pub lambda: f64,
-    /// Match and mismatch score of each segment kind's substitution scoring
-    /// (indexed by [`SegmentKind::index`]), to rescore its alignments as
-    /// log-odds at the read's divergence.
-    pub substitution: [(Score, Score); 3],
-}
-
-impl PosteriorModel {
-    /// Evidence scales of the three segment kinds at divergence `p`.
-    pub fn evidence(&self, p: f64) -> [EvidenceScale; 3] {
-        self.substitution
-            .map(|(matched, mismatch)| EvidenceScale::at_divergence(p, matched, mismatch))
-    }
-}
-
-/// Nats per unit of alignment evidence: a substitution column scoring
-/// `s ≠ 0` is worth `lambda · s + mu`, an `N` column (`s = 0`) nothing. Gaps
-/// are read at the prior λ ([`PosteriorModel::lambda`]).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct EvidenceScale {
-    pub lambda: f64,
-    pub mu: f64,
-}
-
-impl EvidenceScale {
-    /// Scores read as `lambda` nats per unit, with no per-column term.
-    pub fn fixed(lambda: f64) -> Self {
-        Self { lambda, mu: 0.0 }
-    }
-
-    /// Log-odds of "templated at divergence `p`" against "random" (uniform
-    /// background) for a match/mismatch scoring: a match is worth
-    /// `ln 4(1 − p)` nats and a mismatch `ln(4p/3)`.
-    pub fn at_divergence(p: f64, matched: Score, mismatch: Score) -> Self {
-        let (a, b) = ((4.0 * (1.0 - p)).ln(), (4.0 * p / 3.0).ln());
-        let lambda = (a - b) / f64::from(matched - mismatch);
-        Self {
-            lambda,
-            mu: a - lambda * f64::from(matched),
-        }
-    }
-}
-
-/// Divergence of a read from its called germlines: the fraction of
-/// mismatched `Match` columns in the called V and J segments (a D is too
-/// short to tell), with half a pseudo-mismatch so that an unmutated read gets
-/// a small positive rate. Clamped to `[10⁻⁴, 0.5]`.
-pub fn divergence(placements: &[Placement], path: &CallPath) -> f64 {
-    let (mut columns, mut mismatches) = (0usize, 0usize);
-    for segment in &path.segments {
-        let p = &placements[segment.placement];
-        if p.kind == SegmentKind::D {
-            continue;
-        }
-        let span = segment.span.q_lo..segment.span.q_hi;
-        for (_, entry, exit) in p.clip.matches().filter(|(q, ..)| span.contains(q)) {
-            // N columns (score 0) carry no evidence either way.
-            columns += usize::from(exit != entry);
-            mismatches += usize::from(exit < entry);
-        }
-    }
-    ((mismatches as f64 + 0.5) / (columns as f64 + 1.0)).clamp(1e-4, 0.5)
-}
 
 /// `exp(±(λd + μ))` for small integer score steps `d`, to walk cut weights
 /// along an alignment by multiplication.
@@ -341,8 +274,7 @@ fn outgoing<'a>(
 
 impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
     /// Posterior marginals of `placements` under `P(path, cuts) ∝ exp(nats)`,
-    /// with each segment's alignment evidence on `evidence[kind]` and the
-    /// model's prior terms at `lambda` nats per unit.
+    /// with each path term read by `nats`.
     ///
     /// `None` when no grammatical path exists, or when linear arithmetic
     /// cannot hold the read: a placement's evidence range ([`MAX_SPREAD`]) or
@@ -350,20 +282,19 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
     pub fn posterior(
         &self,
         placements: &[Placement],
-        lambda: f64,
-        evidence: &[EvidenceScale; 3],
+        nats: &PathNats,
         scratch: &mut PosteriorScratch,
     ) -> Option<Marginals> {
         let weights = match scratch.weights.take() {
-            Some(w) if w.lambda == lambda => w,
-            _ => Weights::new(lambda),
+            Some(w) if w.lambda == nats.lambda => w,
+            _ => Weights::new(nats.lambda),
         };
         let marginals = Pass {
             dag: self,
             placements,
             w: &weights,
-            d_presence: (-lambda * self.model.d_presence()).exp(),
-            steps: evidence.map(Steps::new),
+            d_presence: (-nats.d_cost).exp(),
+            steps: nats.evidence.map(Steps::new),
         }
         .run(scratch);
         scratch.weights = Some(weights);
@@ -377,7 +308,7 @@ struct Pass<'a, G, M> {
     placements: &'a [Placement],
     /// Prior weights.
     w: &'a Weights,
-    /// `e^{−λ·P*_D}`, the weight of a D's presence cost (unrounded).
+    /// `e^{−c_D}`, the weight of a D's presence cost.
     d_presence: f64,
     /// Evidence steps per segment kind.
     steps: [Steps; 3],
@@ -887,7 +818,10 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adjudicate::{Adjudicator, DagScratch, EngineeringObjective, VdjGrammar};
+    use crate::adjudicate::units::{EvidenceModel, ReadModel, Units};
+    use crate::adjudicate::{
+        CalledSegment, DagScratch, EngineeringObjective, PathScore, VdjGrammar,
+    };
     use crate::align::{Alignment, Op};
     use crate::alphabet::encode;
     use crate::clip::ClipIndex;
@@ -895,6 +829,12 @@ mod tests {
     use crate::scoring::{AffineScoring, SubstitutionProfile};
 
     const LAMBDA: f64 = 0.6337;
+
+    /// The fixtures' scorings: `(2, −3)` for every kind, priors at `LAMBDA`.
+    const EVIDENCE: EvidenceModel = EvidenceModel {
+        lambda: LAMBDA,
+        substitution: [(2, -3); 3],
+    };
 
     fn placement(kind: SegmentKind, query: &[u8], reference: &[u8], q_start: u32) -> Placement {
         let scoring = AffineScoring::new(2, -3, -9, -1);
@@ -921,13 +861,15 @@ mod tests {
         }
     }
 
-    /// Exhaustive sum over grammatical paths and canonical cut pairs.
+    /// Exhaustive search over grammatical paths and canonical cut pairs: the
+    /// sum of `e^{nats}` (marginals) and the best key under `read`.
     struct Brute<'a> {
         dag: &'a PlacementDag,
         placements: &'a [Placement],
-        evidence: EvidenceScale,
+        nats: PathNats,
+        read: ReadModel,
         z: f64,
-        best: Score,
+        best: Option<PathScore<Units>>,
         placement: Vec<f64>,
         d_count: Vec<f64>,
     }
@@ -945,23 +887,46 @@ mod tests {
                 .collect()
         }
 
-        /// Nats of `b`'s evidence on `[entry, exit)`.
-        /// Substitution columns at the evidence scale (N columns, scoring
-        /// 0, are worth nothing), gaps at the prior λ.
-        fn evidence(&self, b: &Placement, entry: u32, exit: u32) -> f64 {
-            let span = b.clip.span(entry, exit).expect("canonical cuts");
-            let (mut nats, mut substitutions) = (0.0, 0);
+        /// `b`'s alignment evidence on `[entry, exit)`, in nats and in units:
+        /// substitution columns on the evidence scale (N columns, scoring 0,
+        /// are worth nothing), gaps at the prior λ.
+        fn evidence(&self, b: &Placement, entry: u32, exit: u32) -> (f64, Units) {
+            let scale = self.nats.evidence[b.kind.index()];
+            let (mut nats, mut units) = (0.0, 0);
+            let mut last: Option<Score> = None;
             for (_, before, after) in b.clip.matches().filter(|(q, ..)| (entry..exit).contains(q)) {
-                let column = after - before;
-                substitutions += column;
-                if column != 0 {
-                    nats += self.evidence.lambda * f64::from(column) + self.evidence.mu;
+                if let Some(previous) = last {
+                    nats += self.nats.lambda * f64::from(before - previous);
+                    units += self.read.prior(before - previous);
                 }
+                let column = after - before;
+                if column != 0 {
+                    nats += scale.lambda * f64::from(column) + scale.mu;
+                }
+                units += self.read.column(b.kind, column);
+                last = Some(after);
             }
-            nats + LAMBDA * f64::from(span.score - substitutions)
+            (nats, units)
         }
 
-        /// `acc`: path score so far; `nats`: its log weight.
+        /// `b`'s cut-independent terms as the `d_used`-th D (if a D).
+        fn bonus(&self, b: &Placement, d_used: u8) -> (f64, Units) {
+            let bonus = self.dag.model.segment_bonus(b, d_used);
+            let (mut nats, mut units) =
+                (self.nats.lambda * f64::from(bonus), self.read.prior(bonus));
+            if b.kind == SegmentKind::D {
+                nats -= self.nats.d_cost;
+                units -= self.read.d_cost();
+            }
+            (nats, units)
+        }
+
+        /// A prior term scoring `k`.
+        fn prior(&self, k: Score) -> (f64, Units) {
+            (self.nats.lambda * f64::from(k), self.read.prior(k))
+        }
+
+        /// `path` so far is worth `nats` and `units`, its last segment entered at `entry`.
         #[allow(clippy::too_many_arguments)]
         fn visit(
             &mut self,
@@ -969,29 +934,26 @@ mod tests {
             entry: u32,
             d_used: u8,
             first: SegmentKind,
-            acc: Score,
             nats: f64,
+            units: Units,
         ) {
             let (dag, placements) = (self.dag, self.placements);
             let b = &placements[*path.last().expect("non-empty")];
             let min_b = dag.min_retained[b.kind.index()].max(1);
+            let bonus = self.bonus(b, d_used);
             for x in Self::exits(b).into_iter().filter(|&x| x >= entry + min_b) {
-                let span = b.clip.span(entry, x).expect("canonical cuts");
-                let bonus = dag.model.segment_bonus(b, d_used);
-                let (cost, nats_cost) = if b.kind == SegmentKind::D {
-                    (dag.model.d_presence_score(), dag.model.d_presence())
-                } else {
-                    (0, 0.0)
-                };
-                let segment = span.score + bonus - cost;
-                let segment_nats =
-                    self.evidence(b, entry, x) + LAMBDA * (f64::from(bonus) - nats_cost);
+                let evidence = self.evidence(b, entry, x);
+                let (nats, units) = (nats + evidence.0 + bonus.0, units + evidence.1 + bonus.1);
                 if dag.grammar.can_end(first, b.kind) && x == b.q_end() {
-                    let end = dag.model.end(first, b.kind, d_used);
-                    let total = acc + segment + end;
-                    let weight = (nats + segment_nats + LAMBDA * f64::from(end)).exp();
+                    let end = self.prior(dag.model.end(first, b.kind, d_used));
+                    let weight = (nats + end.0).exp();
                     self.z += weight;
-                    self.best = self.best.max(total);
+                    let key = PathScore {
+                        score: units + end.1,
+                        d_count: d_used,
+                        support: path.iter().map(|&p| placements[p].score()).sum(),
+                    };
+                    self.best = self.best.max(Some(key));
                     for &p in path.iter() {
                         self.placement[p] += weight;
                     }
@@ -1007,15 +969,15 @@ mod tests {
                     let iota = dag.model.junction_per_base(b.kind, e.kind);
                     let d_next = d_used + u8::from(e.kind == SegmentKind::D);
                     for y in Self::entries(e).into_iter().filter(|&y| y >= x) {
-                        let junction = iota * (y - x) as Score;
+                        let junction = self.prior(iota * (y - x) as Score);
                         path.push(j);
                         self.visit(
                             path,
                             y,
                             d_next,
                             first,
-                            acc + segment + junction,
-                            nats + segment_nats + LAMBDA * f64::from(junction),
+                            nats + junction.0,
+                            units + junction.1,
                         );
                         path.pop();
                     }
@@ -1026,24 +988,46 @@ mod tests {
         fn run(
             dag: &'a PlacementDag,
             placements: &'a [Placement],
-            evidence: EvidenceScale,
+            nats: PathNats,
+            read: ReadModel,
         ) -> Self {
             let mut brute = Brute {
                 dag,
                 placements,
-                evidence,
+                nats,
+                read,
                 z: 0.0,
-                best: Score::MIN,
+                best: None,
                 placement: vec![0.0; placements.len()],
                 d_count: vec![0.0; 3],
             };
             for (s, p) in placements.iter().enumerate() {
                 if dag.grammar.can_start(p.kind) {
                     let d0 = u8::from(p.kind == SegmentKind::D);
-                    brute.visit(&mut vec![s], p.q_start(), d0, p.kind, 0, 0.0);
+                    brute.visit(&mut vec![s], p.q_start(), d0, p.kind, 0.0, 0);
                 }
             }
             brute
+        }
+
+        /// The value of a called path under `read`, term by term.
+        fn rescore(&self, segments: &[CalledSegment]) -> Units {
+            let (dag, placements) = (self.dag, self.placements);
+            let mut d_used = 0;
+            let mut units = 0;
+            for (k, segment) in segments.iter().enumerate() {
+                let b = &placements[segment.placement];
+                d_used += u8::from(b.kind == SegmentKind::D);
+                units += self.evidence(b, segment.entry, segment.exit).1 + self.bonus(b, d_used).1;
+                if let Some(before) = k.checked_sub(1).map(|k| &segments[k]) {
+                    let kind = placements[before.placement].kind;
+                    let inserted = segment.entry - before.exit;
+                    units += self.read.prior(dag.model.junction(kind, b.kind, inserted));
+                }
+            }
+            let kind = |s: &CalledSegment| placements[s.placement].kind;
+            let (first, last) = (kind(&segments[0]), kind(&segments[segments.len() - 1]));
+            units + self.read.prior(dag.model.end(first, last, d_used))
         }
     }
 
@@ -1054,15 +1038,12 @@ mod tests {
         );
     }
 
-    fn check(dag: &PlacementDag, placements: &[Placement], evidence: EvidenceScale) {
-        let brute = Brute::run(dag, placements, evidence);
+    /// Marginals under `nats` and the Viterbi key under `read` against
+    /// exhaustive search; the traced path re-scores to its key.
+    fn check(dag: &PlacementDag, placements: &[Placement], nats: PathNats, read: ReadModel) {
+        let brute = Brute::run(dag, placements, nats, read);
         let m = dag
-            .posterior(
-                placements,
-                LAMBDA,
-                &[evidence; 3],
-                &mut PosteriorScratch::default(),
-            )
+            .posterior(placements, &nats, &mut PosteriorScratch::default())
             .expect("a path exists");
         assert_close(m.log_partition, brute.z.ln(), "ln Z");
         for (i, (&got, &want)) in m.placement.iter().zip(&brute.placement).enumerate() {
@@ -1072,11 +1053,30 @@ mod tests {
             let got = m.d_count.get(k).copied().unwrap_or(0.0);
             assert_close(got, want / brute.z, &format!("D count {k}"));
         }
-        // The Viterbi path is the best path under the same scores.
-        let path = dag
-            .adjudicate(0, placements, &mut DagScratch::default())
+        let (key, segments) = dag
+            .viterbi(placements, &read, &mut DagScratch::default())
             .expect("a path exists");
-        assert_eq!(path.score.score, brute.best);
+        assert_eq!(Some(key), brute.best);
+        assert_eq!(brute.rescore(&segments), key.score);
+    }
+
+    /// The fixed-scale call with the posterior on `evidence` (the
+    /// [`CallModel::FixedScale`] pair): the D costs `⌊P*_D⌋` and `λ·P*_D`.
+    fn check_fixed(dag: &PlacementDag, placements: &[Placement], evidence: EvidenceScale) {
+        let d_presence = dag.model.d_presence();
+        let nats = PathNats {
+            lambda: LAMBDA,
+            evidence: [evidence; 3],
+            d_cost: LAMBDA * d_presence,
+        };
+        check(dag, placements, nats, ReadModel::fixed(LAMBDA, d_presence));
+    }
+
+    /// One read model at divergence `p` for both passes: the Viterbi path is
+    /// a mode of the posterior (the brute-force maximum of `e^{units/F}`).
+    fn check_per_read(dag: &PlacementDag, placements: &[Placement], p: f64) {
+        let read = ReadModel::at(&EVIDENCE, p, dag.model.d_presence());
+        check(dag, placements, read.nats(), read);
     }
 
     /// Competing V alleles, two D candidates (one spurious, overlapping J)
@@ -1177,7 +1177,7 @@ mod tests {
         };
         let fixed = EvidenceScale::fixed(LAMBDA);
         for grammar in [VdjGrammar::VDJ, VdjGrammar::TANDEM_D, VdjGrammar::VJ] {
-            check(
+            check_fixed(
                 &PlacementDag::new(grammar, model, [4, 3, 4]),
                 &placements,
                 fixed,
@@ -1188,23 +1188,50 @@ mod tests {
             ..model
         };
         let dag = PlacementDag::new(VdjGrammar::TANDEM_D, per_base, [4, 3, 4]);
-        check(&dag, &placements, fixed);
+        check_fixed(&dag, &placements, fixed);
         // Evidence at a read's own divergence: a per-column term μ ≠ 0.
-        check(&dag, &placements, EvidenceScale::at_divergence(0.02, 2, -3));
+        check_fixed(&dag, &placements, EvidenceScale::at_divergence(0.02, 2, -3));
         // A D before a J whose alignment starts earlier.
         let (_, over) = j_reaching_over_d();
         for grammar in [VdjGrammar::VDJ, VdjGrammar::TANDEM_D] {
-            check(&PlacementDag::new(grammar, model, [4, 3, 4]), &over, fixed);
+            check_fixed(&PlacementDag::new(grammar, model, [4, 3, 4]), &over, fixed);
         }
         // An N column and an insertion, at the read's divergence and fixed.
         let (_, gapped) = gapped_junction();
         for evidence in [fixed, EvidenceScale::at_divergence(0.005, 2, -3)] {
-            check(&dag, &gapped, evidence);
-            check(
+            check_fixed(&dag, &gapped, evidence);
+            check_fixed(
                 &PlacementDag::new(VdjGrammar::VDJ, model, [4, 3, 4]),
                 &gapped,
                 evidence,
             );
+        }
+    }
+
+    /// One integer model for both passes, from nearly unmutated to heavily
+    /// mutated reads: the marginals are those of `e^{units/F}` and the
+    /// Viterbi key is its exhaustive maximum, so the call is a mode.
+    #[test]
+    fn per_read_call_is_a_mode_of_the_posterior() {
+        let model = EngineeringObjective {
+            d_presence: 4.5,
+            ..EngineeringObjective::default()
+        };
+        let per_base = EngineeringObjective {
+            insertion_per_base: -1,
+            ..model
+        };
+        let delta0 = EVIDENCE.log_odds_divergence(SegmentKind::V);
+        let fixtures = [junction().1, gapped_junction().1, j_reaching_over_d().1];
+        for p in [0.005, delta0, 0.3] {
+            for placements in &fixtures {
+                for grammar in [VdjGrammar::VDJ, VdjGrammar::TANDEM_D, VdjGrammar::VJ] {
+                    for objective in [model, per_base] {
+                        let dag = PlacementDag::new(grammar, objective, [4, 3, 4]);
+                        check_per_read(&dag, placements, p);
+                    }
+                }
+            }
         }
     }
 
@@ -1235,12 +1262,13 @@ mod tests {
                 ..EngineeringObjective::default()
             };
             let dag = PlacementDag::new(VdjGrammar::VDJ, model, [24, 4, 10]);
-            check(&dag, &placements, EvidenceScale::fixed(LAMBDA));
-            check(
+            check_fixed(&dag, &placements, EvidenceScale::fixed(LAMBDA));
+            check_fixed(
                 &dag,
                 &placements,
                 EvidenceScale::at_divergence(0.001, 2, -3),
             );
+            check_per_read(&dag, &placements, 0.001);
         }
     }
 
@@ -1262,11 +1290,9 @@ mod tests {
             require_j: true,
             ..VdjGrammar::VDJ
         };
-        check(
-            &PlacementDag::new(grammar, model, [4, 3, 4]),
-            &placements,
-            EvidenceScale::fixed(LAMBDA),
-        );
+        let dag = PlacementDag::new(grammar, model, [4, 3, 4]);
+        check_fixed(&dag, &placements, EvidenceScale::fixed(LAMBDA));
+        check_per_read(&dag, &placements, 0.01);
     }
 
     /// V and J overlap on 540 matched bases: a junction product would fall
@@ -1280,50 +1306,28 @@ mod tests {
             placement(SegmentKind::J, &query, &query[60..], 60),
         ];
         let dag = PlacementDag::new(VdjGrammar::VDJ, EngineeringObjective::default(), [4, 3, 4]);
-        let evidence = EvidenceScale::at_divergence(0.01, 2, -3);
-        let m = dag.posterior(
-            &placements,
-            LAMBDA,
-            &[evidence; 3],
-            &mut PosteriorScratch::default(),
-        );
+        let nats = EVIDENCE.nats(0.01, dag.model.d_presence);
+        let m = dag.posterior(&placements, &nats, &mut PosteriorScratch::default());
         assert!(m.is_none(), "{m:?}");
         // A junction-sized overlap is fine.
         let short = vec![
             placement(SegmentKind::V, &query, &query[..300], 0),
             placement(SegmentKind::J, &query, &query[260..360], 260),
         ];
-        check(&dag, &short, evidence);
-    }
-
-    #[test]
-    fn evidence_scale_is_log_odds_at_the_divergence() {
-        let at = |p: f64| EvidenceScale::at_divergence(p, 2, -3);
-        let nats = |e: EvidenceScale, s: Score| e.lambda * f64::from(s) + e.mu;
-        for p in [0.001, 0.05, 0.2] {
-            assert_close(nats(at(p), 2), (4.0 * (1.0 - p)).ln(), "match");
-            assert_close(nats(at(p), -3), (4.0 * p / 3.0).ln(), "mismatch");
-        }
-        // (2, −3) is log-odds at 11.2 % divergence: the fixed-λ model.
-        let base = at(0.112);
-        assert!(
-            (base.lambda - 0.634).abs() < 1e-3 && base.mu.abs() < 1e-3,
-            "{base:?}"
-        );
+        check_fixed(&dag, &short, EvidenceScale::at_divergence(0.01, 2, -3));
     }
 
     #[test]
     fn marginals_are_probabilities() {
         let (_, placements) = junction();
         let dag = PlacementDag::new(VdjGrammar::VDJ, EngineeringObjective::default(), [4, 3, 4]);
-        let evidence = [EvidenceScale::fixed(LAMBDA); 3];
+        let nats = PathNats {
+            lambda: LAMBDA,
+            evidence: [EvidenceScale::fixed(LAMBDA); 3],
+            d_cost: LAMBDA * dag.model.d_presence,
+        };
         let m = dag
-            .posterior(
-                &placements,
-                LAMBDA,
-                &evidence,
-                &mut PosteriorScratch::default(),
-            )
+            .posterior(&placements, &nats, &mut PosteriorScratch::default())
             .expect("a path exists");
         assert_close(m.d_count.iter().sum(), 1.0, "D counts sum to 1");
         for kind in [SegmentKind::V, SegmentKind::J] {

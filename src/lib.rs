@@ -66,8 +66,8 @@ pub mod window;
 /// The names most programs need.
 pub mod prelude {
     pub use crate::adjudicate::{
-        Adjudicator, CallPath, CalledSegment, EngineeringObjective, Grammar, PathModel, PathScore,
-        PlacementDag, ResidualAdjudicator, VdjGrammar,
+        Adjudicator, CallModel, CallPath, CalledSegment, EngineeringObjective, Grammar, PathModel,
+        PathScore, PlacementDag, ResidualAdjudicator, VdjGrammar,
     };
     pub use crate::admission::{
         Admission, AdmitAll, AllOf, AnyOf, DistributedEvidence, ExactRunFloor,
