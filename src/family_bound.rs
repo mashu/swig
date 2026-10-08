@@ -34,27 +34,64 @@
 //! whose bands are shifted by each allele's offset. A sibling in another
 //! frame, or with an inconsistent band, has no bound and is always scored.
 //!
-//! `Δ` depends only on the profiles, so it is computed once per ordered
+//! **Theorem L.** Let `π` be a traced local path of `R` in `B_R` (any path,
+//! not only an optimal one), `π_A` its columns from the first to the last
+//! match column on a position of `span(A)`, and `D(R, A)` the positions of
+//! `span(A) ∩ span(R)` whose profile columns differ. With the bands the
+//! same frame diagonals,
+//!
+//! ```text
+//! L(π, A) = max(0, S_R(π_A) + Σ_{f ∈ D(R, A) matched to q in π_A} [s_A(q, f − o_A) − s_R(q, f − o_R)])
+//!         ≤ S*_{B_A}(A)
+//! ```
+//!
+//! *Proof.* Every position between the two end columns lies in `span(A)`
+//! (an interval) and in `span(R)` (`π` is a path of `R`), so `π_A` shifted
+//! into `A`'s coordinates lies inside `A`'s matrix, and inside `B_A` by
+//! the band condition. It starts with a match column, so every gap column
+//! follows the same column as in `π` and scores alike. Its substitution
+//! columns score the same with either profile off `D`. So `L` before the
+//! `max` is the score of a local path of `A`, and a local optimum is at
+//! least that and at least 0. ∎
+//!
+//! [`FramePath`] stores the prefix sums of `π`'s column scores, so `L`
+//! costs `O(|D|)`: the clipped sum plus a correction at the differing
+//! positions. The column scores are the DP's when `open ≤ extend` (a gap
+//! column extends a gap of its own kind and opens one otherwise); with
+//! `open > extend` the DP can score a path higher than this sum, and `L`
+//! stays a lower bound.
+//!
+//! `L ≤ S*(A) ≤ U` together pin the exact score when they meet, and the
+//! `top`-th largest of the lower bounds of a request's candidates — one
+//! value per candidate — never exceeds the `top`-th largest exact score:
+//! the cutoff that prunes siblings in [`crate::segment`].
+//!
+//! `Δ` and `D` depend only on the profiles, so they are computed once per
 //! same-frame pair when the stage is built, both orders in one pass.
 
+use crate::align::{Alignment, Op};
 use crate::alphabet::ALPHABET_SIZE;
 use crate::band::Band;
 use crate::germline::AlleleId;
 use crate::retrieve::{Candidate, GeneFrames};
-use crate::scoring::{Score, SubstitutionProfile};
+use crate::scoring::{GapCosts, Score, SubstitutionProfile};
 use crate::segment::PreparedSegment;
 
-/// `Δ(R, A)` of every ordered pair of alleles that share a frame.
+/// `Δ(R, A)` and `D(R, A)` of every ordered pair of alleles that share a frame.
 #[derive(Clone, Debug, Default)]
 pub struct FamilyBoundTable {
     /// `(frame, offset)` of each allele.
     placement: Vec<(u32, u32)>,
     /// Position of each allele among its frame's members.
     rank: Vec<u32>,
-    /// Per frame: its first entry in `delta` and its member count `n`; the
-    /// pair of member ranks `(r, a)` is entry `first + r·n + a`.
+    /// Per frame: its first entry in `delta` and `diffs` and its member
+    /// count `n`; the pair of member ranks `(r, a)` is entry `first + r·n + a`.
     frames: Vec<(usize, usize)>,
     delta: Vec<Score>,
+    /// `D(R, A)` as a range of `diff_positions` (the same for both orders).
+    diffs: Vec<(u32, u32)>,
+    /// Frame positions, ascending within each pair's range.
+    diff_positions: Vec<u32>,
 }
 
 impl FamilyBoundTable {
@@ -102,17 +139,23 @@ impl FamilyBoundTable {
             cover: &covers[allele as usize],
         };
         let mut frames = Vec::with_capacity(members.len());
-        let mut delta = Vec::new();
+        let (mut delta, mut diffs, mut diff_positions) = (Vec::new(), Vec::new(), Vec::new());
         let mut gains = Gains::default();
         for list in &members {
             let (first, n) = (delta.len(), list.len());
             frames.push((first, n));
             delta.resize(first + n * n, 0);
+            diffs.resize(first + n * n, (0, 0));
             for (i, &r) in list.iter().enumerate() {
                 for (j, &a) in list.iter().enumerate().skip(i + 1) {
-                    let (r_to_a, a_to_r) = gains.deltas(placed(r), placed(a));
+                    let start = diff_positions.len();
+                    let (r_to_a, a_to_r) = gains.deltas(placed(r), placed(a), &mut diff_positions);
                     delta[first + i * n + j] = r_to_a;
                     delta[first + j * n + i] = a_to_r;
+                    let [start, end] = [start, diff_positions.len()]
+                        .map(|p| u32::try_from(p).expect("diff positions fit u32"));
+                    diffs[first + i * n + j] = (start, end);
+                    diffs[first + j * n + i] = (start, end);
                 }
             }
         }
@@ -121,11 +164,14 @@ impl FamilyBoundTable {
             rank,
             frames,
             delta,
+            diffs,
+            diff_positions,
         }
     }
 
-    /// `Δ(R, A)` for two alleles of one frame; `None` across frames.
-    pub fn delta(&self, representative: AlleleId, sibling: AlleleId) -> Option<Score> {
+    /// Entry of the ordered pair in `delta` and `diffs`; `None` across frames.
+    #[inline]
+    fn pair(&self, representative: AlleleId, sibling: AlleleId) -> Option<usize> {
         let (frame, _) = self.placement[representative as usize];
         (frame == self.placement[sibling as usize].0).then(|| {
             let (first, n) = self.frames[frame as usize];
@@ -133,8 +179,14 @@ impl FamilyBoundTable {
                 self.rank[representative as usize] as usize,
                 self.rank[sibling as usize] as usize,
             );
-            self.delta[first + r * n + a]
+            first + r * n + a
         })
+    }
+
+    /// `Δ(R, A)` for two alleles of one frame; `None` across frames.
+    pub fn delta(&self, representative: AlleleId, sibling: AlleleId) -> Option<Score> {
+        self.pair(representative, sibling)
+            .map(|pair| self.delta[pair])
     }
 
     /// Whether the two candidates' bands are the same set of frame
@@ -174,6 +226,127 @@ impl FamilyBoundTable {
         self.delta(representative.allele, sibling.allele)
             .map(|delta| score.saturating_add(delta))
     }
+
+    /// Index `alignment`, a traced path of `representative` against `query`
+    /// with `profile` and `gaps`, by frame position into `out`.
+    pub fn frame_path(
+        &self,
+        representative: AlleleId,
+        alignment: &Alignment,
+        query: &[u8],
+        profile: &SubstitutionProfile,
+        gaps: GapCosts,
+        out: &mut FramePath,
+    ) {
+        out.first = alignment.r_start + self.placement[representative as usize].1;
+        out.matched.clear();
+        out.column.clear();
+        out.prefix.clear();
+        out.prefix.push(0);
+        let (mut q, mut r) = (alignment.q_start as usize, alignment.r_start as usize);
+        let (mut total, mut previous) = (0, None);
+        for (column, &op) in (0..).zip(&alignment.ops) {
+            let gap = if previous == Some(op) {
+                gaps.extend
+            } else {
+                gaps.open
+            };
+            total += match op {
+                Op::Match => {
+                    let code = query[q];
+                    out.matched.push(code);
+                    out.column.push(column);
+                    (q, r) = (q + 1, r + 1);
+                    profile.at(code, r - 1)
+                }
+                Op::Del => {
+                    out.matched.push(DELETED);
+                    out.column.push(column);
+                    r += 1;
+                    gap
+                }
+                Op::Ins => {
+                    q += 1;
+                    gap
+                }
+            };
+            out.prefix.push(total);
+            previous = Some(op);
+        }
+        debug_assert!(
+            gaps.open > gaps.extend || total == alignment.score,
+            "path columns sum to {total}, the alignment scores {}",
+            alignment.score
+        );
+    }
+
+    /// Theorem L: a lower bound on the sibling's local score in its band from
+    /// `path`, a traced path of the representative, when [`Self::frame_band`]
+    /// holds; otherwise `None`. Costs `O(|D(R, A)|)` past the clip ends.
+    pub fn path_lower_bound(
+        &self,
+        path: &FramePath,
+        representative: &Candidate,
+        sibling: &Candidate,
+        segment: &PreparedSegment,
+    ) -> Option<Score> {
+        if !self.frame_band(representative, sibling) {
+            return None;
+        }
+        let (r, a) = (representative.allele, sibling.allele);
+        let (offset_r, offset_a) = (
+            self.placement[r as usize].1 as usize,
+            self.placement[a as usize].1 as usize,
+        );
+        let profile_a = segment.profile(a);
+        // Path positions (frame position − `first`) inside span(A).
+        let first = path.first as usize;
+        let lo = offset_a.saturating_sub(first);
+        let hi = (offset_a + profile_a.len())
+            .saturating_sub(first)
+            .min(path.matched.len());
+        let matched = |&t: &usize| path.matched[t] != DELETED;
+        let Some(start) = (lo..hi).find(matched) else {
+            return Some(0);
+        };
+        let end = (start..hi).rfind(matched).expect("start is matched");
+        let mut score =
+            path.prefix[path.column[end] as usize + 1] - path.prefix[path.column[start] as usize];
+        let profile_r = segment.profile(r);
+        let (from, to) = self.diffs[self.pair(r, a).expect("frame_band holds")];
+        for &f in &self.diff_positions[from as usize..to as usize] {
+            let f = f as usize;
+            let Some(t) = f.checked_sub(first).filter(|&t| t >= start) else {
+                continue;
+            };
+            if t > end {
+                break;
+            }
+            let code = path.matched[t];
+            if code != DELETED {
+                score += profile_a.at(code, f - offset_a) - profile_r.at(code, f - offset_r);
+            }
+        }
+        Some(score.max(0))
+    }
+}
+
+/// [`FramePath::matched`] at a position the path deletes.
+const DELETED: u8 = u8::MAX;
+
+/// A traced path of a representative indexed by frame position, for
+/// [`FamilyBoundTable::path_lower_bound`]; reused across paths.
+#[derive(Clone, Debug, Default)]
+pub struct FramePath {
+    /// Frame position of the path's first reference base.
+    first: u32,
+    /// Per frame position from `first`: the query code the path matches
+    /// there, or [`DELETED`].
+    matched: Vec<u8>,
+    /// Per frame position from `first`: the path column that consumes it.
+    column: Vec<u32>,
+    /// `prefix[k]`: the representative's score of the path's columns `..k`.
+    prefix: Vec<Score>,
 }
 
 /// `cover[j] = Σ_{t < j} max(0, max_q s(q, t))`: the most a stretch of
@@ -228,10 +401,11 @@ struct Gains {
 }
 
 impl Gains {
-    /// `(Δ(R, A), Δ(A, R))`. One pass over the five profile rows of the
-    /// overlap computes `max(0, max_q d)` and `max(0, max_q −d)` for
-    /// `d = s_A − s_R` together; the overhangs come from [`cover`].
-    fn deltas(&mut self, r: Placed<'_>, a: Placed<'_>) -> (Score, Score) {
+    /// `(Δ(R, A), Δ(A, R))`, appending `D(R, A)` to `diffs`. One pass over
+    /// the five profile rows of the overlap computes `max(0, max_q d)` and
+    /// `max(0, max_q −d)` for `d = s_A − s_R` together; a column differs
+    /// where either is positive. The overhangs come from [`cover`].
+    fn deltas(&mut self, r: Placed<'_>, a: Placed<'_>, diffs: &mut Vec<u32>) -> (Score, Score) {
         let lo = r.offset.max(a.offset);
         let hi = r.end().min(a.end()).max(lo);
         let width = hi - lo;
@@ -253,6 +427,12 @@ impl Gains {
                 *b = (*b).max(s_r - s_a);
             }
         }
+        diffs.extend(
+            (lo..hi)
+                .zip(self.forward.iter().zip(&self.backward))
+                .filter(|&(_, (&f, &b))| f > 0 || b > 0)
+                .map(|(position, _)| u32::try_from(position).expect("frame positions fit u32")),
+        );
         (
             self.forward.iter().sum::<Score>() + a.outside(lo, hi),
             self.backward.iter().sum::<Score>() + r.outside(lo, hi),
@@ -466,7 +646,8 @@ mod tests {
     /// each allele's coordinates (and the full matrix), every ordered pair of
     /// six alleles — a SNP and an N, a 5′ extension, a 3′ truncation, an
     /// inner start with a 3′ overhang, a 2-nt allele — under three scorings,
-    /// one with `open = extend`: `S*(A) ≤ S*(R) + Δ(R, A)`.
+    /// one with `open = extend`: `L(π_R, A) ≤ S*(A) ≤ S*(R) + Δ(R, A)` for
+    /// the traced path `π_R`, whose frame path sums to its score.
     #[test]
     fn frame_bounds_hold_exhaustively() {
         let alleles: [(&[u8], u32); 6] = [
@@ -495,6 +676,7 @@ mod tests {
             }
         }
         let mut workspace = Default::default();
+        let mut path = FramePath::default();
         let mut checked = 0u64;
         for scoring in [
             SCORING,
@@ -515,27 +697,39 @@ mod tests {
                     })
                     .collect();
                 for query in &queries {
-                    let scores: Vec<Score> = candidates
+                    let paths: Vec<Option<Alignment>> = candidates
                         .iter()
                         .map(|c| {
-                            BandedGotoh
-                                .score(
-                                    query,
-                                    segment.profile(c.allele),
-                                    scoring.gaps,
-                                    c.band,
-                                    &mut workspace,
-                                )
-                                .map_or(0, |hit| hit.score)
+                            let profile = segment.profile(c.allele);
+                            BandedGotoh.align(query, profile, scoring.gaps, c.band, &mut workspace)
                         })
                         .collect();
+                    let scores: Vec<Score> = paths
+                        .iter()
+                        .map(|path| path.as_ref().map_or(0, |path| path.score))
+                        .collect();
                     for r in &candidates {
+                        let traced = paths[r.allele as usize].as_ref().map(|alignment| {
+                            let profile = segment.profile(r.allele);
+                            table.frame_path(
+                                r.allele,
+                                alignment,
+                                query,
+                                profile,
+                                scoring.gaps,
+                                &mut path,
+                            );
+                            assert_eq!(path.prefix.last(), Some(&alignment.score));
+                        });
                         for a in &candidates {
                             let upper = table.upper_bound(r, a, scores[r.allele as usize]).unwrap();
+                            let lower = traced.map_or(0, |()| {
+                                table.path_lower_bound(&path, r, a, &segment).unwrap()
+                            });
                             let exact = scores[a.allele as usize];
                             assert!(
-                                exact <= upper,
-                                "{scoring:?} {frame_band:?} {query:?}: S({}) = {exact} > {upper}",
+                                lower <= exact && exact <= upper,
+                                "{scoring:?} {frame_band:?} {query:?}: S({}) = {exact} ∉ [{lower}, {upper}]",
                                 a.allele
                             );
                             checked += 1;
@@ -547,10 +741,45 @@ mod tests {
         assert!(checked > 30_000_000, "{checked} cases");
     }
 
+    /// `L` by its definition: the path's columns from the first to the last
+    /// match on a position of `span(A)`, each scored with `A`'s profile.
+    fn direct_lower_bound(
+        path: &Alignment,
+        query: &[u8],
+        offsets: (u32, u32),
+        sibling: &SubstitutionProfile,
+        gaps: GapCosts,
+    ) -> Score {
+        let shift = i64::from(offsets.0) - i64::from(offsets.1);
+        let at = |r: u32| {
+            let j = i64::from(r) + shift;
+            (0..sibling.len() as i64).contains(&j).then_some(j as usize)
+        };
+        let columns: Vec<_> = path.columns().collect();
+        let inside = |&(op, _, r): &(Op, u32, u32)| op == Op::Match && at(r).is_some();
+        let (Some(start), Some(end)) = (
+            columns.iter().position(inside),
+            columns.iter().rposition(inside),
+        ) else {
+            return 0;
+        };
+        let mut score = 0;
+        for k in start..=end {
+            let (op, q, r) = columns[k];
+            score += match op {
+                Op::Match => sibling.at(query[q as usize], at(r).expect("inside the clip")),
+                gap if columns[k - 1].0 == gap => gaps.extend,
+                _ => gaps.open,
+            };
+        }
+        score.max(0)
+    }
+
     /// Longer alleles with realistic bands: mutated, shifted, indel-carrying
-    /// copies of either allele of a pair.
+    /// copies of either allele of a pair. Both bounds hold, and the
+    /// `O(|D|)` lower bound equals its definition.
     #[test]
-    fn bound_never_underestimates_local_score() {
+    fn bounds_bracket_the_local_score() {
         let rep = encode(b"CAGGTCACCTTGAAGGAGTCTGGTCCTGCCTGGTGAAACCCACACAGACC");
         let mut sib = rep[3..].to_vec();
         sib[20] = 1;
@@ -566,6 +795,8 @@ mod tests {
         let mut words = crate::testing::rng(3);
         let mut next = || words() as usize;
         let mut workspace = Default::default();
+        let mut path = FramePath::default();
+        let mut checked = 0;
         for _ in 0..300 {
             let source = if next() % 2 == 0 { &rep } else { &sib };
             let mut query: Vec<u8> = (0..next() % 12).map(|_| (next() % 4) as u8).collect();
@@ -603,21 +834,38 @@ mod tests {
                     candidate(allele, band)
                 })
                 .collect();
-            let mut score = |c: &Candidate| {
-                BandedGotoh
-                    .score(
-                        &query,
-                        segment.profile(c.allele),
-                        SCORING.gaps,
-                        c.band,
-                        &mut workspace,
-                    )
-                    .map_or(0, |hit| hit.score)
-            };
+            let paths: Vec<Option<Alignment>> = pair
+                .iter()
+                .map(|c| {
+                    let profile = segment.profile(c.allele);
+                    BandedGotoh.align(&query, profile, SCORING.gaps, c.band, &mut workspace)
+                })
+                .collect();
+            let score = |c: &Candidate| paths[c.allele as usize].as_ref().map_or(0, |p| p.score);
             for (r, a) in [(&pair[0], &pair[1]), (&pair[1], &pair[0])] {
                 let upper = table.upper_bound(r, a, score(r)).unwrap();
                 assert!(score(a) <= upper, "{:?}: {} > {upper}", a.band, score(a));
+                let Some(alignment) = &paths[r.allele as usize] else {
+                    continue;
+                };
+                let profile = segment.profile(r.allele);
+                table.frame_path(
+                    r.allele,
+                    alignment,
+                    &query,
+                    profile,
+                    SCORING.gaps,
+                    &mut path,
+                );
+                let lower = table.path_lower_bound(&path, r, a, &segment).unwrap();
+                let offsets = (alleles[r.allele as usize].1, alleles[a.allele as usize].1);
+                let profile = segment.profile(a.allele);
+                let direct = direct_lower_bound(alignment, &query, offsets, profile, SCORING.gaps);
+                assert_eq!(lower, direct, "{:?}", a.band);
+                assert!(lower <= score(a), "{:?}: {} < {lower}", a.band, score(a));
+                checked += u32::from(lower > 0);
             }
         }
+        assert!(checked > 300, "{checked} positive lower bounds");
     }
 }

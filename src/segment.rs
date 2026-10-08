@@ -19,7 +19,7 @@ use std::sync::Arc;
 use crate::align::{AlignJob, Aligner, Alignment, ScoreHit};
 use crate::clip::ClipIndex;
 use crate::evidence::Evidence;
-use crate::family_bound::FamilyBoundTable;
+use crate::family_bound::{FamilyBoundTable, FramePath};
 use crate::flank::{OuterExtend, extend_outer};
 use crate::germline::{AlleleId, GermlineSet, SegmentKind};
 use crate::placement::{Placement, merge_identical};
@@ -219,6 +219,17 @@ pub struct BatchScratch {
     exact: Vec<Score>,
     /// Per gene id: the leader found so far in the current request.
     gene_leader: Vec<u32>,
+    /// Alignments computed while ranking, consumed by traceback.
+    traced: Vec<Option<Alignment>>,
+    /// Per candidate: its entry in `traced`, or [`NONE`].
+    cached: Vec<u32>,
+    /// Frame paths of the traced representatives; `paths[..path_count]`
+    /// are live, the rest keep their buffers.
+    paths: Vec<FramePath>,
+    path_count: usize,
+    /// Per live path: its request and representative candidate index, in
+    /// request order.
+    path_owners: Vec<(usize, u32)>,
 }
 
 impl BatchScratch {
@@ -243,6 +254,11 @@ impl BatchScratch {
         self.leaders.resize(total, 0);
         self.exact.clear();
         self.exact.resize(total, 0);
+        self.traced.clear();
+        self.cached.clear();
+        self.cached.resize(total, NONE);
+        self.path_count = 0;
+        self.path_owners.clear();
     }
 
     /// Per-candidate buffer slots of request `index`.
@@ -325,7 +341,8 @@ pub struct SegmentStage<R> {
     pub family_delta: Option<FamilyBoundTable>,
 }
 
-/// No candidate (a per-gene slot of [`BatchScratch`]'s leader search).
+/// No candidate (a per-gene slot of [`BatchScratch`]'s leader search), or no
+/// cached alignment.
 const NONE: u32 = u32::MAX;
 
 /// Whether a local score enters the ranking: positive (an alignment exists)
@@ -542,17 +559,27 @@ impl<R: Retriever> SegmentStage<R> {
         }
     }
 
-    /// Family-delta ranking: score each gene's leader (its representative),
-    /// then only the siblings whose sound upper bound `S(rep) + Δ(rep, sibling)`
-    /// reaches the `top`-th best representative score (see [`crate::family_bound`]).
-    /// The cutoff can only rise as more alleles are scored, so a sibling below
-    /// it can never enter the top scores. A sibling whose band is not its
-    /// representative's frame band has no bound and is always scored.
+    /// Family-delta ranking (see [`crate::family_bound`]), with each gene's
+    /// leader as its representative `R`:
     ///
-    /// The cutoff applies only under permissive acceptance
+    /// 1. Score the representatives. A score below the floor still bounds.
+    /// 2. Trace each request's best-scoring representatives (every tie);
+    ///    traceback reuses the alignments.
+    /// 3. Bound each sibling `A`: `U = S*(R) + Δ(R, A)` through its
+    ///    representative, `L` the best lower bound over the request's traced
+    ///    paths. The cutoff `c` is the `top`-th largest of one lower bound
+    ///    per candidate that ranks — `S*(R)` of a representative, `L` of a
+    ///    sibling — so `c ≤ T`, the `top`-th largest exact score.
+    /// 4. Score the siblings with `U ≥ floor` and `U ≥ c`. A pruned sibling
+    ///    scores below `T`, so it can enter neither the top `top` scores nor
+    ///    their ties, and the ranking from `T` up is that of full scoring.
+    ///
+    /// Steps 2 and the cutoff apply only under permissive acceptance
     /// ([`HitAcceptance::is_permissive`]). Otherwise a rejected alignment makes
-    /// the traceback waves refill from below the `top`-th score, where a pruned
-    /// sibling may lie, so siblings are pruned only below the floor.
+    /// the traceback waves refill from below `T`, where a pruned sibling may
+    /// lie, so siblings are pruned only below the floor. A sibling without a
+    /// bound (another frame, or a band that is not its representative's
+    /// frame band) is always scored.
     fn rank_with_bounds<'a, A: Aligner>(
         &'a self,
         aligner: &A,
@@ -561,12 +588,10 @@ impl<R: Retriever> SegmentStage<R> {
         dp: &mut A::Workspace,
         batch: &mut BatchScratch,
     ) {
-        // Representative scores are recorded even below the floor: a weak
-        // representative can still bound a sibling that clears it.
         batch.owners.clear();
         for (index, request) in requests.iter().enumerate() {
             if self.needs_scores(request) {
-                let leaders = &batch.leaders[batch.starts[index]..batch.starts[index + 1]];
+                let leaders = &batch.leaders[batch.slots(index)];
                 batch.owners.extend(
                     (0..)
                         .zip(leaders)
@@ -576,29 +601,66 @@ impl<R: Retriever> SegmentStage<R> {
             }
         }
         self.score_owners(aligner, requests, dp, batch);
-        let permissive = self.accept.is_permissive();
+        let cut = self.accept.is_permissive() && self.keep.top > 0;
+        if cut {
+            self.trace_best_representatives(aligner, requests, table, dp, batch);
+        }
         batch.owners.clear();
+        // `batch.path_owners[paths]`: the current request's traced paths.
+        let mut paths = 0..0;
         for (index, request) in requests.iter().enumerate() {
+            paths.start = paths.end;
+            while paths.end < batch.path_count && batch.path_owners[paths.end].0 == index {
+                paths.end += 1;
+            }
             if !self.needs_scores(request) {
                 continue;
             }
-            let cutoff = permissive
-                .then(|| top_score(&batch.ranked[index], self.keep.top, &mut batch.scores))
-                .flatten();
             let floor = self.floor(request);
             let start = batch.starts[index];
-            for (c, candidate) in (0..).zip(request.candidates) {
+            let cutoff = if cut {
+                // Representatives that rank are in `ranked`; add the siblings' `L`.
+                batch.scores.clear();
+                batch
+                    .scores
+                    .extend(batch.ranked[index].iter().map(|&(_, s)| s));
+                for (c, sibling) in (0..).zip(request.candidates) {
+                    if batch.leaders[start + c as usize] == c {
+                        continue;
+                    }
+                    let lower = paths
+                        .clone()
+                        .filter_map(|p| {
+                            let representative = batch.path_owners[p].1;
+                            table.path_lower_bound(
+                                &batch.paths[p],
+                                &request.candidates[representative as usize],
+                                sibling,
+                                &self.segment,
+                            )
+                        })
+                        .max()
+                        .unwrap_or(0);
+                    if ranks(lower, floor) {
+                        batch.scores.push(lower);
+                    }
+                }
+                nth_largest(&mut batch.scores, self.keep.top)
+            } else {
+                None
+            };
+            for (c, sibling) in (0..).zip(request.candidates) {
                 let leader = batch.leaders[start + c as usize];
                 if leader == c {
                     continue;
                 }
-                let rep = &request.candidates[leader as usize];
+                let representative = &request.candidates[leader as usize];
                 // No positive cell means the representative's optimum is 0.
-                let rep_score = batch.exact[start + leader as usize];
-                let bound = table.upper_bound(rep, candidate, rep_score);
-                let prunable =
-                    bound.is_some_and(|b| b < floor || cutoff.is_some_and(|cutoff| b < cutoff));
-                if !prunable {
+                let score = batch.exact[start + leader as usize];
+                let upper = table.upper_bound(representative, sibling, score);
+                let pruned =
+                    upper.is_some_and(|u| u < floor || cutoff.is_some_and(|cutoff| u < cutoff));
+                if !pruned {
                     batch.owners.push((index, c));
                 }
             }
@@ -606,8 +668,78 @@ impl<R: Retriever> SegmentStage<R> {
         self.score_owners(aligner, requests, dp, batch);
     }
 
+    /// Align each scored request's best-scoring representatives (every tie;
+    /// `batch.ranked` holds the representatives that rank), cache the
+    /// alignments for traceback and index their paths by frame position.
+    fn trace_best_representatives<'a, A: Aligner>(
+        &'a self,
+        aligner: &A,
+        requests: &[SegmentRequest<'a>],
+        table: &FamilyBoundTable,
+        dp: &mut A::Workspace,
+        batch: &mut BatchScratch,
+    ) {
+        batch.owners.clear();
+        for (index, request) in requests.iter().enumerate() {
+            if !self.needs_scores(request) {
+                continue;
+            }
+            let ranked = &batch.ranked[index];
+            if let Some(best) = ranked.iter().map(|&(_, s)| s).max() {
+                batch.owners.extend(
+                    ranked
+                        .iter()
+                        .filter(|&&(_, s)| s == best)
+                        .map(|&(c, _)| (index, c)),
+                );
+            }
+        }
+        if batch.owners.is_empty() {
+            return;
+        }
+        let jobs: Vec<AlignJob<'a>> = batch
+            .owners
+            .iter()
+            .map(|&(index, candidate)| self.job(&requests[index], candidate))
+            .collect();
+        aligner.align_batch(&jobs, dp, &mut batch.alignments);
+        let BatchScratch {
+            owners,
+            alignments,
+            starts,
+            traced,
+            cached,
+            paths,
+            path_count,
+            path_owners,
+            ..
+        } = batch;
+        for (&(index, candidate), alignment) in owners.iter().zip(alignments.drain(..)) {
+            if let Some(alignment) = &alignment {
+                let request = &requests[index];
+                let allele = request.candidates[candidate as usize].allele;
+                if paths.len() == *path_count {
+                    paths.push(FramePath::default());
+                }
+                table.frame_path(
+                    allele,
+                    alignment,
+                    &request.query[request.window.clone()],
+                    self.segment.profile(allele),
+                    self.segment.gaps(),
+                    &mut paths[*path_count],
+                );
+                *path_count += 1;
+                path_owners.push((index, candidate));
+            }
+            cached[starts[index] + candidate as usize] = entry(traced.len());
+            traced.push(alignment);
+        }
+    }
+
     /// Traceback waves until every request has `top` accepted alignments
-    /// (plus ties), runs out of candidates, or reaches `cap`.
+    /// (plus ties), runs out of candidates, or reaches `cap`. Alignments
+    /// cached while ranking are taken, not recomputed.
     fn trace<'a, A: Aligner>(
         &'a self,
         aligner: &A,
@@ -644,38 +776,69 @@ impl<R: Retriever> SegmentStage<R> {
             let jobs: Vec<AlignJob<'a>> = batch
                 .owners
                 .iter()
+                .filter(|&&(index, c)| batch.cached[batch.starts[index] + c as usize] == NONE)
                 .map(|&(index, candidate)| self.job(&requests[index], candidate))
                 .collect();
             aligner.align_batch(&jobs, dp, &mut batch.alignments);
-            for (&(index, candidate), alignment) in
-                batch.owners.iter().zip(batch.alignments.drain(..))
-            {
-                let Some(mut alignment) = alignment else {
+            let BatchScratch {
+                owners,
+                alignments,
+                starts,
+                traced,
+                cached,
+                accepted,
+                pending,
+                ..
+            } = &mut *batch;
+            let mut fresh = alignments.drain(..);
+            for &(index, candidate) in owners.iter() {
+                let alignment = match cached[starts[index] + candidate as usize] {
+                    NONE => fresh.next().expect("one alignment per job"),
+                    cached => traced[cached as usize].take(),
+                };
+                let Some(alignment) = alignment else {
                     continue;
                 };
-                let request = &requests[index];
-                if alignment.score < self.floor(request) {
-                    continue;
-                }
-                alignment.shift_query(request.window.start as u32);
-                let local = alignment.score;
-                let mut placement = Placement::new(
-                    self.kind(),
-                    request.candidates[candidate as usize].allele,
+                self.keep_alignment(
+                    &requests[index],
+                    candidate,
                     alignment,
-                    request.query,
-                    &self.segment,
+                    &mut accepted[index],
+                    &mut pending[index],
                 );
-                placement.anchor = self
-                    .significance
-                    .is_some_and(|s| local >= s.min_score(request.window.len(), s.gates.anchor));
-                if self.accept.allows(&placement.evidence) {
-                    let accepted = &mut batch.accepted[index];
-                    let at = accepted.partition_point(|&s| s >= local);
-                    accepted.insert(at, local);
-                    batch.pending[index].push(placement);
-                }
             }
+        }
+    }
+
+    /// Place a traced alignment of candidate `candidate` of `request` and
+    /// keep it when it clears the floor and acceptance.
+    fn keep_alignment(
+        &self,
+        request: &SegmentRequest<'_>,
+        candidate: u32,
+        mut alignment: Alignment,
+        accepted: &mut Vec<Score>,
+        pending: &mut Vec<Placement>,
+    ) {
+        if alignment.score < self.floor(request) {
+            return;
+        }
+        alignment.shift_query(request.window.start as u32);
+        let local = alignment.score;
+        let mut placement = Placement::new(
+            self.kind(),
+            request.candidates[candidate as usize].allele,
+            alignment,
+            request.query,
+            &self.segment,
+        );
+        placement.anchor = self
+            .significance
+            .is_some_and(|s| local >= s.min_score(request.window.len(), s.gates.anchor));
+        if self.accept.allows(&placement.evidence) {
+            let at = accepted.partition_point(|&s| s >= local);
+            accepted.insert(at, local);
+            pending.push(placement);
         }
     }
 
@@ -720,15 +883,16 @@ impl<R: Retriever> SegmentStage<R> {
     }
 }
 
-/// The `top`-th best score of `ranked`, if it has that many entries.
-fn top_score(ranked: &[(u32, Score)], top: usize, buffer: &mut Vec<Score>) -> Option<Score> {
-    if top == 0 || ranked.len() < top {
-        return None;
-    }
-    buffer.clear();
-    buffer.extend(ranked.iter().map(|&(_, s)| s));
-    let (_, &mut nth, _) = buffer.select_nth_unstable_by_key(top - 1, |&s| std::cmp::Reverse(s));
+/// The `n`-th largest of `values` (reordered), if there are that many.
+fn nth_largest(values: &mut [Score], n: usize) -> Option<Score> {
+    let k = n.checked_sub(1).filter(|&k| k < values.len())?;
+    let (_, &mut nth, _) = values.select_nth_unstable_by_key(k, |&s| std::cmp::Reverse(s));
     Some(nth)
+}
+
+/// An index into [`BatchScratch::traced`].
+fn entry(index: usize) -> u32 {
+    u32::try_from(index).expect("traced alignments fit u32")
 }
 
 #[cfg(test)]
@@ -738,7 +902,7 @@ mod tests {
     use crate::alphabet::{decode, encode};
     use crate::band::Band;
     use crate::family_bound::FamilyBoundTable;
-    use crate::retrieve::Retriever;
+    use crate::retrieve::{GeneFrames, Retriever};
     use crate::scoring::AffineScoring;
 
     struct EmptyRetriever;
@@ -953,6 +1117,205 @@ mod tests {
         let full = placed(&stage(false), &candidates, &query);
         assert_eq!(full, vec![(vec![2], score(2))]);
         assert_eq!(placed(&stage(true), &candidates, &query), full);
+    }
+
+    /// [`BandedGotoh`] that records the `(query, profile)` of every DP it runs.
+    #[derive(Default)]
+    struct Recording(std::cell::RefCell<Vec<(*const u8, *const SubstitutionProfile)>>);
+
+    impl Aligner for Recording {
+        type Workspace = <BandedGotoh as Aligner>::Workspace;
+
+        fn score(
+            &self,
+            query: &[u8],
+            profile: &SubstitutionProfile,
+            gaps: GapCosts,
+            band: Band,
+            workspace: &mut Self::Workspace,
+        ) -> Option<ScoreHit> {
+            self.0.borrow_mut().push((query.as_ptr(), profile));
+            BandedGotoh.score(query, profile, gaps, band, workspace)
+        }
+
+        fn align(
+            &self,
+            query: &[u8],
+            profile: &SubstitutionProfile,
+            gaps: GapCosts,
+            band: Band,
+            workspace: &mut Self::Workspace,
+        ) -> Option<Alignment> {
+            self.0.borrow_mut().push((query.as_ptr(), profile));
+            BandedGotoh.align(query, profile, gaps, band, workspace)
+        }
+    }
+
+    /// Two V genes in gene frames: SNP alleles, 5′ and 3′ truncations, a 5′
+    /// extension, an internal deletion (a frame of its own) and an exact
+    /// duplicate, which ties with its twin.
+    fn frame_family() -> (Arc<PreparedSegment>, GeneFrames) {
+        let scoring = AffineScoring::new(2, -3, -9, -1);
+        let mut next = crate::testing::rng(17);
+        let b = crate::testing::random_codes(&mut next, 90);
+        let c = crate::testing::random_codes(&mut next, 90);
+        let snp = |codes: &[u8], at: &[usize]| {
+            let mut codes = codes.to_vec();
+            for &at in at {
+                codes[at] = (codes[at] + 1) % 4;
+            }
+            codes
+        };
+        let mut deleted = b.clone();
+        deleted.drain(45..48);
+        let extended = [crate::testing::random_codes(&mut next, 4), b.clone()].concat();
+        let mut set = GermlineSet::new(SegmentKind::V);
+        for (name, codes) in [
+            ("IGHV1-1*01", b.clone()),
+            ("IGHV1-1*02", snp(&b, &[20])),
+            ("IGHV1-1*03", snp(&b, &[20, 61])),
+            ("IGHV1-1*04", b[5..].to_vec()),
+            ("IGHV1-1*05", snp(&b[..82], &[40])),
+            ("IGHV1-1*06", extended),
+            ("IGHV1-1*07", deleted),
+            ("IGHV1-1*08", snp(&b, &[20])),
+            ("IGHV2-1*01", c.clone()),
+            ("IGHV2-1*02", snp(&c, &[30])),
+            ("IGHV2-1*03", c[3..].to_vec()),
+        ] {
+            set.push(name, decode(&codes).as_bytes(), None).unwrap();
+        }
+        let frames = GeneFrames::build(&set, &crate::seed::SeedShape::contiguous(7));
+        let segment = Arc::new(PreparedSegment::new(set, &scoring, scoring.gaps));
+        (segment, frames)
+    }
+
+    /// Bounded ranking places exactly what scoring every candidate does —
+    /// alleles, their order and alignments — for batches of requests with
+    /// more candidates than `top + 1` (and some with fewer), shifted frame
+    /// bands with either edge moved, unbanded requests, siblings with an
+    /// inconsistent band, every `top` and `cap`, and both acceptance kinds;
+    /// and it skips the DP of some siblings entirely.
+    #[test]
+    fn bounded_ranking_equals_brute_force() {
+        let (segment, frames) = frame_family();
+        let table = FamilyBoundTable::with_frames(&segment, &frames);
+        let alleles = segment.set().len() as AlleleId;
+        let mut next = crate::testing::rng(23);
+        let mut pruned = 0;
+        for case in 0..240 {
+            let keep = KeepPolicy {
+                top: [1, 2, 3, 5][case % 4],
+                min_score: 1,
+                cap: [2, 3, 64][case / 4 % 3],
+            };
+            let accept = if case % 7 == 6 {
+                HitAcceptance {
+                    min_subst: 40,
+                    min_identity: 0.9,
+                }
+            } else {
+                HitAcceptance::PERMISSIVE
+            };
+            let mut queries = Vec::new();
+            let mut candidates = Vec::new();
+            for _ in 0..3 {
+                // A mutated stretch of one allele between random flanks.
+                let source = (next() % u64::from(alleles)) as AlleleId;
+                let codes = &segment.set().allele(source).codes;
+                let from = (next() % 20) as usize;
+                let to = codes.len() - (next() % 20) as usize;
+                let lead = (next() % 12) as usize;
+                let mut query = crate::testing::random_codes(&mut next, lead);
+                for &code in &codes[from..to] {
+                    match next() % 40 {
+                        0..=2 => query.push((code + 1 + (next() % 3) as u8) % 4),
+                        3 => query.push(4),
+                        4 => {}
+                        5 => query.extend([code, (next() % 4) as u8]),
+                        _ => query.push(code),
+                    }
+                }
+                let trail = (next() % 12) as usize;
+                query.extend(crate::testing::random_codes(&mut next, trail));
+                // Frame diagonal of the source's placement, widened unevenly.
+                let diagonal = lead as i32 + 1 - from as i32 - frames.offset(source) as i32;
+                let (below, above) = ((next() % 6) as i32, (next() % 6) as i32);
+                let unbanded = next().is_multiple_of(4);
+                let count = if next().is_multiple_of(5) {
+                    1 + (next() % (keep.top as u64 + 1)) as usize
+                } else {
+                    keep.top + 2 + (next() % 8) as usize
+                };
+                let mut chosen: Vec<AlleleId> = (0..alleles).collect();
+                for k in 0..chosen.len() {
+                    let other = k + (next() as usize) % (chosen.len() - k);
+                    chosen.swap(k, other);
+                }
+                chosen.truncate(count.min(chosen.len()));
+                let request: Vec<Candidate> = chosen
+                    .iter()
+                    .map(|&allele| {
+                        let offset = frames.offset(allele) as i32;
+                        let skew = i32::from(next().is_multiple_of(10));
+                        let band = if unbanded {
+                            Band::Full
+                        } else {
+                            Band::Diagonals {
+                                lo: diagonal - below + offset + skew,
+                                hi: diagonal + above + offset,
+                            }
+                        };
+                        Candidate {
+                            allele,
+                            band,
+                            votes: (next() % 4) as u32,
+                        }
+                    })
+                    .collect();
+                queries.push(query);
+                candidates.push(request);
+            }
+            let starts: Vec<usize> = (0..3).map(|_| (next() % 4) as usize).collect();
+            let run = |bounded: bool, aligner: &Recording| {
+                let mut stage = SegmentStage::new(Arc::clone(&segment), EmptyRetriever, keep);
+                stage.accept = accept;
+                stage.ties = TieOrder::GeneLeadersFirst;
+                stage.family_delta = bounded.then(|| table.clone());
+                let requests: Vec<SegmentRequest<'_>> = (0..3)
+                    .map(|read| SegmentRequest {
+                        read,
+                        query: &queries[read],
+                        window: starts[read]..queries[read].len(),
+                        candidates: &candidates[read],
+                    })
+                    .collect();
+                let mut outs = vec![Vec::new(); 3];
+                let (mut dp, mut batch) = (Default::default(), BatchScratch::default());
+                stage.place_many(aligner, &requests, &mut dp, &mut batch, &mut outs);
+                outs.iter()
+                    .map(|out| {
+                        out.iter()
+                            .map(|p| (p.alleles.clone(), p.alignment.clone()))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let (full, bounded) = (Recording::default(), Recording::default());
+            assert_eq!(run(true, &bounded), run(false, &full), "case {case}");
+            let ran = bounded.0.into_inner();
+            for (read, request) in candidates.iter().enumerate() {
+                if request.len() <= keep.top + 1 {
+                    continue;
+                }
+                let query = queries[read][starts[read]..].as_ptr();
+                pruned += request
+                    .iter()
+                    .filter(|c| !ran.contains(&(query, segment.profile(c.allele))))
+                    .count();
+            }
+        }
+        assert!(pruned > 100, "{pruned} siblings pruned");
     }
 
     #[test]
