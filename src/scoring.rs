@@ -222,6 +222,8 @@ pub struct SubstitutionProfile {
     len: usize,
     rows: Vec<Score>,
     max: Score,
+    /// Largest column maximum outside the first column attaining `max`.
+    rest: Score,
     min: Score,
     /// Reference codes (ambiguity collapsed to `N`).
     codes: Vec<u8>,
@@ -247,12 +249,27 @@ impl SubstitutionProfile {
         }
         let max = rows.iter().copied().max().unwrap_or(0);
         let min = rows.iter().copied().min().unwrap_or(0);
+        let mut columns = rows[..len].to_vec();
+        for row in rows.chunks_exact(len.max(1)).skip(1) {
+            for (column, &score) in columns.iter_mut().zip(row) {
+                *column = (*column).max(score);
+            }
+        }
+        let top = columns.iter().position(|&c| c == max);
+        let rest = columns
+            .iter()
+            .enumerate()
+            .filter(|&(j, _)| Some(j) != top)
+            .map(|(_, &c)| c)
+            .max()
+            .unwrap_or(max);
         let codes: Vec<u8> = reference.iter().map(|&c| c.min(N)).collect();
         let uniform = uniform_scores(&rows, &codes);
         Self {
             len,
             rows,
             max,
+            rest,
             min,
             codes,
             uniform,
@@ -269,9 +286,25 @@ impl SubstitutionProfile {
         &self.codes
     }
 
-    /// Largest single-cell score; bounds any alignment score by `max × min(n, m)`.
-    pub fn max_score(&self) -> Score {
-        self.max
+    /// Upper bound on any local alignment score with at most `k` substitution
+    /// columns (`k = min(n, m)` for an `n`-base query):
+    ///
+    /// ```text
+    /// S ≤ max⁺ + rest⁺ · (k − 1)
+    /// ```
+    ///
+    /// with `max` the largest entry and `rest` the largest column maximum
+    /// outside the first column attaining it, `x⁺ = max(x, 0)`. Each reference
+    /// column is aligned at most once and gaps cost ≤ 0, so the alignment
+    /// collects at most one entry from the top column and at most `rest` from
+    /// each other. For [`AffineScoring`] and [`HotspotScoring`] every canonical
+    /// column's maximum is `matched`, so this is `matched · k`; a profile with
+    /// one outsized column (an anchor bonus) is bounded by that column once.
+    pub fn local_bound(&self, k: usize) -> i64 {
+        match k {
+            0 => 0,
+            k => i64::from(self.max.max(0)) + i64::from(self.rest.max(0)) * (k as i64 - 1),
+        }
     }
 
     /// Most negative single-cell score.
@@ -372,6 +405,37 @@ mod tests {
             }
         }
         assert_eq!(scoring.gaps.cost(3), -7);
+    }
+
+    /// `local_bound` is `matched · k` for the shipped models on references
+    /// with two or more canonical bases, so lane admission is unchanged for
+    /// every V/D/J job, and it bounds every local alignment score.
+    #[test]
+    fn local_bound_is_matched_per_column_and_bounds_local_scores() {
+        use crate::align::{Aligner, BandedGotoh, GotohWorkspace};
+        use crate::band::Band;
+        use crate::testing::{random_codes, rng};
+        let scoring = AffineScoring::new(2, -3, -9, -1);
+        let hotspot = HotspotScoring::for_shm(scoring);
+        let mut next = rng(11);
+        let mut ws = GotohWorkspace::default();
+        for _ in 0..200 {
+            let (m, n) = (3 + (next() % 60) as usize, 1 + (next() % 80) as usize);
+            let mut reference = random_codes(&mut next, m);
+            reference[(next() as usize) % m] = N;
+            let query = random_codes(&mut next, n);
+            let models: [&dyn SubstitutionModel; 2] = [&scoring, &hotspot];
+            for model in models {
+                let profile = SubstitutionProfile::build(model, &reference);
+                for k in 0..=reference.len() {
+                    assert_eq!(profile.local_bound(k), 2 * k as i64);
+                }
+                let k = query.len().min(reference.len());
+                let hit = BandedGotoh.score(&query, &profile, scoring.gaps, Band::Full, &mut ws);
+                let best = hit.map_or(0, |hit| i64::from(hit.score));
+                assert!(best <= profile.local_bound(k));
+            }
+        }
     }
 
     #[test]

@@ -48,8 +48,8 @@
 //!
 //! **16-bit safety.** Lanes are 16-bit with saturating arithmetic and
 //! `−∞ = −16384`. A job enters a lane only if its attainable score
-//! (`max profile entry × min(n, m)`) and its costs stay far from that
-//! sentinel; others fall back to the scalar kernel.
+//! ([`SubstitutionProfile::local_bound`] over `min(n, m)` columns) and its
+//! costs stay far from that sentinel; others fall back to the scalar kernel.
 
 use super::gotoh::{BandedGotoh, GotohWorkspace, traceback_with};
 #[cfg(target_arch = "aarch64")]
@@ -61,6 +61,7 @@ use super::{AlignJob, Aligner, Alignment, Op, ScoreHit};
 use crate::alphabet::N;
 use crate::band::Band;
 use crate::scoring::{GapCosts, Score, SubstitutionProfile};
+use std::ops::Range;
 
 /// Base codes with a profile row: A C G T N.
 const CODES: usize = N as usize + 1;
@@ -248,7 +249,7 @@ fn lane_of(job_index: usize, job: &AlignJob<'_>) -> Option<Lane> {
     if n == 0 || m == 0 {
         return None;
     }
-    let bound = i64::from(job.profile.max_score().max(0)) * n.min(m) as i64;
+    let bound = job.profile.local_bound(n.min(m));
     let floor = i64::from(
         job.profile
             .min_score()
@@ -343,6 +344,14 @@ struct LaneResult {
     start: Option<(usize, usize, Vec<Op>)>,
 }
 
+/// Reference indices `j0` whose layout position `t = j0 + offset` lies in
+/// `[0, positions)`, and the position of the first.
+fn reachable(len: usize, offset: i64, positions: usize) -> (Range<usize>, usize) {
+    let lo = (-offset).clamp(0, len as i64);
+    let hi = (positions as i64 - offset).clamp(lo, len as i64);
+    (lo as usize..hi as usize, (lo + offset).max(0) as usize)
+}
+
 /// Lay out the group's queries and, per position, either the five
 /// interleaved profile rows or (`UNIFORM`) the reference codes; return its shape.
 fn build<const DIAG: bool, const UNIFORM: bool, const L: usize>(
@@ -382,26 +391,22 @@ fn build<const DIAG: bool, const UNIFORM: bool, const L: usize>(
         } else {
             0
         };
-        let positions = 0..positions as i64;
+        // Only the reference indices that land inside the layout: a long
+        // reference under a narrow band touches `positions` columns, not `m`.
+        let (reach, first) = reachable(job.profile.len(), offset, positions);
         if UNIFORM {
             let scores = job.profile.uniform().expect("uniform group");
             shape.matched[l] = scores.matched as i16;
             shape.mismatch[l] = scores.mismatch as i16;
-            for (j0, &code) in job.profile.codes().iter().enumerate() {
-                let t = j0 as i64 + offset;
-                if positions.contains(&t) {
-                    profile[t as usize][l] = i16::from(code);
-                }
+            for (t, &code) in (first..).zip(&job.profile.codes()[reach]) {
+                profile[t][l] = i16::from(code);
             }
         } else {
             for code in 0..CODES {
                 let row = job.profile.row(code as u8);
                 let column = &mut profile[code * shape.positions..(code + 1) * shape.positions];
-                for (j0, &score) in row.iter().enumerate() {
-                    let t = j0 as i64 + offset;
-                    if positions.contains(&t) {
-                        column[t as usize][l] = score as i16;
-                    }
+                for (t, &score) in (first..).zip(&row[reach.clone()]) {
+                    column[t][l] = score as i16;
                 }
             }
         }
