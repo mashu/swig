@@ -27,6 +27,7 @@ cargo test --release -- --ignored              # + accuracy at scale: 20,000 rea
 target/release/vdj-assign --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta \
     [--profile r|truth|igblast|sensitive-d] [--threads N] [--tandem-d] \
     [--chain heavy|light] [--forward-only] [--no-anchor-window] [--no-posterior] [--residual] \
+    [--calls per-read|fixed] [--d-allele map|max-marginal] [--d-presence-rate R] \
     [--simd avx512|avx2|neon|portable|scalar] reads.fastq > calls.tsv
 
 zcat reads.fastq.gz | target/release/vdj-assign --v V.fasta --d D.fasta --j J.fasta - > calls.tsv
@@ -270,7 +271,10 @@ The full description, with the guarantee of each search step, is in
   junction positions. Including it pays off when `λ·S_D > ln(N·L) − ln(prior
   odds)`, which gives `P*_D` = 10.55 for human IGH (32 genes, L = 25, even
   odds) and 6.17 for TRB, kept unrounded; on integer scores the fixed scale
-  charges `⌊P*_D⌋`, which decides `S > P*_D` exactly.
+  charges `⌊P*_D⌋`, which decides `S > P*_D` exactly. `--d-presence-rate π`
+  counts what the D search tries instead (Karlin–Altschul `K·m·n_D` over
+  alleles × offsets × positions) at the D-presence rate `π`; the rate has to
+  come from the user, so it is not the default.
 - **Significance.** A V or J hit is kept at E ≤ 1 against its database and
   window. A read is called only when its path contains an *anchor*, a V or J
   hit at E ≤ 10⁻³, so random sequence receives no call.
@@ -795,8 +799,9 @@ Each is a named field you can change.
   or the keep policy dropped gets no mass. The call is a mode of the
   posterior over paths and cuts, not the allele of largest marginal, so a
   reported posterior can still fall below 0.5. D-presence calibration is the
-  weakest (ECE up to 1.4 % on human IGH, 3.3 % on the synthetic database),
-  because the D prior counts genes × positions (see ALGORITHM.md §8).
+  weakest (ECE up to 1.4 % on human IGH, 3.3 % on the synthetic database):
+  one D cost per database cannot follow what the residual tracks, junction
+  length (see ALGORITHM.md §8).
 - **E-values** use exact *ungapped* λ and K and the total database length.
   Gapped scores are slightly higher (anti-conservative); near-identical alleles
   inflate the database length (conservative). They gate hits; they are not
@@ -833,9 +838,16 @@ In order of expected value; reasons and measurements are in
    remnants of 4 nt or more (the overall −0.3–0.4 pp on the synthetic
    database lies in 1–3 nt remnants, below `min_d_match`). Max-marginal D
    alleles are a switch (+0.25 pp on hard reads only). See ASSESSMENT §9.8.
-2. **D prior from the D search's statistics** (Karlin–Altschul `K·m·n` and a
-   D-inclusion rate), checked by D-presence calibration. It should replace
-   `P*_D` in the per-read D cost and keep its dependence on `p̂`.
+2. ~~**D prior from the D search's statistics.**~~ Done as a switch,
+   `--d-presence-rate π`: `P*_D = [ln(K·m·n_D) − ln(π/(1 − π))]/λ` counts
+   every distinct allele, offset and read position the search tries, and is
+   read per read like the default. At π = 0.9 it meets every criterion on
+   20,000 reads per preset (D-presence Brier better on all six sets, no D
+   call +0.77 pp on human hard, D on remnants of 4 nt or more within
+   noise), but that rate was found by measuring; at the simulator's own
+   rate (0.94) exact 5-mers win and D-free specificity falls 14–26 pp. The
+   default stays `ln(N·L)` at even odds. Next on that line: a prior on N/P
+   lengths, which the remaining miscalibration follows. See ASSESSMENT §9.9.
 3. ~~**Wider SIMD.**~~ Done: AVX-512BW, NEON and portable backends of one
    kernel. Next on that line: 8-bit lanes for D jobs (32 per AVX2 register).
 4. ~~**Allele rescoring along the gene frame.**~~ Done: siblings are bounded
