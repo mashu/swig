@@ -13,7 +13,7 @@ use crate::placement::Placement;
 use crate::scoring::Score;
 
 /// Which segment sequences form a path. Transitions between kinds must go
-/// forward in [`SegmentKind::ALL`] order (V, D, J): the DAG visits kinds in
+/// forward in [`SegmentKind::REARRANGED`] order (V, D, J): the DAG visits kinds in
 /// that order ([`super::PlacementDag`]).
 pub trait Grammar: Send + Sync {
     fn can_start(&self, kind: SegmentKind) -> bool;
@@ -66,6 +66,7 @@ impl Grammar for VdjGrammar {
             SegmentKind::V => true,
             SegmentKind::D => !self.require_v && self.max_d > 0,
             SegmentKind::J => !self.require_v,
+            SegmentKind::C => false,
         }
     }
 

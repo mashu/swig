@@ -8,16 +8,41 @@ use crate::alphabet;
 use crate::fasta::{FastaError, parse_fasta};
 use crate::translate::codon;
 
-/// Gene segment type. The derive order (V < D < J) is genomic order.
+/// Gene segment type. The derive order (V < D < J < C) is genomic order.
+///
+/// V, D and J are the [`REARRANGED`](Self::REARRANGED) kinds: the placement
+/// lattice, its posteriors and every per-kind array of the adjudicator are
+/// built over them alone. C (the constant region) is joined to J by an RNA
+/// splice at a fixed phase, with no N/P additions and no hypermutation, so it
+/// is assigned after adjudication by [`crate::constant`] and never enters a
+/// lattice. Non-exhaustive: further kinds may follow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum SegmentKind {
     V,
     D,
     J,
+    C,
 }
 
 impl SegmentKind {
-    pub const ALL: [SegmentKind; 3] = [SegmentKind::V, SegmentKind::D, SegmentKind::J];
+    pub const ALL: [SegmentKind; 4] = [
+        SegmentKind::V,
+        SegmentKind::D,
+        SegmentKind::J,
+        SegmentKind::C,
+    ];
+
+    /// The kinds a recombination lattice is built over; per-rearranged-kind
+    /// arrays are indexed by [`index`](Self::index) below
+    /// `REARRANGED.len()`.
+    pub const REARRANGED: [SegmentKind; 3] = [SegmentKind::V, SegmentKind::D, SegmentKind::J];
+
+    /// Whether the kind takes part in V(D)J recombination.
+    #[inline]
+    pub const fn is_rearranged(self) -> bool {
+        !matches!(self, SegmentKind::C)
+    }
 
     /// Dense index for per-kind arrays.
     #[inline]
@@ -26,6 +51,7 @@ impl SegmentKind {
             SegmentKind::V => 0,
             SegmentKind::D => 1,
             SegmentKind::J => 2,
+            SegmentKind::C => 3,
         }
     }
 
@@ -34,6 +60,7 @@ impl SegmentKind {
             SegmentKind::V => "V",
             SegmentKind::D => "D",
             SegmentKind::J => "J",
+            SegmentKind::C => "C",
         }
     }
 }
@@ -607,6 +634,20 @@ impl GermlineSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Per-rearranged-kind arrays (`[_; 3]` indexed by `index()`) cover V, D
+    /// and J exactly; C indexes past them and is the one non-rearranged kind.
+    #[test]
+    fn rearranged_kinds_index_the_per_kind_arrays() {
+        for (i, kind) in SegmentKind::REARRANGED.into_iter().enumerate() {
+            assert_eq!(kind.index(), i);
+            assert!(kind.is_rearranged());
+        }
+        assert_eq!(SegmentKind::C.index(), SegmentKind::REARRANGED.len());
+        assert!(!SegmentKind::C.is_rearranged());
+        assert_eq!(SegmentKind::ALL[..3], SegmentKind::REARRANGED);
+        assert_eq!(SegmentKind::C.label(), "C");
+    }
 
     #[test]
     fn groups_alleles_by_gene() {

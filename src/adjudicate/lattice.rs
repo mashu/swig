@@ -22,8 +22,9 @@ use super::model::Grammar;
 use crate::germline::SegmentKind;
 use crate::placement::Placement;
 
-/// Segment kinds: passes keep one array per successor or predecessor kind.
-pub(super) const KINDS: usize = SegmentKind::ALL.len();
+/// Rearranged segment kinds: passes keep one array per successor or
+/// predecessor kind. C never enters a lattice ([`SegmentKind::REARRANGED`]).
+pub(super) const KINDS: usize = SegmentKind::REARRANGED.len();
 
 /// One placement in DAG order.
 #[derive(Clone, Copy, Debug)]
@@ -134,6 +135,7 @@ impl Lattice {
         self.cells = 0;
         for &i in &self.order {
             let p = &placements[i];
+            debug_assert!(p.kind.is_rearranged(), "a C placement reached the lattice");
             let first = self.entries.len();
             self.entries
                 .extend(p.clip.matches().map(|(q, ..)| q - p.q_start()));

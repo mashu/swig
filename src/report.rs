@@ -75,7 +75,8 @@ pub struct AirrRecord {
     oriented: String,
 }
 
-/// Per-kind statistics for support values (indexed by [`SegmentKind::index`]).
+/// Statistics for support values per rearranged kind ([`SegmentKind::REARRANGED`]),
+/// indexed by [`SegmentKind::index`].
 pub type SupportModels = [Option<KarlinAltschul>; 3];
 
 const SEGMENT_FIELDS: [&str; 12] = [
@@ -118,6 +119,10 @@ fn segment_report<C: AlleleCatalog>(
 ) -> Option<SegmentReport> {
     let dag_placement = &call.placements[called.placement];
     let kind = dag_placement.kind;
+    debug_assert!(
+        kind.is_rearranged(),
+        "a C placement reached the V(D)J report"
+    );
     let segment = catalog.segment(kind)?;
     let set = segment.set();
     let called_score = called.span.score;
@@ -343,6 +348,7 @@ impl AirrRecord {
                 SegmentKind::D if record.d.is_none() => &mut record.d,
                 SegmentKind::D => &mut record.d2,
                 SegmentKind::J => &mut record.j,
+                SegmentKind::C => unreachable!("C placements never enter a V(D)J path"),
             };
             *slot = report;
         }

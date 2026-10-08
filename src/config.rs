@@ -264,7 +264,8 @@ pub struct EngineConfig {
     pub anchor_window: bool,
     pub grammar: VdjGrammar,
     pub objective: ObjectiveConfig,
-    /// Minimum retained query bases after clipping, per [`SegmentKind::index`].
+    /// Minimum retained query bases after clipping, per rearranged kind
+    /// ([`SegmentKind::REARRANGED`]), indexed by [`SegmentKind::index`].
     pub min_retained: [u32; 3],
     /// The model the DAG's call maximises: each read's own (the model its
     /// posteriors come from) or the fixed scores.

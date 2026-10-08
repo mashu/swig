@@ -310,7 +310,7 @@ struct Pass<'a, G, M> {
     w: &'a Weights,
     /// `e^{−c_D}`, the weight of a D's presence cost.
     d_presence: f64,
-    /// Evidence steps per segment kind.
+    /// Evidence steps per rearranged segment kind.
     steps: [Steps; 3],
 }
 
@@ -387,13 +387,13 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
             // can precede this one, exits before the end only when one can
             // follow it. Only those set the centres and the spread.
             let starts = grammar.can_start(p.kind);
-            let ends = SegmentKind::ALL
+            let ends = SegmentKind::REARRANGED
                 .iter()
                 .any(|&f| any_d(&|d| grammar.can_end(f, p.kind, d)));
-            let preceded = SegmentKind::ALL
+            let preceded = SegmentKind::REARRANGED
                 .iter()
                 .any(|&k| any_d(&|d| grammar.can_follow(k, p.kind, d)));
-            let followed = SegmentKind::ALL
+            let followed = SegmentKind::REARRANGED
                 .iter()
                 .any(|&k| any_d(&|d| grammar.can_follow(p.kind, k, d)));
             let entry_used = |o: u32| preceded || (starts && o == 0);
@@ -574,7 +574,7 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
                     tails[b.kind.index() * width + beyond] += factor * r[b.len as usize];
                 }
             }
-            for kind in SegmentKind::ALL {
+            for kind in SegmentKind::REARRANGED {
                 let tail = &tails[kind.index() * width..(kind.index() + 1) * width];
                 if tail.iter().all(|&v| v == 0.0) {
                     continue;
@@ -634,7 +634,7 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
         let mut end = None;
         if exit_scale > f64::NEG_INFINITY {
             let mut done: Option<(Score, usize)> = None;
-            for kind in SegmentKind::ALL {
+            for kind in SegmentKind::REARRANGED {
                 if !self.dag.grammar.can_follow(node.kind, kind, d_used) {
                     continue;
                 }
@@ -690,7 +690,7 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
             self.w.lambda * f64::from(iota * e.q_start.saturating_sub(node.q_end()) as Score)
         };
         let mut reference = if can_end { 0.0 } else { f64::NEG_INFINITY };
-        for kind in SegmentKind::ALL.into_iter().filter(|&k| follows(k)) {
+        for kind in SegmentKind::REARRANGED.into_iter().filter(|&k| follows(k)) {
             for (e, u) in outgoing(&s.lattice, &s.scales, successors, kind, slot.group) {
                 reference = reference.max(s.scales[u].backward + gap(&e));
             }
@@ -707,7 +707,7 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
             inner[width - 1] = self.w.of(model.end(first, node.kind, d_used)) * (-reference).exp();
         }
         let mut tails = std::mem::take(&mut s.tails);
-        for kind in SegmentKind::ALL.into_iter().filter(|&k| follows(k)) {
+        for kind in SegmentKind::REARRANGED.into_iter().filter(|&k| follows(k)) {
             let iota = model.junction_per_base(node.kind, kind);
             tails.clear();
             tails.resize(width, 0.0);
@@ -765,7 +765,7 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
 
         // Suffix sums for predecessors of each kind that can precede this slot.
         let mut done: Option<(Score, usize)> = None;
-        for kind in SegmentKind::ALL {
+        for kind in SegmentKind::REARRANGED {
             if !(0..=d_used).any(|d| grammar.can_follow(kind, node.kind, d)) {
                 continue;
             }

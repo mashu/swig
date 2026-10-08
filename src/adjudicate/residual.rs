@@ -16,7 +16,8 @@ pub struct ResidualAdjudicator {
     pub pair_bonus: Score,
     /// V/J pairs overlapping by more query bases are rejected.
     pub max_vj_overlap: u32,
-    /// Minimum query bases per clipped segment, indexed by [`SegmentKind::index`].
+    /// Minimum query bases per clipped segment, per rearranged kind
+    /// ([`SegmentKind::REARRANGED`]), indexed by [`SegmentKind::index`].
     pub min_retained: [u32; 3],
 }
 
@@ -127,6 +128,7 @@ impl Adjudicator for ResidualAdjudicator {
                 SegmentKind::V => v.push(i),
                 SegmentKind::D => d.push(i),
                 SegmentKind::J => j.push(i),
+                SegmentKind::C => {}
             }
         }
 

@@ -110,12 +110,13 @@ impl EvidenceScale {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EvidenceModel {
     pub lambda: f64,
-    /// Match and mismatch score per [`SegmentKind::index`].
+    /// Match and mismatch score per rearranged kind ([`SegmentKind::REARRANGED`]), indexed by
+    /// [`SegmentKind::index`].
     pub substitution: [(Score, Score); 3],
 }
 
 impl EvidenceModel {
-    /// Evidence scales of the three segment kinds at divergence `p`.
+    /// Evidence scales of the three rearranged kinds at divergence `p`.
     pub fn evidence(&self, p: f64) -> [EvidenceScale; 3] {
         self.substitution
             .map(|(matched, mismatch)| EvidenceScale::at_divergence(p, matched, mismatch))
@@ -145,7 +146,8 @@ impl EvidenceModel {
 pub struct PathNats {
     /// Nats per score unit of the prior terms and of gaps.
     pub lambda: f64,
-    /// Alignment evidence per [`SegmentKind::index`].
+    /// Alignment evidence per rearranged kind ([`SegmentKind::REARRANGED`]), indexed by
+    /// [`SegmentKind::index`].
     pub evidence: [EvidenceScale; 3],
     /// What including a D costs.
     pub d_cost: f64,
@@ -383,7 +385,7 @@ mod tests {
             let fixed = ReadModel::fixed(m.lambda, d_presence);
             let u0 = read.prior(1);
             assert_eq!(u0, (UNITS_PER_NAT * m.lambda).round() as Units);
-            for kind in SegmentKind::ALL {
+            for kind in SegmentKind::REARRANGED {
                 for s in [-3, 0, 2, 5] {
                     assert_eq!(read.column(kind, s), fixed.column(kind, s) * u0);
                 }

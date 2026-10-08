@@ -507,6 +507,7 @@ impl<A, RV, RJ, RD, W, Adm, Adj> AlleleCatalog for Assigner<A, RV, RJ, RD, W, Ad
             SegmentKind::V => Some(&self.v.segment),
             SegmentKind::D => self.d.as_ref().map(|stage| &*stage.segment),
             SegmentKind::J => Some(&self.j.segment),
+            SegmentKind::C => None,
         }
     }
 }

@@ -73,7 +73,8 @@ const START: u32 = u32::MAX;
 pub struct PlacementDag<G = VdjGrammar, M = EngineeringObjective> {
     pub grammar: G,
     pub model: M,
-    /// Minimum query bases a clipped segment must keep, indexed by [`SegmentKind::index`].
+    /// Minimum query bases a clipped segment must keep, per rearranged kind
+    /// ([`SegmentKind::REARRANGED`]), indexed by [`SegmentKind::index`].
     pub min_retained: [u32; 3],
     /// How alignments read as log-odds at a read's divergence. Without it
     /// everything stays on the fixed scale and there are no posteriors.
@@ -296,7 +297,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
                     prefer(&mut s.tails[b.kind.index() * width + beyond], candidate);
                 }
             }
-            for kind in SegmentKind::ALL {
+            for kind in SegmentKind::REARRANGED {
                 let tail = &s.tails[kind.index() * width..(kind.index() + 1) * width];
                 if tail.iter().all(Option::is_none) {
                     continue;
@@ -376,7 +377,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         if !open {
             return None;
         }
-        for kind in SegmentKind::ALL {
+        for kind in SegmentKind::REARRANGED {
             if !self.grammar.can_follow(node.kind, kind, d_used) {
                 continue;
             }
@@ -665,6 +666,22 @@ mod tests {
         assert_eq!(path.score.score, 44);
         let (v_seg, j_seg) = (path.segments[0], path.segments[1]);
         assert_eq!((v_seg.span.q_hi, j_seg.span.q_lo), (11, 15));
+    }
+
+    /// C is assigned after adjudication and never enters a lattice, whose
+    /// per-kind arrays cover the rearranged kinds only.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a C placement reached the lattice")]
+    fn a_c_placement_never_enters_the_lattice() {
+        let query = encode(b"TTTTTTTTTTACGTACCCCCCCCCCCGGGGGGGGGG");
+        let placements = [
+            placement(SegmentKind::V, &query, &query[..16], 0),
+            placement(SegmentKind::J, &query, &query[10..26], 10),
+            placement(SegmentKind::C, &query, &query[26..], 26),
+        ];
+        let dag = PlacementDag::new(VdjGrammar::VJ, EngineeringObjective::default(), [1, 1, 1]);
+        dag.adjudicate(query.len(), &placements, &mut DagScratch::default());
     }
 
     /// The J alignment starts one base before the D, its first 13 bases
