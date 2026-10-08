@@ -827,6 +827,7 @@ mod tests {
     use crate::clip::ClipIndex;
     use crate::evidence::Evidence;
     use crate::scoring::{AffineScoring, SubstitutionProfile};
+    use crate::testing::placement;
 
     const LAMBDA: f64 = 0.6337;
 
@@ -835,31 +836,6 @@ mod tests {
         lambda: LAMBDA,
         substitution: [(2, -3); 3],
     };
-
-    fn placement(kind: SegmentKind, query: &[u8], reference: &[u8], q_start: u32) -> Placement {
-        let scoring = AffineScoring::new(2, -3, -9, -1);
-        let profile = SubstitutionProfile::build(&scoring, reference);
-        let len = reference.len() as u32;
-        let score = (0..reference.len())
-            .map(|k| profile.at(query[q_start as usize + k], k))
-            .sum();
-        let alignment = Alignment {
-            q_start,
-            q_end: q_start + len,
-            r_start: 0,
-            r_end: len,
-            score,
-            ops: vec![Op::Match; reference.len()],
-        };
-        Placement {
-            kind,
-            alleles: vec![0],
-            clip: ClipIndex::build(&alignment, query, &profile, scoring.gaps),
-            evidence: Evidence::default(),
-            anchor: true,
-            alignment,
-        }
-    }
 
     /// Exhaustive search over grammatical paths and canonical cut pairs: the
     /// sum of `e^{nats}` (marginals) and the best key under `read`.

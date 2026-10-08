@@ -53,7 +53,6 @@
 //! exactly when it beats `⌊c⌋`. Conditioning the cost on `p̂` does not use
 //! the junction twice, because `p̂` comes from columns outside it.
 
-use super::CalledSegment;
 use crate::germline::SegmentKind;
 use crate::placement::Placement;
 use crate::scoring::Score;
@@ -231,23 +230,55 @@ impl ReadModel {
     }
 }
 
-/// Divergence of a read from its called germlines: the fraction of
-/// mismatched `Match` columns in the called V and J segments (a D is too
-/// short to tell), with half a pseudo-mismatch so that an unmutated read gets
-/// a small positive rate. Clamped to `[10⁻⁴, 0.5]`.
-pub fn divergence(placements: &[Placement], segments: &[CalledSegment]) -> f64 {
-    let (mut columns, mut mismatches) = (0usize, 0usize);
-    for segment in segments {
-        let p = &placements[segment.placement];
-        if p.kind == SegmentKind::D {
-            continue;
+/// The read's divergence `p̂`, estimated before adjudication from the columns
+/// no path contests: the best-scoring V placement's `Match` columns before
+/// every D and J placement starts, and the best J's after every V and D
+/// placement ends. Whichever path is called explains them by that V or J,
+/// and they exclude the junction, so a D cost conditioned on `p̂` does not
+/// use the junction's bases twice.
+///
+/// `p̂ = (k + ½)/(n + 1)` for `k` mismatches among `n` informative columns
+/// (`N` columns, scoring 0, excluded): the posterior mean under a Jeffreys
+/// `Beta(½, ½)` prior, i.e. the predictive mismatch probability of a new
+/// column, such as a D's. With fewer than 50 such columns (a spurious D or J
+/// placement far out), every `Match` column of the two placements counts.
+/// Clamped to `[10⁻⁴, 0.5]`.
+pub fn divergence(placements: &[Placement]) -> f64 {
+    const MIN_COLUMNS: usize = 50;
+    let best = |kind: SegmentKind| {
+        placements
+            .iter()
+            .filter(|p| p.kind == kind)
+            .reduce(|best, p| if p.score() > best.score() { p } else { best })
+    };
+    let (v, j) = (best(SegmentKind::V), best(SegmentKind::J));
+    let lo = placements
+        .iter()
+        .filter(|p| p.kind != SegmentKind::V)
+        .map(Placement::q_start)
+        .min()
+        .unwrap_or(u32::MAX);
+    let hi = placements
+        .iter()
+        .filter(|p| p.kind != SegmentKind::J)
+        .map(Placement::q_end)
+        .max()
+        .unwrap_or(0);
+    // (informative columns, mismatches) of V before `lo` and J from `hi` on.
+    let count = |lo: u32, hi: u32| {
+        let (mut columns, mut mismatches) = (0usize, 0usize);
+        for (placement, kept) in [(v, 0..lo), (j, hi..u32::MAX)] {
+            let matches = placement.into_iter().flat_map(|p| p.clip.matches());
+            for (_, entry, exit) in matches.filter(|(q, ..)| kept.contains(q)) {
+                columns += usize::from(exit != entry);
+                mismatches += usize::from(exit < entry);
+            }
         }
-        let span = segment.span.q_lo..segment.span.q_hi;
-        for (_, entry, exit) in p.clip.matches().filter(|(q, ..)| span.contains(q)) {
-            // N columns (score 0) carry no evidence either way.
-            columns += usize::from(exit != entry);
-            mismatches += usize::from(exit < entry);
-        }
+        (columns, mismatches)
+    };
+    let (mut columns, mut mismatches) = count(lo, hi);
+    if columns < MIN_COLUMNS {
+        (columns, mismatches) = count(u32::MAX, 0);
     }
     ((mismatches as f64 + 0.5) / (columns as f64 + 1.0)).clamp(1e-4, 0.5)
 }
@@ -255,8 +286,58 @@ pub fn divergence(placements: &[Placement], segments: &[CalledSegment]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alphabet::N;
     use crate::scoring::AffineScoring;
     use crate::stats::KarlinAltschul;
+
+    /// An ungapped placement of `kind` on `query[q_start..q_start + len]`
+    /// with mismatches at the `mismatched` offsets.
+    fn placement(
+        kind: SegmentKind,
+        query: &[u8],
+        q_start: u32,
+        len: u32,
+        mismatched: &[u32],
+    ) -> Placement {
+        let mut reference = query[q_start as usize..(q_start + len) as usize].to_vec();
+        for &k in mismatched {
+            reference[k as usize] = (reference[k as usize] + 1) & 3;
+        }
+        crate::testing::placement(kind, query, &reference, q_start)
+    }
+
+    #[test]
+    fn divergence_counts_uncontested_v_and_j_columns() {
+        let query = crate::sim::Rng::new(3).codes(400);
+        let v = |mismatched: &[u32]| placement(SegmentKind::V, &query, 0, 300, mismatched);
+        let j = placement(SegmentKind::J, &query, 330, 60, &[59]);
+        let d = placement(SegmentKind::D, &query, 290, 20, &[]);
+        // An unmutated V alone: half a pseudo-mismatch in 301.
+        assert_eq!(divergence(&[v(&[])]), 0.5 / 301.0);
+        // V before the D (0..290) and J after V and D (330..390): the V
+        // mismatch at 295 and the J one at 389 are contested or not.
+        let both = [v(&[10, 295]), d, j.clone()];
+        assert_eq!(divergence(&both), 2.5 / 351.0);
+        // The best-scoring V counts, not the first.
+        let worse = v(&[1, 2, 3, 4]);
+        assert_eq!(divergence(&[worse, v(&[10]), j]), 2.5 / 361.0);
+        // Nothing to count: the 0.5 clamp.
+        assert_eq!(divergence(&[]), 0.5);
+    }
+
+    /// A spurious J far to the left leaves fewer than 50 uncontested V
+    /// columns: every column of the best V and J counts instead.
+    #[test]
+    fn divergence_falls_back_to_whole_placements() {
+        let query = crate::sim::Rng::new(4).codes(400);
+        let v = placement(SegmentKind::V, &query, 0, 300, &[100, 200]);
+        let j = placement(SegmentKind::J, &query, 40, 30, &[]);
+        assert_eq!(divergence(&[v, j]), 2.5 / 331.0);
+        // All-N query: no informative column.
+        let blank = vec![N; 100];
+        let n = placement(SegmentKind::V, &blank, 0, 100, &[]);
+        assert_eq!(divergence(&[n]), 0.5);
+    }
 
     fn model() -> EvidenceModel {
         let scoring = AffineScoring::new(2, -3, -9, -1);

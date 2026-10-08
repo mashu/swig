@@ -173,7 +173,7 @@ impl Adjudicator for ResidualAdjudicator {
             .map(Pick::segment)
             .collect();
         Some(CallPath {
-            divergence: divergence(placements, &segments),
+            divergence: divergence(placements),
             segments,
             score: PathScore {
                 score: flank_score + d_score,

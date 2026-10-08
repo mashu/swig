@@ -520,12 +520,8 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
         placements: &[Placement],
         scratch: &mut DagScratch,
     ) -> Option<CallPath> {
-        let fixed = ReadModel::fixed(1.0, self.model.d_presence());
-        let (_, mut segments) = self.viterbi(placements, &fixed, scratch)?;
-        let divergence = divergence(placements, &segments);
-        if self.calls == CallModel::PerRead && self.evidence.is_some() {
-            (_, segments) = self.viterbi(placements, &self.read_model(divergence), scratch)?;
-        }
+        let divergence = divergence(placements);
+        let (_, segments) = self.viterbi(placements, &self.read_model(divergence), scratch)?;
         Some(CallPath {
             score: self.path_score(placements, &segments),
             segments,
@@ -547,36 +543,8 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::align::{Alignment, Op};
     use crate::alphabet::encode;
-    use crate::clip::ClipIndex;
-    use crate::evidence::Evidence;
-    use crate::scoring::{AffineScoring, SubstitutionProfile};
-
-    fn placement(kind: SegmentKind, query: &[u8], reference: &[u8], q_start: u32) -> Placement {
-        let scoring = AffineScoring::new(2, -3, -9, -1);
-        let profile = SubstitutionProfile::build(&scoring, reference);
-        let len = reference.len() as u32;
-        let score = (0..reference.len())
-            .map(|k| profile.at(query[q_start as usize + k], k))
-            .sum();
-        let alignment = Alignment {
-            q_start,
-            q_end: q_start + len,
-            r_start: 0,
-            r_end: len,
-            score,
-            ops: vec![Op::Match; reference.len()],
-        };
-        Placement {
-            kind,
-            alleles: vec![0],
-            clip: ClipIndex::build(&alignment, query, &profile, scoring.gaps),
-            evidence: Evidence::default(),
-            anchor: true,
-            alignment,
-        }
-    }
+    use crate::testing::placement;
 
     /// V's tail and J's head overlap on six bases, V mismatching at the 2nd and
     /// 3rd and J at the 4th and 5th. One shared cut must give one side the

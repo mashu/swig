@@ -618,7 +618,7 @@ fn per_read_dag_equals_exhaustive_enumeration() {
                 else {
                     continue;
                 };
-                let own = divergence(&placements, &fixed_path);
+                let own = divergence(&placements);
                 for p in [own, 1e-3, 0.02, 0.3] {
                     let model = ReadModel::at(&evidence, p, objective.d_presence);
                     let (fast, exhaustive) = dag_and_brute(&dag, &placements, model, &mut scratch);
