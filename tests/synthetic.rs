@@ -473,6 +473,88 @@ fn the_constant_region_is_called_from_the_j_exit() {
     assert!(false_calls <= 1, "{false_calls} false C calls");
 }
 
+/// Rows gain the twelve `c_` columns after `productive` only with a C stage;
+/// the columns before them are unchanged.
+#[test]
+fn c_columns_follow_the_vdj_columns_only_with_a_c_stage() {
+    let db = Db::new();
+    let config = EngineConfig::default();
+    let (plain, constant) = (db.assigner(&config), with_c(&db, &config));
+    let header = AirrRecord::tsv_header();
+    let with_header = AirrRecord::tsv_header_with(true);
+    assert_eq!(with_header.strip_prefix(&header).unwrap(), {
+        let c: Vec<String> = [
+            "call",
+            "score",
+            "identity",
+            "support",
+            "posterior",
+            "cigar",
+            "sequence_start",
+            "sequence_end",
+            "germline_start",
+            "germline_end",
+            "sequence_alignment",
+            "germline_alignment",
+        ]
+        .iter()
+        .map(|f| format!("\tc_{f}"))
+        .collect();
+        c.concat()
+    });
+    let mut rng = Rng::new(41);
+    let (mut ws_plain, mut ws_c) = (plain.workspace(), constant.workspace());
+    for k in 0..60 {
+        let d = rng.below(8);
+        let sim = simulate(&db, &mut rng, &[d], 0.02);
+        let (name, c) = &db.c[rng.below(4)];
+        let len = if k % 3 == 0 { 0 } else { 60 + rng.below(100) };
+        let query = with_constant(&sim.query, c, len, 5, &mut rng);
+        let encoded = encode(query.as_bytes());
+        let row = |assigner: &DefaultAssigner, ws| {
+            let call = assigner.assign(&encoded, ws);
+            AirrRecord::from_call("q", &query, &call, assigner, &[None, None, None])
+        };
+        let (without, with) = (row(&plain, &mut ws_plain), row(&constant, &mut ws_c));
+        assert!(without.c.is_none());
+        let (a, b) = (without.to_tsv(), with.to_tsv());
+        let tail = b.strip_prefix(&a).unwrap();
+        assert_eq!(tail.matches('\t').count(), 12);
+        assert_eq!(b.split('\t').count(), with_header.split('\t').count());
+        match &with.c {
+            Some(report) if len > 0 => {
+                assert!(report.call.split(',').any(|n| n == name));
+                let j_end = with.j.as_ref().unwrap().sequence_end;
+                assert_eq!(report.sequence_start, j_end + 1);
+                assert_eq!(report.germline_start, 1);
+                assert!(report.sequence_end as usize >= j_end as usize + len);
+                assert!(report.support.unwrap() <= 1e-3);
+            }
+            None => assert_eq!(len, 0),
+            Some(report) => panic!("a C call without C: {report:?}"),
+        }
+    }
+}
+
+/// The V(D)J report refuses a C placement on the path.
+#[test]
+#[should_panic(expected = "V(D)J")]
+fn a_c_placement_never_reaches_the_vdj_report() {
+    let db = Db::new();
+    let config = EngineConfig::default();
+    let assigner = with_c(&db, &config);
+    let mut rng = Rng::new(43);
+    let sim = simulate(&db, &mut rng, &[0], 0.0);
+    let query = with_constant(&sim.query, &db.c[0].1, 100, 0, &mut rng);
+    let mut call = assigner.assign(&encode(query.as_bytes()), &mut assigner.workspace());
+    let c = call.c.expect("a C call");
+    call.placements
+        .push(call.constant[c.segment.placement].clone());
+    let path = call.path.as_mut().unwrap();
+    path.segments.last_mut().unwrap().placement = call.placements.len() - 1;
+    AirrRecord::from_call("q", &query, &call, &assigner, &[None, None, None]);
+}
+
 // ---------------------------------------------------------------------------
 // Brute-force check of the DAG's running-maximum shortcuts.
 // ---------------------------------------------------------------------------

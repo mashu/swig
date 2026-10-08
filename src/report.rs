@@ -18,6 +18,25 @@
 //! interval, or whose germline bases between the call's neighbours the
 //! primary allele contains: the probability that the reported names include
 //! the read's allele up to germline equivalence. `d_presence_posterior` is the probability that the read has a D.
+//!
+//! **Constant region.** With a C stage ([`crate::constant`]) the twelve `c_`
+//! columns follow `productive`; without one the rows are unchanged. The C
+//! call is reported like the others, with three differences.
+//! * `c_support` is the anchored E-value `N_C·(2s + 1)·e^(−λS)` — a union
+//!   bound over C genes and start diagonals — not the Karlin–Altschul
+//!   `K·m·n·e^(−λS)` of `v_`, `d_` and `j_support`; the columns are not
+//!   comparable.
+//! * Ties are on the fixed scale, and `c_posterior` weighs C's placements
+//!   at C's own divergence, given that the read reaches C.
+//! * Coordinates are those of the C alignment clipped to the J exit:
+//!   `c_germline_start` 2 flags a reference whose base 1 repeats the J's
+//!   last base (codon-aligned records).
+//!
+//! A short C remnant matches the shared 5′ end of several genes (IGHG1,
+//! IGHG2 and IGHG4 share `GCCTCCACCAAG`), so `c_call` then lists several
+//! genes and its *first* name is merely first by the tie-break (longest
+//! exact run, most matches, lowest allele id); read the isotype from the
+//! whole list.
 
 use std::fmt::Write as _;
 use std::ops::Range;
@@ -64,6 +83,8 @@ pub struct AirrRecord {
     pub d: Option<SegmentReport>,
     pub d2: Option<SegmentReport>,
     pub j: Option<SegmentReport>,
+    /// The constant region ([`crate::constant`]).
+    pub c: Option<SegmentReport>,
     pub np1: Option<String>,
     pub np2: Option<String>,
     pub np3: Option<String>,
@@ -74,6 +95,8 @@ pub struct AirrRecord {
     pub regions: ReadRegions,
     /// Oriented query as ASCII (region sequences are slices of it).
     oriented: String,
+    /// Whether the assigner has a C stage, so rows carry the `c_` columns.
+    c_columns: bool,
 }
 
 /// Statistics for support values per rearranged kind ([`SegmentKind::REARRANGED`]),
@@ -103,6 +126,27 @@ fn probability(p: f64) -> String {
         format!("{p:.10}")
     } else {
         format!("{p:.6}")
+    }
+}
+
+/// The [`SEGMENT_FIELDS`] of `segment`, empty when there is none.
+fn push_segment(fields: &mut Vec<String>, segment: &Option<SegmentReport>) {
+    match segment {
+        Some(s) => fields.extend([
+            s.call.clone(),
+            s.score.to_string(),
+            format!("{:.4}", s.identity),
+            s.support.map_or_else(String::new, |e| format!("{e:.3e}")),
+            s.posterior.map_or_else(String::new, probability),
+            s.cigar.clone(),
+            s.sequence_start.to_string(),
+            s.sequence_end.to_string(),
+            s.germline_start.to_string(),
+            s.germline_end.to_string(),
+            s.sequence_alignment.clone(),
+            s.germline_alignment.clone(),
+        ]),
+        None => fields.extend(std::iter::repeat_n(String::new(), SEGMENT_FIELDS.len())),
     }
 }
 
@@ -236,6 +280,87 @@ pub(crate) fn co_optimal<'a>(
     CoOptimal { tied, counted }
 }
 
+/// The CIGAR, the sequence and germline alignment strings, and the evidence
+/// of `placement`'s columns on `span` (`reference` its primary allele).
+fn aligned(
+    query: &[u8],
+    placement: &Placement,
+    span: &ClipSpan,
+    reference: &[u8],
+) -> (String, String, String, Evidence) {
+    let mut cigar = String::new();
+    push_run(&mut cigar, 'S', span.q_lo);
+    push_run(&mut cigar, 'N', span.r_lo);
+    let mut sequence_alignment = String::with_capacity(span.q_len() as usize + 8);
+    let mut germline_alignment = String::with_capacity(span.r_len() as usize + 8);
+    let mut run: Option<(char, u32)> = None;
+    for (op, q, r) in placement.clip.columns(span) {
+        let (symbol, qs, rs) = match op {
+            Op::Match => {
+                let (a, b) = (query[q as usize], reference[r as usize]);
+                let symbol = if a < N && a == b { '=' } else { 'X' };
+                (
+                    symbol,
+                    char::from(decode_base(a)),
+                    char::from(decode_base(b)),
+                )
+            }
+            Op::Ins => ('I', char::from(decode_base(query[q as usize])), '-'),
+            Op::Del => ('D', '-', char::from(decode_base(reference[r as usize]))),
+        };
+        sequence_alignment.push(qs);
+        germline_alignment.push(rs);
+        run = match run {
+            Some((s, len)) if s == symbol => Some((s, len + 1)),
+            Some((s, len)) => {
+                push_run(&mut cigar, s, len);
+                Some((symbol, 1))
+            }
+            None => Some((symbol, 1)),
+        };
+    }
+    if let Some((s, len)) = run {
+        push_run(&mut cigar, s, len);
+    }
+    push_run(&mut cigar, 'S', query.len() as u32 - span.q_hi);
+    let evidence = Evidence::from_columns(placement.clip.columns(span), query, reference);
+    (cigar, sequence_alignment, germline_alignment, evidence)
+}
+
+/// The report of `called`: the co-optimal names, and the primary's clipped
+/// alignment and coordinates.
+fn called_report(
+    query: &[u8],
+    set: &GermlineSet,
+    co: &CoOptimal<'_>,
+    called: &CalledSegment,
+    support: Option<f64>,
+    posterior: Option<f64>,
+) -> SegmentReport {
+    let placement = co.tied[0];
+    let span = placement
+        .clip
+        .span(called.entry, called.exit)
+        .expect("primary tied placement clips to the called interval");
+    let reference = &set.allele(placement.primary_allele()).codes;
+    let (cigar, sequence_alignment, germline_alignment, evidence) =
+        aligned(query, placement, &span, reference);
+    SegmentReport {
+        call: co.names(set).join(","),
+        score: span.score,
+        identity: evidence.identity(),
+        support,
+        posterior,
+        cigar,
+        sequence_start: span.q_lo + 1,
+        sequence_end: span.q_hi,
+        germline_start: span.r_lo + 1,
+        germline_end: span.r_hi,
+        sequence_alignment,
+        germline_alignment,
+    }
+}
+
 fn segment_report<C: AlleleCatalog>(
     call: &Call,
     called: &CalledSegment,
@@ -243,7 +368,7 @@ fn segment_report<C: AlleleCatalog>(
     support: &SupportModels,
 ) -> Option<SegmentReport> {
     let kind = call.placements[called.placement].kind;
-    debug_assert!(
+    assert!(
         kind.is_rearranged(),
         "a C placement reached the V(D)J report"
     );
@@ -267,12 +392,6 @@ fn segment_report<C: AlleleCatalog>(
             before.unwrap_or(0)..after.unwrap_or(call.query.len() as u32)
         });
     let co = co_optimal(&call.placements, &call.query, set, called, per_read, region);
-    let placement = co.tied[0];
-    let span = placement
-        .clip
-        .span(called.entry, called.exit)
-        .expect("primary tied placement clips to the called interval");
-    let reference = &set.allele(placement.primary_allele()).codes;
     let posterior = call.marginals.as_ref().map(|m| {
         co.counted
             .iter()
@@ -282,63 +401,46 @@ fn segment_report<C: AlleleCatalog>(
             // D placements, so the sum is then an upper bound.
             .min(1.0)
     });
-    let names = co.names(set);
-
-    // CIGAR and alignment strings.
-    let mut cigar = String::new();
-    push_run(&mut cigar, 'S', span.q_lo);
-    push_run(&mut cigar, 'N', span.r_lo);
-    let mut sequence_alignment = String::with_capacity(span.q_len() as usize + 8);
-    let mut germline_alignment = String::with_capacity(span.r_len() as usize + 8);
-    let mut run: Option<(char, u32)> = None;
-    for (op, q, r) in placement.clip.columns(&span) {
-        let (symbol, qs, rs) = match op {
-            Op::Match => {
-                let (a, b) = (call.query[q as usize], reference[r as usize]);
-                let symbol = if a < N && a == b { '=' } else { 'X' };
-                (
-                    symbol,
-                    char::from(decode_base(a)),
-                    char::from(decode_base(b)),
-                )
-            }
-            Op::Ins => ('I', char::from(decode_base(call.query[q as usize])), '-'),
-            Op::Del => ('D', '-', char::from(decode_base(reference[r as usize]))),
-        };
-        sequence_alignment.push(qs);
-        germline_alignment.push(rs);
-        run = match run {
-            Some((s, len)) if s == symbol => Some((s, len + 1)),
-            Some((s, len)) => {
-                push_run(&mut cigar, s, len);
-                Some((symbol, 1))
-            }
-            None => Some((symbol, 1)),
-        };
-    }
-    if let Some((s, len)) = run {
-        push_run(&mut cigar, s, len);
-    }
-    push_run(&mut cigar, 'S', call.query.len() as u32 - span.q_hi);
-
-    let evidence = Evidence::from_columns(placement.clip.columns(&span), &call.query, reference);
-    let evalue = support[kind.index()]
-        .map(|ka| ka.evalue(span.score, call.query.len(), set.total_len(), set.len()));
-
-    Some(SegmentReport {
-        call: names.join(","),
-        score: span.score,
-        identity: evidence.identity(),
-        support: evalue,
+    let evalue = support[kind.index()].map(|ka| {
+        ka.evalue(
+            called.span.score,
+            call.query.len(),
+            set.total_len(),
+            set.len(),
+        )
+    });
+    Some(called_report(
+        &call.query,
+        set,
+        &co,
+        called,
+        evalue,
         posterior,
-        cigar,
-        sequence_start: span.q_lo + 1,
-        sequence_end: span.q_hi,
-        germline_start: span.r_lo + 1,
-        germline_end: span.r_hi,
-        sequence_alignment,
-        germline_alignment,
-    })
+    ))
+}
+
+/// The report of the read's C call: support is its anchored E-value
+/// ([`crate::constant`]), not a K·m·n E-value.
+fn constant_report<C: AlleleCatalog>(call: &Call, catalog: &C) -> Option<SegmentReport> {
+    let c = call.c.as_ref()?;
+    let set = catalog.segment(SegmentKind::C)?.set();
+    let called = &c.segment;
+    let co = co_optimal(
+        &call.constant,
+        &call.query,
+        set,
+        called,
+        false,
+        called.entry..called.exit,
+    );
+    Some(called_report(
+        &call.query,
+        set,
+        &co,
+        called,
+        Some(c.evalue),
+        Some(c.posterior),
+    ))
 }
 
 impl AirrRecord {
@@ -357,6 +459,7 @@ impl AirrRecord {
             d: None,
             d2: None,
             j: None,
+            c: constant_report(call, catalog),
             np1: None,
             np2: None,
             np3: None,
@@ -364,6 +467,7 @@ impl AirrRecord {
             d_presence_posterior: None,
             regions: ReadRegions::from_call(call, catalog),
             oriented: decode(&call.query),
+            c_columns: catalog.segment(SegmentKind::C).is_some(),
         };
         let Some(path) = &call.path else {
             return record;
@@ -387,7 +491,7 @@ impl AirrRecord {
                 SegmentKind::D if record.d.is_none() => &mut record.d,
                 SegmentKind::D => &mut record.d2,
                 SegmentKind::J => &mut record.j,
-                SegmentKind::C => unreachable!("C placements never enter a V(D)J path"),
+                SegmentKind::C => unreachable!("segment_report refuses C"),
             };
             *slot = report;
         }
@@ -404,7 +508,14 @@ impl AirrRecord {
         self.oriented.get(range.start as usize..range.end as usize)
     }
 
+    /// Column names of [`Self::to_tsv`] for an assigner without a C stage.
     pub fn tsv_header() -> String {
+        Self::tsv_header_with(false)
+    }
+
+    /// Column names of [`Self::to_tsv`]; with a C stage (`constant`) the
+    /// twelve `c_` columns follow `productive`.
+    pub fn tsv_header_with(constant: bool) -> String {
         let mut columns = vec![
             "sequence_id".to_string(),
             "sequence".to_string(),
@@ -438,6 +549,9 @@ impl AirrRecord {
             ]
             .map(str::to_string),
         );
+        if constant {
+            columns.extend(SEGMENT_FIELDS.iter().map(|f| format!("c_{f}")));
+        }
         columns.join("\t")
     }
 
@@ -448,23 +562,7 @@ impl AirrRecord {
             (if self.rev_comp { "T" } else { "F" }).to_string(),
         ];
         for segment in [&self.v, &self.d, &self.d2, &self.j] {
-            match segment {
-                Some(s) => fields.extend([
-                    s.call.clone(),
-                    s.score.to_string(),
-                    format!("{:.4}", s.identity),
-                    s.support.map_or_else(String::new, |e| format!("{e:.3e}")),
-                    s.posterior.map_or_else(String::new, probability),
-                    s.cigar.clone(),
-                    s.sequence_start.to_string(),
-                    s.sequence_end.to_string(),
-                    s.germline_start.to_string(),
-                    s.germline_end.to_string(),
-                    s.sequence_alignment.clone(),
-                    s.germline_alignment.clone(),
-                ]),
-                None => fields.extend(std::iter::repeat_n(String::new(), SEGMENT_FIELDS.len())),
-            }
+            push_segment(&mut fields, segment);
         }
         for np in [&self.np1, &self.np2, &self.np3] {
             match np {
@@ -511,6 +609,9 @@ impl AirrRecord {
             flag(self.regions.stop_codon),
             flag(self.regions.productive),
         ]);
+        if self.c_columns {
+            push_segment(&mut fields, &self.c);
+        }
         fields.join("\t")
     }
 }
