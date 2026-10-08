@@ -7,7 +7,8 @@
 //! W occur), random mutation of non-conserved framework residues, random
 //! synonymous codons, and optional 5′ truncation that shifts the frame.
 
-use vdj_assign::annotate::{AnchorSource, AnnotateOptions, ChainType, annotate};
+use vdj_assign::annotate::{AlleleAnnotation, AnchorSource, AnnotateOptions, ChainType, annotate};
+use vdj_assign::germline::Allele;
 use vdj_assign::prelude::*;
 use vdj_assign::sim::Rng;
 use vdj_assign::translate::{codon, translate};
@@ -315,9 +316,10 @@ fn annotation_of_thousands_of_alleles_takes_milliseconds() {
 }
 
 /// 6,000 adversarial alleles per chain type: every anchor must be exact,
-/// and a wrong region start must be flagged `uncertain` (in practice a
-/// mutation-made decoy Cys next to Cys23 in a 5′-truncated allele); at most
-/// 3 starts may be wrong at all.
+/// and a wrong region start must be flagged `uncertain`; at most 3 starts
+/// may be wrong at all. (The 3 were CDR1 starts of 5′-truncated alleles
+/// with a mutation-made decoy Cys next to Cys23; the database's Cys23
+/// model now places all of them.)
 #[test]
 fn every_error_is_flagged_across_many_databases() {
     let mut flagged_errors = [0; 5];
@@ -1048,4 +1050,113 @@ fn every_tr_error_is_flagged_with_a_few_annotated_alleles() {
         }
     }
     eprintln!("flagged TR errors per start (FR1, CDR1, FR2, CDR2, FR3): {flagged:?}");
+}
+
+/// `count` TRB_38 genes without headers, named `TRBV{g}*01`.
+fn trb_38_text(count: usize, rng: &mut Rng) -> String {
+    (0..count)
+        .map(|g| {
+            record(
+                &format!("TRBV{g}*01"),
+                "",
+                &from_template(&TRB_38, rng, 0).sequence,
+            )
+        })
+        .collect()
+}
+
+/// The last allele of a TRB_38 database built from `text`, annotated.
+fn annotate_last(text: &str) -> (Allele, AlleleAnnotation) {
+    let mut v = GermlineSet::from_fasta(SegmentKind::V, text).unwrap();
+    let options = AnnotateOptions {
+        chain: Some(ChainType::Light),
+    };
+    let report = annotate(&mut v, None, options);
+    let annotation = report.v.last().unwrap().clone();
+    (v.alleles().last().unwrap().clone(), annotation)
+}
+
+/// TRB Cys23 is preceded by R, not S/T. A 5′-truncated allele (other frame,
+/// so no positional prior) with no close relative and an upstream decoy
+/// `SC` used to lose to the IG context `[ST]C`; the context, CDR1 length
+/// and offsets the database's settled alleles teach pick the true Cys23.
+#[test]
+fn cys23_model_learns_a_tr_context_and_resolves_a_truncated_allele() {
+    let mut rng = Rng::new(13);
+    let mut text = trb_38_text(40, &mut rng);
+    let target = from_template(&TRB_38, &mut rng, 0);
+    let mut sequence = target.sequence.clone();
+    let cys23 = (target.starts[1] - 12) as usize;
+    sequence[cys23 - 9..cys23 - 3].copy_from_slice(b"TCCTGT"); // S, C two codons upstream
+    text += &record("TRBVX*01", "", &sequence[1..]);
+    let (allele, annotation) = annotate_last(&text);
+    assert_eq!(
+        allele.regions.cdr1,
+        Some(target.starts[1] - 1),
+        "{annotation:?}"
+    );
+    assert!(
+        annotation.notes.iter().any(|n| n.starts_with(
+            "Cys23 ambiguous (1 other C in window); CDR1 start from the database model"
+        )),
+        "{annotation:?}"
+    );
+    assert!(annotation.uncertain[1]);
+}
+
+/// A full-length allele whose Cys23 is mutated to Tyr, with no close
+/// relative: its CDR1 starts where the database's settled alleles have
+/// theirs, and the start is marked uncertain.
+#[test]
+fn a_mutated_cys23_is_placed_at_the_database_offset() {
+    let mut rng = Rng::new(14);
+    let mut text = trb_38_text(40, &mut rng);
+    let target = from_template(&TRB_38, &mut rng, 0);
+    let mut sequence = target.sequence.clone();
+    let cys23 = (target.starts[1] - 12) as usize;
+    sequence[cys23..cys23 + 3].copy_from_slice(b"TAT");
+    text += &record("TRBVY*01", "", &sequence);
+    let (allele, annotation) = annotate_last(&text);
+    assert_eq!(allele.anchor, Some(target.anchor));
+    assert_eq!(
+        allele.regions.cdr1,
+        Some(target.starts[1]),
+        "{annotation:?}"
+    );
+    assert!(
+        annotation.notes.iter().any(|n| n
+            .starts_with("no Cys23 (Y at its position); CDR1 start from the database model (n=")
+            && n.ends_with(", p=1.00)")),
+        "{annotation:?}"
+    );
+    assert!(annotation.uncertain[1]);
+}
+
+/// A 5′-partial allele that starts after its Cys23 has no `C` to find, but
+/// its relative's CDR1 start maps into it.
+#[test]
+fn a_five_prime_partial_allele_takes_cdr1_from_its_relative() {
+    let mut rng = Rng::new(15);
+    let (v, truth, _, _) = database(ChainType::Heavy, 30, &mut rng);
+    let mut text: String = v
+        .alleles()
+        .iter()
+        .zip(&truth)
+        .filter(|(_, gene)| gene.starts[0] == 0)
+        .map(|(allele, gene)| record(&allele.name, "", &gene.sequence))
+        .collect();
+    let source = truth.iter().position(|gene| gene.starts[0] == 0).unwrap();
+    let gene = &truth[source];
+    let cut = (gene.starts[1] - 12 + 4) as usize; // one base past Cys23
+    text += &record("V0*02", "", &gene.sequence[cut..]);
+    let (allele, annotation) = annotate_last(&text);
+    assert_eq!(allele.anchor, Some(gene.anchor - cut as u32));
+    assert_eq!(
+        allele.regions.cdr1,
+        Some(gene.starts[1] - cut as u32),
+        "{annotation:?}"
+    );
+    let note = format!("no Cys23; CDR1 start from {}", v.alleles()[source].name);
+    assert!(annotation.notes.contains(&note), "{annotation:?}");
+    assert!(annotation.uncertain[1]);
 }

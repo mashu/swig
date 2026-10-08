@@ -16,6 +16,11 @@
 //! the FR3 length the database's given starts imply for the allele's
 //! Trp41 → Cys104 spacing ([`Fr3Model`]), else from the chain default
 //! (38 codons heavy, 36 light; wrong for some TR and IGL families).
+//! Likewise, when the Cys23 window holds several `C` codons or none, CDR1
+//! starts where the nearest relative with a settled Cys23 puts it, else
+//! where the database's settled alleles say Cys23 sits ([`Cys23Model`]).
+//! Every start that may be wrong is marked in
+//! [`AlleleAnnotation::uncertain`].
 //!
 //! Sources, in order of trust (a given value is never overridden):
 //!
@@ -32,12 +37,13 @@
 //!    allele's 3′ end (an IMGT 3′-partial sequence), the allele holds no
 //!    anchor and none is reported: a weak motif hit there is another codon.
 //!
-//! The chain type (which fixes the FR3 length) is voted by J residues
+//! The chain type (which fixes the default FR3 length) is voted by J residues
 //! (`W` heavy, `F` light) and Trp41 contexts (`W.R` heavy, `W.Q` light).
 //! Everything runs once per database: one translation per allele plus an
 //! alignment for the rare transferred allele — milliseconds for thousands of
 //! alleles, and nothing is added to per-read work.
 
+mod cys23;
 mod fr3;
 mod given;
 mod j_motif;
@@ -47,6 +53,7 @@ mod v_motif;
 use std::collections::HashMap;
 use std::io::{self, Write};
 
+pub use cys23::Cys23Model;
 pub use fr3::Fr3Model;
 pub use given::ImgtGaps;
 pub use j_motif::{JHit, find_j};
@@ -57,7 +64,7 @@ pub use v_motif::{VHit, VSearch, find_v};
 
 use crate::align::GotohWorkspace;
 use crate::germline::{GermlineSet, RegionSlot, RegionStarts};
-use crate::translate::codon;
+use crate::translate::{codon, translate};
 use given::Given;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,10 +141,14 @@ pub struct AlleleAnnotation {
     pub source: AnchorSource,
     pub notes: Vec<String>,
     /// Region starts (FR1, CDR1, FR2, CDR2, FR3) that may be wrong: derived
-    /// for an allele whose anchor is low-confidence or missing, a CDR1
-    /// start from an ambiguous Cys23, or a derived bound of a CDR of
-    /// unusual length. Given values are never uncertain. An error in a
-    /// start not flagged here is a silent error.
+    /// for an allele whose anchor is low-confidence or missing; a CDR1
+    /// start placed without a Cys23 codon, or from an ambiguous Cys23 that
+    /// no relative settled; a derived bound of a CDR of unusual length; an
+    /// FR3 length of model posterior below 0.95 or outside the model, or
+    /// the chain default under [`DatabaseAnnotation::fr3_warning`]; a start
+    /// transferred from a relative whose own start is uncertain. Given
+    /// values are never uncertain. An error in a start not flagged here is
+    /// a silent error.
     pub uncertain: [bool; 5],
 }
 
@@ -869,61 +880,140 @@ pub fn annotate(
         regions.push(merged);
     }
 
-    // V pass 3: an ambiguous Cys23 in an allele the positional prior could
-    // not reach (5′-truncated, other frame) is taken from the most similar
-    // unambiguous allele, if it lands on a Cys codon in this allele's frame.
-    let unambiguous: Vec<bool> = (0..v.len())
+    // V pass 3: Cys23 where the motif search could not settle it (several
+    // `C` codons in the window, or none) and no header or gap column gives
+    // CDR1: the nearest relative with a settled Cys23, else the database's
+    // Cys23 model.
+    let open_cys23: Vec<Option<VHit>> = (0..v.len())
         .map(|i| {
-            result[i].source.trusted()
-                && regions[i].cdr1.is_some()
-                && hits[i].is_some_and(|h| h.cys23_alternatives == 0)
+            trusted_hits[i]
+                .filter(|h| h.trp41.is_some() && (h.cys23_alternatives > 0 || h.cys23.is_none()))
+                .filter(|_| given[i].regions[1] == RegionSlot::Unknown)
         })
         .collect();
-    let any_unambiguous = unambiguous.iter().any(|&u| u);
-    for index in 0..v.len() {
-        if !any_unambiguous {
-            break;
-        }
-        let Some(hit) =
-            hits[index].filter(|h| h.cys23_alternatives > 0 && result[index].source.trusted())
-        else {
-            continue;
-        };
-        if Some(hit.frame as u32) == frame_mode || given[index].regions[1] != RegionSlot::Unknown {
-            continue;
-        }
-        let relatives = relatives(&mut relative_index, v);
-        let Some(Relative { donor, mapped, .. }) = from_relative(
-            v,
-            index,
-            &unambiguous,
-            relatives,
-            |d| vec![regions[d].cdr1],
-            &mut workspace,
-        ) else {
-            continue;
-        };
-        let codes = &v.alleles()[index].codes;
-        let lands_on_cys = mapped[0]
-            .filter(|&p| p >= 12 && p % 3 == hit.frame as u32)
-            .filter(|&p| residue_at(codes, p - 12) == b'C');
-        if let Some(cdr1) = lands_on_cys {
-            let mut values = regions[index].values();
-            values[1] = Some(cdr1);
-            if RegionStarts::from_values(values)
-                .check(anchors[index], codes.len())
-                .is_ok()
+    if open_cys23.iter().any(Option::is_some) {
+        let settled: Vec<bool> = (0..v.len())
+            .map(|i| {
+                regions[i].cdr1.is_some()
+                    && trusted_hits[i].is_some()
+                    && (given[i].regions[1].known().is_some() || open_cys23[i].is_none())
+            })
+            .collect();
+        let translations: Vec<Option<Vec<u8>>> = trusted_hits
+            .iter()
+            .enumerate()
+            .map(|(i, h)| h.map(|h| translate(&v.alleles()[i].codes, h.frame)))
+            .collect();
+        let model = Cys23Model::learn((0..v.len()).filter(|&i| settled[i]).filter_map(|i| {
+            let h = trusted_hits[i]?;
+            let cys23 = regions[i].cdr1?.checked_sub(12 + h.frame as u32)?;
+            Some(cys23::Label {
+                aa: translations[i].as_deref()?,
+                frame: h.frame,
+                cys23: cys23.is_multiple_of(3).then_some(cys23 as usize / 3)?,
+                trp41: h.trp41?,
+            })
+        }));
+        let any_settled = settled.contains(&true);
+        for index in 0..v.len() {
+            let Some(hit) = open_cys23[index] else {
+                continue;
+            };
+            let missing = hit.cys23.is_none();
+            let codes = &v.alleles()[index].codes;
+            let set_cdr1 = |regions: &mut RegionStarts, cdr1: u32| {
+                let mut values = regions.values();
+                values[1] = Some(cdr1);
+                let candidate = RegionStarts::from_values(values);
+                let fits = candidate.check(anchors[index], codes.len()).is_ok();
+                if fits {
+                    *regions = candidate;
+                }
+                fits
+            };
+            // 1. The nearest relative with a settled Cys23, in any frame. With
+            // no Cys in the window, its CDR1 start is taken as mapped (it may
+            // precede position 12: a 5′-partial allele that starts after Cys23).
+            let relative = if any_settled {
+                from_relative(
+                    v,
+                    index,
+                    &settled,
+                    relatives(&mut relative_index, v),
+                    |d| vec![regions[d].cdr1],
+                    &mut workspace,
+                )
+            } else {
+                None
+            };
+            if let Some(Relative { donor, mapped, .. }) = relative {
+                let lands = mapped[0]
+                    .filter(|&p| p % 3 == hit.frame as u32)
+                    .filter(|&p| missing || (p >= 12 && residue_at(codes, p - 12) == b'C'));
+                if let Some(cdr1) = lands
+                    && set_cdr1(&mut regions[index], cdr1)
+                {
+                    let name = &v.alleles()[donor].name;
+                    let annotation = &mut result[index];
+                    if missing {
+                        annotation
+                            .notes
+                            .push(format!("no Cys23; CDR1 start from {name}"));
+                        annotation.uncertain[1] = true;
+                    } else {
+                        annotation
+                            .notes
+                            .retain(|n| !n.starts_with("Cys23 ambiguous"));
+                        annotation
+                            .notes
+                            .push(format!("ambiguous Cys23 resolved from {name}"));
+                        annotation.uncertain[1] = false;
+                    }
+                    continue;
+                }
+            }
+            // 2. The database's Cys23 model, over the `C` codons of the
+            // window; a mutated Cys23 is placed only at an offset where a
+            // labelled allele has its Cys23 (a full-length 5′ end), and only
+            // when it takes half the posterior.
+            let (Some(model), Some(aa), Some(trp41)) =
+                (&model, translations[index].as_deref(), hit.trp41)
+            else {
+                continue;
+            };
+            let window = trp41.saturating_sub(20)..=(trp41.saturating_sub(10)).min(aa.len() - 1);
+            let candidates = window
+                .filter(|&k| aa[k] == b'C' || (missing && model.seen_offset(3 * k + hit.frame)));
+            let Some((k, p)) = model.choose(aa, hit.frame, trp41, candidates) else {
+                continue;
+            };
+            if (missing && p < 0.5)
+                || !set_cdr1(&mut regions[index], (3 * k + hit.frame) as u32 + 12)
             {
-                regions[index] = RegionStarts::from_values(values);
-                let annotation = &mut result[index];
-                annotation
-                    .notes
-                    .retain(|n| !n.starts_with("Cys23 ambiguous"));
+                continue;
+            }
+            let annotation = &mut result[index];
+            annotation.uncertain[1] = true;
+            if missing {
                 annotation.notes.push(format!(
-                    "ambiguous Cys23 resolved from {}",
-                    v.alleles()[donor].name
+                    "no Cys23 ({} at its position); CDR1 start from the database model (n={}, p={})",
+                    char::from(aa[k]),
+                    model.labels(),
+                    probability(p)
                 ));
-                annotation.uncertain[1] = false;
+            } else {
+                for note in annotation
+                    .notes
+                    .iter_mut()
+                    .filter(|n| n.starts_with("Cys23 ambiguous"))
+                {
+                    *note = format!(
+                        "Cys23 ambiguous ({} other C in window); CDR1 start from the database model (n={}, p={})",
+                        hit.cys23_alternatives,
+                        model.labels(),
+                        probability(p)
+                    );
+                }
             }
         }
     }
