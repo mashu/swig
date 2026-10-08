@@ -367,7 +367,7 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
         let placements = self.placements;
         let grammar = &self.dag.grammar;
         let lambda0 = self.w.lambda;
-        s.lattice.layout(placements);
+        s.lattice.layout(placements, |_| true);
         let cells = s.lattice.cells();
         for (weights, fill) in [(&mut s.entry_w, 0.0), (&mut s.exit_w, 0.0)]
             .into_iter()
@@ -387,7 +387,9 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
             // can precede this one, exits before the end only when one can
             // follow it. Only those set the centres and the spread.
             let starts = grammar.can_start(p.kind);
-            let ends = SegmentKind::ALL.iter().any(|&f| grammar.can_end(f, p.kind));
+            let ends = SegmentKind::ALL
+                .iter()
+                .any(|&f| any_d(&|d| grammar.can_end(f, p.kind, d)));
             let preceded = SegmentKind::ALL
                 .iter()
                 .any(|&k| any_d(&|d| grammar.can_follow(k, p.kind, d)));
@@ -655,7 +657,7 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
                     }
                 }
             }
-            if self.dag.grammar.can_end(first, node.kind) && x[width - 1] > 0.0 {
+            if self.dag.grammar.can_end(first, node.kind, d_used) && x[width - 1] > 0.0 {
                 let bonus = self.w.of(self.dag.model.end(first, node.kind, d_used));
                 end = Some((
                     usize::from(d_used),
@@ -679,7 +681,7 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
         }
         let width = node.width();
         let successors = &s.lattice.nodes[s.lattice.successors(b)..];
-        let can_end = grammar.can_end(first, node.kind);
+        let can_end = grammar.can_end(first, node.kind, d_used);
         let follows = |kind: SegmentKind| grammar.can_follow(node.kind, kind, d_used);
         // As in the forward pass, an N/P gap to a successor that starts after
         // this node's end joins the log scale.
@@ -920,7 +922,7 @@ mod tests {
             for x in Self::exits(b).into_iter().filter(|&x| x >= entry + min_b) {
                 let evidence = self.evidence(b, entry, x);
                 let (nats, units) = (nats + evidence.0 + bonus.0, units + evidence.1 + bonus.1);
-                if dag.grammar.can_end(first, b.kind) && x == b.q_end() {
+                if dag.grammar.can_end(first, b.kind, d_used) && x == b.q_end() {
                     let end = self.prior(dag.model.end(first, b.kind, d_used));
                     let weight = (nats + end.0).exp();
                     self.z += weight;

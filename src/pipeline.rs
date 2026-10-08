@@ -403,7 +403,9 @@ where
     }
 
     /// Stage 5, per read: adjudication into calls. A path
-    /// without an anchor ([`Placement::anchor`]) is not a call.
+    /// without an anchor ([`Placement::anchor`]) is not a call. A path the
+    /// adjudicator decodes from the posterior replaces the call when it
+    /// keeps an anchor.
     fn stage_adjudicate(
         &self,
         reads: &[ReadState],
@@ -413,16 +415,22 @@ where
     ) {
         out.reserve(reads.len());
         for (state, placed) in reads.iter().zip(placements.iter_mut()) {
-            let path = self
+            let anchored = |path: &CallPath| {
+                !self.requires_anchor() || path.segments.iter().any(|s| placed[s.placement].anchor)
+            };
+            let mut path = self
                 .adjudicator
                 .adjudicate(state.query.len(), placed, adjudication)
-                .filter(|path| {
-                    !self.requires_anchor()
-                        || path.segments.iter().any(|s| placed[s.placement].anchor)
-                });
+                .filter(anchored);
             let marginals = path
                 .as_ref()
                 .and_then(|path| self.adjudicator.marginals(placed, path, adjudication));
+            if let (Some(called), Some(m)) = (&path, &marginals)
+                && let Some(decoded) = self.adjudicator.decode(placed, called, m, adjudication)
+                && anchored(&decoded)
+            {
+                path = Some(decoded);
+            }
             out.push(Call {
                 orientation: state.orientation.expect("stage 1 orients every read"),
                 query: state.query.clone(),

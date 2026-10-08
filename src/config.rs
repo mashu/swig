@@ -9,7 +9,9 @@
 use std::fmt;
 use std::sync::Arc;
 
-use crate::adjudicate::{CallModel, EngineeringObjective, EvidenceModel, PlacementDag, VdjGrammar};
+use crate::adjudicate::{
+    CallModel, DAlleleDecoding, EngineeringObjective, EvidenceModel, PlacementDag, VdjGrammar,
+};
 use crate::admission::{AnyOf, DistributedEvidence, ExactRunFloor};
 use crate::align::{Backend, InterSequenceGotoh};
 use crate::flank::OuterExtend;
@@ -195,6 +197,10 @@ pub struct EngineConfig {
     /// The model the DAG's call maximises: each read's own (the model its
     /// posteriors come from) or the fixed scores.
     pub calls: CallModel,
+    /// How the reported D allele is chosen: the call's, or the one of
+    /// largest posterior marginal given the call's topology. The latter
+    /// needs `posterior`; without it the D allele is the call's.
+    pub d_allele: DAlleleDecoding,
     /// Report posterior probabilities (forward–backward over the placement
     /// DAG, priors at the V scoring's λ, alignment evidence at each read's
     /// divergence): per called segment and for D presence. With posteriors,
@@ -287,6 +293,7 @@ impl Default for EngineConfig {
             // A clipped V or J keeps at least one base, a D `min_d_match`.
             min_retained: [1, 4, 1],
             calls: CallModel::default(),
+            d_allele: DAlleleDecoding::default(),
             posterior: true,
             simd: None,
             options: AssignerOptions::default(),
@@ -473,6 +480,7 @@ impl Assigner {
             evidence,
             calls: config.calls,
             posterior: config.posterior && evidence.is_some(),
+            d_allele: config.d_allele,
             ..PlacementDag::new(grammar, objective, config.min_retained)
         };
         Ok(Assigner {

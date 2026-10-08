@@ -64,6 +64,9 @@ options:
   --no-posterior       skip posterior probabilities (*_posterior columns; ~30 % faster)
   --calls MODEL        the model the call maximises: per-read (each read's own, the
                        model its posteriors come from) | fixed (the (2, -3) scores)
+  --d-allele RULE      the reported D allele: map (the call's) | max-marginal (largest
+                       posterior marginal given the call's D presence and topology;
+                       needs posteriors, so --no-posterior and --residual report map)
   --simd NAME          alignment kernel: avx512 | avx2 | neon | portable | scalar
                        (default: the fastest this CPU supports, avx512 excepted)
   --residual           ordinary commit-V/J-then-D adjudication instead of the DAG
@@ -104,6 +107,7 @@ struct Args {
     threads: Option<String>,
     simd: Option<String>,
     calls: Option<String>,
+    d_allele: Option<String>,
     chain: Option<String>,
     tandem_d: bool,
     forward_only: bool,
@@ -163,6 +167,9 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--threads" if assign => set_once(&mut args.threads, "--threads", value("--threads")?)?,
             "--simd" if assign => set_once(&mut args.simd, "--simd", value("--simd")?)?,
             "--calls" if assign => set_once(&mut args.calls, "--calls", value("--calls")?)?,
+            "--d-allele" if assign => {
+                set_once(&mut args.d_allele, "--d-allele", value("--d-allele")?)?
+            }
             "--tandem-d" if assign => args.tandem_d = true,
             "--forward-only" if assign => args.forward_only = true,
             "--no-anchor-window" if assign => args.no_anchor_window = true,
@@ -363,6 +370,13 @@ fn run_assign(args: &Args) -> Result<(), Box<dyn Error>> {
             "per-read" => CallModel::PerRead,
             "fixed" => CallModel::FixedScale,
             _ => return Err(format!("unknown --calls '{name}'").into()),
+        };
+    }
+    if let Some(name) = args.d_allele.as_deref() {
+        config.d_allele = match name {
+            "map" => DAlleleDecoding::Map,
+            "max-marginal" => DAlleleDecoding::MaxMarginal,
+            _ => return Err(format!("unknown --d-allele '{name}'").into()),
         };
     }
     let support: SupportModels = [

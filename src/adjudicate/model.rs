@@ -19,7 +19,8 @@ pub trait Grammar: Send + Sync {
     fn can_start(&self, kind: SegmentKind) -> bool;
     /// `d_used` counts D segments up to and including `prev`.
     fn can_follow(&self, prev: SegmentKind, next: SegmentKind, d_used: u8) -> bool;
-    fn can_end(&self, first: SegmentKind, last: SegmentKind) -> bool;
+    /// Whether a path from `first` to `last` with `d_count` D segments is complete.
+    fn can_end(&self, first: SegmentKind, last: SegmentKind, d_count: u8) -> bool;
 }
 
 /// V → D{0..max_d} → J with optional truncation at either end.
@@ -77,7 +78,7 @@ impl Grammar for VdjGrammar {
         }
     }
 
-    fn can_end(&self, first: SegmentKind, last: SegmentKind) -> bool {
+    fn can_end(&self, first: SegmentKind, last: SegmentKind, _d_count: u8) -> bool {
         let has_flank = first != SegmentKind::D || last != SegmentKind::D;
         has_flank && (!self.require_j || last == SegmentKind::J)
     }
@@ -115,6 +116,24 @@ pub trait PathModel: Send + Sync {
     /// Whole-path term (e.g. the V+J pair bonus).
     fn end(&self, _first: SegmentKind, _last: SegmentKind, _d_count: u8) -> Score {
         0
+    }
+}
+
+impl<M: PathModel> PathModel for &M {
+    fn d_presence(&self) -> f64 {
+        (**self).d_presence()
+    }
+
+    fn segment_bonus(&self, placement: &Placement, d_ordinal: u8) -> Score {
+        (**self).segment_bonus(placement, d_ordinal)
+    }
+
+    fn junction_per_base(&self, prev: SegmentKind, next: SegmentKind) -> Score {
+        (**self).junction_per_base(prev, next)
+    }
+
+    fn end(&self, first: SegmentKind, last: SegmentKind, d_count: u8) -> Score {
+        (**self).end(first, last, d_count)
     }
 }
 
@@ -160,7 +179,8 @@ impl EngineeringObjective {
     /// Smallest D local score that can improve a fixed-scale path: `P_D + 1`,
     /// with `P_D = ⌊P*_D⌋`. It bounds nothing for a per-read call: there a D
     /// scoring 10 ≤ `P_D` (8 matches, 2 mismatches) is worth 6.40 nats at
-    /// `p̂ = 0.3`, above its cost `c_D` of 5.38 ([`super::units`]).
+    /// `p̂ = 0.3`, above its cost `c_D` of 5.38 for `P*_D = 10.45`
+    /// ([`super::ReadModel`]).
     ///
     /// A clipped span of an optimal local alignment never outscores the
     /// whole alignment (its prefixes and suffixes score ≥ 0), so a D scoring

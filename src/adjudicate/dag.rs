@@ -56,6 +56,7 @@
 //! the predecessor's latest exit; and across predecessors, a path start, then
 //! the first predecessor in DAG order.
 
+use super::decode::{DAlleleDecoding, Topology, Within, max_marginal_d};
 use super::lattice::{Group, KINDS, Lattice};
 use super::model::{Grammar, PathModel, VdjGrammar};
 use super::posterior::{Marginals, PosteriorScratch};
@@ -82,6 +83,8 @@ pub struct PlacementDag<G = VdjGrammar, M = EngineeringObjective> {
     /// Whether [`Adjudicator::marginals`] returns posterior marginals (see
     /// [`PlacementDag::posterior`]); needs `evidence`.
     pub posterior: bool,
+    /// How [`Adjudicator::decode`] chooses the D allele.
+    pub d_allele: DAlleleDecoding,
 }
 
 impl Default for PlacementDag {
@@ -176,6 +179,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
             evidence: None,
             calls: CallModel::FixedScale,
             posterior: false,
+            d_allele: DAlleleDecoding::Map,
         }
     }
 
@@ -184,9 +188,16 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         self.min_retained[kind.index()].max(1)
     }
 
-    /// The lattice with the prefix value of every canonical cut under `read`.
-    fn layout(&self, placements: &[Placement], read: &ReadModel, s: &mut DagScratch) {
-        s.lattice.layout(placements);
+    /// The lattice of the kept placements with the prefix value of every
+    /// canonical cut under `read`.
+    fn layout(
+        &self,
+        placements: &[Placement],
+        keep: impl Fn(usize) -> bool,
+        read: &ReadModel,
+        s: &mut DagScratch,
+    ) {
+        s.lattice.layout(placements, keep);
         s.entry.clear();
         s.entry.resize(s.lattice.cells(), None);
         s.exit.clear();
@@ -389,7 +400,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
             }
         }
         let end = s.exits[slot.values + width - 1]?;
-        self.grammar.can_end(first, node.kind).then(|| {
+        self.grammar.can_end(first, node.kind, d_used).then(|| {
             let score = PathScore {
                 score: end.key.0 + read.prior(self.model.end(first, node.kind, d_used)),
                 d_count: d_used,
@@ -426,6 +437,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
                     .clip
                     .span(y, x)
                     .expect("canonical cuts keep at least min_retained bases"),
+                by_marginal: false,
             });
             let back =
                 s.forward[slot.values + entry as usize].expect("traced entries are reachable");
@@ -447,7 +459,42 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         read: &ReadModel,
         s: &mut DagScratch,
     ) -> Option<(PathScore<Units>, Vec<CalledSegment>)> {
-        self.layout(placements, read, s);
+        self.best_path(placements, |_| true, read, s)
+    }
+
+    /// The best path under `read` with `topology` through the placements
+    /// that `keep`.
+    pub fn conditioned(
+        &self,
+        placements: &[Placement],
+        keep: impl Fn(usize) -> bool,
+        topology: Topology,
+        read: &ReadModel,
+        s: &mut DagScratch,
+    ) -> Option<(PathScore<Units>, Vec<CalledSegment>)> {
+        let within = PlacementDag {
+            grammar: Within {
+                grammar: &self.grammar,
+                topology,
+            },
+            model: &self.model,
+            min_retained: self.min_retained,
+            evidence: self.evidence,
+            calls: self.calls,
+            posterior: false,
+            d_allele: DAlleleDecoding::Map,
+        };
+        within.best_path(placements, keep, read, s)
+    }
+
+    fn best_path(
+        &self,
+        placements: &[Placement],
+        keep: impl Fn(usize) -> bool,
+        read: &ReadModel,
+        s: &mut DagScratch,
+    ) -> Option<(PathScore<Units>, Vec<CalledSegment>)> {
+        self.layout(placements, keep, read, s);
         let mut best: Option<(PathScore<Units>, Cell)> = None;
         for e in 0..s.lattice.nodes.len() {
             self.gather(read, s, e);
@@ -547,6 +594,46 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
     ) -> Option<Marginals> {
         let nats = self.nats(path.divergence).filter(|_| self.posterior)?;
         self.posterior(placements, &nats, &mut scratch.posterior)
+    }
+
+    /// Under [`DAlleleDecoding::MaxMarginal`], a call with one D whose
+    /// allele is not the max-marginal one is re-traced with the call's
+    /// topology through the D placements of that allele.
+    fn decode(
+        &self,
+        placements: &[Placement],
+        path: &CallPath,
+        marginals: &Marginals,
+        scratch: &mut DagScratch,
+    ) -> Option<CallPath> {
+        if self.d_allele != DAlleleDecoding::MaxMarginal {
+            return None;
+        }
+        let kind = |segment: &CalledSegment| placements[segment.placement].kind;
+        let mut ds = path.segments.iter().filter(|s| kind(s) == SegmentKind::D);
+        let (Some(called), None) = (ds.next(), ds.next()) else {
+            return None;
+        };
+        let allele = max_marginal_d(placements, &placements[called.placement], marginals)?;
+        let topology = Topology {
+            first: kind(&path.segments[0]),
+            last: kind(&path.segments[path.segments.len() - 1]),
+            d_count: 1,
+        };
+        let keep = |i: usize| {
+            let p = &placements[i];
+            p.kind != SegmentKind::D || p.alleles.contains(&allele)
+        };
+        let read = self.read_model(path.divergence);
+        let (_, mut segments) = self.conditioned(placements, keep, topology, &read, scratch)?;
+        for segment in &mut segments {
+            segment.by_marginal = kind(segment) == SegmentKind::D;
+        }
+        Some(CallPath {
+            score: self.path_score(placements, &segments),
+            segments,
+            ..*path
+        })
     }
 }
 
@@ -654,12 +741,9 @@ mod tests {
     }
 
     /// A read with two D candidates in its N region: an exact 7-mer (score
-    /// 14) and a 10-mer with a mismatch in its middle (score 15), whose best
-    /// clip is 5 bases. The fixed scale takes the 10-mer. At low divergence a
-    /// mismatch costs `ln(4p̂/3)` (−4.1 nats at `p̂ = 1.2 %`, not −1.9), so the
-    /// read's own model takes the exact 7-mer: 9.6 nats against 8.3.
-    #[test]
-    fn a_per_read_call_takes_the_exact_short_d_at_low_divergence() {
+    /// 14, placement 1) and a 10-mer with a mismatch in its middle (score 15,
+    /// placement 2), whose best clip is 5 bases.
+    fn two_ds() -> (Vec<u8>, [Placement; 4]) {
         let v = b"TTTTTTTTTTTTTTTTTTTT";
         let d1 = b"GACCTAG";
         let d2 = b"CAGTCTTGCA";
@@ -674,14 +758,23 @@ mod tests {
         let query = encode(&ascii);
         let mut d2_reference = encode(d2);
         d2_reference[5] = (d2_reference[5] + 1) & 3;
-        let placements = [
+        let mut placements = [
             placement(SegmentKind::V, &query, &encode(v), 0),
             placement(SegmentKind::D, &query, &encode(d1), 22),
             placement(SegmentKind::D, &query, &d2_reference, 31),
             placement(SegmentKind::J, &query, &encode(j), 43),
         ];
-        assert_eq!(placements[1].score(), 14);
-        assert_eq!(placements[2].score(), 15);
+        placements[2].alleles = vec![1];
+        assert_eq!((placements[1].score(), placements[2].score()), (14, 15));
+        (query, placements)
+    }
+
+    /// The fixed scale takes the 10-mer of [`two_ds`]. At low divergence a
+    /// mismatch costs `ln(4p̂/3)` (−4.1 nats at `p̂ = 1.2 %`, not −1.9), so the
+    /// read's own model takes the exact 7-mer: 9.6 nats against 8.3.
+    #[test]
+    fn a_per_read_call_takes_the_exact_short_d_at_low_divergence() {
+        let (query, placements) = two_ds();
         let model = EngineeringObjective {
             d_presence: 10.0,
             ..EngineeringObjective::default()
@@ -712,6 +805,54 @@ mod tests {
         let at = ReadModel::at(&evidence(), delta0, 10.0);
         let (_, segments) = per_read.viterbi(&placements, &at, &mut scratch).unwrap();
         assert_eq!(segments[1].placement, 2);
+    }
+
+    /// On the fixed scale the call takes the 10-mer of [`two_ds`], but the
+    /// posterior at the read's divergence puts more mass on the exact 7-mer:
+    /// decoding its max-marginal allele re-traces the path through it, with
+    /// the call's topology, V and J.
+    #[test]
+    fn the_max_marginal_d_allele_is_retraced() {
+        let (query, placements) = two_ds();
+        let dag = PlacementDag {
+            evidence: Some(evidence()),
+            posterior: true,
+            d_allele: DAlleleDecoding::MaxMarginal,
+            ..PlacementDag::new(
+                VdjGrammar::VDJ,
+                EngineeringObjective {
+                    d_presence: 10.0,
+                    ..EngineeringObjective::default()
+                },
+                [1, 4, 1],
+            )
+        };
+        let mut scratch = DagScratch::default();
+        let call = dag
+            .adjudicate(query.len(), &placements, &mut scratch)
+            .unwrap();
+        assert_eq!(call.segments[1].placement, 2);
+        let m = dag.marginals(&placements, &call, &mut scratch).unwrap();
+        assert!(m.placement[1] > m.placement[2], "{:?}", m.placement);
+        let decoded = dag.decode(&placements, &call, &m, &mut scratch).unwrap();
+        let picks = |path: &CallPath| -> Vec<(usize, bool)> {
+            path.segments
+                .iter()
+                .map(|s| (s.placement, s.by_marginal))
+                .collect()
+        };
+        assert_eq!(picks(&decoded), [(0, false), (1, true), (3, false)]);
+        assert_eq!(decoded.score.score, 84);
+        // The call's own allele is kept when it is the max-marginal one.
+        let map = PlacementDag {
+            d_allele: DAlleleDecoding::Map,
+            ..dag
+        };
+        assert!(map.decode(&placements, &call, &m, &mut scratch).is_none());
+        assert!(
+            dag.decode(&placements, &decoded, &m, &mut scratch)
+                .is_none()
+        );
     }
 
     /// At high divergence a D scoring `P_D` can win a per-read call: 8

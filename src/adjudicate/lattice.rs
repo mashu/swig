@@ -119,10 +119,12 @@ pub(super) struct Lattice {
 }
 
 impl Lattice {
-    /// Lay out `placements` as nodes in DAG order, with no slots yet.
-    pub fn layout(&mut self, placements: &[Placement]) {
+    /// Lay out the `placements` that `keep` (by index) as nodes in DAG order,
+    /// with no slots yet. Nodes index the whole slice.
+    pub fn layout(&mut self, placements: &[Placement], keep: impl Fn(usize) -> bool) {
         self.order.clear();
-        self.order.extend(0..placements.len());
+        self.order
+            .extend((0..placements.len()).filter(|&i| keep(i)));
         self.order.sort_by_key(|&i| {
             let p = &placements[i];
             (p.kind.index(), p.q_start(), p.q_end(), i)

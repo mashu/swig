@@ -20,6 +20,7 @@
 //! reported posterior.
 
 mod dag;
+mod decode;
 mod lattice;
 mod model;
 mod posterior;
@@ -27,6 +28,7 @@ mod residual;
 mod units;
 
 pub use dag::{DagScratch, PlacementDag};
+pub use decode::{DAlleleDecoding, Topology, Within, max_marginal_d};
 pub use model::{EngineeringObjective, Grammar, PathModel, VdjGrammar};
 pub use posterior::{MAX_SPREAD, Marginals, OVERLAP_SPREAD, PosteriorScratch};
 pub use residual::{ResidualAdjudicator, ResidualScratch};
@@ -83,6 +85,10 @@ pub struct CalledSegment {
     pub exit: u32,
     /// The retained sub-alignment (its bounds may be tighter than the cuts).
     pub span: ClipSpan,
+    /// Chosen by its allele's posterior marginal
+    /// ([`DAlleleDecoding::MaxMarginal`]), so that allele is reported first;
+    /// otherwise the call's tie rules order co-optimal names.
+    pub by_marginal: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -117,6 +123,19 @@ pub trait Adjudicator: Send + Sync {
         _path: &CallPath,
         _scratch: &mut Self::Scratch,
     ) -> Option<Marginals> {
+        None
+    }
+
+    /// Another path to report, when the adjudicator decodes a segment from
+    /// the `marginals` instead of keeping the call's (see
+    /// [`DAlleleDecoding`]).
+    fn decode(
+        &self,
+        _placements: &[Placement],
+        _path: &CallPath,
+        _marginals: &Marginals,
+        _scratch: &mut Self::Scratch,
+    ) -> Option<CallPath> {
         None
     }
 }

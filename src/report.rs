@@ -145,7 +145,8 @@ fn segment_report<C: AlleleCatalog>(
                 })
         })
         .collect();
-    // The called placement first, so it wins ties of the sort key.
+    // The called placement first, so it wins ties of the sort key; one
+    // chosen by its allele's posterior marginal stays first.
     let mut tied: Vec<&Placement> = std::iter::once(dag_placement)
         .chain(
             tied_indices
@@ -154,7 +155,7 @@ fn segment_report<C: AlleleCatalog>(
                 .map(|&i| &call.placements[i]),
         )
         .collect();
-    tied.sort_by_cached_key(|p| {
+    tied[usize::from(called.by_marginal)..].sort_by_cached_key(|p| {
         let own = p
             .clip
             .span(called.entry, called.exit)

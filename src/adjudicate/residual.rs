@@ -52,6 +52,7 @@ impl Pick {
             entry: self.entry,
             exit: self.exit,
             span: self.span,
+            by_marginal: false,
         }
     }
 }

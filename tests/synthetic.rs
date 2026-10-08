@@ -7,7 +7,8 @@
 use std::collections::{HashMap, HashSet};
 
 use vdj_assign::adjudicate::{
-    Adjudicator, DagScratch, EvidenceModel, PathScore, ReadModel, Units, divergence,
+    Adjudicator, DagScratch, EvidenceModel, PathScore, ReadModel, Topology, Units, Within,
+    divergence,
 };
 use vdj_assign::placement::Placement;
 use vdj_assign::prelude::*;
@@ -340,12 +341,13 @@ fn batch_matches_sequential() {
 // Brute-force check of the DAG's running-maximum shortcuts.
 // ---------------------------------------------------------------------------
 
-/// Exhaustive search of the segmentation model: every grammatical path, and
+/// Exhaustive search of the segmentation model: every path of `grammar`, and
 /// for every transition every canonical exit cut `x` and every canonical
 /// entry cut `y ≥ x` of the next placement, with no shortcut, valued term by
 /// term under `read`. Memoised on `(placement, entry, D count, first)`.
-struct Brute<'a> {
+struct Brute<'a, G = VdjGrammar> {
     dag: &'a PlacementDag,
+    grammar: &'a G,
     placements: &'a [Placement],
     read: ReadModel,
     memo: HashMap<(usize, u32, u8, SegmentKind), Option<PathScore<Units>>>,
@@ -358,8 +360,21 @@ fn cuts(p: &Placement) -> (Vec<u32>, Vec<u32>) {
 
 impl<'a> Brute<'a> {
     fn new(dag: &'a PlacementDag, placements: &'a [Placement], read: ReadModel) -> Self {
+        Self::within(dag, &dag.grammar, placements, read)
+    }
+}
+
+impl<'a, G: Grammar> Brute<'a, G> {
+    /// The search under another grammar than `dag`'s.
+    fn within(
+        dag: &'a PlacementDag,
+        grammar: &'a G,
+        placements: &'a [Placement],
+        read: ReadModel,
+    ) -> Self {
         Self {
             dag,
+            grammar,
             placements,
             read,
             memo: HashMap::new(),
@@ -407,7 +422,7 @@ impl<'a> Brute<'a> {
         if let Some(known) = self.memo.get(&key) {
             return *known;
         }
-        let (grammar, model) = (&self.dag.grammar, &self.dag.model);
+        let (grammar, model) = (self.grammar, &self.dag.model);
         let pb = &self.placements[b];
         let bonus = self.bonus(pb, d_used);
         let mut best: Option<PathScore<Units>> = None;
@@ -416,7 +431,7 @@ impl<'a> Brute<'a> {
                 best = Some(candidate);
             }
         };
-        if grammar.can_end(first, pb.kind)
+        if grammar.can_end(first, pb.kind, d_used)
             && pb
                 .clip
                 .span(entry, pb.q_end())
@@ -474,7 +489,7 @@ impl<'a> Brute<'a> {
     /// The best path over every start.
     fn best(&mut self) -> Option<PathScore<Units>> {
         (0..self.placements.len())
-            .filter(|&s| self.dag.grammar.can_start(self.placements[s].kind))
+            .filter(|&s| self.grammar.can_start(self.placements[s].kind))
             .filter_map(|s| {
                 let p = &self.placements[s];
                 self.best_from(s, p.q_start(), u8::from(p.kind == SegmentKind::D), p.kind)
@@ -659,6 +674,133 @@ fn per_read_dag_equals_exhaustive_enumeration() {
         checked >= 600 && differs >= 50,
         "{checked} optima, {differs} differ"
     );
+}
+
+/// The conditioned pass behind max-marginal D decoding is the same DAG on a
+/// masked lattice under a restricted grammar: for every D placement of
+/// hypermutated IgSim reads, the best path with the call's topology through
+/// V, J and that D equals the exhaustive search over those placements under
+/// [`Within`]; with every placement kept it is the unconditioned call.
+#[test]
+fn conditioned_dag_equals_exhaustive_enumeration() {
+    use vdj_assign::sim::{SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
+    let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 11);
+    let config = EngineConfig::default();
+    let assigner =
+        DefaultAssigner::from_config(&config, db.v.clone(), Some(db.d.clone()), db.j.clone())
+            .unwrap();
+    let objective = config.objective.resolve(Some(&db.d), &config.d.scoring);
+    let lambda = KarlinAltschul::ungapped(&config.v.scoring).unwrap().lambda;
+    let evidence = EvidenceModel {
+        lambda,
+        substitution: [(2, -3); 3],
+    };
+    let dag = PlacementDag::new(VdjGrammar::VDJ, objective, config.min_retained);
+    let sim = Simulator::new(&db.v, Some(&db.d), &db.j, SimParams::hard()).unwrap();
+    let mut ws = assigner.workspace();
+    let mut scratch = DagScratch::default();
+    let mut checked = 0;
+    for read in sim.reads(40, 7).unwrap() {
+        let call = assigner.assign(&encode(&read.sequence), &mut ws);
+        let mut placements = top_by_kind(&call.placements, SegmentKind::V, 3);
+        placements.extend(top_by_kind(&call.placements, SegmentKind::D, 6));
+        placements.extend(top_by_kind(&call.placements, SegmentKind::J, 3));
+        let model = ReadModel::at(&evidence, divergence(&placements), objective.d_presence);
+        let Some((key, path)) = dag.viterbi(&placements, &model, &mut scratch) else {
+            continue;
+        };
+        let kind = |s: &CalledSegment| placements[s.placement].kind;
+        let topology = Topology {
+            first: kind(&path[0]),
+            last: kind(&path[path.len() - 1]),
+            d_count: key.d_count,
+        };
+        let all = dag.conditioned(&placements, |_| true, topology, &model, &mut scratch);
+        assert_eq!(all, Some((key, path.clone())));
+        let within = Within {
+            grammar: &dag.grammar,
+            topology,
+        };
+        for d in (0..placements.len()).filter(|&i| placements[i].kind == SegmentKind::D) {
+            let keep = |i: usize| placements[i].kind != SegmentKind::D || i == d;
+            let fast = dag.conditioned(&placements, keep, topology, &model, &mut scratch);
+            let kept: Vec<Placement> = (0..placements.len())
+                .filter(|&i| keep(i))
+                .map(|i| placements[i].clone())
+                .collect();
+            let exhaustive = Brute::within(&dag, &within, &kept, model).best();
+            assert_eq!(fast.as_ref().map(|(key, _)| *key), exhaustive);
+            if let Some((key, segments)) = fast {
+                assert!(segments.iter().all(|s| keep(s.placement)));
+                assert_eq!(key.d_count, topology.d_count);
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked >= 100, "{checked} conditioned optima");
+}
+
+/// Max-marginal D decoding keeps the call's topology and D presence on every
+/// read, and changes a D only to an allele of larger posterior mass.
+#[test]
+fn max_marginal_d_keeps_the_topology_and_raises_the_d_mass() {
+    use vdj_assign::sim::{SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
+    let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 11);
+    let assigner = |d_allele| {
+        let config = EngineConfig {
+            d_allele,
+            ..EngineConfig::default()
+        };
+        DefaultAssigner::from_config(&config, db.v.clone(), Some(db.d.clone()), db.j.clone())
+            .unwrap()
+    };
+    let (map, decoded) = (
+        assigner(DAlleleDecoding::Map),
+        assigner(DAlleleDecoding::MaxMarginal),
+    );
+    let sim = Simulator::new(&db.v, Some(&db.d), &db.j, SimParams::mid()).unwrap();
+    let (mut ws, mut ws2) = (map.workspace(), decoded.workspace());
+    let mut changed = 0;
+    for read in sim.reads(400, 9).unwrap() {
+        let query = encode(&read.sequence);
+        let (a, b) = (
+            map.assign(&query, &mut ws),
+            decoded.assign(&query, &mut ws2),
+        );
+        assert_eq!(a.marginals, b.marginals, "the posterior does not move");
+        let (Some(pa), Some(pb)) = (&a.path, &b.path) else {
+            assert_eq!(a.path.is_some(), b.path.is_some());
+            continue;
+        };
+        let kinds = |c: &Call, p: &CallPath| -> Vec<SegmentKind> {
+            p.segments
+                .iter()
+                .map(|s| c.placements[s.placement].kind)
+                .collect()
+        };
+        assert_eq!(kinds(&a, pa), kinds(&b, pb));
+        let d = |c: &Call, p: &CallPath| {
+            p.segments
+                .iter()
+                .find(|s| c.placements[s.placement].kind == SegmentKind::D)
+                .map(|s| c.placements[s.placement].primary_allele())
+        };
+        let (da, db_) = (d(&a, pa), d(&b, pb));
+        if da != db_ {
+            let m = b.marginals.as_ref().unwrap();
+            let mass = |allele| -> f64 {
+                b.placements
+                    .iter()
+                    .zip(&m.placement)
+                    .filter(|(p, _)| p.kind == SegmentKind::D && p.alleles.contains(&allele))
+                    .map(|(_, &q)| q)
+                    .sum()
+            };
+            assert!(mass(db_.unwrap()) > mass(da.unwrap()));
+            changed += 1;
+        }
+    }
+    assert!(changed > 0, "some D calls should change");
 }
 
 fn top_by_kind(placements: &[Placement], kind: SegmentKind, n: usize) -> Vec<Placement> {
