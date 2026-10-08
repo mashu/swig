@@ -1,11 +1,13 @@
-//! Sibling bounds: skip DP for alleles of a gene that cannot enter the
-//! top-N local scores.
+//! Sibling bounds: bracket the local score of each allele of a gene frame
+//! from its representative's score and traceback, so the stage skips the DP
+//! of siblings that cannot enter the top-N local scores or whose score the
+//! bounds pin.
 //!
 //! The alleles of a gene share a *frame* (see [`GeneFrames`]): frame
 //! position `f = j + o_X` for position `j` of allele `X` at offset `o_X`, so
 //! `X` covers `span(X) = [o_X, o_X + |X|)`. With `s_X(q, j)` the profile
-//! score of query code `q` at position `j`, the bound of a sibling `A` given
-//! a representative `R` of the same frame is
+//! score of query code `q` at position `j`, the upper bound of a sibling `A`
+//! given a representative `R` of the same frame is
 //!
 //! ```text
 //! Δ(R, A) = Σ_{f ∈ span(A) ∩ span(R)} max(0, max_q [s_A(q, f − o_A) − s_R(q, f − o_R)])

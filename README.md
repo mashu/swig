@@ -235,7 +235,7 @@ stages are the methods `stage_orient`, `stage_v`, `stage_j`, `stage_d` and
 | `retrieve/seed_vote`, `retrieve/budget` | Radix-sorted diagonal votes per frame, gene budget, candidate bands |
 | `retrieve/exhaustive`, `retrieve/lmer_mask`, `retrieve/ungapped` | J: every allele; D: lossless L-mer bitsets; optional ungapped pre-ranking |
 | `band`, `align/gotoh`, `align/inter_seq`, `align/lanes` | Diagonal bands; scalar banded Gotoh; inter-sequence Gotoh written once over a SIMD lane trait (AVX-512BW 32 lanes; AVX2, NEON, portable 16) |
-| `segment`, `family_bound` | One search stage: score → sibling upper bounds → traceback waves → acceptance and E-value gates → outer extension |
+| `segment`, `family_bound` | One search stage: score → sibling bounds along the gene frame → traceback waves → acceptance and E-value gates → outer extension |
 | `clip`, `evidence`, `placement` | O(1) clip-and-rescore at any cut; exact-run / identity evidence |
 | `window`, `admission` | Where J and D are searched; D evidence gates |
 | `adjudicate/{lattice,dag,posterior,model,residual}` | The placement lattice; Viterbi and forward–backward over it; grammar and log-odds path model; residual baseline |
@@ -427,10 +427,25 @@ then runs in waves down the ranking until `top` alignments pass acceptance
 (plus ties), so a high score that fails the length/identity floor does not
 take a slot. With at most `top + 1` candidates the scoring pass is skipped.
 
-**Sibling upper bounds (`family_bound`).** After a gene's representative is
-scored, a same-length sibling satisfies `S*(A) ≤ S*(R) + Δ(R, A)`, where Δ
-sums the per-position maximum profile gain. Siblings whose bound cannot reach
-the current top-N cutoff are not scored.
+**Sibling bounds along the gene frame (`family_bound`).** The alleles of a
+gene share a frame (`frame position = allele position + offset`), and V and J
+score one representative per frame first. A sibling `A` aligned in the same
+frame diagonals as its representative `R` is bracketed exactly:
+
+- `S*(A) ≤ S*(R) + Δ(R, A)`, where Δ sums the best profile gain at each frame
+  position both cover and the best substitution score where only `A` does;
+- `S*(A) ≥ L`, the traceback of the request's best representative clipped to
+  `A`'s span and rescored with `A`'s profile, in `O(|D|)` from prefix sums
+  (`D`: the positions where the two profiles differ). Any traced path serves,
+  so the strongest representative is aligned instead of scored.
+
+The `top`-th largest lower bound (one per candidate) never exceeds the true
+`top`-th score, so a sibling whose upper bound falls below it is skipped; one
+whose bounds meet needs no DP; one whose lower bound reaches it is aligned
+outright and its traceback reused. The rest is scored. The ranking from the
+`top`-th score up is that of full scoring, so calls are byte-identical, at
+9.0 % fewer instructions on 2000 hard reads and 8.3 % on mid. Under a length
+or identity acceptance floor, siblings are pruned only below the score floor.
 
 **Inter-sequence SIMD (`align/inter_seq`).**
 - Each 16-bit lane holds the same cell of a *different* job. Every lane
@@ -792,8 +807,10 @@ In order of expected value; reasons and measurements are in
    D-inclusion rate), checked by D-presence calibration.
 3. ~~**Wider SIMD.**~~ Done: AVX-512BW, NEON and portable backends of one
    kernel. Next on that line: 8-bit lanes for D jobs (32 per AVX2 register).
-4. **Allele rescoring along the gene frame.** Score siblings along their
-   representative's traceback and run DP only where bounds straddle the cutoff.
+4. ~~**Allele rescoring along the gene frame.**~~ Done: siblings are bounded
+   from both sides along their representative's traceback, and DP runs only
+   where the bounds straddle the cutoff (V and J); calls unchanged, 9 % fewer
+   instructions on hard reads.
 5. **Annotation.** A per-database FR3 length learned from header-annotated
    alleles (TR loci). A consensus position prior for Cys23.
 6. **C-segment assignment.**

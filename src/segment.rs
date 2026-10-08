@@ -4,7 +4,7 @@
 //! every request (a query window and its retrieved candidates) it runs:
 //!
 //! ```text
-//! candidates ─► score-only DP ─► (V) sibling bound pruning ─► rank by score
+//! candidates ─► score-only DP ─► (V, J) sibling bounds ─► rank by score
 //!            ─► traceback in waves until `top` alignments pass acceptance (+ ties)
 //!            ─► outer flank extension ─► rank ─► merge identical alignments
 //! ```

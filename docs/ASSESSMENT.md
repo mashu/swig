@@ -458,10 +458,10 @@ In order of expected value:
    several SHM levels, with precision/recall curves for D.
 5. ~~**AVX-512BW (32 lanes) and NEON**~~ — done (§9.4), with a portable
    backend for every other target.
-6. **Allele rescoring along the gene frame.** Trace one representative per
-   frame, rescore siblings along its path, and run DP only where bounds
-   straddle the top-N cutoff. Most of the remaining V time is siblings of the
-   top gene.
+6. ~~**Allele rescoring along the gene frame.**~~ — done (§9.6): siblings
+   are bracketed by an upper bound from their frame representative's score
+   and a lower bound from its traceback, and DP runs only where the bounds
+   straddle the top-N cutoff, for V and J. Calls are byte-identical.
 7. **Calibrated statistics.** Fit gapped λ/K and an effective database size
    by simulation.
 
@@ -780,13 +780,47 @@ Remaining opportunities, in order of expected gain: (1) 8-bit lanes for D
 jobs — D scores fit in `i8`, so AVX2 would run 32 D jobs per register;
 (2) a single-precision posterior pass; (3) banded J from J seeds when the V
 is unmutated (exhaustive J is the safe default under SHM); (4) overlapping
-input parsing with assignment; (5) allele rescoring along the gene frame
-(plan item 6).
+input parsing with assignment.
+
+*Allele rescoring along the gene frame (plan item 6), done.* Every sibling
+of a frame representative is bracketed, `L ≤ S*(A) ≤ S*(R) + Δ(R, A)`
+(`family_bound`): the upper bound now holds across a gene frame, not only
+at equal length, and the lower bound rescores the representative's
+traceback along the sibling. The top-N cutoff is taken over the lower
+bounds, so it prunes more, siblings whose bounds meet need no DP, and those
+that will be traced are aligned once instead of scored and then aligned.
+J gets the same bounds. Instructions on 2000 reads, one thread, each step
+byte-identical to the last on the 20,000-read sets:
+
+| Step | hard | mid |
+|---|---|---|
+| main | 10,549 M | 10,967 M |
+| cutoff only under permissive acceptance, explicit tie key | 10,556 M | 10,976 M |
+| Δ across the gene frame | 10,488 M | 10,966 M |
+| traced lower bounds, cutoff over them, traceback reuse | 10,064 M | 10,550 M |
+| known and early-traced siblings | 9,953 M | 10,436 M |
+| J bounds | 9,708 M | 10,165 M |
+| bookkeeping | 9,705 M | 10,162 M |
+| strongest representative aligned, not scored | 9,655 M | 10,112 M |
+| one representative per frame | 9,627 M | 10,082 M |
+| representative ties toward the frame's medoid | 9,606 M | 10,057 M |
+
+In all −9.0 % (hard) and −8.3 % (mid): V and J DP fell from 4.04 G to
+3.21 G instructions on hard, while the stage's own bookkeeping rose from
+0.02 G to 0.05 G (frame paths 12 M, the table 6 M, lower bounds 3 M). Two
+experiments
+did not lower the count and were dropped: gene-frame placement for J (J's
+unbanded bounds accept any placement), and raising the cutoff with the
+early-traced siblings' exact scores before scoring the rest. The cutoff
+applies only when acceptance has no length or identity floor: a rejected
+alignment makes traceback refill from below the N-th score, where a pruned
+sibling may lie (with V acceptance of 60 columns and 93 % identity, main's
+bounds changed the allele set of 1 of 20,000 hard reads).
 
 ### 9.7 Roadmap status
 
 Of the roadmap in the README, the wider-SIMD item is done (AVX-512BW, NEON
-and a portable backend). Calls from the per-read model, a D prior from the D
-search's own statistics, allele rescoring along the gene frame, annotation
-priors and C-segment assignment remain open; §9.5 shows the D prior is the
+and a portable backend), and so is allele rescoring along the gene frame
+(§9.6). Calls from the per-read model, a D prior from the D search's own
+statistics, annotation priors and C-segment assignment remain open; §9.5 shows the D prior is the
 one with the clearest measured need.
