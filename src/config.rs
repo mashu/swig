@@ -24,7 +24,7 @@ use crate::retrieve::{
 use crate::scoring::{AffineScoring, Score};
 use crate::seed::SeedShape;
 use crate::segment::{
-    EvalueGates, HitAcceptance, KeepPolicy, PreparedSegment, SegmentStage, Significance,
+    EvalueGates, HitAcceptance, KeepPolicy, PreparedSegment, SegmentStage, Significance, TieOrder,
 };
 use crate::stats::KarlinAltschul;
 use crate::window::{DownstreamWindow, ExpandedResidual, WithAnchorWindow};
@@ -376,6 +376,9 @@ fn v_stage(
     stage.accept = config.accept;
     stage.significance = significance;
     stage.outer = OuterExtend::Prefix;
+    // The order the V stage has always produced: gene leaders were scored,
+    // and so ranked, before their siblings.
+    stage.ties = TieOrder::GeneLeadersFirst;
     stage.family_delta = family_delta;
     Ok(stage)
 }

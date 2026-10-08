@@ -154,6 +154,36 @@ impl KeepPolicy {
     }
 }
 
+/// Order of equal local scores in a request's ranking.
+///
+/// Ties decide which alleles take the last traceback slots when `cap` binds,
+/// and the order of equally scored placements, whose first allele is the
+/// primary allele of a merged placement. The order is therefore part of the
+/// stage's definition: a key over the candidates, independent of which
+/// scores were computed, bounded or traced first.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TieOrder {
+    /// Retrieval order.
+    #[default]
+    Retrieval,
+    /// Every gene's *leader* first, then the other candidates, each group in
+    /// retrieval order. A gene's leader is its candidate with most votes (the
+    /// lowest allele id among equals).
+    GeneLeadersFirst,
+}
+
+impl TieOrder {
+    /// Sort key of candidate `index` of a request whose candidates have the
+    /// gene leaders `leaders` (candidate indices).
+    #[inline]
+    fn key(self, leaders: &[u32], index: u32) -> (bool, u32) {
+        match self {
+            Self::Retrieval => (false, index),
+            Self::GeneLeadersFirst => (leaders[index as usize] != index, index),
+        }
+    }
+}
+
 /// One search of a stage: candidates of one query window, whose placements
 /// are appended to `outs[read]` by [`SegmentStage::place_many`].
 #[derive(Clone, Debug)]
@@ -169,28 +199,56 @@ pub struct SegmentRequest<'a> {
 pub struct BatchScratch {
     hits: Vec<Option<ScoreHit>>,
     alignments: Vec<Option<Alignment>>,
-    /// Per request: score-ranked `(candidate, score)`; `Score::MAX` = not scored.
-    ranked: Vec<Vec<(Candidate, Score)>>,
+    /// Per request: `(candidate index, local score)` ranked by score, then
+    /// by the stage's [`TieOrder`]; `Score::MAX` = not scored.
+    ranked: Vec<Vec<(u32, Score)>>,
     /// Per request: local scores of accepted alignments.
     accepted: Vec<Vec<Score>>,
     /// Per request: accepted placements before ranking.
     pending: Vec<Vec<Placement>>,
-    /// `(request, candidate)` of each job of the current batch.
-    owners: Vec<(usize, Candidate)>,
+    /// `(request, candidate index)` of each job of the current batch.
+    owners: Vec<(usize, u32)>,
     scores: Vec<Score>,
+    /// Request `r`'s candidates occupy `starts[r]..starts[r + 1]` of the
+    /// per-candidate buffers below.
+    starts: Vec<usize>,
+    /// Per candidate: the candidate index of its gene's leader (see
+    /// [`TieOrder::GeneLeadersFirst`]); filled for requests that are scored.
+    leaders: Vec<u32>,
+    /// Per candidate: exact local score once known (0 = no positive cell).
+    exact: Vec<Score>,
+    /// Per gene id: the leader found so far in the current request.
+    gene_leader: Vec<u32>,
 }
 
 impl BatchScratch {
-    fn reset(&mut self, requests: usize) {
+    fn reset(&mut self, requests: &[SegmentRequest<'_>]) {
         fn clear<T>(buffers: &mut Vec<Vec<T>>, len: usize) {
             if buffers.len() < len {
                 buffers.resize_with(len, Vec::new);
             }
             buffers.iter_mut().for_each(Vec::clear);
         }
-        clear(&mut self.ranked, requests);
-        clear(&mut self.accepted, requests);
-        clear(&mut self.pending, requests);
+        clear(&mut self.ranked, requests.len());
+        clear(&mut self.accepted, requests.len());
+        clear(&mut self.pending, requests.len());
+        self.starts.clear();
+        self.starts.push(0);
+        let mut total = 0;
+        for request in requests {
+            total += request.candidates.len();
+            self.starts.push(total);
+        }
+        self.leaders.clear();
+        self.leaders.resize(total, 0);
+        self.exact.clear();
+        self.exact.resize(total, 0);
+    }
+
+    /// Per-candidate buffer slots of request `index`.
+    #[inline]
+    fn slots(&self, index: usize) -> Range<usize> {
+        self.starts[index]..self.starts[index + 1]
     }
 }
 
@@ -260,9 +318,21 @@ pub struct SegmentStage<R> {
     pub significance: Option<Significance>,
     /// Stitch the co-linear V prefix or J suffix back on after traceback, then re-rank.
     pub outer: OuterExtend,
+    /// Order of equal local scores in the ranking.
+    pub ties: TieOrder,
     /// Score one allele per gene first and skip same-length siblings whose
     /// upper bound cannot enter the top `keep.top` scores.
     pub family_delta: Option<FamilyBoundTable>,
+}
+
+/// No candidate (a per-gene slot of [`BatchScratch`]'s leader search).
+const NONE: u32 = u32::MAX;
+
+/// Whether a local score enters the ranking: positive (an alignment exists)
+/// and at least the request's floor.
+#[inline]
+fn ranks(score: Score, floor: Score) -> bool {
+    score > 0 && score >= floor
 }
 
 impl<R: Retriever> SegmentStage<R> {
@@ -274,6 +344,7 @@ impl<R: Retriever> SegmentStage<R> {
             accept: HitAcceptance::PERMISSIVE,
             significance: None,
             outer: OuterExtend::None,
+            ties: TieOrder::Retrieval,
             family_delta: None,
         }
     }
@@ -302,7 +373,9 @@ impl<R: Retriever> SegmentStage<R> {
         self.keep.min_score.max(significant)
     }
 
-    fn job<'a>(&'a self, request: &SegmentRequest<'a>, candidate: &Candidate) -> AlignJob<'a> {
+    /// The alignment problem of candidate `index` of `request`.
+    fn job<'a>(&'a self, request: &SegmentRequest<'a>, index: u32) -> AlignJob<'a> {
+        let candidate = &request.candidates[index as usize];
         AlignJob {
             query: &request.query[request.window.clone()],
             profile: self.segment.profile(candidate.allele),
@@ -349,7 +422,7 @@ impl<R: Retriever> SegmentStage<R> {
         batch: &mut BatchScratch,
         outs: &mut [Vec<Placement>],
     ) {
-        batch.reset(requests.len());
+        batch.reset(requests);
         self.rank(aligner, requests, dp, batch);
         self.trace(aligner, requests, dp, batch);
         for (index, request) in requests.iter().enumerate() {
@@ -366,8 +439,39 @@ impl<R: Retriever> SegmentStage<R> {
         request.candidates.len() > self.keep.top.saturating_add(1)
     }
 
+    /// Each candidate's gene leader (see [`TieOrder::GeneLeadersFirst`]) as
+    /// a candidate index. `best` is per-gene scratch, all [`NONE`] on entry
+    /// and on return.
+    fn find_leaders(&self, candidates: &[Candidate], leaders: &mut [u32], best: &mut Vec<u32>) {
+        debug_assert!(
+            (1..candidates.len()).all(|i| candidates[..i]
+                .iter()
+                .all(|c| c.allele != candidates[i].allele)),
+            "a request lists each allele once"
+        );
+        let set = self.segment.set();
+        if best.len() < set.gene_count() {
+            best.resize(set.gene_count(), NONE);
+        }
+        let gene = |c: &Candidate| set.allele(c.allele).gene as usize;
+        let strength = |c: &Candidate| (c.votes, std::cmp::Reverse(c.allele));
+        for (index, candidate) in (0..).zip(candidates) {
+            let slot = &mut best[gene(candidate)];
+            if *slot == NONE || strength(candidate) > strength(&candidates[*slot as usize]) {
+                *slot = index;
+            }
+        }
+        for (leader, candidate) in leaders.iter_mut().zip(candidates) {
+            *leader = best[gene(candidate)];
+        }
+        for candidate in candidates {
+            best[gene(candidate)] = NONE;
+        }
+    }
+
     /// Fill `batch.ranked[r]` with request `r`'s candidates ranked by local
-    /// score. Requests that skip scoring keep retrieval order.
+    /// score, ties in the stage's [`TieOrder`]. Requests that skip scoring
+    /// keep retrieval order.
     fn rank<'a, A: Aligner>(
         &'a self,
         aligner: &A,
@@ -376,33 +480,43 @@ impl<R: Retriever> SegmentStage<R> {
         batch: &mut BatchScratch,
     ) {
         for (index, request) in requests.iter().enumerate() {
-            if !self.needs_scores(request) {
-                batch.ranked[index].extend(request.candidates.iter().map(|&c| (c, Score::MAX)));
+            if self.needs_scores(request) {
+                let slots = batch.slots(index);
+                self.find_leaders(
+                    request.candidates,
+                    &mut batch.leaders[slots],
+                    &mut batch.gene_leader,
+                );
+            } else {
+                let count = request.candidates.len() as u32;
+                batch.ranked[index].extend((0..count).map(|c| (c, Score::MAX)));
             }
         }
         match &self.family_delta {
             None => {
                 batch.owners.clear();
-                for (index, request) in requests
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, r)| self.needs_scores(r))
-                {
-                    batch
-                        .owners
-                        .extend(request.candidates.iter().map(|&c| (index, c)));
+                for (index, request) in requests.iter().enumerate() {
+                    if self.needs_scores(request) {
+                        let count = request.candidates.len() as u32;
+                        batch.owners.extend((0..count).map(|c| (index, c)));
+                    }
                 }
                 self.score_owners(aligner, requests, dp, batch);
             }
             Some(table) => self.rank_with_bounds(aligner, requests, table, dp, batch),
         }
-        for ranked in &mut batch.ranked[..requests.len()] {
-            ranked.sort_by_key(|&(_, score)| std::cmp::Reverse(score));
+        for (index, request) in requests.iter().enumerate() {
+            if self.needs_scores(request) {
+                let leaders = &batch.leaders[batch.starts[index]..batch.starts[index + 1]];
+                batch.ranked[index].sort_unstable_by_key(|&(candidate, score)| {
+                    (std::cmp::Reverse(score), self.ties.key(leaders, candidate))
+                });
+            }
         }
     }
 
-    /// Score-only DP for every job in `batch.owners`; append hits at or above
-    /// `min_score` to their request's ranking.
+    /// Score-only DP for every job in `batch.owners`: record each exact
+    /// score and append those that rank to their request's ranking.
     fn score_owners<'a, A: Aligner>(
         &'a self,
         aligner: &A,
@@ -416,17 +530,19 @@ impl<R: Retriever> SegmentStage<R> {
         let jobs: Vec<AlignJob<'a>> = batch
             .owners
             .iter()
-            .map(|(index, candidate)| self.job(&requests[*index], candidate))
+            .map(|&(index, candidate)| self.job(&requests[index], candidate))
             .collect();
         aligner.score_batch(&jobs, dp, &mut batch.hits);
         for (&(index, candidate), hit) in batch.owners.iter().zip(&batch.hits) {
-            if let Some(hit) = hit.filter(|h| h.score >= self.floor(&requests[index])) {
-                batch.ranked[index].push((candidate, hit.score));
+            let score = hit.map_or(0, |h| h.score);
+            batch.exact[batch.starts[index] + candidate as usize] = score;
+            if ranks(score, self.floor(&requests[index])) {
+                batch.ranked[index].push((candidate, score));
             }
         }
     }
 
-    /// Family-delta ranking: score the highest-voted allele of each gene,
+    /// Family-delta ranking: score each gene's leader (its representative),
     /// then only the siblings whose sound upper bound `S(rep) + Δ(rep, sibling)`
     /// reaches the `top`-th best representative score (see [`crate::family_bound`]).
     /// The cutoff can only rise as more alleles are scored, so a sibling below
@@ -445,87 +561,48 @@ impl<R: Retriever> SegmentStage<R> {
         dp: &mut A::Workspace,
         batch: &mut BatchScratch,
     ) {
-        // `(request, sibling, job of its representative)`.
-        let mut siblings: Vec<(usize, Candidate, usize)> = Vec::new();
-        let mut representatives: Vec<(Candidate, usize)> = Vec::new();
+        // Representative scores are recorded even below the floor: a weak
+        // representative can still bound a sibling that clears it.
+        batch.owners.clear();
+        for (index, request) in requests.iter().enumerate() {
+            if self.needs_scores(request) {
+                let leaders = &batch.leaders[batch.starts[index]..batch.starts[index + 1]];
+                batch.owners.extend(
+                    (0..)
+                        .zip(leaders)
+                        .filter(|&(c, &leader)| c == leader)
+                        .map(|(c, _)| (index, c)),
+                );
+            }
+        }
+        self.score_owners(aligner, requests, dp, batch);
+        let permissive = self.accept.is_permissive();
         batch.owners.clear();
         for (index, request) in requests.iter().enumerate() {
             if !self.needs_scores(request) {
                 continue;
             }
-            // Representative of each gene: the candidate with most votes
-            // (lowest id on ties); jobs follow candidate order.
-            let strength = |c: &Candidate| (c.votes, std::cmp::Reverse(c.allele));
-            representatives.clear();
-            for &candidate in request.candidates {
-                let gene = table.gene(candidate.allele);
-                match representatives
-                    .iter_mut()
-                    .find(|(r, _)| table.gene(r.allele) == gene)
-                {
-                    Some((rep, _)) if strength(&candidate) > strength(rep) => *rep = candidate,
-                    Some(_) => {}
-                    None => representatives.push((candidate, usize::MAX)),
-                }
-            }
-            for &candidate in request.candidates {
-                let gene = table.gene(candidate.allele);
-                let (rep, job) = representatives
-                    .iter_mut()
-                    .find(|(r, _)| table.gene(r.allele) == gene)
-                    .expect("every gene has a representative");
-                if rep.allele == candidate.allele {
-                    *job = batch.owners.len();
-                    batch.owners.push((index, candidate));
-                }
-            }
-            for &candidate in request.candidates {
-                let gene = table.gene(candidate.allele);
-                let &(rep, job) = representatives
-                    .iter()
-                    .find(|(r, _)| table.gene(r.allele) == gene)
-                    .expect("every gene has a representative");
-                if rep.allele != candidate.allele {
-                    siblings.push((index, candidate, job));
-                }
-            }
-        }
-        // Representative scores are kept even below the floor: a weak
-        // representative can still bound a sibling that clears it.
-        if !batch.owners.is_empty() {
-            let jobs: Vec<AlignJob<'a>> = batch
-                .owners
-                .iter()
-                .map(|(index, candidate)| self.job(&requests[*index], candidate))
-                .collect();
-            aligner.score_batch(&jobs, dp, &mut batch.hits);
-            for (&(index, candidate), hit) in batch.owners.iter().zip(&batch.hits) {
-                if let Some(hit) = hit.filter(|h| h.score >= self.floor(&requests[index])) {
-                    batch.ranked[index].push((candidate, hit.score));
-                }
-            }
-        }
-        let permissive = self.accept.is_permissive();
-        let cutoffs: Vec<Option<Score>> = (0..requests.len())
-            .map(|index| {
-                permissive
-                    .then(|| top_score(&batch.ranked[index], self.keep.top, &mut batch.scores))
-                    .flatten()
-            })
-            .collect();
-        let representative_jobs = std::mem::take(&mut batch.owners);
-        for (index, candidate, job) in siblings {
-            let (_, rep) = representative_jobs[job];
-            // No positive cell means the representative's optimum is 0.
-            let rep_score = batch.hits[job].map_or(0, |h| h.score);
-            let bound = (rep.band == candidate.band)
-                .then(|| table.upper_bound(rep.allele, candidate.allele, rep_score))
+            let cutoff = permissive
+                .then(|| top_score(&batch.ranked[index], self.keep.top, &mut batch.scores))
                 .flatten();
-            let prunable = bound.is_some_and(|bound| {
-                bound < self.floor(&requests[index]) || cutoffs[index].is_some_and(|c| bound < c)
-            });
-            if !prunable {
-                batch.owners.push((index, candidate));
+            let floor = self.floor(request);
+            let start = batch.starts[index];
+            for (c, candidate) in (0..).zip(request.candidates) {
+                let leader = batch.leaders[start + c as usize];
+                if leader == c {
+                    continue;
+                }
+                let rep = &request.candidates[leader as usize];
+                // No positive cell means the representative's optimum is 0.
+                let rep_score = batch.exact[start + leader as usize];
+                let bound = (rep.band == candidate.band)
+                    .then(|| table.upper_bound(rep.allele, candidate.allele, rep_score))
+                    .flatten();
+                let prunable =
+                    bound.is_some_and(|b| b < floor || cutoff.is_some_and(|cutoff| b < cutoff));
+                if !prunable {
+                    batch.owners.push((index, c));
+                }
             }
         }
         self.score_owners(aligner, requests, dp, batch);
@@ -569,7 +646,7 @@ impl<R: Retriever> SegmentStage<R> {
             let jobs: Vec<AlignJob<'a>> = batch
                 .owners
                 .iter()
-                .map(|(index, candidate)| self.job(&requests[*index], candidate))
+                .map(|&(index, candidate)| self.job(&requests[index], candidate))
                 .collect();
             aligner.align_batch(&jobs, dp, &mut batch.alignments);
             for (&(index, candidate), alignment) in
@@ -586,7 +663,7 @@ impl<R: Retriever> SegmentStage<R> {
                 let local = alignment.score;
                 let mut placement = Placement::new(
                     self.kind(),
-                    candidate.allele,
+                    request.candidates[candidate as usize].allele,
                     alignment,
                     request.query,
                     &self.segment,
@@ -646,7 +723,7 @@ impl<R: Retriever> SegmentStage<R> {
 }
 
 /// The `top`-th best score of `ranked`, if it has that many entries.
-fn top_score(ranked: &[(Candidate, Score)], top: usize, buffer: &mut Vec<Score>) -> Option<Score> {
+fn top_score(ranked: &[(u32, Score)], top: usize, buffer: &mut Vec<Score>) -> Option<Score> {
     if top == 0 || ranked.len() < top {
         return None;
     }
@@ -752,6 +829,59 @@ mod tests {
             &mut out,
         );
         out.iter().map(|p| (p.alleles.clone(), p.score())).collect()
+    }
+
+    /// Three alleles in two genes align identically to the read; the tie
+    /// order alone decides the merged placement's allele order. Bounded and
+    /// full scoring rank in a different sequence (gene leaders first), so
+    /// they agree only because the order is an explicit key.
+    #[test]
+    fn tie_order_is_independent_of_bounding() {
+        let scoring = AffineScoring::new(2, -3, -9, -1);
+        let mut next = crate::testing::rng(8);
+        let shared = crate::testing::random_codes(&mut next, 60);
+        let other = crate::testing::random_codes(&mut next, 60);
+        // SNPs past the read's end leave the three alignments identical.
+        let snp = |at: usize| {
+            let mut codes = shared.clone();
+            codes[at] = (codes[at] + 1) % 4;
+            codes
+        };
+        let mut set = GermlineSet::new(SegmentKind::V);
+        for (name, codes) in [
+            ("IGHV1-1*01", shared.clone()),
+            ("IGHV1-1*02", snp(55)),
+            ("IGHV2-1*01", other),
+            ("IGHV2-1*02", snp(58)),
+        ] {
+            set.push(name, decode(&codes).as_bytes(), None).unwrap();
+        }
+        let segment = Arc::new(PreparedSegment::new(set, &scoring, scoring.gaps));
+        let query = shared[..50].to_vec();
+        // Leaders: IGHV1-1*01 (index 2) and IGHV2-1*01 (index 1).
+        let candidates = [(1, 10), (2, 30), (0, 20), (3, 5)].map(|(allele, votes)| Candidate {
+            allele,
+            band: Band::Full,
+            votes,
+        });
+        let keep = KeepPolicy {
+            top: 1,
+            min_score: 1,
+            cap: 8,
+        };
+        for (ties, primary) in [(TieOrder::Retrieval, 1), (TieOrder::GeneLeadersFirst, 0)] {
+            let placements: Vec<_> = [false, true]
+                .map(|family_delta| {
+                    let mut stage = SegmentStage::new(Arc::clone(&segment), EmptyRetriever, keep);
+                    stage.ties = ties;
+                    stage.family_delta = family_delta.then(|| FamilyBoundTable::build(&segment));
+                    placed(&stage, &candidates, &query)
+                })
+                .into();
+            assert_eq!(placements[0], placements[1], "{ties:?}");
+            assert_eq!(placements[0][0].0[0], primary, "{ties:?}");
+            assert_eq!(placements[0][0].0.len(), 3, "{ties:?}");
+        }
     }
 
     /// The best representative outscores everything but fails acceptance,
