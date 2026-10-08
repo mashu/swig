@@ -320,7 +320,7 @@ pub struct SegmentStage<R> {
     pub outer: OuterExtend,
     /// Order of equal local scores in the ranking.
     pub ties: TieOrder,
-    /// Score one allele per gene first and skip same-length siblings whose
+    /// Score one allele per gene first and skip same-frame siblings whose
     /// upper bound cannot enter the top `keep.top` scores.
     pub family_delta: Option<FamilyBoundTable>,
 }
@@ -546,8 +546,8 @@ impl<R: Retriever> SegmentStage<R> {
     /// then only the siblings whose sound upper bound `S(rep) + Δ(rep, sibling)`
     /// reaches the `top`-th best representative score (see [`crate::family_bound`]).
     /// The cutoff can only rise as more alleles are scored, so a sibling below
-    /// it can never enter the top scores. A sibling in another band than its
-    /// representative has no bound and is always scored.
+    /// it can never enter the top scores. A sibling whose band is not its
+    /// representative's frame band has no bound and is always scored.
     ///
     /// The cutoff applies only under permissive acceptance
     /// ([`HitAcceptance::is_permissive`]). Otherwise a rejected alignment makes
@@ -595,9 +595,7 @@ impl<R: Retriever> SegmentStage<R> {
                 let rep = &request.candidates[leader as usize];
                 // No positive cell means the representative's optimum is 0.
                 let rep_score = batch.exact[start + leader as usize];
-                let bound = (rep.band == candidate.band)
-                    .then(|| table.upper_bound(rep.allele, candidate.allele, rep_score))
-                    .flatten();
+                let bound = table.upper_bound(rep, candidate, rep_score);
                 let prunable =
                     bound.is_some_and(|b| b < floor || cutoff.is_some_and(|cutoff| b < cutoff));
                 if !prunable {
@@ -948,7 +946,9 @@ mod tests {
                 .map_or(0, |hit| hit.score)
         };
         let table = FamilyBoundTable::build(&segment);
-        let bound = table.upper_bound(1, 2, score(1)).unwrap();
+        let bound = table
+            .upper_bound(&candidates[1], &candidates[2], score(1))
+            .unwrap();
         assert!(score(0) > score(2) && score(2) > score(1) && bound < score(0));
         let full = placed(&stage(false), &candidates, &query);
         assert_eq!(full, vec![(vec![2], score(2))]);

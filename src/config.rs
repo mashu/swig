@@ -12,6 +12,7 @@ use std::sync::Arc;
 use crate::adjudicate::{EngineeringObjective, PlacementDag, PosteriorModel, VdjGrammar};
 use crate::admission::{AnyOf, DistributedEvidence, ExactRunFloor};
 use crate::align::{Backend, InterSequenceGotoh};
+use crate::family_bound::FamilyBoundTable;
 use crate::flank::OuterExtend;
 use crate::germline::{GermlineSet, SegmentKind};
 use crate::index::IndexError;
@@ -368,10 +369,11 @@ fn v_stage(
         &config.scoring,
         config.scoring.gaps,
     ));
-    let retriever = UngappedPrefilter::new(seeds, Arc::clone(&segment), config.ungapped);
+    // Bounds are sound for bands shifted through the frames the bands come from.
     let family_delta = config
         .family_delta
-        .then(|| crate::family_bound::FamilyBoundTable::build(&segment));
+        .then(|| FamilyBoundTable::with_frames(&segment, seeds.frames()));
+    let retriever = UngappedPrefilter::new(seeds, Arc::clone(&segment), config.ungapped);
     let mut stage = SegmentStage::new(segment, retriever, config.keep);
     stage.accept = config.accept;
     stage.significance = significance;
