@@ -20,13 +20,14 @@
 //! the read's allele up to germline equivalence. `d_presence_posterior` is the probability that the read has a D.
 
 use std::fmt::Write as _;
+use std::ops::Range;
 
 use crate::adjudicate::{CallModel, CalledSegment};
 use crate::align::Op;
 use crate::alphabet::{N, decode, decode_base};
 use crate::clip::ClipSpan;
 use crate::evidence::Evidence;
-use crate::germline::SegmentKind;
+use crate::germline::{GermlineSet, SegmentKind};
 use crate::pipeline::{AlleleCatalog, Call};
 use crate::placement::Placement;
 use crate::read_regions::ReadRegions;
@@ -111,39 +112,71 @@ fn push_run(cigar: &mut String, symbol: char, length: u32) {
     }
 }
 
-fn segment_report<C: AlleleCatalog>(
-    call: &Call,
-    called: &CalledSegment,
-    catalog: &C,
-    support: &SupportModels,
-) -> Option<SegmentReport> {
-    let dag_placement = &call.placements[called.placement];
-    let kind = dag_placement.kind;
-    debug_assert!(
-        kind.is_rearranged(),
-        "a C placement reached the V(D)J report"
-    );
-    let segment = catalog.segment(kind)?;
-    let set = segment.set();
-    let called_score = called.span.score;
+/// The placements tied with a called segment on its interval, and those its
+/// posterior counts (see the module documentation).
+pub(crate) struct CoOptimal<'a> {
+    /// Tied placements, the primary — reported first — at index 0.
+    pub tied: Vec<&'a Placement>,
+    /// Indices of the placements of the called kind whose probability the
+    /// posterior sums: tied with the call, or carried by its primary allele.
+    pub counted: Vec<usize>,
+}
 
-    // Co-optimal alleles on the called interval: worth exactly the call there
-    // under the call's model. The primary name is the one with the most
-    // germline support (unclipped score, the DAG's own tie-break), then the
-    // longest exact run and most matches on the interval.
+impl CoOptimal<'_> {
+    /// The tied placements' allele names, primary first, each once.
+    pub fn names<'s>(&self, set: &'s GermlineSet) -> Vec<&'s str> {
+        let mut names: Vec<&str> = Vec::new();
+        for p in &self.tied {
+            for &allele in &p.alleles {
+                for name in set.allele(allele).names() {
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+            }
+        }
+        names
+    }
+}
+
+/// Co-optimal alleles of `called` among `placements` (of every kind; only
+/// the called one's count), `set` holding their alleles.
+///
+/// Tied: worth exactly the call on its interval `[entry, exit)` — an equal
+/// score, and under a per-read call (`per_read`) equal matches and
+/// mismatches. The primary is the one with the most germline support
+/// (unclipped score, the DAG's own tie-break), then the longest exact run
+/// and most matches on the interval, then the lowest allele id; a call
+/// chosen by its allele's posterior marginal stays first.
+///
+/// Counted by the posterior: the tied placements, and every placement that
+/// explains most of the read bases the call explains (more than half of the
+/// called span, within `region`, the read the call's neighbours leave to
+/// it) with germline bases there that the primary allele contains. If the
+/// read came from such a placement, the call still carries its germline
+/// bases. A placement that only reaches into the region by a few bases (a
+/// D inside the called J, a tandem D's partner) is another hypothesis, so
+/// it does not count.
+pub(crate) fn co_optimal<'a>(
+    placements: &'a [Placement],
+    query: &[u8],
+    set: &GermlineSet,
+    called: &CalledSegment,
+    per_read: bool,
+    region: Range<u32>,
+) -> CoOptimal<'a> {
+    let called_placement = &placements[called.placement];
+    let kind = called_placement.kind;
+    let called_score = called.span.score;
     let columns = |p: &Placement, span: &ClipSpan| {
         let reference = &set.allele(p.primary_allele()).codes;
-        let e = Evidence::from_columns(p.clip.columns(span), &call.query, reference);
+        let e = Evidence::from_columns(p.clip.columns(span), query, reference);
         (e.matches, e.mismatches)
     };
-    let per_read = call
-        .path
-        .as_ref()
-        .is_some_and(|path| path.model == CallModel::PerRead);
-    let called_columns = per_read.then(|| columns(dag_placement, &called.span));
-    let tied_indices: Vec<usize> = (0..call.placements.len())
+    let called_columns = per_read.then(|| columns(called_placement, &called.span));
+    let tied_indices: Vec<usize> = (0..placements.len())
         .filter(|&i| {
-            let p = &call.placements[i];
+            let p = &placements[i];
             p.kind == kind
                 && p.clip.span(called.entry, called.exit).is_some_and(|s| {
                     s.score == called_score && called_columns.is_none_or(|c| columns(p, &s) == c)
@@ -152,12 +185,12 @@ fn segment_report<C: AlleleCatalog>(
         .collect();
     // The called placement first, so it wins ties of the sort key; one
     // chosen by its allele's posterior marginal stays first.
-    let mut tied: Vec<&Placement> = std::iter::once(dag_placement)
+    let mut tied: Vec<&Placement> = std::iter::once(called_placement)
         .chain(
             tied_indices
                 .iter()
                 .filter(|&&i| i != called.placement)
-                .map(|&i| &call.placements[i]),
+                .map(|&i| &placements[i]),
         )
         .collect();
     tied[usize::from(called.by_marginal)..].sort_by_cached_key(|p| {
@@ -167,7 +200,7 @@ fn segment_report<C: AlleleCatalog>(
             .expect("tied placement clips to the called interval");
         let e = Evidence::from_columns(
             p.clip.columns(&own),
-            &call.query,
+            query,
             &set.allele(p.primary_allele()).codes,
         );
         (
@@ -177,35 +210,7 @@ fn segment_report<C: AlleleCatalog>(
             p.primary_allele(),
         )
     });
-    let placement = tied[0];
-    let span = placement
-        .clip
-        .span(called.entry, called.exit)
-        .expect("primary tied placement clips to the called interval");
-    let reference = &set.allele(placement.primary_allele()).codes;
-
-    // Posterior that the reported names include the read's allele up to
-    // germline equivalence: the mass of every placement of this kind that is
-    // tied with the call, or that explains most of the read bases the call
-    // explains (more than half of the called span, within the region the
-    // call's neighbours leave to this segment) with germline bases there that
-    // the primary allele contains. If the read came from such a placement,
-    // the call still carries its germline bases. A placement that only
-    // reaches into the region by a few bases (a D inside the called J, a
-    // tandem D's partner) is another hypothesis, so it does not count.
-    let region = call
-        .path
-        .as_ref()
-        .map_or(0..call.query.len() as u32, |path| {
-            let at = path.segments.iter().position(|s| s == called);
-            let before = at
-                .and_then(|i| i.checked_sub(1))
-                .map(|i| path.segments[i].span.q_hi);
-            let after = at
-                .and_then(|i| path.segments.get(i + 1))
-                .map(|s| s.span.q_lo);
-            before.unwrap_or(0)..after.unwrap_or(call.query.len() as u32)
-        });
+    let reference = &set.allele(tied[0].primary_allele()).codes;
     let called_bases = called.span.q_lo..called.span.q_hi;
     let carried = |p: &Placement| {
         let Some(own) = p.clip.span(region.start, region.end) else {
@@ -222,28 +227,62 @@ fn segment_report<C: AlleleCatalog>(
         let bases = &codes[own.r_lo as usize..own.r_hi as usize];
         bases.is_empty() || reference.windows(bases.len()).any(|w| w == bases)
     };
+    let counted = (0..placements.len())
+        .filter(|&i| {
+            let p = &placements[i];
+            p.kind == kind && (tied_indices.contains(&i) || carried(p))
+        })
+        .collect();
+    CoOptimal { tied, counted }
+}
+
+fn segment_report<C: AlleleCatalog>(
+    call: &Call,
+    called: &CalledSegment,
+    catalog: &C,
+    support: &SupportModels,
+) -> Option<SegmentReport> {
+    let kind = call.placements[called.placement].kind;
+    debug_assert!(
+        kind.is_rearranged(),
+        "a C placement reached the V(D)J report"
+    );
+    let segment = catalog.segment(kind)?;
+    let set = segment.set();
+    let per_read = call
+        .path
+        .as_ref()
+        .is_some_and(|path| path.model == CallModel::PerRead);
+    let region = call
+        .path
+        .as_ref()
+        .map_or(0..call.query.len() as u32, |path| {
+            let at = path.segments.iter().position(|s| s == called);
+            let before = at
+                .and_then(|i| i.checked_sub(1))
+                .map(|i| path.segments[i].span.q_hi);
+            let after = at
+                .and_then(|i| path.segments.get(i + 1))
+                .map(|s| s.span.q_lo);
+            before.unwrap_or(0)..after.unwrap_or(call.query.len() as u32)
+        });
+    let co = co_optimal(&call.placements, &call.query, set, called, per_read, region);
+    let placement = co.tied[0];
+    let span = placement
+        .clip
+        .span(called.entry, called.exit)
+        .expect("primary tied placement clips to the called interval");
+    let reference = &set.allele(placement.primary_allele()).codes;
     let posterior = call.marginals.as_ref().map(|m| {
-        (0..call.placements.len())
-            .filter(|&i| {
-                let p = &call.placements[i];
-                p.kind == kind && (tied_indices.contains(&i) || carried(p))
-            })
-            .filter_map(|i| m.placement.get(i))
+        co.counted
+            .iter()
+            .filter_map(|&i| m.placement.get(i))
             .sum::<f64>()
             // Rounding; and under a tandem grammar, a path holding two such
             // D placements, so the sum is then an upper bound.
             .min(1.0)
     });
-    let mut names: Vec<&str> = Vec::new();
-    for p in &tied {
-        for &allele in &p.alleles {
-            for name in set.allele(allele).names() {
-                if !names.contains(&name) {
-                    names.push(name);
-                }
-            }
-        }
-    }
+    let names = co.names(set);
 
     // CIGAR and alignment strings.
     let mut cigar = String::new();

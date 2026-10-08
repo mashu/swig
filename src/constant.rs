@@ -16,13 +16,329 @@
 //! with column 0, so the existing banded kernels — scalar and every SIMD
 //! backend — return the exact anchored optimum plus the bonus, and
 //! [`strip_anchor`] turns the traceback into the alignment on `C`.
-//! [`SpliceWindow`] sets the query window and the band.
+//! [`SpliceWindow`] sets the query window and the band, and
+//! [`ReachClasses`] aligns one allele per class of alleles the window cannot
+//! tell apart.
+//!
+//! **A stage after adjudication.** [`ConstantStage`] reads finished calls
+//! only — a path whose last segment is J, the J's exit `x` — so V, D and J
+//! calls are unchanged by construction, and a read without the stage costs
+//! nothing. C never enters the placement lattice: a C kind there would let
+//! C evidence move the J exit or the J allele, and every read would pay for
+//! it. Its placements live in [`Call::constant`], clipped to `[x, n)` so C
+//! explains only bases the J does not.
+//!
+//! **Significance.** Under random bases after `x`, the walk of one start
+//! `(gene, δ)` reaches score `S` with probability at most `e^(−λS)`
+//! (Lundberg's bound for an ungapped walk with `E[e^(λX)] = 1`; gaps are
+//! mildly anti-conservative, as for every E-value of the crate). The union
+//! over the `N_C` genes of the database and the `2s + 1` start diagonals
+//! gives the anchored E-value
+//!
+//! ```text
+//! E_C(S) = N_C · (2s + 1) · e^(−λS)
+//! ```
+//!
+//! of the clipped score `S`, and C is called iff `E_C` is at most the gate,
+//! by default `10⁻³`, the gate of a hit that must stand on its own
+//! ([`crate::segment::EvalueGates::anchor`]): C is not implied by V(D)J, it
+//! depends on the library. For `(2, −3)` scoring
+//! (`λ = 0.634`) that is `S ≥ 18` for the 10 human IGHC genes. `N_C`
+//! counts every gene of the C database, so one database per locus keeps the
+//! gate tight. This is not the K·m·n E-value of V, D and J.
+//!
+//! **Posterior.** Among the read's C placements (the best `top` classes and
+//! ties), a placement's weight is the log-odds of its alignment at C's own
+//! divergence — C is not hypermutated, so the read's SHM rate `p̂` does not
+//! apply — estimated from the called C's columns,
+//! `p_C = (mismatches + ½)/(informative columns + 1)` clamped to
+//! `[10⁻⁴, ½]`:
+//!
+//! ```text
+//! w_p = exp(Σ_columns (λ_C·s + μ_C) + λ·S_gap)      (λ_C, μ_C) at p_C
+//! c_posterior = Σ_{p tied or carried} w_p / Σ_p w_p
+//! ```
+//!
+//! with ties and carried placements as for V, D and J
+//! ([`crate::report`]): the probability that the reported names include
+//! the read's C allele, given that the read reaches C. No C-presence
+//! probability is reported.
 
 use std::ops::Range;
+use std::sync::Arc;
 
-use crate::align::{Alignment, Op};
+use crate::adjudicate::{CalledSegment, EvidenceScale};
+use crate::align::{Aligner, Alignment, Op};
 use crate::band::Band;
-use crate::scoring::{AnchorColumn, GapCosts};
+use crate::clip::ClipIndex;
+use crate::config::CSegmentConfig;
+use crate::germline::{GermlineSet, SegmentKind};
+use crate::pipeline::Call;
+use crate::placement::{Placement, merge_identical};
+use crate::report::co_optimal;
+use crate::retrieve::{Candidate, ReachClasses, RetrievalScratch};
+use crate::scoring::{AffineScoring, AnchorColumn, GapCosts, Score};
+use crate::segment::{BatchScratch, KeepPolicy, PreparedSegment, SegmentRequest, SegmentStage};
+use crate::stats::KarlinAltschul;
+
+/// The anchored E-value of a clipped C score (see the module documentation):
+/// `E_C(S) = N_C · (2s + 1) · e^(−λS)`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AnchoredSignificance {
+    /// Karlin–Altschul `λ` of the C scoring.
+    pub lambda: f64,
+    /// `ln(N_C · (2s + 1))`: genes × start diagonals.
+    pub ln_hypotheses: f64,
+    /// Largest E-value called.
+    pub gate: f64,
+}
+
+impl AnchoredSignificance {
+    /// `None` when the scoring has no `λ` (a non-negative expected score).
+    pub fn new(set: &GermlineSet, scoring: &AffineScoring, spread: u32, gate: f64) -> Option<Self> {
+        let hypotheses = set.gene_count() as f64 * f64::from(2 * spread + 1);
+        Some(Self {
+            lambda: KarlinAltschul::ungapped(scoring)?.lambda,
+            ln_hypotheses: hypotheses.ln(),
+            gate,
+        })
+    }
+
+    pub fn evalue(&self, score: Score) -> f64 {
+        (self.ln_hypotheses - self.lambda * f64::from(score)).exp()
+    }
+
+    /// Smallest score called: `⌈(ln(N_C·(2s + 1)) − ln gate) / λ⌉`.
+    pub fn min_score(&self) -> Score {
+        ((self.ln_hypotheses - self.gate.ln()) / self.lambda)
+            .ceil()
+            .max(1.0) as Score
+    }
+}
+
+/// The C call of a read.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ConstantCall {
+    /// The called C: `placement` indexes [`Call::constant`], cut to `[x, n)`.
+    pub segment: CalledSegment,
+    /// Anchored E-value of its score, `E_C`.
+    pub evalue: f64,
+    /// Probability that the reported names include the read's C allele,
+    /// given that the read reaches C.
+    pub posterior: f64,
+}
+
+/// Reusable buffers of [`ConstantStage::assign`].
+#[derive(Debug, Default)]
+pub struct CScratch {
+    windows: Vec<Option<SpliceWindow>>,
+    candidates: Vec<Vec<Candidate>>,
+    placed: Vec<Vec<Placement>>,
+}
+
+/// Constant-region assignment after adjudication (see the module
+/// documentation).
+pub struct ConstantStage {
+    /// The anchored search over `C′ = [N] + C`: reach classes, banded DP
+    /// with the anchor column, the best classes traced.
+    pub anchored: SegmentStage<ReachClasses>,
+    /// The C database, in whose coordinates C placements are reported.
+    pub plain: Arc<PreparedSegment>,
+    /// The anchor model of `anchored`.
+    pub model: AnchorColumn,
+    /// `s`: C's base 0 lies within `s` bases of the J exit.
+    pub spread: u32,
+    pub significance: AnchoredSignificance,
+}
+
+impl ConstantStage {
+    /// The stage for C database `set`; `None` when `config.scoring` has no
+    /// Karlin–Altschul `λ`.
+    pub fn new(set: GermlineSet, config: &CSegmentConfig) -> Option<Self> {
+        let scoring = config.scoring;
+        let significance = AnchoredSignificance::new(&set, &scoring, config.spread, config.evalue)?;
+        let longest = set
+            .alleles()
+            .iter()
+            .map(|a| a.codes.len())
+            .max()
+            .unwrap_or(0);
+        let model = AnchorColumn::new(scoring, longest);
+        let anchored = PreparedSegment::new(set.with_anchor_column(), &model, scoring.gaps);
+        let keep = KeepPolicy {
+            min_score: model.bonus + config.keep.min_score,
+            ..config.keep
+        };
+        let retriever = ReachClasses::new(&set, config.spread);
+        Some(Self {
+            anchored: SegmentStage::new(Arc::new(anchored), retriever, keep),
+            plain: Arc::new(PreparedSegment::new(set, &scoring, scoring.gaps)),
+            model,
+            spread: config.spread,
+            significance,
+        })
+    }
+
+    /// The splice window of a call whose path ends with a J, if C can follow.
+    pub fn window(&self, call: &Call) -> Option<SpliceWindow> {
+        let last = call.path.as_ref()?.segments.last()?;
+        if call.placements[last.placement].kind != SegmentKind::J {
+            return None;
+        }
+        SpliceWindow::new(last.span.q_hi, call.query.len(), self.spread)
+    }
+
+    /// Place and call C for a chunk of finished calls: one score batch and
+    /// traceback waves for the whole chunk, then per read the C placements
+    /// ([`Call::constant`]) and the call ([`Call::c`]).
+    pub fn assign<A: Aligner>(
+        &self,
+        aligner: &A,
+        calls: &mut [Call],
+        scratch: &mut CScratch,
+        retrieval: &mut RetrievalScratch,
+        dp: &mut A::Workspace,
+        batch: &mut BatchScratch,
+    ) {
+        let CScratch {
+            windows,
+            candidates,
+            placed,
+        } = scratch;
+        windows.clear();
+        windows.extend(calls.iter().map(|call| self.window(call)));
+        if placed.len() < calls.len() {
+            candidates.resize_with(calls.len(), Vec::new);
+            placed.resize_with(calls.len(), Vec::new);
+        }
+        let placed = &mut placed[..calls.len()];
+        placed.iter_mut().for_each(Vec::clear);
+        for ((window, found), call) in windows.iter().zip(candidates.iter_mut()).zip(&*calls) {
+            if let Some(w) = window {
+                self.anchored
+                    .retrieve(&call.query, w.window.clone(), retrieval, found);
+            }
+        }
+        let requests: Vec<SegmentRequest<'_>> = windows
+            .iter()
+            .zip(calls.iter())
+            .enumerate()
+            .filter_map(|(read, (window, call))| {
+                window.as_ref().map(|w| SegmentRequest {
+                    read,
+                    query: &call.query,
+                    window: w.window.clone(),
+                    candidates: &candidates[read],
+                })
+            })
+            .collect();
+        self.anchored
+            .place_many(aligner, &requests, dp, batch, placed);
+        drop(requests);
+        for ((call, window), anchored) in calls.iter_mut().zip(windows.iter()).zip(placed.iter()) {
+            if let Some(w) = window {
+                self.settle(call, w, anchored);
+            }
+        }
+    }
+
+    /// The read's C placements from its anchored ones: anchor stripped,
+    /// clipped to `[x, n)`, class members joined, ranked by (score, longest
+    /// exact run, matches, allele id) and merged; then the call.
+    fn settle(&self, call: &mut Call, w: &SpliceWindow, anchored: &[Placement]) {
+        let n = call.query.len() as u32;
+        let reach = self.anchored.retriever.reach(w.window.len());
+        for p in anchored {
+            let Some(stripped) = strip_anchor(&p.alignment, &self.model) else {
+                continue;
+            };
+            let representative = p.primary_allele();
+            let profile = self.plain.profile(representative);
+            let clip = ClipIndex::build(&stripped, &call.query, profile, self.plain.gaps());
+            let Some(span) = clip.span(w.x, n) else {
+                continue;
+            };
+            let mut placement = Placement::new(
+                SegmentKind::C,
+                representative,
+                clip.alignment(&span),
+                &call.query,
+                &self.plain,
+            );
+            placement.alleles = p
+                .alleles
+                .iter()
+                .flat_map(|&a| self.anchored.retriever.members(a, reach))
+                .copied()
+                .collect();
+            placement.alleles.sort_unstable();
+            placement.alleles.dedup();
+            call.constant.push(placement);
+        }
+        call.constant.sort_by_key(|p| {
+            (
+                std::cmp::Reverse(p.score()),
+                std::cmp::Reverse(p.evidence.longest_exact_run),
+                std::cmp::Reverse(p.evidence.matches),
+                p.primary_allele(),
+            )
+        });
+        merge_identical(&mut call.constant, 0);
+        call.c = self.decide(call, w.x);
+    }
+
+    /// The call from the ranked C placements: the best, if significant.
+    fn decide(&self, call: &Call, x: u32) -> Option<ConstantCall> {
+        let best = call.constant.first()?;
+        if best.score() < self.significance.min_score() {
+            return None;
+        }
+        let n = call.query.len() as u32;
+        let segment = CalledSegment {
+            placement: 0,
+            entry: x,
+            exit: n,
+            span: best.clip.full(),
+            by_marginal: false,
+        };
+        let co = co_optimal(
+            &call.constant,
+            &call.query,
+            self.plain.set(),
+            &segment,
+            false,
+            x..n,
+        );
+        // Log-odds at C's own divergence, from the called columns.
+        let AffineScoring {
+            matched, mismatch, ..
+        } = self.model.inner;
+        let e = &best.evidence;
+        let p = ((f64::from(e.mismatches) + 0.5) / f64::from(e.matches + e.mismatches + 1))
+            .clamp(1e-4, 0.5);
+        let scale = EvidenceScale::at_divergence(p, matched, mismatch);
+        let nats = |q: &Placement| {
+            let e = &q.evidence;
+            let substitution = matched * e.matches as Score + mismatch * e.mismatches as Score;
+            scale.lambda * f64::from(substitution)
+                + scale.mu * f64::from(e.matches + e.mismatches)
+                + self.significance.lambda * f64::from(q.score() - substitution)
+        };
+        let top = call
+            .constant
+            .iter()
+            .map(nats)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let weight = |q: &Placement| (nats(q) - top).exp();
+        let total: f64 = call.constant.iter().map(weight).sum();
+        let counted: f64 = co.counted.iter().map(|&i| weight(&call.constant[i])).sum();
+        Some(ConstantCall {
+            segment,
+            evalue: self.significance.evalue(best.score()),
+            posterior: (counted / total).min(1.0),
+        })
+    }
+}
 
 /// Where one read's anchored hypotheses are searched.
 ///
@@ -319,6 +635,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `S ≥ ⌈(ln(N_C·(2s + 1)) + ln 10³)/λ⌉`: 18 for the 10 human IGHC genes,
+    /// 19 with IGKC and IGLC (16 genes), and the E-value crosses the gate there.
+    #[test]
+    fn the_anchored_gate_counts_genes_and_start_diagonals() {
+        use crate::germline::{GermlineSet, SegmentKind};
+        let genes = |count: usize| {
+            let mut set = GermlineSet::new(SegmentKind::C);
+            for g in 0..count {
+                set.push(&format!("IGHC{g}*01"), b"ACGT", None).unwrap();
+                set.push(&format!("IGHC{g}*02"), b"ACGA", None).unwrap();
+            }
+            set
+        };
+        let gate = |count: usize, spread: u32| {
+            AnchoredSignificance::new(&genes(count), &SCORING, spread, 1e-3).unwrap()
+        };
+        assert_eq!(gate(10, 3).min_score(), 18);
+        assert_eq!(gate(16, 3).min_score(), 19);
+        assert!(gate(10, 6).min_score() > gate(10, 1).min_score());
+        let human = gate(10, 3);
+        assert!(human.evalue(18) <= 1e-3 && human.evalue(17) > 1e-3);
+        assert!((human.lambda - 0.634).abs() < 1e-3);
     }
 
     #[test]

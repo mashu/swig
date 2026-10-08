@@ -7,6 +7,8 @@
 //!                 ─► per read: D windows from V/J geometry, D candidates
 //!                 ─► D stage over the whole chunk ─► per read: admission gates
 //!                 ─► per read: adjudicator (placement DAG) ─► Call
+//!                 ─► C stage over the whole chunk (optional; reads finished
+//!                    calls only, see [`crate::constant`])
 //! ```
 //!
 //! **Trick — stage-wise batching across reads.** After prefiltering a read has
@@ -35,6 +37,7 @@ use crate::admission::{Admission, DefaultAdmission};
 use crate::align::{Aligner, InterSequenceGotoh, InterSequenceWorkspace};
 use crate::alphabet::reverse_complement_into;
 use crate::config::DefaultVRetriever;
+use crate::constant::{CScratch, ConstantCall, ConstantStage};
 use crate::germline::SegmentKind;
 use crate::orient::{Orientation, OrientationPolicy, StrandIndex};
 use crate::placement::Placement;
@@ -59,6 +62,12 @@ pub struct Call {
     /// Posterior marginals of `placements` (indexed alike), when the
     /// adjudicator computes them and the read has a call.
     pub marginals: Option<Marginals>,
+    /// C placements right of a J-final path, clipped to the J exit; empty
+    /// without a C stage. Never part of `placements`, so C cannot change
+    /// the V(D)J call.
+    pub constant: Vec<Placement>,
+    /// The C call, when a C stage finds a significant one.
+    pub c: Option<ConstantCall>,
 }
 
 /// Anything that assigns V(D)J to encoded queries with a reusable workspace.
@@ -118,6 +127,9 @@ pub struct Assigner<
     pub d_window: W,
     pub d_admission: Adm,
     pub adjudicator: Adj,
+    /// Constant-region assignment after adjudication; `None` without a C
+    /// database ([`Assigner::with_constant`]).
+    pub c: Option<ConstantStage>,
     pub options: AssignerOptions,
 }
 
@@ -153,6 +165,7 @@ pub struct Workspace<W = InterSequenceWorkspace, S = DagScratch> {
     placements: Vec<Vec<Placement>>,
     d: DScratch,
     adjudication: S,
+    c: CScratch,
     calls: Vec<Call>,
 }
 
@@ -182,18 +195,18 @@ macro_rules! replace {
 /// monomorphises again around it.
 impl<A, RV, RJ, RD, W, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj> {
     pub fn with_aligner<A2>(self, aligner: A2) -> Assigner<A2, RV, RJ, RD, W, Adm, Adj> {
-        replace!(self { v, j, d, strand, j_window, d_window, d_admission, adjudicator, options } aligner: aligner)
+        replace!(self { v, j, d, strand, j_window, d_window, d_admission, adjudicator, c, options } aligner: aligner)
     }
 
     pub fn with_d_window<W2>(self, d_window: W2) -> Assigner<A, RV, RJ, RD, W2, Adm, Adj> {
-        replace!(self { v, j, d, strand, j_window, aligner, d_admission, adjudicator, options } d_window: d_window)
+        replace!(self { v, j, d, strand, j_window, aligner, d_admission, adjudicator, c, options } d_window: d_window)
     }
 
     pub fn with_d_admission<Adm2>(
         self,
         d_admission: Adm2,
     ) -> Assigner<A, RV, RJ, RD, W, Adm2, Adj> {
-        replace!(self { v, j, d, strand, j_window, aligner, d_window, adjudicator, options } d_admission: d_admission)
+        replace!(self { v, j, d, strand, j_window, aligner, d_window, adjudicator, c, options } d_admission: d_admission)
     }
 
     /// Swap the adjudicator. The D stage keeps the D placements the original
@@ -205,7 +218,7 @@ impl<A, RV, RJ, RD, W, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj> {
         self,
         adjudicator: Adj2,
     ) -> Assigner<A, RV, RJ, RD, W, Adm, Adj2> {
-        replace!(self { v, j, d, strand, j_window, aligner, d_window, d_admission, options } adjudicator: adjudicator)
+        replace!(self { v, j, d, strand, j_window, aligner, d_window, d_admission, c, options } adjudicator: adjudicator)
     }
 
     pub fn with_options(mut self, options: AssignerOptions) -> Self {
@@ -437,6 +450,8 @@ where
                 placements: std::mem::take(placed),
                 path,
                 marginals,
+                constant: Vec::new(),
+                c: None,
             });
         }
     }
@@ -486,6 +501,7 @@ where
             placements,
             d,
             adjudication,
+            c,
             ..
         } = ws;
         let (reads, placements) = (&mut reads[..count], &mut placements[..count]);
@@ -497,7 +513,11 @@ where
         if let Some(stage) = &self.d {
             self.stage_d(stage, reads, placements, d, retrieval, dp, batch);
         }
+        let first = out.len();
         self.stage_adjudicate(reads, placements, adjudication, out);
+        if let Some(stage) = &self.c {
+            stage.assign(&self.aligner, &mut out[first..], c, retrieval, dp, batch);
+        }
     }
 }
 
@@ -507,7 +527,7 @@ impl<A, RV, RJ, RD, W, Adm, Adj> AlleleCatalog for Assigner<A, RV, RJ, RD, W, Ad
             SegmentKind::V => Some(&self.v.segment),
             SegmentKind::D => self.d.as_ref().map(|stage| &*stage.segment),
             SegmentKind::J => Some(&self.j.segment),
-            SegmentKind::C => None,
+            SegmentKind::C => self.c.as_ref().map(|stage| &*stage.plain),
         }
     }
 }

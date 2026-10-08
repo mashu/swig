@@ -14,6 +14,7 @@ use crate::adjudicate::{
 };
 use crate::admission::{AnyOf, DistributedEvidence, ExactRunFloor};
 use crate::align::{Backend, InterSequenceGotoh};
+use crate::constant::ConstantStage;
 use crate::family_bound::FamilyBoundTable;
 use crate::flank::OuterExtend;
 use crate::germline::{GermlineSet, SegmentKind};
@@ -64,6 +65,19 @@ pub struct JSegmentConfig {
     pub window: DownstreamWindow,
     /// Sibling bounds as for V, each gene one frame; lossless.
     pub family_delta: bool,
+}
+
+/// C: splice-anchored alignment right of the called J ([`crate::constant`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CSegmentConfig {
+    pub scoring: AffineScoring,
+    /// `s`: C's germline base 0 lies within `s` bases of the J exit.
+    pub spread: u32,
+    /// Call C iff its anchored E-value is at most this.
+    pub evalue: f64,
+    /// Anchored alignments kept per read. `min_score` is an anchored score;
+    /// the stage adds the anchor bonus.
+    pub keep: KeepPolicy,
 }
 
 /// D: L-mer prefilter, unbanded DP inside junction windows, admission gates.
@@ -259,6 +273,8 @@ pub struct EngineConfig {
     pub v: VSegmentConfig,
     pub d: DSegmentConfig,
     pub j: JSegmentConfig,
+    /// Used by [`Assigner::with_constant`] when a C database is given.
+    pub c: CSegmentConfig,
     pub d_window: ExpandedResidual,
     /// Add the conserved-anchor D window when alleles carry `anchor=` positions.
     pub anchor_window: bool,
@@ -335,6 +351,27 @@ impl Default for JSegmentConfig {
     }
 }
 
+impl Default for CSegmentConfig {
+    /// The V scoring, so the gate and the posterior read V's λ. `s = 3`:
+    /// reference conventions put C's base 0 within one base of the J exit
+    /// (IMGT CH1 records after the J's last base, codon-aligned records on
+    /// it, 3′-partial J records one base early), and SHM indels near the J's
+    /// 3′ end misplace the exit by up to two more. The gate is the anchor
+    /// gate of [`EvalueGates`]: C is called on its own evidence.
+    fn default() -> Self {
+        Self {
+            scoring: AffineScoring::new(2, -3, -9, -1),
+            spread: 3,
+            evalue: EvalueGates::default().anchor,
+            keep: KeepPolicy {
+                top: 3,
+                min_score: 1,
+                cap: 64,
+            },
+        }
+    }
+}
+
 impl Default for DSegmentConfig {
     fn default() -> Self {
         Self {
@@ -360,6 +397,7 @@ impl Default for EngineConfig {
             v: VSegmentConfig::default(),
             d: DSegmentConfig::default(),
             j: JSegmentConfig::default(),
+            c: CSegmentConfig::default(),
             d_window: ExpandedResidual::default(),
             anchor_window: true,
             grammar: VdjGrammar::VDJ,
@@ -386,6 +424,8 @@ pub enum BuildError {
         found: SegmentKind,
     },
     Empty(SegmentKind),
+    /// The segment's scoring has no Karlin–Altschul `λ`.
+    NoStatistics(SegmentKind),
     /// The requested SIMD backend does not run on this CPU.
     Unsupported(Backend),
 }
@@ -403,6 +443,11 @@ impl fmt::Display for BuildError {
                 )
             }
             Self::Empty(kind) => write!(f, "the {} germline set is empty", kind.label()),
+            Self::NoStatistics(kind) => write!(
+                f,
+                "the {} scoring has no Karlin–Altschul statistics (its expected score must be negative)",
+                kind.label()
+            ),
             Self::Unsupported(backend) => {
                 write!(f, "this CPU does not support the {} kernel", backend.name())
             }
@@ -592,8 +637,25 @@ impl Assigner {
                 config.d.distributed,
             ),
             adjudicator,
+            c: None,
             options: config.options,
         })
+    }
+}
+
+impl<A, RV, RJ, RD, W, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj> {
+    /// Add constant-region assignment against C database `c`
+    /// ([`crate::constant`]); V, D and J calls are unchanged.
+    pub fn with_constant(
+        mut self,
+        c: GermlineSet,
+        config: &CSegmentConfig,
+    ) -> Result<Self, BuildError> {
+        check(&c, SegmentKind::C)?;
+        let stage =
+            ConstantStage::new(c, config).ok_or(BuildError::NoStatistics(SegmentKind::C))?;
+        self.c = Some(stage);
+        Ok(self)
     }
 }
 

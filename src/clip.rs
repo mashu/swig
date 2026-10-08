@@ -241,6 +241,19 @@ impl ClipIndex {
         })
     }
 
+    /// The sub-alignment of `span`: its columns, bounds and score. It starts
+    /// and ends with a `Match`, as a span does.
+    pub fn alignment(&self, span: &ClipSpan) -> Alignment {
+        Alignment {
+            q_start: span.q_lo,
+            q_end: span.q_hi,
+            r_start: span.r_lo,
+            r_end: span.r_hi,
+            score: span.score,
+            ops: self.columns(span).map(|(op, ..)| op).collect(),
+        }
+    }
+
     /// Query position aligned to reference position `r`, extrapolated along the
     /// alignment's end diagonals when `r` lies outside the aligned reference range.
     /// Used to project conserved anchors (V Cys, J Trp/Phe) onto the query.
@@ -338,6 +351,13 @@ mod tests {
                     naive_clip_score(&aln, &query, &reference, lo, hi),
                     "[{lo},{hi})"
                 );
+                // The span's sub-alignment is a whole alignment worth the span.
+                if let Some(span) = clip.span(lo, hi) {
+                    let sub = clip.alignment(&span);
+                    let whole = naive_clip_score(&sub, &query, &reference, 0, u32::MAX);
+                    assert_eq!(whole, Some(span.score));
+                    assert_eq!((sub.q_start, sub.q_end), (span.q_lo, span.q_hi));
+                }
             }
         }
     }

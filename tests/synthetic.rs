@@ -1,7 +1,8 @@
 //! End-to-end tests on a synthetic germline database.
 //!
 //! The database is random but deterministic (SplitMix64): 6 V genes × 2
-//! alleles (SNPs at 50/150/250), 8 D genes of 14–21 nt, 4 J genes of 48 nt.
+//! alleles (SNPs at 50/150/250), 8 D genes of 14–21 nt, 4 J genes of 48 nt,
+//! and 2 C isotypes × 2 subclasses of 330 nt sharing their first 24 nt.
 //! Queries are simulated rearrangements with trimming and random N regions.
 
 use std::collections::{HashMap, HashSet};
@@ -28,6 +29,7 @@ struct Db {
     v: Vec<(String, String)>,
     d: Vec<(String, String)>,
     j: Vec<(String, String)>,
+    c: Vec<(String, String)>,
 }
 
 const V_LEN: usize = 290;
@@ -53,7 +55,25 @@ impl Db {
         let j = (1..=4)
             .map(|g| (format!("IGHJ{g}*01"), bases(&mut rng, 48)))
             .collect();
-        Self { v, d, j }
+        let mut c = Vec::new();
+        for isotype in 1..=2 {
+            let root = bases(&mut rng, 330);
+            for subclass in 1..=2 {
+                let sequence: String = root
+                    .chars()
+                    .enumerate()
+                    .map(|(k, b)| {
+                        if k >= 24 && rng.below(10) == 0 {
+                            substitute(b, &mut rng)
+                        } else {
+                            b
+                        }
+                    })
+                    .collect();
+                c.push((format!("IGHG{isotype}{subclass}*01"), sequence));
+            }
+        }
+        Self { v, d, j, c }
     }
 
     fn set(kind: SegmentKind, entries: &[(String, String)], anchor: Option<u32>) -> GermlineSet {
@@ -115,6 +135,18 @@ fn simulate(db: &Db, rng: &mut Rng, d_choice: &[usize], shm_rate: f64) -> Sim {
         d: d_names,
         j: j_name.clone(),
     }
+}
+
+/// `query` with `c[..len]` spliced after its J and `tail` random bases.
+fn with_constant(query: &str, c: &str, len: usize, tail: usize, rng: &mut Rng) -> String {
+    format!("{query}{}{}", &c[..len], bases(rng, tail))
+}
+
+/// The assigner with the database's C stage.
+fn with_c(db: &Db, config: &EngineConfig) -> DefaultAssigner {
+    db.assigner(config)
+        .with_constant(Db::set(SegmentKind::C, &db.c, None), &config.c)
+        .unwrap()
 }
 
 fn first_label(report: &Option<vdj_assign::report::SegmentReport>) -> Option<String> {
@@ -335,6 +367,110 @@ fn batch_matches_sequential() {
         assert_eq!(sequential.path, call.path);
         assert_eq!(sequential.orientation, call.orientation);
     }
+}
+
+/// The C stage reads finished calls only: placements, path and marginals are
+/// those of the assigner without it, and a read without C gets none.
+#[test]
+fn the_constant_stage_leaves_vdj_calls_unchanged() {
+    let db = Db::new();
+    let config = EngineConfig::default();
+    let (plain, constant) = (db.assigner(&config), with_c(&db, &config));
+    let mut rng = Rng::new(31);
+    let queries: Vec<Vec<u8>> = (0..300)
+        .map(|_| {
+            let d = rng.below(8);
+            let sim = simulate(&db, &mut rng, &[d], 0.05);
+            let (c, len) = (&db.c[rng.below(4)].1, rng.below(80));
+            let q = with_constant(&sim.query, c, len, rng.below(20), &mut rng);
+            let q = if rng.below(2) == 0 {
+                q
+            } else {
+                reverse_complement(&q)
+            };
+            encode(q.as_bytes())
+        })
+        .collect();
+    let without = assign_all(&plain, &queries, 2);
+    let with = assign_all(&constant, &queries, 3);
+    let mut called = 0;
+    for (a, b) in without.iter().zip(&with) {
+        assert_eq!(
+            (a.orientation, &a.path, &a.marginals),
+            (b.orientation, &b.path, &b.marginals)
+        );
+        assert_eq!(a.placements.len(), b.placements.len());
+        for (p, q) in a.placements.iter().zip(&b.placements) {
+            assert_eq!(
+                (p.kind, &p.alleles, &p.alignment),
+                (q.kind, &q.alleles, &q.alignment)
+            );
+        }
+        assert!(a.constant.is_empty() && a.c.is_none());
+        assert!(b.placements.iter().all(|p| p.kind != SegmentKind::C));
+        assert!(b.constant.iter().all(|p| p.kind == SegmentKind::C));
+        called += usize::from(b.c.is_some());
+    }
+    assert!(called > 100, "{called} C calls");
+}
+
+/// A spliced C of 30 or more bases is called, as an allele equal to the
+/// read's on the spliced bases; random tails are not called; one read alone,
+/// a batch and the scalar kernel agree.
+#[test]
+fn the_constant_region_is_called_from_the_j_exit() {
+    let db = Db::new();
+    let config = EngineConfig::default();
+    let simd = with_c(&db, &config);
+    let scalar = with_c(&db, &config).with_aligner(BandedGotoh);
+    let mut rng = Rng::new(37);
+    let mut reads = Vec::new();
+    for k in 0..400 {
+        let d = rng.below(8);
+        let sim = simulate(&db, &mut rng, &[d], 0.03);
+        let c = &db.c[rng.below(4)].1;
+        let len = if k % 4 == 0 { 0 } else { 30 + rng.below(150) };
+        let tail = if len == 0 { 40 } else { rng.below(10) };
+        let query = with_constant(&sim.query, c, len, tail, &mut rng);
+        let equivalent: Vec<&str> =
+            db.c.iter()
+                .filter(|(_, other)| other[..len] == c[..len])
+                .map(|(name, _)| name.as_str())
+                .collect();
+        reads.push((encode(query.as_bytes()), (len > 0).then_some(equivalent)));
+    }
+    let queries: Vec<&[u8]> = reads.iter().map(|(q, _)| q.as_slice()).collect();
+    let batched = assign_all(&simd, &queries, 3);
+    let mut ws = scalar.workspace();
+    let mut false_calls = 0;
+    for ((query, truth), call) in reads.iter().zip(&batched) {
+        let alone = scalar.assign(query, &mut ws);
+        assert_eq!(alone.c, call.c);
+        assert_eq!(alone.constant.len(), call.constant.len());
+        for (a, b) in alone.constant.iter().zip(&call.constant) {
+            assert_eq!((&a.alleles, &a.alignment), (&b.alleles, &b.alignment));
+        }
+        let record = AirrRecord::from_call("q", "", call, &simd, &[None, None, None]);
+        let primary = call.c.map(|c| {
+            let allele = call.constant[c.segment.placement].primary_allele();
+            simd.segment(SegmentKind::C)
+                .unwrap()
+                .set()
+                .allele(allele)
+                .name
+                .clone()
+        });
+        match truth {
+            Some(equivalent) => {
+                assert!(equivalent.contains(&primary.unwrap().as_str()));
+                let c = call.c.unwrap();
+                assert!(c.evalue <= 1e-3 && (0.0..=1.0).contains(&c.posterior));
+                assert!(c.segment.span.q_lo >= record.j.as_ref().unwrap().sequence_end);
+            }
+            None => false_calls += usize::from(primary.is_some()),
+        }
+    }
+    assert!(false_calls <= 1, "{false_calls} false C calls");
 }
 
 // ---------------------------------------------------------------------------
