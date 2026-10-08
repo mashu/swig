@@ -103,13 +103,16 @@ the V region boundaries follow from three conserved residues:
 ```text
 FR1  = [frame start, Cys23 + 4 codons)      CDR1 = [Cys23 + 4, Trp41 − 2)
 FR2  = [Trp41 − 2, Trp41 + 15)              CDR2 = [Trp41 + 15, FR3 start)
-FR3  = [Cys104 − (L − 1), Cys104 + 1)       L = 38 codons heavy, 36 light
+FR3  = [Cys104 − (L − 1), Cys104 + 1)       L = FR3 length in codons
 CDR3 = [Cys104 + 1, J Trp/Phe118)           FR4  = [J Trp/Phe118, J end)
 junction = [Cys104, Trp/Phe118 + 1)         (both conserved codons included)
 ```
 
-These are the IMGT/AIRR definitions. FR2 has no IMGT gaps, and FR3 has
-constant gaps per locus (heavy: 73; kappa and lambda: 73, 81, 82).
+These are the IMGT/AIRR definitions. FR2 has no IMGT gaps. FR3 (IMGT 66–104)
+has no conserved residue at its start, and its length varies: 38 codons in
+IG heavy and 36 in kappa, but by gene family in lambda (36/38), TRA (32–34),
+TRB (37/38), TRG and TRD (37–39). The CDR2/FR3 boundary therefore comes from
+annotated relatives or a length learned from the database (below).
 
 ### Header keys
 
@@ -121,11 +124,29 @@ All positions are 0-based in the germline sequence; unknown keys are ignored.
 | `fr1=` `cdr1=` `fr2=` `cdr2=` `fr3=` | V region starts |
 | `aliases=A,B` | other names of this sequence |
 
+### IMGT-gapped input
+
+An IMGT-gapped V set (the IMGT reference format: `.` for the gap columns) is
+numbered from its gap columns. The FR1, CDR1, FR2, CDR2 and FR3 starts are
+IMGT columns 1, 79, 115, 166 and 196, and Cys104 is column 310.
+
+- The gaps are used only when most gapped alleles are codon-aligned and
+  carry Cys, Trp and Cys at IMGT 23, 41 and 104. Otherwise they are ignored
+  (a codon alignment in other columns) and the summary line says why.
+- A region that the numbering places before a 5′-partial sequence stays
+  empty; a motif hit cannot fill it.
+- An allele whose numbering ends before Cys104 gets no anchor (`3′-partial`).
+- A one- or two-column interior gap (an IMGT frameshift marker) is noted, and
+  the columns after it still map exactly.
+- Header keys win over the gap columns.
+- Ungapped alleles appended to a gapped set are annotated as below, and take
+  their FR3 start from their gapped relatives.
+
 ### Sources, in order of trust
 
 A header value is never overridden.
 
-1. **Header keys.**
+1. **Header keys**, then the **IMGT gap columns** (source `imgt-gaps`).
 2. **Motif search** on a one-pass three-frame translation. For V, Cys23, Trp41
    and Cys104 are placed jointly under spacing constraints, scored by
    conserved context: `[ST]C`; `W` with `Q`+3, `P`+5, `G`+6 (`WVRQAPG` /
@@ -134,13 +155,19 @@ A header value is never overridden.
    FR4.
 3. **Database consensus.** Once pass 1 has run, the chain type is voted:
    J `W`/`F` and Trp41 context `W.R`/`W.Q`. That turns the Trp41 → Cys104 window
-   into a CDR2-length constraint, `[14 + L, 26 + L]`. The dominant V 3′ tail
+   into a CDR2-length constraint, `[14 + L, 26 + L]`, over every FR3 length `L`
+   the chain default or the given FR3 starts admit. The dominant V 3′ tail
    (applied to confident alleles only when it holds ≥ 50 % of the database) and
    the Cys23 codon index of full-length alleles (only in their frame) become
    priors for a second pass.
 4. **Sibling alignment.**
-   - An ambiguous Cys23 in a 5′-truncated allele is taken from the most similar
-     unambiguous allele.
+   - An FR3 start that is not given is taken from the most similar allele
+     whose FR3 start is given. If the two share a Trp41 → Cys104 spacing, the
+     Cys104 → FR3 distance is copied; otherwise the FR3 start is mapped by
+     alignment, so a CDR2 indel stays in CDR2.
+   - A Cys23 window with several Cys codons, or none (a mutated Cys23, or a
+     5′-partial allele that starts after it), takes CDR1 from the most
+     similar allele whose Cys23 is settled, in any frame.
    - An allele whose motifs stay weak (pseudogene, mutated Cys) gets its anchor
      and every region start transferred by alignment from the most similar
      trusted allele.
@@ -152,7 +179,29 @@ A header value is never overridden.
      partial V alleles (IGHV4-31\*06–\*09, IGHV2-70\*02, …) had been given an
      out-of-frame TGT ~30 nt upstream, which shifted every junction they
      produced.
-5. **Low-confidence motif hit (no relative), or missing.** Both are reported.
+5. **Database models**, for alleles that no relative settles. Both are
+   learned once per database, with Jeffreys (½) pseudo-counts:
+   - *FR3 length.* Trp41 → Cys104 spans `d = 14 + c + L` codons for a CDR2 of
+     `c` and an FR3 of `L` codons. The model picks the `L` that maximises
+     `P(L) · P(c = d − 14 − L)`, both estimated from the given FR3 starts. `L`
+     ranges over the observed lengths ±1 codon, up to 39. Without any given
+     FR3 start, the chain default (38 heavy, 36 light) is used.
+   - *Cys23.* Each candidate codon is scored by the database's Cys23
+     nucleotide offsets, its CDR1 lengths and the two residues before
+     Cys23, against background frequencies. TRB Cys23 follows `R`, not the
+     IG `[ST]`. A mutated Cys23 is placed only at an offset the database
+     has, with posterior ≥ ½.
+6. **Low-confidence motif hit (no relative), or missing.** Both are reported.
+
+Every derived start that may be wrong is flagged in `annotation.tsv` as
+`uncertain=…`; given values never are. The flagged cases are:
+- every start of a low-confidence or missing anchor;
+- an FR3 length with model posterior below 0.95, or outside the model;
+- the chain default in a TR or IGL database without any given FR3 start
+  (`prepare` and `assign` also warn);
+- a CDR1 from an ambiguous Cys23 that no relative settled, or from no Cys23;
+- a CDR of unusual length;
+- a start transferred from a relative whose own start is flagged.
 
 ### Speed
 
@@ -160,11 +209,13 @@ A header value is never overridden.
   the 2-bit codon index.
 - **Candidate scoring:** a V allele costs a few dozen candidate scores per pass.
 - **Relative search:** an inverted 8-mer index (CSR over 65,536 keys, built
-  lazily) is searched only for the rare unresolved allele, touching only
-  alleles that share k-mers.
+  lazily) is searched only for an unresolved allele or an FR3 start that is
+  not given while others are, touching only alleles that share k-mers.
 
 | Database | Preparation time |
 |---|---|
+| Human IGH, IMGT-gapped (415 V) | 1.1 ms |
+| Human IGH, ungapped | 29 ms |
 | IGH-sized, anchors in headers | 0.8 ms |
 | IGH-sized, worst case (no recognisable motifs) | 1.3 ms |
 | 3,400 alleles, worst case | 11.7 ms |
@@ -187,8 +238,12 @@ Synthetic genes are built from heavy and light framework templates:
 | Test | Result |
 |---|---|
 | 300 heavy + 300 light alleles | every boundary exact |
-| 12,000 alleles over 40 databases | 0 anchor, FR2, CDR2 or FR3 errors |
-| CDR1 starts in the same 12,000 | 5 wrong, all flagged `Cys23 ambiguous` (truncated alleles without a sibling); 0 silent errors |
+| 12,000 alleles over 40 databases | every anchor and region start exact (3 flagged CDR1 errors before the Cys23 model) |
+| IMGT-gapped heavy and light sets with a Cys104 → Ser pseudogene, a 3′-partial, a 5′-partial starting in CDR1, a frameshift marker and a header override | every anchor and start exact; no FR1 or CDR1 before the sequence |
+| TRB (FR3 37/38) and TRA (34/32) sets, 3 headers per family | every boundary exact; without headers `fr3_warning` and every FR3 start flagged |
+| TRB and TRA sets with one header per family, 5′-truncated alleles | 0 errors (6 flagged CDR1 errors before the Cys23 model) |
+| Ungapped alleles appended to an IMGT-gapped 36/38 light set; a CDR2 deletion | FR3 from the gapped relative, exact |
+| Truncated TRB allele with an upstream `SC` decoy; Cys23 → Tyr; 5′-partial after Cys23 | CDR1 exact |
 | Pseudogene with Cys104 and Trp41 destroyed | anchor and all regions transferred exactly from its sibling |
 | 3′-partial allele ending inside Cys104, with an out-of-frame TGT decoy | no anchor, flagged `3′-partial` |
 | 200 simulated reads, half reverse-complemented | FR1–FR4, CDR1–CDR3, junction, frame, stop codon and productive flag exact |
@@ -201,12 +256,14 @@ anchor and region start in the headers (plus `annotation=SOURCE`), and
 
 - frame, anchor and its residue;
 - region starts, CDR1 and CDR2 lengths in codons;
-- source (`header`, `motif`, `consensus`, `transfer:NAME`, `low-confidence`,
-  `missing`) and notes.
+- source (`header`, `imgt-gaps`, `motif`, `consensus`, `transfer:NAME`,
+  `low-confidence`, `missing`) and notes. The notes end with an
+  `uncertain=cdr1,fr3`-style token naming the starts that may be wrong.
 
 Reloading the written FASTA uses the headers as-is, so manual corrections
-stick. Assignment runs log a one-line summary and warn when any allele is
-transferred, low-confidence or missing.
+stick. Assignment runs log a one-line summary. They warn when any allele is
+transferred, low-confidence or missing, and when a TR or IGL database gives
+no FR3 start, so that every FR3 start rests on one chain default.
 
 ## Architecture
 
@@ -228,7 +285,7 @@ stages are the methods `stage_orient`, `stage_v`, `stage_j`, `stage_d` and
 | Module | Responsibility |
 |---|---|
 | `alphabet`, `fasta`, `germline`, `reads` | 2-bit codes (N = 4), germline FASTA and sets with anchors, streaming FASTA/FASTQ |
-| `translate`, `annotate`, `prepare`, `read_regions` | Codon table, anchors and V regions (header > motif > consensus > sibling transfer), per-read FR/CDR/junction projection |
+| `translate`, `annotate`, `prepare`, `read_regions` | Codon table, anchors and V regions (header > IMGT gaps > motif > consensus > relatives > database models), per-read FR/CDR/junction projection |
 | `scoring`, `stats` | Log-odds substitution profiles (uniform or position-specific), affine gaps, Karlin–Altschul λ/K/E-values |
 | `orient` | Strand from germline k-mer presence on both strands, with a significance test |
 | `seed`, `index`, `retrieve/frames` | Rolling k-mers, CSR k-mer index over gene frames (alleles of a gene in one coordinate system) |
@@ -766,18 +823,24 @@ Each is a named field you can change.
   the CLI cannot detect a D file passed as `--j`.
 - **Compressed input.** Gzip must be piped through `zcat`; there is no built-in
   decompression.
-- **FR3 length rule.** The CDR2/FR3 boundary uses the FR3 length (38 codons
-  heavy, 36 light). That length holds across human IGHV/IGKV/IGLV families
-  but is unverified for TR loci. Give `fr3=` in the header where it differs;
-  CDR2 lengths outside 0–12 codons are noted.
+- **FR3 starts need some annotated alleles.** The CDR2/FR3 boundary has no
+  conserved residue. Across 13 tcrdist3 loci, FR3 starts not given were
+  scored against IMGT:
+  - with no given FR3 start, the chain default is wrong for 539 of 1,695
+    alleles (32 %), all flagged but IGHV4-31\*05, whose FR3 lacks a codon;
+  - with `fr3=` on the \*01 alleles, 1 of 872 others is wrong, flagged;
+  - with `fr3=` on 10 %, 73 of 1,519 are wrong, all flagged, most of them
+    behind a low-confidence anchor.
+  Supply an IMGT-gapped V set, or `fr3=` on a few alleles per gene family.
 - **Chain type is one per database.** It is voted per database, so a mixed
   IGK + IGL database is fine, but a mixed heavy + light database needs
   `--chain` or separate runs.
 - **FR1 start.** FR1 starts at the first complete codon. A V sequence that
   includes a leader needs `fr1=` in the header.
-- **Ambiguous Cys23.** A 5′-truncated allele with no sibling and an adjacent
-  decoy Cys may get a wrong CDR1 start. This is always flagged in
-  `annotation.tsv`.
+- **A lone decoy Cys23.** When the Cys23 window holds exactly one Cys
+  codon, it is taken as Cys23. An allele whose Cys23 is mutated or cut
+  away, with a mutation-made Cys in the window, would get a wrong CDR1
+  start without a flag. None occurred in the tests or the 13 loci.
 - **IUPAC codes.** Germline IUPAC codes are stored as N, and a written
   database spells them N.
 
@@ -794,6 +857,7 @@ In order of expected value; reasons and measurements are in
    kernel. Next on that line: 8-bit lanes for D jobs (32 per AVX2 register).
 4. **Allele rescoring along the gene frame.** Score siblings along their
    representative's traceback and run DP only where bounds straddle the cutoff.
-5. **Annotation.** A per-database FR3 length learned from header-annotated
-   alleles (TR loci). A consensus position prior for Cys23.
+5. ~~**Annotation.**~~ Done: IMGT gap numbering, FR3 from annotated relatives
+   or a learned length, a learned Cys23 model, and structured `uncertain=`
+   flags (see the assessment, §10).
 6. **C-segment assignment.**

@@ -135,6 +135,74 @@ starts and ends on match columns and so never splits a gap run.
 **Separability.** The clipped score is `exit(hi).prefix − entry(lo).prefix`:
 one term per cut. The support key is cut-independent.
 
+## 3a. Germline annotation (`annotate/`)
+
+Anchors fix every reading frame and junction end: V Cys104 and J
+Trp/Phe118. V region starts give the FR/CDR columns. Both are settled once
+per database, before any read is seen. A value given in a header is never
+overridden. The other sources, in order:
+
+1. **IMGT numbering** of an IMGT-gapped V set. The gap runs are kept by the
+   parser, and the gapped columns of the five region starts and of Cys104
+   are mapped onto bases.
+   - The gaps are trusted only when most gapped alleles are codon-aligned
+     and carry C/W/C at IMGT 23/41/104 (human IGH: 97.8 / 95.3 / 98.5 %).
+   - Each start is *known*, *before the sequence* (a 5′-partial record; no
+     motif may fill it) or *unknown*.
+   - One- and two-column interior runs are IMGT frameshift markers; the
+     mapping stays exact across them.
+2. **Motifs**: Cys23, Trp41 and Cys104 placed jointly (§5), then a second
+   pass with database priors.
+3. **Relatives**: the most similar allele (≥ 50 % shared 8-mers) donates
+   positions by local alignment.
+4. **Database models**, below.
+
+**FR3 length.** The CDR2/FR3 boundary (IMGT 66) has no conserved residue,
+and FR3 spans 32–39 codons depending on the locus and family. With Trp41 →
+Cys104 spanning `d` codons, a CDR2 of `c` codons and an FR3 of `L` (Cys104
+included), `d = 14 + c + L`. The alleles whose FR3 start is given are the
+labels:
+
+```text
+P(L | d) ∝ P(L) · P_c(d − 14 − L)
+P(L)   = (n_L + ½) / (N + ½·|S|),   L ∈ S = [L_min − 1, min(L_max + 1, 39)]
+P_c(c) = (m_c + ½) / (M + ½·13),    c ∈ 0..=12
+```
+
+The MAP length is used only when no relative with a given FR3 start exists.
+A relative's start is a homologous position, so a CDR2 indel stays in CDR2.
+Without labels the chain default is used (38 heavy, 36 light).
+
+The model treats `c` and `L` as independent across labels, which fails for a
+family with no label: human TRGV1–8 get `L = 39` at `p = 0.92` when only
+TRGV9–11 are annotated. On 13 loci with 10 % of alleles annotated, values with
+`p ≥ 0.95` were 309/309 right and values with `0.8 ≤ p < 0.95` were 102/115
+right. A model length below 0.95 is therefore flagged uncertain.
+
+**Cys23.** When the window `[Trp41 − 20, Trp41 − 10]` holds several `C`, or
+none, and no relative with a settled Cys23 maps into it:
+
+```text
+P(k) ∝ P_x(3k + frame) · P_ℓ(Trp41 − k − 6) · Π_{j=1,2} P_j(aa[k−j]) / P_bg(aa[k−j])
+```
+
+The terms are Jeffreys tables of the settled alleles: the Cys23 nucleotide
+offset, the CDR1 length, and the residues before Cys23 against the residues
+upstream of Trp41. A mutated Cys23 is placed only at a seen offset with
+`P ≥ ½`. The motif search itself is unchanged, so anchors and frames cannot
+move.
+
+**Flags.** Every derived start that may be wrong carries an `uncertain` bit,
+written to `annotation.tsv` as `uncertain=…`; an error without the bit is a
+silent error. The bit is set for:
+- every derived start of a low-confidence or missing anchor;
+- a model FR3 length below 0.95, or a spacing outside the model;
+- the chain default in a TR/IGL database without labels;
+- a CDR1 start placed without a Cys23 codon, or from an ambiguous Cys23
+  that no relative settled;
+- the bounds of a CDR of unusual length;
+- a start transferred from a flagged one.
+
 ## 4. Adjudication: exact semi-Markov Viterbi (`adjudicate/dag.rs`)
 
 Placements are nodes, sorted by segment kind (V, D, J), then read start.
@@ -398,6 +466,16 @@ Metrics (`sim/evaluate.rs`):
   germline equivalence" (§4a); D presence's is "the read has a simulated D",
   however short.
 
+**Junction truth depends on the annotation.** The simulator places each
+read's junction with the anchors that the same germline set's annotation
+gives. A wrong germline anchor therefore relabels the truth instead of
+showing up as an error. Reading the IMGT gap columns of the human IGH set
+moved 12 V anchors, and regenerating the same reads (seed 7, byte-identical
+FASTA) changed the junction of 551 / 560 / 610 reads (easy / mid / hard).
+On that truth, the previous release's junctions are 97.76 / 97.50 / 96.94 %
+exact, and this release's 100.00 / 99.99 / 99.84 %. Accuracy claims compare
+two callers on one truth.
+
 **Comparisons** (`sim::Paired`). Two callers or settings are compared on the
 same reads, at least 20,000 per preset: for each metric, the accuracy
 difference with its 95 % interval (paired Wald) and an exact two-sided
@@ -447,3 +525,10 @@ this objective can do better.
    (D-presence ECE 0.2–2.2 %). Both should come from data.
 3. **Calibrated statistics.** Fit gapped λ and K, and an effective database
    size for near-identical alleles, by simulation.
+4. **Annotation without labels.** The FR3 model assumes CDR2 and FR3 lengths
+   independent across labelled alleles; a family with no label is
+   extrapolated (flagged, but often wrong), and a joint or family-aware
+   model would need more labels than a user supplies. A Cys23 window with a
+   single `C` is never questioned, so a mutated Cys23 next to a
+   mutation-made decoy would give a silent CDR1 error; none occurs in the
+   tests or the 13 loci measured.

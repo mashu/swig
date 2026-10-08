@@ -439,11 +439,13 @@ work.
     they also keep every admissible D in the lattice. No slot is negligible
     (every admissible D scores ≥ 8 against `P_D` 11), so pruning would be
     an approximation; a single-precision pass is the remaining option.
-11. **Anchors without a relative.** Seven V alleles of the human IGH set
-    (pseudogenes and ORFs) keep a low-confidence motif anchor. One of them,
-    IGHV1-38-4\*01 (Cys104 → Tyr), is placed on a TGT in another frame;
-    without a relative there is no evidence to place it better, so it is
-    reported as low-confidence rather than silently trusted.
+11. **Anchors without a relative.** Read without its gap columns, the
+    human IGH set leaves seven V alleles (pseudogenes and ORFs) with a
+    low-confidence motif anchor. One of them, IGHV1-38-4\*01 (Cys104 → Tyr),
+    is placed on a TGT in another frame. Without a relative there is no
+    evidence to place it better, so it is reported as low-confidence rather
+    than silently trusted. IMGT-gapped input numbers all of them exactly
+    (§10).
 
 ## 6. Plan
 
@@ -786,7 +788,136 @@ input parsing with assignment; (5) allele rescoring along the gene frame
 ### 9.7 Roadmap status
 
 Of the roadmap in the README, the wider-SIMD item is done (AVX-512BW, NEON
-and a portable backend). Calls from the per-read model, a D prior from the D
-search's own statistics, allele rescoring along the gene frame, annotation
-priors and C-segment assignment remain open; §9.5 shows the D prior is the
-one with the clearest measured need.
+and a portable backend), and so are the annotation priors (§10). Calls from
+the per-read model, a D prior from the D search's own statistics, allele
+rescoring along the gene frame and C-segment assignment remain open; §9.5
+shows the D prior is the one with the clearest measured need.
+
+## 10. Annotation priors (roadmap item 5)
+
+### 10.1 What was wrong
+
+- **The harness's own germline set was misread.** `IGHV.fasta` is
+  IMGT-gapped, and the parser dropped the dots. With them went the
+  numbering that fixes every region start and Cys104. Twelve V alleles got a
+  wrong anchor:
+  - IGHV1-68\*01–03, IGHV3-30-2/-33/-52, IGHV3-32, IGHV3-33-2 and IGHV1-38-4
+    were pseudogenes placed on a TGT two codons upstream;
+  - three 3′-partial IGHV1/OR16 alleles got an anchor they do not hold.
+- **The truth inherited those errors.** The simulator's junction truth uses
+  the same annotation, so the harness scored those reads' junctions as right
+  (ALGORITHM.md §7).
+- **FR3 starts in TR and lambda loci came from one chain default.** A whole
+  family whose FR3 length differs (TRA 32–34, TRB 37/38, TRG/TRD 37–39,
+  lambda 36/38 codons) was wrong without a flag.
+- **"Flagged" had no definition.** The tests and the scoring scripts used
+  different notes.
+
+### 10.2 What replaced it
+
+- **IMGT gap numbering.** The parser keeps the gap runs, and `ImgtNumbering`
+  maps the IMGT columns onto bases.
+  - Each start is known, before the sequence, or unknown.
+  - Frameshift markers are accepted.
+  - The policy lives in `annotate()`: the gaps are used only when most
+    gapped alleles are codon-aligned with C/W/C at IMGT 23/41/104.
+  - Header keys win over the gaps.
+- **FR3 starts that are not given** come from:
+  1. the nearest relative with a given FR3 start;
+  2. else `Fr3Model`, a Jeffreys posterior over FR3 and CDR2 lengths
+     (ALGORITHM.md §3a);
+  3. else the chain default.
+
+  The provenance note is written after the merge, only for the value kept.
+- **Cys23 when the window holds several `C` or none** comes from the nearest
+  relative with a settled Cys23, in any frame, else from `Cys23Model`.
+- **A structured `uncertain` bit per region start**, written as
+  `uncertain=…`. Tests and scripts count an error as silent only when the
+  bit is clear.
+
+### 10.3 Measurements
+
+Annotation is scored against IMGT's gap columns: the human IGH set, and 13
+tcrdist3 loci (human and mouse TRA/TRB/TRG/TRD where present, IGH, IGK and
+IGL). "Main" is the code before this item.
+
+| Check | Main | Now |
+|---|---|---|
+| Gapped human IGH (415 V): anchors | 370 right, 9 wrong, 3 spurious | 379 right, 0 wrong; the 36 without one are 3′-partial |
+| — CDR1 / CDR2 / FR3 starts | 373 / 389 / 399 right of 413 / 412 / 412 | all right |
+| — preparation | 28 ms | 1.0 ms |
+| Same set, dots stripped from every non-\*01 / half / 90 % of alleles: silent anchor, CDR1 or FR3 errors among them | — | 0 / 0 / 0 |
+| — CDR1 missing among them | 22 / 18 / 38 | 1 / 4 / 16 |
+| IGH without dots, 13 loci without headers | — | anchor, frame, FR1, FR2, CDR2, FR3 and source identical; 29 CDR1 starts missing → right, none wrong |
+| Headers on \*01 alleles: FR3 of the others | 190 silent, 5 flagged | 0 silent, 1 flagged |
+| Headers on 10 %: FR3 of the others | 341 silent, 74 flagged, 1082 right | 0 silent, 73 flagged, 1432 right |
+| — CDR1 missing (\*01 / 10 %) | 17 / 64 | 5 / 50 |
+| A gapped set with dots moved one codon in FR1 (not IMGT) | — | falls back, `annotation.tsv` identical to the ungapped run |
+| `every_error_is_flagged` (12,000 alleles) | 3 flagged CDR1 errors | 0 errors |
+
+Wherever headers are given, anchor, frame, FR1, FR2 and CDR2 are
+byte-identical to main.
+
+Without any given FR3 start, 539 of 1,695 FR3 starts are wrong (32 %). All
+but one are flagged; the exception is IGHV4-31\*05, whose FR3 lacks a codon
+and which the gapped set numbers correctly.
+
+**Why the FR3 flag sits at p < 0.95, not ½.** With 10 % of alleles
+annotated, model values were right as follows:
+
+| Posterior | Right |
+|---|---|
+| `p ≥ 0.95` | 309 of 309 |
+| `0.8 ≤ p < 0.95` | 102 of 115 |
+| `p < 0.8` | 11 of 22 |
+
+Relatives were right 721 of 721 times. At ½, 14 errors would stay silent:
+TRGV1–8 at `p` = 0.58–0.92, when only TRGV9–11 carry labels, and
+TRAV2/40 at 0.84. A transferred start now inherits its donor's flag. Before, 12 mouse
+TRGV starts copied from an unflagged chain-default donor were silent.
+
+**Reads** (20,000 per preset, `measure.sh`, paired with exact McNemar):
+
+- **Allele calls.** V, D and J have 0 discordant reads. "No D call" differs
+  on 1 hard read (87.22 → 87.13 %, p = 1.0). Every read whose call text
+  changed comes from one of the 12 re-anchored alleles: mostly reordered
+  D ties.
+- **Junctions.** The truth was regenerated with the new build (seed 7,
+  reads byte-identical), and both builds were scored on it:
+
+  | Preset | Main | Now | Reads that moved | McNemar p |
+  |---|---|---|---|---|
+  | easy | 97.76 % | 100.00 % | 409 | 1.5e−123 |
+  | mid | 97.50 % | 99.99 % | 368 | 3.3e−111 |
+  | hard | 96.94 % | 99.84 % | 246 | 1.8e−74 |
+
+  Every moved read went from wrong to right. On the stored truth, the same
+  outputs read 100.00 → 97.00, 99.99 → 96.26 and 99.82 → 92.96 %. That gap
+  is the relabelling, not a loss: §9.5's junction column was scored on the
+  old truth.
+- **Synthetic database.** Outputs are byte-identical.
+- **Calibration** is unchanged (ECE %, V / D / J / D presence): mid
+  0.09 / 1.02 / 0.16 / 2.23, hard 0.33 / 0.98 / 0.35 / 0.99.
+- **Speed.** Per read: 1933 / 1967 vs 1932 / 1994 reads/s/thread, hard, two
+  runs each.
+
+**Database preparation** (best of 7–15 runs):
+
+| Database | Main | Now |
+|---|---|---|
+| Gapped IGH | 28 ms | 1.0 ms |
+| Ungapped IGH | 26 ms | 29 ms |
+| Mouse TRA, 10 % headers | 16–17 ms | 18–19 ms |
+| Human TRB, 10 % headers | 4.8 ms | 7.0 ms |
+| 3,000 synthetic alleles (test; bound 200 ms) | ~40 ms | 43–79 ms |
+
+### 10.4 What is still weak
+
+- **An FR3 family with no label is extrapolated.** It is flagged, but at
+  `p < 0.95` about one model value in ten is wrong.
+- **One `C` in the Cys23 window is taken as Cys23 without question.** A
+  mutated Cys23 next to a mutation-made decoy would be a silent CDR1 error.
+  None was seen.
+- **Pre-existing silent errors on stripped IGH alleles:**
+  - IGHV3-41\*02's CDR2 start, transferred from IGHV3-7\*03 across an indel;
+  - IGHV1/OR15-4\*01's FR2 start (stripped half only).
