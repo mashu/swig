@@ -67,6 +67,9 @@ options:
   --d-allele RULE      the reported D allele: map (the call's) | max-marginal (largest
                        posterior marginal given the call's D presence and topology;
                        needs posteriors, so --no-posterior and --residual report map)
+  --d-presence-rate R  D prior from the D search's own chance-hit count (alleles x
+                       offsets x positions) at D-presence rate R, 0 < R < 1, instead
+                       of genes x positions at even odds (docs/ALGORITHM.md 2.3)
   --simd NAME          alignment kernel: avx512 | avx2 | neon | portable | scalar
                        (default: the fastest this CPU supports, avx512 excepted)
   --residual           ordinary commit-V/J-then-D adjudication instead of the DAG
@@ -108,6 +111,7 @@ struct Args {
     simd: Option<String>,
     calls: Option<String>,
     d_allele: Option<String>,
+    d_presence_rate: Option<String>,
     chain: Option<String>,
     tandem_d: bool,
     forward_only: bool,
@@ -170,6 +174,11 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--d-allele" if assign => {
                 set_once(&mut args.d_allele, "--d-allele", value("--d-allele")?)?
             }
+            "--d-presence-rate" if assign => set_once(
+                &mut args.d_presence_rate,
+                "--d-presence-rate",
+                value("--d-presence-rate")?,
+            )?,
             "--tandem-d" if assign => args.tandem_d = true,
             "--forward-only" if assign => args.forward_only = true,
             "--no-anchor-window" if assign => args.no_anchor_window = true,
@@ -378,6 +387,13 @@ fn run_assign(args: &Args) -> Result<(), Box<dyn Error>> {
             "max-marginal" => DAlleleDecoding::MaxMarginal,
             _ => return Err(format!("unknown --d-allele '{name}'").into()),
         };
+    }
+    if let Some(rate) = args.d_presence_rate.as_deref() {
+        let presence = rate.parse::<f64>().unwrap_or(f64::NAN);
+        if !(presence > 0.0 && presence < 1.0) {
+            return Err(format!("--d-presence-rate expects a rate in (0, 1), got '{rate}'").into());
+        }
+        config.objective.d_prior = DPrior::search(presence);
     }
     let support: SupportModels = [
         KarlinAltschul::ungapped(&config.v.scoring),

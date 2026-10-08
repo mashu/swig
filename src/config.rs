@@ -112,6 +112,32 @@ impl DSegmentConfig {
     }
 }
 
+/// What the D search spans, for the D prior ([`DPrior::cost`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DSearchSpace {
+    /// Genes of the D database.
+    pub genes: usize,
+    /// `n_D = Σ_a (L_a − k + 1)⁺`: the offsets of the D alleles the search
+    /// aligns (each distinct sequence once) at which an exact run of
+    /// `k = min_d_match` bases, the admission gate, can start.
+    pub offsets: usize,
+}
+
+impl DSearchSpace {
+    /// The search space of `d` under the exact-run gate `min_exact_run`.
+    pub fn of(d: &GermlineSet, min_exact_run: u32) -> Self {
+        let run = min_exact_run.max(1) as usize;
+        Self {
+            genes: d.gene_count(),
+            offsets: d
+                .alleles()
+                .iter()
+                .map(|a| (a.codes.len() + 1).saturating_sub(run))
+                .sum(),
+        }
+    }
+}
+
 /// Prior cost of including a D, in score units (see [`EngineeringObjective`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DPrior {
@@ -124,6 +150,28 @@ pub enum DPrior {
     /// 6.17. It is not rounded: the fixed-scale call compares integer scores
     /// with `⌊P*_D⌋`, which decides `S > P*_D` exactly.
     Derived { window: u32, prior_odds: f64 },
+    /// The D search's own chance-hit count against a D-presence rate `π`:
+    ///
+    /// ```text
+    /// P*_D = [ln(K · m · n_D) − ln(π / (1 − π))] / λ
+    /// ```
+    ///
+    /// `K` and `λ` are the (lattice) Karlin–Altschul parameters of the D
+    /// scoring, `m = window` read positions and `n_D` the database offsets
+    /// at which an admissible hit can start ([`DSearchSpace`]). The search
+    /// expects `E(S) = K·m·n_D·e^{−λS}` chance hits scoring `S` or more. A
+    /// present D scores above the threshold almost surely, so the best hit
+    /// is more likely a D than chance when `π·1 > (1 − π)·E(S)`, i.e. when
+    /// `S > P*_D`. `Derived` is the same rule with `K·m·n_D` undercounted as
+    /// `N·L` (genes × positions; every allele and allele offset is tried)
+    /// and `π = ½`. The two errors offset: at even odds the search's count
+    /// puts `P*_D` at 14.2 for human IGH, and a measured `π` (0.9–0.99)
+    /// lowers it by 3.5–7.3. Against a brute-force count of chance hits
+    /// (random windows, one best hit per allele) `K·m·n_D·e^{−λS}` is high
+    /// by a factor 1.3 at even `S` and 1.85 at odd `S`: exact runs put most
+    /// chance hits on even scores. Read per read like every D cost, as
+    /// `P*_D/2` matched D columns ([`crate::adjudicate`]).
+    Search { window: u32, presence: f64 },
 }
 
 impl DPrior {
@@ -132,18 +180,33 @@ impl DPrior {
         prior_odds: 1.0,
     };
 
-    /// The cost for a D database of `genes` genes scored with `scoring`.
-    /// Falls back to `ln(N · window)` nats per score unit when the tuple has
-    /// no Karlin–Altschul λ (it is then not a log-odds score).
-    pub fn cost(&self, genes: usize, scoring: &AffineScoring) -> f64 {
-        match *self {
-            Self::Fixed(cost) => f64::from(cost),
-            Self::Derived { window, prior_odds } => {
-                let lambda = KarlinAltschul::ungapped(scoring).map_or(1.0, |ka| ka.lambda);
-                let nats = (genes.max(1) as f64 * f64::from(window.max(1))).ln() - prior_odds.ln();
-                (nats / lambda).max(0.0)
-            }
+    /// [`DPrior::Search`] over the default 25 read positions at D-presence
+    /// rate `presence`.
+    pub const fn search(presence: f64) -> Self {
+        Self::Search {
+            window: 25,
+            presence,
         }
+    }
+
+    /// The cost for a D search over `space` scored with `scoring`. Falls back
+    /// to `λ = 1` (nats per score unit) and `K = 1` when the tuple has no
+    /// Karlin–Altschul statistics (it is then not a log-odds score).
+    pub fn cost(&self, space: DSearchSpace, scoring: &AffineScoring) -> f64 {
+        let ka = KarlinAltschul::ungapped(scoring);
+        let lambda = ka.map_or(1.0, |ka| ka.lambda);
+        let nats = match *self {
+            Self::Fixed(cost) => return f64::from(cost),
+            Self::Derived { window, prior_odds } => {
+                (space.genes.max(1) as f64 * f64::from(window.max(1))).ln() - prior_odds.ln()
+            }
+            Self::Search { window, presence } => {
+                let k = ka.map_or(1.0, |ka| ka.k);
+                (k * f64::from(window.max(1)) * space.offsets.max(1) as f64).ln()
+                    - (presence / (1.0 - presence)).ln()
+            }
+        };
+        (nats / lambda).max(0.0)
     }
 }
 
@@ -172,13 +235,18 @@ impl ObjectiveConfig {
     pub fn resolve(
         &self,
         d: Option<&GermlineSet>,
-        d_scoring: &AffineScoring,
+        d_config: &DSegmentConfig,
     ) -> EngineeringObjective {
+        let space = d.map_or(
+            DSearchSpace {
+                genes: 1,
+                offsets: 1,
+            },
+            |d| DSearchSpace::of(d, d_config.min_exact_run),
+        );
         EngineeringObjective {
             pair_bonus: self.pair_bonus,
-            d_presence: self
-                .d_prior
-                .cost(d.map_or(1, GermlineSet::gene_count), d_scoring),
+            d_presence: self.d_prior.cost(space, &d_config.scoring),
             tandem_d_penalty: self.tandem_d_penalty,
             insertion_per_base: self.insertion_per_base,
         }
@@ -481,7 +549,7 @@ impl Assigner {
             }
         };
         let strand = StrandIndex::build([&v, &j], StrandIndex::K);
-        let objective = config.objective.resolve(d.as_ref(), &config.d.scoring);
+        let objective = config.objective.resolve(d.as_ref(), &config.d);
         let substitution = |s: &AffineScoring| (s.matched, s.mismatch);
         let evidence = KarlinAltschul::ungapped(&config.v.scoring).map(|ka| EvidenceModel {
             lambda: ka.lambda,
@@ -532,27 +600,147 @@ mod tests {
     use super::*;
     use crate::adjudicate::PathModel;
 
+    /// A search space of `genes` genes and as many offsets.
+    fn genes(genes: usize) -> DSearchSpace {
+        DSearchSpace {
+            genes,
+            offsets: genes,
+        }
+    }
+
     #[test]
     fn d_prior_scales_with_the_d_database() {
         let scoring = AffineScoring::new(2, -3, -13, -1);
-        let cost = |prior: DPrior, genes| (prior.cost(genes, &scoring) * 100.0).round() / 100.0;
-        assert_eq!(cost(DPrior::DERIVED, 32), 10.55); // human IGH
-        assert_eq!(cost(DPrior::DERIVED, 2), 6.17); // TRB
-        assert_eq!(cost(DPrior::Fixed(0), 32), 0.0);
+        let cost = |prior: DPrior, space| (prior.cost(space, &scoring) * 100.0).round() / 100.0;
+        assert_eq!(cost(DPrior::DERIVED, genes(32)), 10.55); // human IGH
+        assert_eq!(cost(DPrior::DERIVED, genes(2)), 6.17); // TRB
+        assert_eq!(cost(DPrior::Fixed(0), genes(32)), 0.0);
         let more_likely = DPrior::Derived {
             window: 25,
             prior_odds: 4.0,
         };
-        assert_eq!(cost(more_likely, 32), 8.36);
+        assert_eq!(cost(more_likely, genes(32)), 8.36);
         // The fixed-scale call charges ⌊P*_D⌋: an integer D score must exceed it.
         let objective = EngineeringObjective {
-            d_presence: DPrior::DERIVED.cost(32, &scoring),
+            d_presence: DPrior::DERIVED.cost(genes(32), &scoring),
             ..EngineeringObjective::default()
         };
         assert_eq!(
             (objective.d_presence_score(), objective.d_floor()),
             (10, 11)
         );
+    }
+
+    /// The 20,000-read human IGH database: 30 genes, 37 distinct alleles
+    /// with 802 offsets for an exact run of 4.
+    const HUMAN: DSearchSpace = DSearchSpace {
+        genes: 30,
+        offsets: 802,
+    };
+
+    #[test]
+    fn search_prior_counts_the_d_search() {
+        let scoring = AffineScoring::new(2, -3, -13, -1);
+        let ka = KarlinAltschul::ungapped(&scoring).unwrap();
+        let cost = |presence| DPrior::search(presence).cost(HUMAN, &scoring);
+        // At even odds the threshold is where one chance hit is expected.
+        let even = cost(0.5);
+        assert!((ka.k * 25.0 * 802.0 * (-ka.lambda * even).exp() - 1.0).abs() < 1e-9);
+        assert_eq!((even * 100.0).round(), 1422.0);
+        // At presence π, π/(1 − π) chance hits.
+        assert_eq!((cost(0.9) * 100.0).round(), 1075.0);
+        assert!((cost(0.9) - (even - 9f64.ln() / ka.lambda)).abs() < 1e-9);
+        // Derived counts genes × positions: the same rule with K·n_D = N.
+        let derived = DPrior::DERIVED.cost(HUMAN, &scoring);
+        let as_genes = DSearchSpace {
+            offsets: (30.0 / ka.k).round() as usize,
+            ..HUMAN
+        };
+        assert!((DPrior::search(0.5).cost(as_genes, &scoring) - derived).abs() < 0.01);
+    }
+
+    #[test]
+    fn search_space_counts_gate_offsets_of_distinct_alleles() {
+        let text = ">IGHD1-1*01\nACGTACGTAC\n>IGHD1-1*02\nACGTACGTAA\n>IGHD2-2*01\nACG\n";
+        let d = GermlineSet::from_fasta(SegmentKind::D, text).unwrap();
+        // 10 − 4 + 1 offsets for each 10-mer; the 3-mer holds no run of 4.
+        assert_eq!(
+            DSearchSpace::of(&d, 4),
+            DSearchSpace {
+                genes: 2,
+                offsets: 14
+            }
+        );
+    }
+
+    /// Alleles (each of the D database) with a chance hit scoring at
+    /// least `score` against `window`: the best ungapped local alignment, per
+    /// allele as the search keeps it, among those holding an exact run of
+    /// `run` (the admission gate).
+    fn chance_hits(
+        alleles: &[Vec<u8>],
+        window: &[u8],
+        scoring: &AffineScoring,
+        run: u32,
+        score: Score,
+    ) -> usize {
+        let best = |allele: &[u8]| {
+            let mut best = 0;
+            for shift in -(allele.len() as isize - 1)..window.len() as isize {
+                let (mut sum, mut exact, mut longest) = (0, 0, 0);
+                for (i, &base) in allele.iter().enumerate() {
+                    let Some(&read) = usize::try_from(i as isize + shift)
+                        .ok()
+                        .and_then(|q| window.get(q))
+                    else {
+                        continue;
+                    };
+                    (sum, exact) = if base == read {
+                        (sum + scoring.matched, exact + 1)
+                    } else {
+                        (sum + scoring.mismatch, 0)
+                    };
+                    if sum <= 0 {
+                        (sum, longest) = (0, 0);
+                        continue;
+                    }
+                    longest = longest.max(exact);
+                    if longest >= run {
+                        best = best.max(sum);
+                    }
+                }
+            }
+            best
+        };
+        alleles.iter().filter(|a| best(a) >= score).count()
+    }
+
+    /// The closed form against a brute-force count of chance hits of random
+    /// D-like alleles (lengths 12–31) in random 25-base windows: it brackets
+    /// the count from above within a factor of two around the threshold.
+    #[test]
+    fn search_count_matches_brute_force_chance_hits() {
+        let scoring = AffineScoring::new(2, -3, -13, -1);
+        let ka = KarlinAltschul::ungapped(&scoring).unwrap();
+        let mut rng = crate::sim::Rng::new(7);
+        let mut random = |len: usize| (0..len).map(|_| rng.below(4) as u8).collect::<Vec<_>>();
+        let alleles: Vec<Vec<u8>> = (0..20).map(|i| random(12 + i)).collect();
+        let offsets: usize = alleles.iter().map(|a| a.len() - 3).sum();
+        let (window, trials) = (25, 4000);
+        let windows: Vec<Vec<u8>> = (0..trials).map(|_| random(window)).collect();
+        for score in [10, 11, 12] {
+            let brute = windows
+                .iter()
+                .map(|w| chance_hits(&alleles, w, &scoring, 4, score))
+                .sum::<usize>() as f64
+                / trials as f64;
+            let closed =
+                ka.k * window as f64 * offsets as f64 * (-ka.lambda * f64::from(score)).exp();
+            assert!(
+                brute < closed && closed < 2.0 * brute,
+                "S = {score}: brute force {brute:.3}, closed form {closed:.3}"
+            );
+        }
     }
 
     #[test]

@@ -551,7 +551,7 @@ fn dag_equals_brute_force_on_hypermutated_igsim_reads() {
     let assigner =
         DefaultAssigner::from_config(&config, db.v.clone(), Some(db.d.clone()), db.j.clone())
             .unwrap();
-    let base = config.objective.resolve(Some(&db.d), &config.d.scoring);
+    let base = config.objective.resolve(Some(&db.d), &config.d);
     let sim = Simulator::new(&db.v, Some(&db.d), &db.j, SimParams::hard()).unwrap();
     let mut ws = assigner.workspace();
     let mut scratch = DagScratch::default();
@@ -604,7 +604,7 @@ fn per_read_dag_equals_exhaustive_enumeration() {
     let assigner =
         DefaultAssigner::from_config(&config, db.v.clone(), Some(db.d.clone()), db.j.clone())
             .unwrap();
-    let base = config.objective.resolve(Some(&db.d), &config.d.scoring);
+    let base = config.objective.resolve(Some(&db.d), &config.d);
     let lambda = KarlinAltschul::ungapped(&config.v.scoring).unwrap().lambda;
     let substitution = |s: &AffineScoring| (s.matched, s.mismatch);
     let evidence = EvidenceModel {
@@ -689,7 +689,7 @@ fn conditioned_dag_equals_exhaustive_enumeration() {
     let assigner =
         DefaultAssigner::from_config(&config, db.v.clone(), Some(db.d.clone()), db.j.clone())
             .unwrap();
-    let objective = config.objective.resolve(Some(&db.d), &config.d.scoring);
+    let objective = config.objective.resolve(Some(&db.d), &config.d);
     let lambda = KarlinAltschul::ungapped(&config.v.scoring).unwrap().lambda;
     let evidence = EvidenceModel {
         lambda,
@@ -824,10 +824,9 @@ fn dag_equals_brute_force_over_all_paths_and_cuts() {
     let config = EngineConfig::default();
     let model = EngineeringObjective {
         insertion_per_base: -1,
-        ..config.objective.resolve(
-            Some(&Db::set(SegmentKind::D, &db.d, None)),
-            &config.d.scoring,
-        )
+        ..config
+            .objective
+            .resolve(Some(&Db::set(SegmentKind::D, &db.d, None)), &config.d)
     };
     let dag = PlacementDag::new(VdjGrammar::TANDEM_D, model, [10, 3, 6]);
     let mut rng = Rng::new(23);
