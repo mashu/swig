@@ -88,6 +88,34 @@ The non-alignment terms are log prior odds in score units:
   all three heavy-chain sets); rounding to nearest is not faithful when the
   fraction is ≥ ½. The posterior uses `P*_D` itself, and the per-read call
   reads it at the read's scale (§4). The legacy profiles set `P_D = 0`.
+- **`P*_D` from the D search** (`DPrior::Search`, `--d-presence-rate π`).
+  `N·L` undercounts the hypotheses a local D search tries: every distinct
+  allele, every allele offset and every read position. The search expects
+  `E(S) = K·m·n_D·e^{−λS}` chance hits scoring `S` or more, with `K` and `λ`
+  the lattice Karlin–Altschul parameters of the D scoring (0.408 and 0.634
+  for `(2, −3)`), `m = L` read positions and
+  `n_D = Σ_a (L_a − k + 1)⁺` the allele offsets at which an exact run of
+  `k = min_d_match` bases, the admission gate, can start (802 for the human
+  set, 659 for the synthetic one). A present D clears the threshold almost
+  surely, so the best hit is more likely a D than chance when
+  `π > (1 − π)·E(S)`:
+
+  ```text
+  P*_D = [ln(K·m·n_D) − ln(π / (1 − π))] / λ
+  ```
+
+  `ln(K·m·n_D)` exceeds `ln(N·L)` by 2.4 nats on human IGH; the even odds
+  of `Derived` offset it. Against a brute-force count of chance hits
+  (random 25-base windows, one best hit per allele, the run gate) the closed
+  form is high by 1.30–1.35 at even scores and 1.85 at odd ones: exact runs
+  put most chance hits on even scores (`config` tests, and the real D sets).
+  The cost is read per read like the default (§4). It is a switch, not the
+  default, because the rate is not a property of the search: at the
+  simulator's own rate (0.94 on mid reads) `P*_D` falls below 10, so exact
+  5-mers win, and the rate at which every measured criterion holds (0.9)
+  was found by measuring (ASSESSMENT §9.9). The per-read window, `m = W`,
+  measured worse on every set: long junctions carry a D more often, which
+  outweighs their larger chance-hit count.
 - **`tandem`**: the prior odds of a second D (DJ → DDJ), on top of its own `P_D`.
 - **`pair_bonus`**: the prior odds of a complete V…J rearrangement against a
   partial read. It is 0 by default: on full-length reads the J's own clip
@@ -533,19 +561,18 @@ this objective can do better.
 
 1. **The D threshold on the read's scale.** Calls come from the per-read
    model (§4), but its D cost `c_D(p̂)` converts `P*_D` so that the fixed
-   scale's exact-run classes survive; it is a level-preserving threshold,
-   not a derived prior. Item 2 should replace `P*_D` by search statistics at
-   the per-read scale (where λ = 1 nat), keeping the dependence on `p̂`.
+   scale's exact-run classes survive; it is a level-preserving threshold.
    One `p̂` per read also assumes uniform mutation: a D-region rate differing
    from V and J is untested, and the plug-in `p̂` under-weights D remnants
    with two mismatches on unmutated reads against the Beta-binomial
    predictive (by up to `ln 3`).
-2. **D prior from the D search's own statistics.** `P_D = ln(N·L) − ln odds`
-   counts genes × read positions. A local search actually tries every allele,
-   allele offset and read position, so the chance-match burden is closer to
-   the Karlin–Altschul `K·m·n` of the D window against the D database (about
-   `e^{10}` for human IGH, against `e^{6.7}`); even prior odds understate how
-   often IgSim includes a D (99 %). On IgSim the two errors roughly cancel
-   (D-presence ECE 0.2–2.2 %). Both should come from data.
+2. **D prior from data.** The D search's chance-hit count replaces `N·L`
+   behind `--d-presence-rate` (§2.3), but the presence rate has to be
+   supplied, and the count and the rate are not separately identifiable from
+   the calls: every constant cost moves along one curve of D accuracy
+   against D-free specificity (ASSESSMENT §9.9). What the posterior's
+   residual miscalibration tracks is junction length (short junctions want
+   1–2 nats more cost, long ones less), which points to a prior on N/P
+   lengths, not to the D search.
 3. **Calibrated statistics.** Fit gapped λ and K, and an effective database
    size for near-identical alleles, by simulation.
