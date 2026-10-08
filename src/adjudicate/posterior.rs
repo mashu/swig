@@ -362,6 +362,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
             dag: self,
             placements,
             w: &weights,
+            d_presence: (-lambda * self.model.d_presence()).exp(),
             steps: evidence.map(Steps::new),
         }
         .run(scratch);
@@ -376,11 +377,25 @@ struct Pass<'a, G, M> {
     placements: &'a [Placement],
     /// Prior weights.
     w: &'a Weights,
+    /// `e^{−λ·P*_D}`, the weight of a D's presence cost (unrounded).
+    d_presence: f64,
     /// Evidence steps per segment kind.
     steps: [Steps; 3],
 }
 
 impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
+    /// Weight of `node`'s cut-independent terms: its bonus and, for a D,
+    /// the presence cost.
+    fn segment_bonus(&self, node: Node, d_used: u8) -> f64 {
+        let placement = &self.placements[node.placement];
+        let bonus = self.w.of(self.dag.model.segment_bonus(placement, d_used));
+        if node.kind == SegmentKind::D {
+            bonus * self.d_presence
+        } else {
+            bonus
+        }
+    }
+
     fn run(&self, s: &mut PosteriorScratch) -> Option<Marginals> {
         if self.placements.is_empty() || !self.layout(s) {
             return None;
@@ -662,10 +677,7 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
         }
         let width = node.width();
         let min = self.dag.min_bases(node.kind) as usize;
-        let bonus = self.w.of(self
-            .dag
-            .model
-            .segment_bonus(&self.placements[node.placement], d_used));
+        let bonus = self.segment_bonus(node, d_used);
         let mut x = std::mem::take(&mut s.work);
         x.clear();
         let mut acc = 0.0;
@@ -798,9 +810,7 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
 
         // B(y) = e^{−λ entry(y)} · Σ_{x ≥ y + min} X-weight(x) · inner(x).
         let min = self.dag.min_bases(node.kind) as usize;
-        let bonus = self
-            .w
-            .of(model.segment_bonus(&self.placements[node.placement], d_used));
+        let bonus = self.segment_bonus(node, d_used);
         let mut acc = 0.0;
         for o in (0..width).rev() {
             acc += s.exit_w[node.cuts + o] * bonus * inner[o];
@@ -968,8 +978,14 @@ mod tests {
             for x in Self::exits(b).into_iter().filter(|&x| x >= entry + min_b) {
                 let span = b.clip.span(entry, x).expect("canonical cuts");
                 let bonus = dag.model.segment_bonus(b, d_used);
-                let segment = span.score + bonus;
-                let segment_nats = self.evidence(b, entry, x) + LAMBDA * f64::from(bonus);
+                let (cost, nats_cost) = if b.kind == SegmentKind::D {
+                    (dag.model.d_presence_score(), dag.model.d_presence())
+                } else {
+                    (0, 0.0)
+                };
+                let segment = span.score + bonus - cost;
+                let segment_nats =
+                    self.evidence(b, entry, x) + LAMBDA * (f64::from(bonus) - nats_cost);
                 if dag.grammar.can_end(first, b.kind) && x == b.q_end() {
                     let end = dag.model.end(first, b.kind, d_used);
                     let total = acc + segment + end;
@@ -1154,8 +1170,9 @@ mod tests {
     #[test]
     fn marginals_equal_exhaustive_summation() {
         let (_, placements) = junction();
+        // An unrounded D prior: the posterior uses 4.5, the Viterbi call 4.
         let model = EngineeringObjective {
-            d_presence: 4,
+            d_presence: 4.5,
             ..EngineeringObjective::default()
         };
         let fixed = EvidenceScale::fixed(LAMBDA);

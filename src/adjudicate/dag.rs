@@ -301,7 +301,12 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         let width = node.width();
         let placement = &placements[node.placement];
         let min = self.min_bases(node.kind) as usize;
-        let bonus = self.model.segment_bonus(placement, d_used);
+        let presence = if node.kind == SegmentKind::D {
+            self.model.d_presence_score()
+        } else {
+            0
+        };
+        let bonus = self.model.segment_bonus(placement, d_used) - presence;
         let support = placement.score();
 
         // Running best of F(y) − entry(y) over entries, read min bases later.

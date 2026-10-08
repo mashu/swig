@@ -112,10 +112,12 @@ impl DSegmentConfig {
 pub enum DPrior {
     /// A fixed cost (0 = D only has to beat the no-D path).
     Fixed(Score),
-    /// `[ln(N · window) − ln(prior_odds)] / λ`: `N` D genes in the database,
-    /// `window` junction positions, `λ` of the D substitution scores, and the
-    /// prior odds of a D against none. For human IGH (32 genes, 25 positions,
-    /// even odds) this is 11; for TRB (2 D genes) it is 6.
+    /// `P*_D = [ln(N · window) − ln(prior_odds)] / λ`: `N` D genes in the
+    /// database, `window` junction positions, `λ` of the D substitution
+    /// scores, and the prior odds of a D against none. For human IGH (32
+    /// genes, 25 positions, even odds) this is 10.55; for TRB (2 D genes)
+    /// 6.17. It is not rounded: the fixed-scale call compares integer scores
+    /// with `⌊P*_D⌋`, which decides `S > P*_D` exactly.
     Derived { window: u32, prior_odds: f64 },
 }
 
@@ -128,13 +130,13 @@ impl DPrior {
     /// The cost for a D database of `genes` genes scored with `scoring`.
     /// Falls back to `ln(N · window)` nats per score unit when the tuple has
     /// no Karlin–Altschul λ (it is then not a log-odds score).
-    pub fn cost(&self, genes: usize, scoring: &AffineScoring) -> Score {
+    pub fn cost(&self, genes: usize, scoring: &AffineScoring) -> f64 {
         match *self {
-            Self::Fixed(cost) => cost,
+            Self::Fixed(cost) => f64::from(cost),
             Self::Derived { window, prior_odds } => {
                 let lambda = KarlinAltschul::ungapped(scoring).map_or(1.0, |ka| ka.lambda);
                 let nats = (genes.max(1) as f64 * f64::from(window.max(1))).ln() - prior_odds.ln();
-                (nats / lambda).round().max(0.0) as Score
+                (nats / lambda).max(0.0)
             }
         }
     }
@@ -497,18 +499,29 @@ impl Assigner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adjudicate::PathModel;
 
     #[test]
     fn d_prior_scales_with_the_d_database() {
         let scoring = AffineScoring::new(2, -3, -13, -1);
-        assert_eq!(DPrior::DERIVED.cost(32, &scoring), 11); // human IGH
-        assert_eq!(DPrior::DERIVED.cost(2, &scoring), 6); // TRB
-        assert_eq!(DPrior::Fixed(0).cost(32, &scoring), 0);
+        let cost = |prior: DPrior, genes| (prior.cost(genes, &scoring) * 100.0).round() / 100.0;
+        assert_eq!(cost(DPrior::DERIVED, 32), 10.55); // human IGH
+        assert_eq!(cost(DPrior::DERIVED, 2), 6.17); // TRB
+        assert_eq!(cost(DPrior::Fixed(0), 32), 0.0);
         let more_likely = DPrior::Derived {
             window: 25,
             prior_odds: 4.0,
         };
-        assert_eq!(more_likely.cost(32, &scoring), 8);
+        assert_eq!(cost(more_likely, 32), 8.36);
+        // The fixed-scale call charges ⌊P*_D⌋: an integer D score must exceed it.
+        let objective = EngineeringObjective {
+            d_presence: DPrior::DERIVED.cost(32, &scoring),
+            ..EngineeringObjective::default()
+        };
+        assert_eq!(
+            (objective.d_presence_score(), objective.d_floor()),
+            (10, 11)
+        );
     }
 
     #[test]

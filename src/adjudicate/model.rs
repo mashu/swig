@@ -84,8 +84,20 @@ impl Grammar for VdjGrammar {
 }
 
 pub trait PathModel: Send + Sync {
-    /// Added to the clip score of `placement`; `d_ordinal` counts D segments up
-    /// to and including this one (so the first D sees 1).
+    /// Prior cost of including a D (`P*_D`), in score units and unrounded.
+    /// Every D on a path pays it. On the fixed scale an integer path score
+    /// beats it exactly when it beats `⌊P*_D⌋` ([`PathModel::d_presence_score`]).
+    fn d_presence(&self) -> f64;
+
+    /// `⌊P*_D⌋`: for integer scores `S`, `S > P*_D ⟺ S > ⌊P*_D⌋`, so this is
+    /// the fixed-scale cost of a D, not an approximation of it.
+    fn d_presence_score(&self) -> Score {
+        self.d_presence().floor() as Score
+    }
+
+    /// Added to the clip score of `placement` besides the D presence cost;
+    /// `d_ordinal` counts D segments up to and including this one (so the
+    /// first D sees 1).
     fn segment_bonus(&self, placement: &Placement, d_ordinal: u8) -> Score;
 
     /// Score per unassigned query base (N/P region) between two segments.
@@ -113,18 +125,20 @@ pub trait PathModel: Send + Sync {
 /// this germline" against "random sequence"; N/P bases score 0 under both.
 /// The remaining terms are log prior odds of the path's hypotheses:
 ///
-/// * `d_presence` (`P_D`) — a D is one of `N` genes at one of `L` positions of
-///   the junction, so its prior is spread over `N·L` hypotheses: including
+/// * `d_presence` (`P*_D`) — a D is one of `N` genes at one of `L` positions
+///   of the junction, so its prior is spread over `N·L` hypotheses: including
 ///   the best one is worth it when `λ·S_D > ln(N·L) − ln(prior odds of D)`.
 ///   [`crate::config::DPrior`] derives it from the database at build time.
+///   It is kept unrounded: the posterior uses it as it is, and the fixed-scale
+///   call as `⌊P*_D⌋` ([`PathModel::d_presence_score`]).
 /// * `tandem_d_penalty` — prior odds of a second D (DJ → DDJ), on top of its `P_D`.
 /// * `pair_bonus` — prior odds of a complete V…J rearrangement over a partial
 ///   read. 0 by default: on full-length reads the J's own clip score already
 ///   completes the path, and 0–48 changed no call.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EngineeringObjective {
     pub pair_bonus: Score,
-    pub d_presence: Score,
+    pub d_presence: f64,
     /// Extra prior cost for every D beyond the first.
     pub tandem_d_penalty: Score,
     /// Score per unassigned junction base (0 = no N/P length prior).
@@ -135,7 +149,7 @@ impl Default for EngineeringObjective {
     fn default() -> Self {
         Self {
             pair_bonus: 0,
-            d_presence: 11,
+            d_presence: 11.0,
             tandem_d_penalty: 12,
             insertion_per_base: 0,
         }
@@ -143,7 +157,8 @@ impl Default for EngineeringObjective {
 }
 
 impl EngineeringObjective {
-    /// Smallest D local score that can improve a path: `P_D + 1`.
+    /// Smallest D local score that can improve a fixed-scale path: `P_D + 1`,
+    /// with `P_D = ⌊P*_D⌋`.
     ///
     /// A clipped span of an optimal local alignment never outscores the
     /// whole alignment (its prefixes and suffixes score ≥ 0), so a D scoring
@@ -156,23 +171,21 @@ impl EngineeringObjective {
         if self.insertion_per_base < 0 {
             Score::MIN
         } else {
-            self.d_presence + 1
+            self.d_presence_score() + 1
         }
     }
 }
 
 impl PathModel for EngineeringObjective {
+    fn d_presence(&self) -> f64 {
+        self.d_presence
+    }
+
     fn segment_bonus(&self, placement: &Placement, d_ordinal: u8) -> Score {
-        match placement.kind {
-            SegmentKind::D => {
-                let tandem = if d_ordinal >= 2 {
-                    self.tandem_d_penalty
-                } else {
-                    0
-                };
-                -self.d_presence - tandem
-            }
-            SegmentKind::V | SegmentKind::J => 0,
+        if placement.kind == SegmentKind::D && d_ordinal >= 2 {
+            -self.tandem_d_penalty
+        } else {
+            0
         }
     }
 
