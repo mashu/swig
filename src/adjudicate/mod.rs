@@ -94,6 +94,8 @@ pub struct CallPath {
     /// The read's divergence `p̂` ([`divergence`]): the posterior reads
     /// alignment evidence at it, and so does a [`CallModel::PerRead`] call.
     pub divergence: f64,
+    /// The model the call maximised.
+    pub model: CallModel,
 }
 
 pub trait Adjudicator: Send + Sync {

@@ -198,9 +198,10 @@ pub struct EngineConfig {
     /// Report posterior probabilities (forward–backward over the placement
     /// DAG, priors at the V scoring's λ, alignment evidence at each read's
     /// divergence): per called segment and for D presence. With posteriors,
-    /// D placements below the objective's floor (`P_D + 1`) are kept, since
-    /// they carry probability; without, they are pruned, which never changes
-    /// the DAG's call.
+    /// or with a per-read call, D placements below the objective's floor
+    /// (`P_D + 1`) are kept, since they carry probability and can win a
+    /// per-read call; otherwise they are pruned, which never changes a
+    /// fixed-scale call.
     pub posterior: bool,
     /// Instruction set of the alignment kernel; `None` picks the fastest
     /// this CPU runs ([`Backend::detect`]).
@@ -403,16 +404,15 @@ fn d_stage(
     set: GermlineSet,
     config: &DSegmentConfig,
     objective: &EngineeringObjective,
-    posterior: bool,
+    keep_below_floor: bool,
 ) -> SegmentStage<LmerMaskRetriever> {
     let lmer = config.lmer.unwrap_or_else(|| config.lossless_lmer());
     let retriever = LmerMaskRetriever::build(&set, lmer, 1);
     let segment = PreparedSegment::new(set, &config.scoring, config.scoring.gaps);
     let keep = KeepPolicy {
-        // The objective's D floor prunes only what cannot win the Viterbi
-        // call; a D below it still carries posterior mass, so posteriors keep
-        // every admissible D.
-        min_score: if posterior {
+        // The objective's D floor prunes only what cannot win a fixed-scale
+        // call (see `EngineeringObjective::d_floor`).
+        min_score: if keep_below_floor {
             config.lossless_min_score()
         } else {
             config.lossless_min_score().max(objective.d_floor())
@@ -478,9 +478,12 @@ impl Assigner {
         Ok(Assigner {
             v: v_stage(v, &config.v)?,
             j: j_stage(j, &config.j),
-            // Only an adjudicator that computes posteriors needs the Ds below
-            // the objective's floor.
-            d: d.map(|set| d_stage(set, &config.d, &objective, adjudicator.posterior)),
+            // A D below the objective's floor carries posterior mass, and can
+            // win a per-read call.
+            d: d.map(|set| {
+                let keep = adjudicator.posterior || !adjudicator.calls_on_fixed_scale();
+                d_stage(set, &config.d, &objective, keep)
+            }),
             strand,
             j_window: config.j.window,
             aligner: match config.simd {

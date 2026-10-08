@@ -490,6 +490,11 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         }
     }
 
+    /// Whether the call maximises the fixed scores.
+    pub fn calls_on_fixed_scale(&self) -> bool {
+        self.calls == CallModel::FixedScale || self.evidence.is_none()
+    }
+
     /// The model a call at divergence `p` maximises.
     fn read_model(&self, p: f64) -> ReadModel {
         let d_presence = self.model.d_presence();
@@ -526,6 +531,11 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
             score: self.path_score(placements, &segments),
             segments,
             divergence,
+            model: if self.calls_on_fixed_scale() {
+                CallModel::FixedScale
+            } else {
+                CallModel::PerRead
+            },
         })
     }
 
@@ -633,5 +643,113 @@ mod tests {
             .map(|s| (s.span.q_lo, s.span.q_hi))
             .collect();
         assert_eq!(spans, vec![(0, 20), (22, 40)]);
+    }
+
+    /// `(2, −3)` scored at the KA λ0 for every kind.
+    fn evidence() -> EvidenceModel {
+        EvidenceModel {
+            lambda: 0.633_731_443_097_907_7,
+            substitution: [(2, -3); 3],
+        }
+    }
+
+    /// A read with two D candidates in its N region: an exact 7-mer (score
+    /// 14) and a 10-mer with a mismatch in its middle (score 15), whose best
+    /// clip is 5 bases. The fixed scale takes the 10-mer. At low divergence a
+    /// mismatch costs `ln(4p̂/3)` (−4.1 nats at `p̂ = 1.2 %`, not −1.9), so the
+    /// read's own model takes the exact 7-mer: 9.6 nats against 8.3.
+    #[test]
+    fn a_per_read_call_takes_the_exact_short_d_at_low_divergence() {
+        let v = b"TTTTTTTTTTTTTTTTTTTT";
+        let d1 = b"GACCTAG";
+        let d2 = b"CAGTCTTGCA";
+        let j = b"AAAAAAAAAAAAAAAAAAAA";
+        let mut ascii = v.to_vec();
+        ascii.extend_from_slice(b"CC");
+        ascii.extend_from_slice(d1);
+        ascii.extend_from_slice(b"GG");
+        ascii.extend_from_slice(d2);
+        ascii.extend_from_slice(b"CC");
+        ascii.extend_from_slice(j);
+        let query = encode(&ascii);
+        let mut d2_reference = encode(d2);
+        d2_reference[5] = (d2_reference[5] + 1) & 3;
+        let placements = [
+            placement(SegmentKind::V, &query, &encode(v), 0),
+            placement(SegmentKind::D, &query, &encode(d1), 22),
+            placement(SegmentKind::D, &query, &d2_reference, 31),
+            placement(SegmentKind::J, &query, &encode(j), 43),
+        ];
+        assert_eq!(placements[1].score(), 14);
+        assert_eq!(placements[2].score(), 15);
+        let model = EngineeringObjective {
+            d_presence: 10.0,
+            ..EngineeringObjective::default()
+        };
+        let fixed = PlacementDag {
+            evidence: Some(evidence()),
+            ..PlacementDag::new(VdjGrammar::VDJ, model, [1, 4, 1])
+        };
+        let per_read = PlacementDag {
+            calls: CallModel::PerRead,
+            ..fixed
+        };
+        let mut scratch = DagScratch::default();
+        let d_of = |path: &CallPath| path.segments[1].placement;
+        let call = fixed
+            .adjudicate(query.len(), &placements, &mut scratch)
+            .unwrap();
+        assert_eq!((d_of(&call), call.model), (2, CallModel::FixedScale));
+        let call = per_read
+            .adjudicate(query.len(), &placements, &mut scratch)
+            .unwrap();
+        assert_eq!(call.divergence, 0.5 / 41.0);
+        assert_eq!((d_of(&call), call.model), (1, CallModel::PerRead));
+        // The reported path score stays the fixed scale's: 40 + 14 − 10 + 40.
+        assert_eq!(call.score.score, 84);
+        // At δ0 the per-read model is the fixed one.
+        let delta0 = evidence().log_odds_divergence(SegmentKind::D);
+        let at = ReadModel::at(&evidence(), delta0, 10.0);
+        let (_, segments) = per_read.viterbi(&placements, &at, &mut scratch).unwrap();
+        assert_eq!(segments[1].placement, 2);
+    }
+
+    /// At high divergence a D scoring `P_D` can win a per-read call: 8
+    /// matches and 2 mismatches score 10, no better than `P_D` = 10, but are
+    /// worth 6.40 nats at `p̂ = 0.3`, above `c_D` = 5.15. So a per-read call
+    /// keeps every admissible D, below the fixed-scale floor too.
+    #[test]
+    fn a_d_at_the_fixed_floor_can_win_a_per_read_call() {
+        let v = b"TTTTTTTTTTTTTTTTTTTT";
+        let d = b"GACCTAGCAG";
+        let j = b"AAAAAAAAAAAAAAAAAAAA";
+        let mut ascii = v.to_vec();
+        ascii.extend_from_slice(b"CC");
+        ascii.extend_from_slice(d);
+        ascii.extend_from_slice(b"CC");
+        ascii.extend_from_slice(j);
+        let query = encode(&ascii);
+        let mut reference = encode(d);
+        for k in [3, 6] {
+            reference[k] = (reference[k] + 1) & 3;
+        }
+        let placements = [
+            placement(SegmentKind::V, &query, &encode(v), 0),
+            placement(SegmentKind::D, &query, &reference, 22),
+            placement(SegmentKind::J, &query, &encode(j), 34),
+        ];
+        let model = EngineeringObjective {
+            d_presence: 10.0,
+            ..EngineeringObjective::default()
+        };
+        assert_eq!(placements[1].score(), model.d_floor() - 1);
+        let dag = PlacementDag::new(VdjGrammar::VDJ, model, [1, 4, 1]);
+        let mut scratch = DagScratch::default();
+        let d_count = |read: &ReadModel, scratch: &mut DagScratch| {
+            dag.viterbi(&placements, read, scratch).unwrap().0.d_count
+        };
+        assert_eq!(d_count(&ReadModel::fixed(1.0, 10.0), &mut scratch), 0);
+        let high = ReadModel::at(&evidence(), 0.3, 10.0);
+        assert_eq!(d_count(&high, &mut scratch), 1);
     }
 }

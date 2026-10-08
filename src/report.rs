@@ -6,9 +6,13 @@
 //! germline bases before the alignment, and `=`/`X`/`I`/`D` for columns.
 //!
 //! Co-optimal labels are recomputed on the called cut interval: every
-//! placement of the same kind whose clip to `[entry, exit)` scores exactly the
-//! called score contributes its alleles. As the note says, this means "equal
-//! score under this caller", not equal biological probability. The
+//! placement of the same kind whose clip to `[entry, exit)` is worth exactly
+//! the called clip under the call's model contributes its alleles. On the
+//! fixed scale that is an equal score; under a per-read call
+//! ([`crate::adjudicate::CallModel::PerRead`]) also equal matches and
+//! mismatches, which makes the value `λ_r·S_sub + μ_r·n + λ0·S_gap` equal at
+//! every divergence. As the note says, this means "equal value under this
+//! caller", not equal biological probability. The
 //! probability is the `posterior` column ([`crate::adjudicate::Marginals`]):
 //! the posterior mass of every placement of that kind that is tied on the
 //! interval, or whose germline bases between the call's neighbours the
@@ -17,9 +21,10 @@
 
 use std::fmt::Write as _;
 
-use crate::adjudicate::CalledSegment;
+use crate::adjudicate::{CallModel, CalledSegment};
 use crate::align::Op;
 use crate::alphabet::{N, decode, decode_base};
+use crate::clip::ClipSpan;
 use crate::evidence::Evidence;
 use crate::germline::SegmentKind;
 use crate::pipeline::{AlleleCatalog, Call};
@@ -117,16 +122,27 @@ fn segment_report<C: AlleleCatalog>(
     let set = segment.set();
     let called_score = called.span.score;
 
-    // Co-optimal alleles on the called interval. The primary name is the one
-    // with the most germline support (unclipped score, the DAG's own tie-break),
-    // then the longest exact run and most matches on the interval.
+    // Co-optimal alleles on the called interval: worth exactly the call there
+    // under the call's model. The primary name is the one with the most
+    // germline support (unclipped score, the DAG's own tie-break), then the
+    // longest exact run and most matches on the interval.
+    let columns = |p: &Placement, span: &ClipSpan| {
+        let reference = &set.allele(p.primary_allele()).codes;
+        let e = Evidence::from_columns(p.clip.columns(span), &call.query, reference);
+        (e.matches, e.mismatches)
+    };
+    let per_read = call
+        .path
+        .as_ref()
+        .is_some_and(|path| path.model == CallModel::PerRead);
+    let called_columns = per_read.then(|| columns(dag_placement, &called.span));
     let tied_indices: Vec<usize> = (0..call.placements.len())
         .filter(|&i| {
             let p = &call.placements[i];
             p.kind == kind
-                && p.clip
-                    .span(called.entry, called.exit)
-                    .is_some_and(|s| s.score == called_score)
+                && p.clip.span(called.entry, called.exit).is_some_and(|s| {
+                    s.score == called_score && called_columns.is_none_or(|c| columns(p, &s) == c)
+                })
         })
         .collect();
     // The called placement first, so it wins ties of the sort key.

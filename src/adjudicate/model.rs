@@ -158,7 +158,9 @@ impl Default for EngineeringObjective {
 
 impl EngineeringObjective {
     /// Smallest D local score that can improve a fixed-scale path: `P_D + 1`,
-    /// with `P_D = ⌊P*_D⌋`.
+    /// with `P_D = ⌊P*_D⌋`. It bounds nothing for a per-read call: there a D
+    /// scoring 10 ≤ `P_D` (8 matches, 2 mismatches) is worth 6.40 nats at
+    /// `p̂ = 0.3`, above its cost `c_D` of 5.38 ([`super::units`]).
     ///
     /// A clipped span of an optimal local alignment never outscores the
     /// whole alignment (its prefixes and suffixes score ≥ 0), so a D scoring
