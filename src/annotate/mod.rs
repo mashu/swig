@@ -125,6 +125,37 @@ impl AnchorSource {
 pub struct AlleleAnnotation {
     pub source: AnchorSource,
     pub notes: Vec<String>,
+    /// Region starts (FR1, CDR1, FR2, CDR2, FR3) that may be wrong: derived
+    /// for an allele whose anchor is low-confidence or missing, a CDR1
+    /// start from an ambiguous Cys23, or a derived bound of a CDR of
+    /// unusual length. Given values are never uncertain. An error in a
+    /// start not flagged here is a silent error.
+    pub uncertain: [bool; 5],
+}
+
+impl AlleleAnnotation {
+    fn new(source: AnchorSource, notes: Vec<String>) -> Self {
+        Self {
+            source,
+            notes,
+            uncertain: [false; 5],
+        }
+    }
+
+    /// The notes, then `uncertain=` and the keys of the uncertain starts
+    /// (`uncertain=cdr1,fr3`), as one `; `-separated field.
+    pub fn notes_field(&self) -> String {
+        let keys: Vec<&str> = RegionStarts::KEYS
+            .iter()
+            .zip(self.uncertain)
+            .filter_map(|(&key, uncertain)| uncertain.then_some(key))
+            .collect();
+        let mut fields = self.notes.clone();
+        if !keys.is_empty() {
+            fields.push(format!("uncertain={}", keys.join(",")));
+        }
+        fields.join("; ")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -187,14 +218,16 @@ fn regions_from_hit(hit: &VHit, chain: Option<ChainType>) -> RegionStarts {
 /// Given values (header, then IMGT gaps) win; derived values fill the
 /// unknown slots, never one the IMGT numbering places before the sequence
 /// start. Derived values that break the ordering are dropped, latest first,
-/// with a note.
+/// with a note. A CDR of unusual length is noted, and its derived bounds
+/// are marked uncertain.
 fn merge_regions(
     given: &[RegionSlot; 5],
     derived: RegionStarts,
     anchor: Option<u32>,
     len: usize,
-    notes: &mut Vec<String>,
+    annotation: &mut AlleleAnnotation,
 ) -> RegionStarts {
+    let notes = &mut annotation.notes;
     let mut values = given.map(RegionSlot::known);
     for ((value, slot), derived) in values.iter_mut().zip(given).zip(derived.values()) {
         if *slot == RegionSlot::Unknown {
@@ -218,12 +251,20 @@ fn merge_regions(
         values[index] = None;
         merged = RegionStarts::from_values(values);
     }
-    let codons = |a: Option<u32>, b: Option<u32>| a.zip(b).map(|(a, b)| (b as i64 - a as i64) / 3);
-    if let Some(cdr1) = codons(merged.cdr1, merged.fr2).filter(|c| !(4..=14).contains(c)) {
-        notes.push(format!("unusual CDR1 length {cdr1} codons"));
-    }
-    if let Some(cdr2) = codons(merged.cdr2, merged.fr3).filter(|c| !(0..=12).contains(c)) {
-        notes.push(format!("unusual CDR2 length {cdr2} codons"));
+    let values = merged.values();
+    for (region, [start, end], usual) in [("CDR1", [1, 2], 4..=14), ("CDR2", [3, 4], 0..=12)] {
+        let Some(codons) = values[start]
+            .zip(values[end])
+            .map(|(a, b)| (i64::from(b) - i64::from(a)) / 3)
+        else {
+            continue;
+        };
+        if !usual.contains(&codons) {
+            notes.push(format!("unusual {region} length {codons} codons"));
+            for bound in [start, end] {
+                annotation.uncertain[bound] |= given[bound].known().is_none();
+            }
+        }
     }
     merged
 }
@@ -298,10 +339,7 @@ fn annotate_j(
             if !matches!(residue, b'W' | b'F') {
                 notes.push(format!("header anchor codon is {}", char::from(residue)));
             }
-            result.push(AlleleAnnotation {
-                source: AnchorSource::Header,
-                notes,
-            });
+            result.push(AlleleAnnotation::new(AnchorSource::Header, notes));
             anchors.push(Some(anchor));
             weak.push(None);
             continue;
@@ -310,18 +348,12 @@ fn annotate_j(
         match hit.filter(|h| h.confident) {
             Some(h) => {
                 vote += 2 * i32::from(h.chain_vote());
-                result.push(AlleleAnnotation {
-                    source: AnchorSource::Motif,
-                    notes,
-                });
+                result.push(AlleleAnnotation::new(AnchorSource::Motif, notes));
                 anchors.push(Some(h.anchor()));
                 weak.push(None);
             }
             None => {
-                result.push(AlleleAnnotation {
-                    source: AnchorSource::Missing,
-                    notes,
-                });
+                result.push(AlleleAnnotation::new(AnchorSource::Missing, notes));
                 anchors.push(None);
                 weak.push(hit);
             }
@@ -434,10 +466,7 @@ pub fn annotate(
         .map(|allele| {
             let mut notes = Vec::new();
             let given = Given::read(allele, imgt_gaps.used(), &mut notes);
-            result.push(AlleleAnnotation {
-                source: AnchorSource::Missing,
-                notes,
-            });
+            result.push(AlleleAnnotation::new(AnchorSource::Missing, notes));
             given
         })
         .collect();
@@ -548,18 +577,20 @@ pub fn annotate(
         let anchor = given.anchor.or(trusted_hit.map(|h| h.anchor()));
         let merged = match (anchor, trusted_hit) {
             (Some(anchor), Some(hit)) => {
+                let annotation = &mut result[index];
                 if hit.cys23_alternatives > 0 && given.regions[1] == RegionSlot::Unknown {
-                    result[index].notes.push(format!(
+                    annotation.notes.push(format!(
                         "Cys23 ambiguous ({} other C in window); CDR1 start from the best-scoring one",
                         hit.cys23_alternatives
                     ));
+                    annotation.uncertain[1] = true;
                 }
                 merge_regions(
                     &given.regions,
                     regions_from_hit(&hit, chain),
                     Some(anchor),
                     len_of(v, index),
-                    &mut result[index].notes,
+                    annotation,
                 )
             }
             _ => given.known(),
@@ -615,12 +646,15 @@ pub fn annotate(
                 .is_ok()
             {
                 regions[index] = RegionStarts::from_values(values);
-                let notes = &mut result[index].notes;
-                notes.retain(|n| !n.starts_with("Cys23 ambiguous"));
-                notes.push(format!(
+                let annotation = &mut result[index];
+                annotation
+                    .notes
+                    .retain(|n| !n.starts_with("Cys23 ambiguous"));
+                annotation.notes.push(format!(
                     "ambiguous Cys23 resolved from {}",
                     v.alleles()[donor].name
                 ));
+                annotation.uncertain[1] = false;
             }
         }
     }
@@ -657,13 +691,20 @@ pub fn annotate(
                 let derived = RegionStarts::from_values([
                     mapped[1], mapped[2], mapped[3], mapped[4], mapped[5],
                 ]);
-                let notes = &mut result[index].notes;
+                let annotation = &mut result[index];
                 let residue = residue_at(&v.alleles()[index].codes, anchor);
                 if residue != b'C' {
-                    notes.push(format!("conserved residue is {}", char::from(residue)));
+                    annotation
+                        .notes
+                        .push(format!("conserved residue is {}", char::from(residue)));
                 }
-                regions[index] =
-                    merge_regions(&given[index].regions, derived, Some(anchor), len, notes);
+                regions[index] = merge_regions(
+                    &given[index].regions,
+                    derived,
+                    Some(anchor),
+                    len,
+                    annotation,
+                );
                 result[index].source = AnchorSource::Transfer {
                     from: v.alleles()[donor].name.clone(),
                 };
@@ -682,17 +723,18 @@ pub fn annotate(
                     r.mapped[4],
                     r.mapped[5],
                 ]);
-                let notes = &mut result[index].notes;
-                notes.push(format!(
+                let annotation = &mut result[index];
+                annotation.notes.push(format!(
                     "3′-partial: the anchor codon of {} maps past the 3′ end",
                     v.alleles()[r.donor].name
                 ));
-                regions[index] = merge_regions(&given[index].regions, derived, None, len, notes);
+                regions[index] =
+                    merge_regions(&given[index].regions, derived, None, len, annotation);
             }
             relative => {
                 if let Some(hit) = hits[index] {
-                    let notes = &mut result[index].notes;
-                    notes.push(match relative {
+                    let annotation = &mut result[index];
+                    annotation.notes.push(match relative {
                         Some(r) => format!(
                             "weak motifs; the anchor of {} does not fit and their alignment stops short",
                             v.alleles()[r.donor].name
@@ -704,12 +746,23 @@ pub fn annotate(
                         regions_from_hit(&hit, chain),
                         Some(hit.anchor()),
                         len,
-                        notes,
+                        annotation,
                     );
                     result[index].source = AnchorSource::LowConfidence;
                     anchors[index] = Some(hit.anchor());
                 }
             }
+        }
+    }
+    // Every derived start of an allele without a trusted anchor is uncertain.
+    for ((annotation, given), regions) in result.iter_mut().zip(&given).zip(&regions) {
+        if annotation.source.trusted() || matches!(annotation.source, AnchorSource::Transfer { .. })
+        {
+            continue;
+        }
+        let derived = given.regions.iter().zip(regions.values());
+        for (flag, (slot, value)) in annotation.uncertain.iter_mut().zip(derived) {
+            *flag |= value.is_some() && slot.known().is_none();
         }
     }
     for ((_, anchor, slot), (found, merged)) in
@@ -816,7 +869,7 @@ impl DatabaseAnnotation {
                     span(r.cdr1, r.fr2),
                     span(r.cdr2, r.fr3),
                     annotation.source.label(),
-                    annotation.notes.join("; "),
+                    annotation.notes_field(),
                 )?;
             }
         }

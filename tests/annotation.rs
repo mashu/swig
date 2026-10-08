@@ -243,6 +243,19 @@ fn three_prime_partial_allele_gets_no_anchor() {
         "{:?}",
         annotation.notes
     );
+    // Without an anchor of its own, every derived start is uncertain, and
+    // annotation.tsv says so at the end of the notes column.
+    assert_eq!(annotation.uncertain, [true; 5]);
+    let mut tsv = Vec::new();
+    report.write_tsv(&mut tsv, &v, Some(&j)).unwrap();
+    let tsv = String::from_utf8(tsv).unwrap();
+    let row = tsv.lines().find(|l| l.starts_with("V\tV0*02\t")).unwrap();
+    assert!(
+        row.ends_with("past the 3′ end; uncertain=fr1,cdr1,fr2,cdr2,fr3"),
+        "{row}"
+    );
+    let trusted = tsv.lines().find(|l| l.starts_with("V\tV0*01\t")).unwrap();
+    assert!(!trusted.contains("uncertain="), "{trusted}");
 }
 
 /// An allele that keeps its Cys104 but lost 21 bases just before it: the
@@ -301,54 +314,46 @@ fn annotation_of_thousands_of_alleles_takes_milliseconds() {
     assert!(elapsed.as_millis() < if cfg!(debug_assertions) { 3000 } else { 200 });
 }
 
-/// 12,000 adversarial alleles per chain type: anchors, FR2, CDR2 and FR3 must
-/// be exact; a CDR1 start may only be wrong where the report flags Cys23 as
-/// ambiguous (a mutation-made decoy Cys next to Cys23 in a 5′-truncated allele).
+/// 6,000 adversarial alleles per chain type: every anchor must be exact,
+/// and a wrong region start must be flagged `uncertain` (in practice a
+/// mutation-made decoy Cys next to Cys23 in a 5′-truncated allele); at most
+/// 3 starts may be wrong at all.
 #[test]
 fn every_error_is_flagged_across_many_databases() {
+    let mut flagged_errors = [0; 5];
     for chain in [ChainType::Heavy, ChainType::Light] {
-        let (mut total, mut flagged_errors) = (0, 0);
         for seed in 100..120 {
             let mut rng = Rng::new(seed);
             let (mut v, truth, mut j, j_truth) = database(chain, 300, &mut rng);
             let report = annotate(&mut v, Some(&mut j), AnnotateOptions::default());
             for (id, (allele, expected)) in v.alleles().iter().zip(&truth).enumerate() {
-                total += 1;
+                let name = &allele.name;
                 assert_eq!(
                     allele.anchor,
                     Some(expected.anchor),
-                    "{chain:?} seed {seed} {}",
-                    allele.name
+                    "{chain:?} {seed} {name}"
                 );
                 let got = allele.regions.values();
-                let want = expected.starts.map(Some);
-                for field in [0, 2, 3, 4] {
-                    assert_eq!(
-                        got[field], want[field],
-                        "{chain:?} seed {seed} {} field {field}",
-                        allele.name
-                    );
-                }
-                if got[1] != want[1] {
-                    assert!(
-                        report.v[id]
-                            .notes
-                            .iter()
-                            .any(|n| n.contains("Cys23 ambiguous")),
-                        "{chain:?} seed {seed} {}: silent CDR1 error",
-                        allele.name
-                    );
-                    flagged_errors += 1;
+                for (field, want) in expected.starts.into_iter().enumerate() {
+                    if got[field] != Some(want) {
+                        assert!(
+                            report.v[id].uncertain[field],
+                            "{chain:?} seed {seed} {name}: silent error in start {field}"
+                        );
+                        flagged_errors[field] += 1;
+                    }
                 }
             }
             for (allele, &expected) in j.alleles().iter().zip(&j_truth) {
                 assert_eq!(allele.anchor, Some(expected));
             }
         }
-        eprintln!(
-            "{chain:?}: {total} alleles, {flagged_errors} flagged CDR1 errors, no silent errors"
-        );
     }
+    eprintln!("flagged errors per start (FR1, CDR1, FR2, CDR2, FR3): {flagged_errors:?}");
+    assert!(
+        flagged_errors.iter().sum::<usize>() <= 3,
+        "{flagged_errors:?}"
+    );
 }
 
 #[test]
