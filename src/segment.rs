@@ -575,7 +575,10 @@ impl<R: Retriever> SegmentStage<R> {
     /// leader as its representative `R`:
     ///
     /// 1. Score the representatives. A score below the floor still bounds.
-    /// 2. Trace each request's best-scoring representatives (every tie);
+    ///    The strongest one (most votes, then lowest id) is aligned instead:
+    ///    it is most often the best and traced anyway.
+    /// 2. Align each request's best-scoring representatives (every tie) too.
+    ///    Their paths and the strongest's bound siblings from below, and
     ///    traceback reuses the alignments.
     /// 3. Bound each sibling `A`: `U = S*(R) + Δ(R, A)` through its
     ///    representative, `L` the best lower bound over the request's traced
@@ -592,10 +595,11 @@ impl<R: Retriever> SegmentStage<R> {
     ///      exact score ([`Aligner`]'s contract) and traceback reuses it;
     ///    * *scored* otherwise.
     ///
-    /// Step 2, the cutoff and early tracing apply only under permissive
-    /// acceptance ([`HitAcceptance::is_permissive`]). Otherwise a rejected
-    /// alignment makes the traceback waves refill from below `T`, where a
-    /// pruned sibling may lie, so siblings are pruned only below the floor.
+    /// Aligning representatives, the cutoff and early tracing apply only
+    /// under permissive acceptance ([`HitAcceptance::is_permissive`]).
+    /// Otherwise a rejected alignment makes the traceback waves refill from
+    /// below `T`, where a pruned sibling may lie, so siblings are pruned only
+    /// below the floor.
     /// A sibling without an upper bound (another frame, or a band that is
     /// not its representative's frame band) is never pruned or known.
     fn rank_with_bounds<'a, A: Aligner>(
@@ -606,22 +610,36 @@ impl<R: Retriever> SegmentStage<R> {
         dp: &mut A::Workspace,
         batch: &mut BatchScratch,
     ) {
+        let cut = self.accept.is_permissive() && self.keep.top > 0;
         batch.owners.clear();
         for (index, request) in requests.iter().enumerate() {
             if self.needs_scores(request) {
                 let leaders = &batch.leaders[batch.slots(index)];
-                batch.owners.extend(
-                    (0..)
-                        .zip(leaders)
-                        .filter(|&(c, &leader)| c == leader)
-                        .map(|(c, _)| (index, c)),
-                );
+                let representatives = (0..)
+                    .zip(leaders)
+                    .filter(|&(c, &leader)| c == leader)
+                    .map(|(c, _)| c);
+                let strength = |&c: &u32| {
+                    let candidate = &request.candidates[c as usize];
+                    (candidate.votes, std::cmp::Reverse(candidate.allele))
+                };
+                let strongest = cut
+                    .then(|| representatives.clone().max_by_key(strength))
+                    .flatten();
+                for c in representatives {
+                    if Some(c) == strongest {
+                        batch.early.push((index, c));
+                    } else {
+                        batch.owners.push((index, c));
+                    }
+                }
             }
         }
         self.score_owners(aligner, requests, dp, batch);
-        let cut = self.accept.is_permissive() && self.keep.top > 0;
         if cut {
+            self.trace_early(aligner, requests, dp, batch);
             self.trace_best_representatives(aligner, requests, table, dp, batch);
+            batch.early.clear();
         }
         batch.owners.clear();
         // `batch.path_owners[paths]`: the current request's traced paths.
@@ -729,8 +747,9 @@ impl<R: Retriever> SegmentStage<R> {
     }
 
     /// Align each scored request's best-scoring representatives (every tie;
-    /// `batch.ranked` holds the representatives that rank), cache the
-    /// alignments for traceback and index their paths by frame position.
+    /// `batch.ranked` holds the representatives that rank) not aligned yet,
+    /// cache the alignments for traceback, and index their paths and the
+    /// strongest representative's (`batch.early`) by frame position.
     fn trace_best_representatives<'a, A: Aligner>(
         &'a self,
         aligner: &A,
@@ -745,28 +764,35 @@ impl<R: Retriever> SegmentStage<R> {
                 continue;
             }
             let ranked = &batch.ranked[index];
+            let start = batch.starts[index];
             if let Some(best) = ranked.iter().map(|&(_, s)| s).max() {
                 batch.owners.extend(
                     ranked
                         .iter()
-                        .filter(|&&(_, s)| s == best)
+                        .filter(|&&(c, s)| s == best && batch.cached[start + c as usize] == NONE)
                         .map(|&(c, _)| (index, c)),
                 );
             }
         }
-        if batch.owners.is_empty() {
-            return;
+        if !batch.owners.is_empty() {
+            let jobs: Vec<AlignJob<'a>> = batch
+                .owners
+                .iter()
+                .map(|&(index, candidate)| self.job(&requests[index], candidate))
+                .collect();
+            aligner.align_batch(&jobs, dp, &mut batch.alignments);
+            for (&(index, candidate), alignment) in
+                batch.owners.iter().zip(batch.alignments.drain(..))
+            {
+                batch.cached[batch.starts[index] + candidate as usize] = entry(batch.traced.len());
+                batch.traced.push(alignment);
+            }
         }
-        let jobs: Vec<AlignJob<'a>> = batch
-            .owners
-            .iter()
-            .map(|&(index, candidate)| self.job(&requests[index], candidate))
-            .collect();
-        aligner.align_batch(&jobs, dp, &mut batch.alignments);
         let BatchScratch {
-            owners,
-            alignments,
+            ranked,
+            early,
             starts,
+            exact,
             traced,
             cached,
             paths,
@@ -774,9 +800,27 @@ impl<R: Retriever> SegmentStage<R> {
             path_owners,
             ..
         } = batch;
-        for (&(index, candidate), alignment) in owners.iter().zip(alignments.drain(..)) {
-            if let Some(alignment) = &alignment {
-                let request = &requests[index];
+        // Paths of the best representatives and of the strongest, if another.
+        let mut strongest = early.iter().peekable();
+        for (index, request) in requests.iter().enumerate() {
+            if !self.needs_scores(request) {
+                continue;
+            }
+            let start = starts[index];
+            let best = ranked[index].iter().map(|&(_, s)| s).max();
+            let other = strongest
+                .next_if(|&&(i, _)| i == index)
+                .map(|&(_, c)| c)
+                .filter(|&c| best != Some(exact[start + c as usize]));
+            let chosen = ranked[index]
+                .iter()
+                .filter(|&&(_, s)| Some(s) == best)
+                .map(|&(c, _)| c)
+                .chain(other);
+            for candidate in chosen {
+                let Some(alignment) = &traced[cached[start + candidate as usize] as usize] else {
+                    continue;
+                };
                 let allele = request.candidates[candidate as usize].allele;
                 if paths.len() == *path_count {
                     paths.push(FramePath::default());
@@ -792,8 +836,6 @@ impl<R: Retriever> SegmentStage<R> {
                 *path_count += 1;
                 path_owners.push((index, candidate));
             }
-            cached[starts[index] + candidate as usize] = entry(traced.len());
-            traced.push(alignment);
         }
     }
 
