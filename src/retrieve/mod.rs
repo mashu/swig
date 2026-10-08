@@ -9,6 +9,7 @@ mod budget;
 mod exhaustive;
 mod frames;
 mod lmer_mask;
+mod reach;
 mod seed_vote;
 mod ungapped;
 
@@ -16,6 +17,7 @@ pub use budget::{AmbiguityBudget, CandidateBudget, FixedBudget};
 pub use exhaustive::ExhaustiveRetriever;
 pub use frames::GeneFrames;
 pub use lmer_mask::{LmerMaskRetriever, MAX_LMER};
+pub use reach::ReachClasses;
 pub use seed_vote::{SeedVoteParams, SeedVoteRetriever};
 pub use ungapped::{UngappedParams, UngappedPrefilter};
 

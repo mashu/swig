@@ -27,19 +27,20 @@ use crate::scoring::{AnchorColumn, GapCosts};
 /// Where one read's anchored hypotheses are searched.
 ///
 /// The anchor column takes the read base before `C[0]`, at `x + δ − 1`, so
-/// the window starts at the earliest one, `max(0, x − s − 1)`, and runs to
-/// the read's end. In window coordinates (`x_rel = x − start`) the anchor of
-/// `H(a, δ)` lies on diagonal `x_rel − 1 + δ` of `C′`, so the band is
+/// the window starts at the earliest one, `x − s − 1`, and runs to the
+/// read's end. The splice lies `s + 1` bases into every window, so the
+/// anchor of `H(a, δ)` lies on diagonal `s + δ` of `C′` and the band is
 ///
 /// ```text
-/// lo = x_rel − 1 − s,   hi = x_rel − 1 + s
+/// lo = 0,   hi = 2s
 /// ```
 ///
-/// exactly the `2s + 1` start diagonals (fewer when `x ≤ s`: an anchor
-/// cannot precede the read). The band is also the corridor indels drift in:
-/// a C starting at `x + δ` admits `s + δ` net deletions and `s − δ` net
-/// insertions; beyond that the free end truncates the alignment. Widening
-/// the band would add start hypotheses, which the significance counts.
+/// exactly the `2s + 1` start diagonals, and an alignment reaches at most
+/// `|window| − 1 = (n − x) + s` bases of `C` ([`crate::retrieve::ReachClasses`]).
+/// The band is also the corridor indels drift in: a C starting at `x + δ`
+/// admits `s + δ` net deletions and `s − δ` net insertions; beyond that the
+/// free end truncates the alignment. Widening the band would add start
+/// hypotheses, which the significance counts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpliceWindow {
     /// Read position of the splice: the called J's exit.
@@ -52,20 +53,16 @@ pub struct SpliceWindow {
 
 impl SpliceWindow {
     /// The window for a splice at `x` in a read of `read_len` bases with
-    /// spread `s`; `None` when nothing follows `x`.
+    /// spread `s`; `None` when nothing follows `x`, or when `x ≤ s` leaves no
+    /// room for every anchor (a called J is far longer than `s`).
     pub fn new(x: u32, read_len: usize, spread: u32) -> Option<Self> {
-        if x as usize >= read_len {
-            return None;
-        }
-        let start = x.saturating_sub(spread + 1);
-        let centre = (x - start) as i32 - 1;
-        let spread = spread as i32;
-        Some(Self {
+        let start = x.checked_sub(spread + 1)?;
+        (read_len > x as usize).then(|| Self {
             x,
             window: start as usize..read_len,
             band: Band::Diagonals {
-                lo: centre - spread,
-                hi: centre + spread,
+                lo: 0,
+                hi: 2 * spread as i32,
             },
         })
     }
@@ -163,7 +160,7 @@ mod tests {
     /// the splice, mutated with substitutions, `N`s and indels, then a random
     /// tail; returns the read and `x`.
     fn read(next: &mut impl FnMut() -> u64, c: &[u8], s: i64) -> (Vec<u8>, u32) {
-        let x = 1 + (next() % 12) as usize;
+        let x = s as usize + 1 + (next() % 8) as usize;
         let delta = (next() % (2 * s as u64 + 5)) as i64 - s - 2;
         let mut read = random_codes(next, x);
         if delta > 0 {
@@ -278,15 +275,60 @@ mod tests {
         }
     }
 
+    /// The members of a reach class align exactly like their representative
+    /// in the window the class was formed for.
     #[test]
-    fn the_window_holds_every_anchor_and_clamps_at_the_read_start() {
+    fn reach_class_members_align_identically() {
+        use crate::alphabet::decode;
+        use crate::germline::{GermlineSet, SegmentKind};
+        use crate::retrieve::{ReachClasses, RetrievalScratch, Retriever};
+        let mut next = rng(21);
+        let root = random_codes(&mut next, 300);
+        let mut set = GermlineSet::new(SegmentKind::C);
+        for k in 0..24 {
+            let mut allele = root[..150 + (next() % 150) as usize].to_vec();
+            let p = (next() as usize) % allele.len();
+            allele[p] = (allele[p] + 1) % 4;
+            let name = format!("IGHC{}*{k:02}", k % 4);
+            set.push(&name, decode(&allele).as_bytes(), None).unwrap();
+        }
+        let model = AnchorColumn::new(SCORING, 300);
+        let anchored = set.with_anchor_column();
+        let profiles: Vec<_> = anchored
+            .alleles()
+            .iter()
+            .map(|a| SubstitutionProfile::build(&model, &a.codes))
+            .collect();
+        let classes = ReachClasses::new(&set, 3);
+        let (mut scratch, mut candidates) = (RetrievalScratch::default(), Vec::new());
+        let mut ws = GotohWorkspace::default();
+        for _ in 0..200 {
+            let (query, x) = read(&mut next, &set.allele(0).codes, 3);
+            let w = SpliceWindow::new(x, query.len(), 3).unwrap();
+            let window = &query[w.window.clone()];
+            classes.retrieve(window, &mut scratch, &mut candidates);
+            for candidate in &candidates {
+                let align = |allele: u32, ws: &mut GotohWorkspace| {
+                    let profile = &profiles[allele as usize];
+                    BandedGotoh.align(window, profile, SCORING.gaps, w.band, ws)
+                };
+                let expected = align(candidate.allele, &mut ws);
+                assert_eq!(candidate.band, w.band);
+                for &member in classes.members(candidate.allele, classes.reach(window.len())) {
+                    assert_eq!(align(member, &mut ws), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_window_holds_every_anchor() {
         let w = SpliceWindow::new(40, 100, 3).unwrap();
         assert_eq!(w.window, 36..100);
-        // x_rel = 4: anchors at window positions 0..=6, diagonals 0..=6.
+        // The splice 4 bases in: anchors at window positions 0..=6.
         assert_eq!(w.band, Band::Diagonals { lo: 0, hi: 6 });
-        let w = SpliceWindow::new(2, 100, 3).unwrap();
-        assert_eq!(w.window, 0..100);
-        assert_eq!(w.band, Band::Diagonals { lo: -2, hi: 4 });
+        assert_eq!(SpliceWindow::new(4, 5, 3).unwrap().window, 0..5);
+        assert_eq!(SpliceWindow::new(3, 100, 3), None);
         assert_eq!(SpliceWindow::new(100, 100, 3), None);
     }
 
