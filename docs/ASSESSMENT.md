@@ -399,13 +399,16 @@ work.
    `P_D` sets the trade-off, and the prior odds are the single knob.
    Precision/recall curves, not one number, belong in the paper; the
    reported `d_presence_posterior` now carries this uncertainty per read.
-   The derivation itself undercounts the search: `ln(N·L)` counts genes ×
-   read positions, but a local alignment tries every allele, allele offset
-   and read position (Karlin–Altschul `K·m·n ≈ e^{10}` against `e^{6.7}` for
-   human IGH; ~0.26 expected chance 9-mer matches per junction, in line with
-   the 22 % false-positive rate on mid). Even prior odds understate IgSim's
-   99 % D inclusion, and the two errors roughly cancel there. Both terms
-   should be estimated, not assumed.
+   The derivation undercounts the search: `ln(N·L)` counts genes × read
+   positions, but a local alignment tries every allele, allele offset and
+   read position (`K·m·n_D = e^{9.0}` against `e^{6.6}` for human IGH), and
+   even prior odds understate IgSim's D inclusion; the two errors cancel.
+   The search's own count is now a switch, `--d-presence-rate` (§9.9). It
+   cannot replace the default: no presence rate follows from the search,
+   at the simulator's rate exact 5-mers win (no-D −14 to −26 pp), and every
+   constant cost moves along the same curve of D accuracy against D-free
+   specificity. What the residual miscalibration tracks is junction length,
+   a matter for an N/P length prior.
 3. ~~**Calls and posteriors use different evidence scales.**~~ Resolved
    (§9.8): one integer model at the read's divergence drives both, so the
    call is a mode of its posterior. What remains is the gap between a mode
@@ -453,8 +456,10 @@ work.
 In order of expected value:
 
 1. ~~**Posterior decoding**~~ — done (§3, item 12), and calls from the
-   per-read model (§9.8). Next on that line: a D prior from the D search's
-   own statistics (limitation 2), at the per-read scale.
+   per-read model (§9.8). The D prior from the D search's own statistics is
+   a switch (§9.9). Next on that line: a prior on N/P lengths, which the
+   D-presence residual points to (short junctions are D-free more often than
+   the model allows).
 2. ~~**Two cuts per overlap with N/P between**~~ — done (§3, item 11).
 3. ~~**Sensitivity analysis**~~ — done (§7).
 4. **Cross-tool benchmark.** IgBLAST done (§8). partis and Swig remain, at
@@ -824,10 +829,10 @@ bounds changed the allele set of 1 of 20,000 hard reads).
 
 Of the roadmap in the README, the wider-SIMD item is done (AVX-512BW, NEON
 and a portable backend), and so are allele rescoring along the gene frame
-(§9.6) and calls from the per-read model (§9.8). A D prior from the D
-search's own statistics, annotation priors and C-segment assignment remain
-open; §9.5 and §9.8 show the D prior is the one with the clearest measured
-need.
+(§9.6) and calls from the per-read model (§9.8). The D prior from the D
+search's own statistics is implemented and measured, and stays a switch
+(§9.9): the search's count is derived, the presence rate is not.
+Annotation priors and C-segment assignment remain open.
 
 ### 9.8 Calls from the per-read model
 
@@ -909,3 +914,99 @@ only, it stays off by default.
 Instructions on 2000 hard reads: main 10.550 G; per-read call (default)
 10.659 G (+1.0 %); fixed-scale call 10.605 G; per-read call with
 max-marginal D 10.713 G (+1.5 %).
+
+### 9.9 A D prior from the D search's statistics
+
+`P*_D = [ln(N·L) − ln π_odds]/λ` counts genes × positions at even odds.
+`DPrior::Search` (`--d-presence-rate π`) counts what the search tries
+instead (ALGORITHM §2.3): `P*_D = [ln(K·m·n_D) − ln(π/(1 − π))]/λ`, the
+score at which `π/(1 − π)` chance hits are expected, with the lattice
+`K = 0.408` and `λ = 0.634` of `(2, −3)`, `m = 25` positions and
+`n_D = Σ_a (L_a − 3)⁺`, the offsets of the distinct D alleles at which an
+exact run of 4 can start: 802 for the 37 human alleles and 659 for the 36
+synthetic ones. `ln(K·m·n_D)` is 9.01 and 8.81 nats, against `ln(N·L)` =
+6.62 and 6.55. The per-read reading (`P*_D/2` matched D columns, §9.8) is
+unchanged.
+
+**The count against brute force** (random 25-base windows against the
+human alleles, best ungapped hit per allele, the exact-run gate; 1500
+windows):
+
+| S | 10 | 11 | 12 | 13 | 14 |
+|---|---|---|---|---|---|
+| chance hits ≥ S, brute force | 10.85 | 4.17 | 3.06 | 1.13 | 0.79 |
+| `K·m·n_D·e^{−λS}` | 14.49 | 7.69 | 4.08 | 2.17 | 1.15 |
+
+Exact runs carry 85–95 % of the chance hits at even scores, so the
+closed form is high by 1.35 there and by 1.85 at odd scores; BLAST's
+length adjustment would make it low by 0.55. A unit test checks the bracket
+on random alleles.
+
+**What the posterior wants**, measured offline on the default's output by
+moving the D cost with the calls held: P*_D + 0.25 to + 0.5 improves
+D-presence ECE and Brier on all six sets; the Brier optimum is + 1.1 (human
+mid), + 0.25 (human hard), + 1.5 (synthetic mid), + 0.75 (synthetic hard).
+By junction length, junctions of up to 8 nt want 1.1–1.7 nats more (up to
+12 nt on the mid sets) and those of 17 nt or more want less: IgSim's D-free
+reads have short junctions. By `p̂`, the mid sets want a flat shift and the hard sets more
+cost at high `p̂`.
+
+**What the calls allow**, paired against the default on 20,000 reads per
+preset:
+
+- A constant + 0.5 (P*_D 10.95 and 10.84): D-presence Brier better on all
+  six sets, but D on 4–7 nt remnants −0.56 pp on human hard (p 0.008) and
+  −0.39 pp on synthetic hard (p 0.002). Every discordant read moves one
+  way: the same D accuracy against D-free specificity curve as every prior
+  change before.
+- The count with the read's own D window, `m = W` (π = 0.94): Brier worse
+  on all six sets (t + 6 to + 23), and 8.9–9.8 pp fewer D-free synthetic
+  reads without a D. Long junctions carry a D more often than the window's
+  larger chance-hit count allows for.
+- The count at the simulator's rate, π = 0.94 (P*_D 9.88 and 9.57, below
+  10): exact 5-mers win. No D call −24.0 / −14.5 / −26.3 / −18.4 pp (human
+  mid / hard, synthetic mid / hard), Brier worse on all six sets.
+- The count at π = 0.9 (P*_D 10.75 and 10.44):
+
+| Set | V | D allele | D 1–3 nt | D 4–7 nt | D 8+ nt | no D | J | Junction |
+|---|---|---|---|---|---|---|---|---|
+| igh.easy | 0 | 0 | — | 0 | 0 | 0 | 0 | 0 |
+| igh.mid | 0 | −0.05 (0.002) | −1.17 (0.016) | −0.14 (0.5) | −0.01 (1.0) | +0.18 (0.5) | 0 | 0 |
+| igh.hard | 0 | −0.09 (2e−5) | −1.77 (0.001) | −0.21 (0.25) | −0.02 (0.25) | **+0.77** (0.008) | 0 | 0 |
+| syn.easy | 0 | 0 | — | — | 0 | 0 | 0 | 0 |
+| syn.mid | 0 | −0.02 (0.12) | −0.17 (0.5) | −0.08 (0.5) | 0 | +0.15 (0.25) | 0 | 0 |
+| syn.hard | 0 | −0.03 (0.06) | −0.34 (0.12) | −0.04 (1.0) | 0 | +0.20 (0.12) | 0 | 0 |
+
+| Set | D presence Brier (paired t) | D presence ECE % | D allele ECE % | D allele Brier t |
+|---|---|---|---|---|
+| igh.easy | 0.00035 → 0.00029 (−5.2) | 0.10 → 0.09 | 0.32 → 0.32 | −1.4 |
+| igh.mid | 0.02462 → 0.02398 (−9.1) | 1.36 → 1.13 | 0.66 → 0.63 | −5.9 |
+| igh.hard | 0.02168 → 0.02158 (−1.5) | 0.47 → 0.39 | 0.87 → 0.78 | −5.8 |
+| syn.easy | 0.00029 → 0.00027 (−5.5) | 0.12 → 0.12 | 0.59 → 0.59 | +6.7 |
+| syn.mid | 0.04547 → 0.04485 (−20.0) | 3.27 → 3.08 | 1.67 → 1.63 | −13.9 |
+| syn.hard | 0.04079 → 0.04041 (−11.9) | 1.82 → 1.60 | 1.50 → 1.44 | −11.0 |
+
+(The synthetic easy D allele Brier moves by less than 10⁻⁵.) V, J and the
+junction do not change; V and J ECE move by at most 0.01.
+
+At π = 0.9 the switch meets every adoption criterion: D-presence
+calibration better on all six sets, no D call and D on remnants of 4 nt or
+more nowhere worse, the overall D allele loss on human mid and hard all in
+1–3 nt remnants (undetectable under `min_d_match` = 4) or within noise.
+
+**Why it is not the default.** The count is derived from the search, the
+rate is not, and the rate decides. 0.9 was found by measuring on the
+simulator; the rate a user would know or estimate breaks specificity. An
+EM estimate over the batch, offline, recovers IgSim's rate (0.942 against
+0.944 on human mid, 0.899 against 0.901 on synthetic mid, 0.934 / 0.948
+and 0.872 / 0.902 on the hard sets) and is batch-dependent; with it the
+count admits exact 5-mers as above. What passes is a band, P*_D from 10.45
+to about 10.8, while the count is uncertain by more than that: the mean D
+window is 52–58 positions, not 25, and Σ L_a instead of `n_D` adds 0.13
+nats, together 1.4 score units. So the default stays the per-read
+model's `ln(N·L)` at even odds; `--d-presence-rate` serves a user who
+knows the repertoire's rate. The posterior's residual tracks junction
+length, which a prior on N/P lengths would model.
+
+Instructions on 2000 hard reads: 9.715 G with the default and with
+`--d-presence-rate 0.9` (the prior is one constant per database).
