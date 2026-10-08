@@ -510,6 +510,24 @@ impl GermlineSet {
         Ok(set)
     }
 
+    /// The same alleles — ids, names, aliases and genes — with an `N` anchor
+    /// column prepended to every sequence (`C′ = [N] + C`), the reference of
+    /// an anchored alignment ([`crate::scoring::AnchorColumn`]). Reference
+    /// position `r` of an allele is position `r + 1` of its copy; annotations
+    /// are not carried.
+    pub fn with_anchor_column(&self) -> Self {
+        let mut set = Self::new(self.kind);
+        for allele in &self.alleles {
+            let codes = std::iter::once(alphabet::N)
+                .chain(allele.codes.iter().copied())
+                .collect();
+            set.push_codes(&allele.name, codes, None)
+                .expect("a copied allele is valid");
+            set.alleles.last_mut().expect("just pushed").aliases = allele.aliases.clone();
+        }
+        set
+    }
+
     /// Merge identical sequences into the first allele carrying them (later
     /// names become aliases). Lossless for assignment: the merged alleles would
     /// always score identically, and reports list every name. The kept

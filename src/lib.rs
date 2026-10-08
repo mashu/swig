@@ -38,6 +38,7 @@ pub mod band;
 pub mod batch;
 pub mod clip;
 pub mod config;
+pub mod constant;
 pub mod evidence;
 pub mod family_bound;
 pub mod fasta;

@@ -209,6 +209,52 @@ impl SubstitutionModel for HotspotScoring {
     }
 }
 
+/// An anchored alignment as a local one: reference position 0 is an *anchor
+/// column* that scores `bonus` against every query code, `N` included; every
+/// other position scores `inner`. The reference carries the anchor as its
+/// first position (`C′ = [N] + C`, see [`crate::germline::GermlineSet::with_anchor_column`]).
+///
+/// With `bonus = matched · ℓ + 1`, `ℓ` the longest `C`, any alignment that
+/// avoids column 0 scores at most `matched · ℓ < bonus`, and a local
+/// alignment entering column 0 can only start there (it is the first column;
+/// a leading gap only lowers a score). So every optimal local alignment
+/// starts with the anchor column, and
+///
+/// ```text
+/// max local score = bonus + max over starts of the anchored score
+/// ```
+///
+/// where a start is a band diagonal through column 0 and the anchored score
+/// is the best alignment of `C` from its first base onward with a free end.
+/// Any local aligner — every SIMD backend included — therefore computes the
+/// exact anchored optimum, start set and drift corridor being the band.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnchorColumn {
+    pub inner: AffineScoring,
+    pub bonus: Score,
+}
+
+impl AnchorColumn {
+    /// The anchor model for references up to `longest` bases (anchor excluded).
+    pub fn new(inner: AffineScoring, longest: usize) -> Self {
+        let longest = Score::try_from(longest).expect("reference length fits a score");
+        Self {
+            inner,
+            bonus: inner.matched.max(0) * longest + 1,
+        }
+    }
+}
+
+impl SubstitutionModel for AnchorColumn {
+    #[inline]
+    fn score(&self, query_code: u8, reference: &[u8], position: usize) -> Score {
+        match position {
+            0 => self.bonus,
+            _ => self.inner.substitution(query_code, reference[position]),
+        }
+    }
+}
+
 /// Match and mismatch scores of a position-independent profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UniformScores {
@@ -435,6 +481,30 @@ mod tests {
                 let best = hit.map_or(0, |hit| i64::from(hit.score));
                 assert!(best <= profile.local_bound(k));
             }
+        }
+    }
+
+    /// An anchor profile is bounded by its bonus once plus `matched` per
+    /// further column, and that bounds its local scores.
+    #[test]
+    fn anchor_profiles_count_the_bonus_once() {
+        use crate::align::{Aligner, BandedGotoh, GotohWorkspace};
+        use crate::band::Band;
+        use crate::testing::{random_codes, rng};
+        let scoring = AffineScoring::new(2, -3, -9, -1);
+        let model = AnchorColumn::new(scoring, 50);
+        assert_eq!(model.bonus, 101);
+        let mut next = rng(12);
+        let mut ws = GotohWorkspace::default();
+        for _ in 0..200 {
+            let (m, n) = (2 + (next() % 50) as usize, 1 + (next() % 80) as usize);
+            let reference = random_codes(&mut next, m);
+            let query = random_codes(&mut next, n);
+            let profile = SubstitutionProfile::build(&model, &reference);
+            let k = n.min(m);
+            assert_eq!(profile.local_bound(k), 101 + 2 * (k as i64 - 1));
+            let hit = BandedGotoh.score(&query, &profile, scoring.gaps, Band::Full, &mut ws);
+            assert!(i64::from(hit.expect("the anchor scores").score) <= profile.local_bound(k));
         }
     }
 

@@ -778,9 +778,9 @@ impl Aligner for InterSequenceGotoh {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scoring::{AffineScoring, HotspotScoring};
+    use crate::scoring::{AffineScoring, AnchorColumn, HotspotScoring};
 
-    use crate::testing::rng;
+    use crate::testing::{random_codes, rng};
 
     /// A reference plus a mutated, indel-carrying, N-sprinkled query that
     /// contains it at `offset`.
@@ -963,6 +963,75 @@ mod tests {
                     BandedGotoh.align(query, profile, gaps, band, &mut scalar),
                     "{:?} job {k}",
                     simd.backend()
+                );
+            }
+        }
+    }
+
+    /// C-like jobs: anchor profiles (one outsized column) on 1.3 kb
+    /// references under 7-diagonal bands, batched with uniform jobs. They
+    /// stay in SIMD lanes and match the scalar kernel.
+    #[test]
+    fn anchor_profiles_on_long_references_match_the_scalar_kernel() {
+        let scoring = AffineScoring::new(2, -3, -9, -1);
+        let model = AnchorColumn::new(scoring, 1300);
+        let mut next = rng(9);
+        let mut cases = Vec::new();
+        for k in 0..48 {
+            let mut reference = vec![N];
+            reference.extend(random_codes(&mut next, 1300));
+            let x = 4 + (next() % 4) as usize;
+            let len = (next() % 1301) as usize;
+            let mut query = random_codes(&mut next, x);
+            query.extend(&reference[1..=len]);
+            for _ in 0..(next() % 4) {
+                let p = (next() as usize) % query.len();
+                query[p] = (next() % 5) as u8;
+            }
+            if len > 2 && next().is_multiple_of(2) {
+                query.remove(x + 1 + (next() as usize) % (len - 1));
+            }
+            let tail = (next() % 40) as usize;
+            query.extend(random_codes(&mut next, tail));
+            let profile = if k % 4 == 3 {
+                SubstitutionProfile::build(&scoring, &reference)
+            } else {
+                SubstitutionProfile::build(&model, &reference)
+            };
+            let band = Band::Diagonals {
+                lo: x as i32 - 4,
+                hi: x as i32 + 2,
+            };
+            cases.push((query, profile, band));
+        }
+        let jobs: Vec<AlignJob> = cases
+            .iter()
+            .map(|(query, profile, band)| AlignJob {
+                query,
+                profile,
+                gaps: scoring.gaps,
+                band: *band,
+            })
+            .collect();
+        assert!(jobs.iter().all(|job| lane_of(0, job).is_some()));
+        let (mut hits, mut alignments) = (Vec::new(), Vec::new());
+        let mut ws = InterSequenceWorkspace::default();
+        let mut scalar = GotohWorkspace::default();
+        for simd in backends() {
+            simd.score_batch(&jobs, &mut ws, &mut hits);
+            simd.align_batch(&jobs, &mut ws, &mut alignments);
+            for (k, job) in jobs.iter().enumerate() {
+                let (query, profile, gaps, band) = (job.query, job.profile, job.gaps, job.band);
+                let backend = simd.backend();
+                assert_eq!(
+                    hits[k],
+                    BandedGotoh.score(query, profile, gaps, band, &mut scalar),
+                    "{backend:?} job {k}"
+                );
+                assert_eq!(
+                    alignments[k],
+                    BandedGotoh.align(query, profile, gaps, band, &mut scalar),
+                    "{backend:?} job {k}"
                 );
             }
         }
