@@ -11,9 +11,12 @@
 //! CDR3 = [Cys104 + 1, J Trp/Phe118)           FR4  = [J Trp/Phe118, J end)
 //! ```
 //!
-//! Sources, in order of trust (a header value is never overridden):
+//! Sources, in order of trust (a given value is never overridden):
 //!
-//! 1. `anchor=` / `fr1=` … `fr3=` in the FASTA header.
+//! 1. `anchor=` / `fr1=` … `fr3=` in the FASTA header, then the IMGT
+//!    numbering of an IMGT-gapped V set ([`ImgtGaps`]). A region the
+//!    numbering places before a 5′-partial sequence stays empty, and an
+//!    allele whose numbering ends before Cys104 gets no anchor.
 //! 2. Motif search on a one-pass three-frame translation ([`find_v`], [`find_j`]).
 //! 3. The same search with a database-consensus prior on the anchor's
 //!    distance from the 3′ end, for alleles whose motifs were weak.
@@ -29,6 +32,7 @@
 //! alignment for the rare transferred allele — milliseconds for thousands of
 //! alleles, and nothing is added to per-read work.
 
+mod given;
 mod j_motif;
 mod transfer;
 mod v_motif;
@@ -36,6 +40,7 @@ mod v_motif;
 use std::collections::HashMap;
 use std::io::{self, Write};
 
+pub use given::ImgtGaps;
 pub use j_motif::{JHit, find_j};
 pub use transfer::{
     MIN_SHARED_FRACTION, MIN_SHARED_KMERS, RelativeIndex, kmers, shared, transfer, transfer_aligned,
@@ -43,8 +48,9 @@ pub use transfer::{
 pub use v_motif::{VHit, VSearch, find_v};
 
 use crate::align::GotohWorkspace;
-use crate::germline::{GermlineSet, RegionStarts};
+use crate::germline::{GermlineSet, RegionSlot, RegionStarts};
 use crate::translate::codon;
+use given::Given;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChainType {
@@ -82,9 +88,13 @@ impl ChainType {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AnchorSource {
     Header,
+    /// The IMGT numbering of a gapped input record.
+    ImgtGaps,
     Motif,
     Consensus,
-    Transfer { from: String },
+    Transfer {
+        from: String,
+    },
     LowConfidence,
     Missing,
 }
@@ -93,6 +103,7 @@ impl AnchorSource {
     pub fn label(&self) -> String {
         match self {
             Self::Header => "header".into(),
+            Self::ImgtGaps => "imgt-gaps".into(),
             Self::Motif => "motif".into(),
             Self::Consensus => "consensus".into(),
             Self::Transfer { from } => format!("transfer:{from}"),
@@ -103,7 +114,10 @@ impl AnchorSource {
 
     /// Reliable enough to serve as a transfer donor.
     fn trusted(&self) -> bool {
-        matches!(self, Self::Header | Self::Motif | Self::Consensus)
+        matches!(
+            self,
+            Self::Header | Self::ImgtGaps | Self::Motif | Self::Consensus
+        )
     }
 }
 
@@ -128,6 +142,8 @@ pub struct DatabaseAnnotation {
     pub j_tail: Option<u32>,
     pub v: Vec<AlleleAnnotation>,
     pub j: Vec<AlleleAnnotation>,
+    /// Whether the V set's IMGT gap columns were read.
+    pub imgt_gaps: ImgtGaps,
 }
 
 fn mode(values: impl Iterator<Item = u32>) -> Option<u32> {
@@ -168,27 +184,28 @@ fn regions_from_hit(hit: &VHit, chain: Option<ChainType>) -> RegionStarts {
     }
 }
 
-/// Header values win; derived values fill the gaps. Derived values that break
-/// the ordering are dropped, latest first, with a note.
+/// Given values (header, then IMGT gaps) win; derived values fill the
+/// unknown slots, never one the IMGT numbering places before the sequence
+/// start. Derived values that break the ordering are dropped, latest first,
+/// with a note.
 fn merge_regions(
-    header: RegionStarts,
+    given: &[RegionSlot; 5],
     derived: RegionStarts,
     anchor: Option<u32>,
     len: usize,
     notes: &mut Vec<String>,
 ) -> RegionStarts {
-    let header_values = header.values();
-    let mut values = header_values;
-    for (slot, value) in values.iter_mut().zip(derived.values()) {
-        if slot.is_none() {
-            *slot = value;
+    let mut values = given.map(RegionSlot::known);
+    for ((value, slot), derived) in values.iter_mut().zip(given).zip(derived.values()) {
+        if *slot == RegionSlot::Unknown {
+            *value = derived;
         }
     }
     let mut merged = RegionStarts::from_values(values);
     while let Err(reason) = merged.check(anchor, len) {
         let Some(index) = (0..5)
             .rev()
-            .find(|&i| merged.values()[i].is_some() && header_values[i].is_none())
+            .find(|&i| merged.values()[i].is_some() && given[i].known().is_none())
         else {
             notes.push(format!("header regions inconsistent: {reason}"));
             break;
@@ -407,32 +424,55 @@ pub fn annotate(
         None => (Vec::new(), None, 0),
     };
 
-    // V pass 1: header anchors fix the frame; otherwise free motif search.
-    let mut hits: Vec<Option<VHit>> = Vec::with_capacity(v.len());
+    // What the input states: header keys, then IMGT gap columns if the
+    // database's gaps follow the IMGT numbering.
+    let imgt_gaps = ImgtGaps::check(v);
     let mut result: Vec<AlleleAnnotation> = Vec::with_capacity(v.len());
-    for allele in v.alleles() {
-        let search = VSearch {
-            fixed_anchor: allele.anchor,
-            ..VSearch::default()
+    let given: Vec<Given> = v
+        .alleles()
+        .iter()
+        .map(|allele| {
+            let mut notes = Vec::new();
+            let given = Given::read(allele, imgt_gaps.used(), &mut notes);
+            result.push(AlleleAnnotation {
+                source: AnchorSource::Missing,
+                notes,
+            });
+            given
+        })
+        .collect();
+
+    // V pass 1: given anchors fix the frame; otherwise free motif search. An
+    // allele whose IMGT numbering ends before Cys104 is not searched.
+    let mut hits: Vec<Option<VHit>> = Vec::with_capacity(v.len());
+    for ((allele, given), annotation) in v.alleles().iter().zip(&given).zip(&mut result) {
+        let hit = if given.ends_before_cys104 {
+            None
+        } else {
+            let search = VSearch {
+                fixed_anchor: given.anchor,
+                ..VSearch::default()
+            };
+            find_v(&allele.codes, search, &mut frames)
         };
-        let hit = find_v(&allele.codes, search, &mut frames);
-        let source = match (allele.anchor, hit) {
-            (Some(_), _) => AnchorSource::Header,
+        annotation.source = match (&given.source, hit) {
+            (Some(source), _) => source.clone(),
             (None, Some(h)) if h.confident => AnchorSource::Motif,
             _ => AnchorSource::Missing,
         };
-        let mut notes = Vec::new();
-        if let Some(anchor) = allele.anchor {
-            let residue = residue_at(&allele.codes, anchor);
-            if residue != b'C' {
-                notes.push(format!("header anchor codon is {}", char::from(residue)));
+        if let (Some(anchor), Some(source)) = (given.anchor, &given.source) {
+            let residue = char::from(residue_at(&allele.codes, anchor));
+            if residue != 'C' {
+                annotation.notes.push(match source {
+                    AnchorSource::ImgtGaps => format!("IMGT 104 codon is {residue}"),
+                    _ => format!("header anchor codon is {residue}"),
+                });
             }
         }
-        if source.trusted() {
+        if annotation.source.trusted() {
             vote += hit.map_or(0, |h| i32::from(h.chain_vote));
         }
         hits.push(hit);
-        result.push(AlleleAnnotation { source, notes });
     }
     let chain = options.chain.or(match vote.signum() {
         1 => Some(ChainType::Heavy),
@@ -450,7 +490,7 @@ pub fn annotate(
         (0..v.len())
             .filter(|&i| result[i].source.trusted())
             .filter_map(|i| {
-                v.alleles()[i]
+                given[i]
                     .anchor
                     .or(hits[i].map(|h| h.anchor()))
                     .map(|x| v.alleles()[i].codes.len() as u32 - x)
@@ -472,16 +512,19 @@ pub fn annotate(
     // V pass 2: every allele again with the database priors. The tail prior
     // applies to confident alleles only when one tail dominates the database.
     for (index, allele) in v.alleles().iter().enumerate() {
+        if given[index].ends_before_cys104 {
+            continue;
+        }
         let was_confident = result[index].source.trusted();
         let search = VSearch {
-            fixed_anchor: allele.anchor,
+            fixed_anchor: given[index].anchor,
             tail_prior: tail.filter(|_| !was_confident || tail_share >= 0.5),
             cys23_prior,
             fr3_codons: chain.map(ChainType::fr3_codons),
         };
         let refined = find_v(&allele.codes, search, &mut frames);
         match (&result[index].source, refined) {
-            (AnchorSource::Header, Some(h)) => hits[index] = Some(h),
+            (AnchorSource::Header | AnchorSource::ImgtGaps, Some(h)) => hits[index] = Some(h),
             (AnchorSource::Motif, Some(h)) if h.confident => hits[index] = Some(h),
             (AnchorSource::Missing, Some(h)) if h.confident => {
                 hits[index] = Some(h);
@@ -500,26 +543,26 @@ pub fn annotate(
     let len_of = |set: &GermlineSet, i: usize| set.alleles()[i].codes.len();
     let mut anchors: Vec<Option<u32>> = Vec::with_capacity(v.len());
     let mut regions: Vec<RegionStarts> = Vec::with_capacity(v.len());
-    for (index, allele) in v.alleles().iter().enumerate() {
+    for (index, given) in given.iter().enumerate() {
         let trusted_hit = hits[index].filter(|_| result[index].source.trusted());
-        let anchor = allele.anchor.or(trusted_hit.map(|h| h.anchor()));
+        let anchor = given.anchor.or(trusted_hit.map(|h| h.anchor()));
         let merged = match (anchor, trusted_hit) {
             (Some(anchor), Some(hit)) => {
-                if hit.cys23_alternatives > 0 && allele.regions.cdr1.is_none() {
+                if hit.cys23_alternatives > 0 && given.regions[1] == RegionSlot::Unknown {
                     result[index].notes.push(format!(
                         "Cys23 ambiguous ({} other C in window); CDR1 start from the best-scoring one",
                         hit.cys23_alternatives
                     ));
                 }
                 merge_regions(
-                    allele.regions,
+                    &given.regions,
                     regions_from_hit(&hit, chain),
                     Some(anchor),
                     len_of(v, index),
                     &mut result[index].notes,
                 )
             }
-            _ => allele.regions,
+            _ => given.known(),
         };
         anchors.push(anchor);
         regions.push(merged);
@@ -546,7 +589,7 @@ pub fn annotate(
         else {
             continue;
         };
-        if Some(hit.frame as u32) == frame_mode || v.alleles()[index].regions.cdr1.is_some() {
+        if Some(hit.frame as u32) == frame_mode || given[index].regions[1] != RegionSlot::Unknown {
             continue;
         }
         let relatives = relatives(&mut relative_index, v);
@@ -590,7 +633,7 @@ pub fn annotate(
         .collect();
     let any_donor = trusted.iter().any(|&t| t);
     for index in 0..v.len() {
-        if anchors[index].is_some() {
+        if anchors[index].is_some() || given[index].ends_before_cys104 {
             continue;
         }
         let positions_of = |d: usize| {
@@ -619,13 +662,8 @@ pub fn annotate(
                 if residue != b'C' {
                     notes.push(format!("conserved residue is {}", char::from(residue)));
                 }
-                regions[index] = merge_regions(
-                    v.alleles()[index].regions,
-                    derived,
-                    Some(anchor),
-                    len,
-                    notes,
-                );
+                regions[index] =
+                    merge_regions(&given[index].regions, derived, Some(anchor), len, notes);
                 result[index].source = AnchorSource::Transfer {
                     from: v.alleles()[donor].name.clone(),
                 };
@@ -649,8 +687,7 @@ pub fn annotate(
                     "3′-partial: the anchor codon of {} maps past the 3′ end",
                     v.alleles()[r.donor].name
                 ));
-                regions[index] =
-                    merge_regions(v.alleles()[index].regions, derived, None, len, notes);
+                regions[index] = merge_regions(&given[index].regions, derived, None, len, notes);
             }
             relative => {
                 if let Some(hit) = hits[index] {
@@ -663,7 +700,7 @@ pub fn annotate(
                         None => "weak motifs; no similar annotated allele".into(),
                     });
                     regions[index] = merge_regions(
-                        v.alleles()[index].regions,
+                        &given[index].regions,
                         regions_from_hit(&hit, chain),
                         Some(hit.anchor()),
                         len,
@@ -687,6 +724,7 @@ pub fn annotate(
         j_tail,
         v: result,
         j: j_annotations,
+        imgt_gaps,
     }
 }
 
@@ -717,10 +755,20 @@ impl DatabaseAnnotation {
         if !self.j.is_empty() {
             text += &format!("; J anchors: {}", Self::counts(&self.j));
         }
+        match &self.imgt_gaps {
+            ImgtGaps::Absent => {}
+            ImgtGaps::Used { gapped } => {
+                text += &format!("; IMGT numbering read from {gapped} gapped V alleles");
+            }
+            ImgtGaps::Ignored { gapped, reason } => {
+                text +=
+                    &format!("; gaps of {gapped} V alleles ignored, not IMGT numbering ({reason})");
+            }
+        }
         text
     }
 
-    /// Alleles whose anchor is not from a header, motif or consensus.
+    /// Alleles whose anchor is not from a header, IMGT gaps, motif or consensus.
     pub fn uncertain(&self) -> usize {
         self.v
             .iter()

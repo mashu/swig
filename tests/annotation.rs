@@ -463,3 +463,217 @@ fn read_regions_match_the_simulated_rearrangement() {
         "both junction frames exercised"
     );
 }
+
+/// Gap columns for IMGT codons `positions`: `codons` in order, `...` at the
+/// codons in `gaps`.
+fn place(
+    out: &mut Vec<u8>,
+    codons: &[u8],
+    positions: std::ops::RangeInclusive<usize>,
+    gaps: &[usize],
+) {
+    let mut codons = codons.chunks(3);
+    for position in positions {
+        if gaps.contains(&position) {
+            out.extend(b"...");
+        } else {
+            out.extend(codons.next().expect("enough codons"));
+        }
+    }
+    assert!(codons.next().is_none(), "every codon placed");
+}
+
+/// The middle `positions − n` codons of a CDR of `n` codons, IMGT style.
+fn middle_gaps(positions: std::ops::RangeInclusive<usize>, n: usize) -> Vec<usize> {
+    let first = positions.start() + n.div_ceil(2);
+    (first..first + (positions.count() - n)).collect()
+}
+
+/// IMGT-gapped text of a full-length synthetic gene: FR1 on IMGT codons
+/// 1–26 (heavy lacks 10), CDR1 on 27–38, FR2 on 39–55, CDR2 on 56–65 and
+/// FR3 on 66–104 (heavy lacks 73; light 73, 81 and 82), CDR gaps in the
+/// middle, then the 3′ tail.
+fn imgt_gapped(gene: &SyntheticV, chain: ChainType) -> Vec<u8> {
+    let [fr1, cdr1, fr2, cdr2, fr3] = gene.starts.map(|s| s as usize);
+    assert_eq!(fr1, 0, "full-length gene");
+    let s = &gene.sequence;
+    let end = gene.anchor as usize + 3;
+    let (fr1_gaps, fr3_gaps): (&[usize], &[usize]) = match chain {
+        ChainType::Heavy => (&[10], &[73]),
+        ChainType::Light => (&[], &[73, 81, 82]),
+    };
+    let mut out = Vec::new();
+    place(&mut out, &s[..cdr1], 1..=26, fr1_gaps);
+    let cdr1_gaps = middle_gaps(27..=38, (fr2 - cdr1) / 3);
+    place(&mut out, &s[cdr1..fr2], 27..=38, &cdr1_gaps);
+    place(&mut out, &s[fr2..cdr2], 39..=55, &[]);
+    let cdr2_gaps = middle_gaps(56..=65, (fr3 - cdr2) / 3);
+    place(&mut out, &s[cdr2..fr3], 56..=65, &cdr2_gaps);
+    place(&mut out, &s[fr3..end], 66..=104, fr3_gaps);
+    out.extend(&s[end..]);
+    out
+}
+
+fn record(name: &str, header: &str, sequence: &[u8]) -> String {
+    format!(">{name}{header}\n{}\n", String::from_utf8_lossy(sequence))
+}
+
+fn j_set(chain: ChainType, rng: &mut Rng) -> GermlineSet {
+    let mut j = GermlineSet::new(SegmentKind::J);
+    for g in 0..4 {
+        let (sequence, _) = synthetic_j(chain, rng);
+        j.push(&format!("J{g}*01"), &sequence, None).unwrap();
+    }
+    j
+}
+
+/// An IMGT-gapped database is numbered from its gap columns: every anchor
+/// and region start is exact, including a Cys104 → Ser pseudogene, a
+/// 3′-partial record (no anchor), a 5′-partial record that starts inside
+/// CDR1 (no FR1 or CDR1, although a motif hit would offer both), a record
+/// with a frameshift marker, and a header key that overrides a gap column.
+#[test]
+fn imgt_gapped_input_numbers_every_region() {
+    for (chain, seed) in [(ChainType::Heavy, 31), (ChainType::Light, 32)] {
+        let mut rng = Rng::new(seed);
+        let genes: Vec<SyntheticV> = (0..40).map(|_| synthetic_v(chain, &mut rng, 0)).collect();
+        let gapped: Vec<Vec<u8>> = genes.iter().map(|g| imgt_gapped(g, chain)).collect();
+        let mut text = String::new();
+        for (g, columns) in gapped.iter().enumerate() {
+            text += &record(&format!("V{g}*01"), "", columns);
+        }
+        // V0*02: Cys104 → Ser.
+        let mut pseudogene = gapped[0].clone();
+        pseudogene[309..312].copy_from_slice(b"AGC");
+        text += &record("V0*02", "", &pseudogene);
+        // V1*02: 3′-partial, ending inside FR3.
+        text += &record("V1*02", "", &gapped[1][..250]);
+        // V2*02: 5′-partial, starting inside CDR1.
+        let mut late = gapped[2].clone();
+        late[..84].fill(b'.');
+        let lost = gapped[2][..84].iter().filter(|&&c| c != b'.').count() as u32;
+        text += &record("V2*02", "", &late);
+        // V3*02: a base lost in FR3, marked by one gap column (codon 84).
+        let mut shifted = gapped[3].clone();
+        shifted[250] = b'.';
+        text += &record("V3*02", "", &shifted);
+        // V4*02: a header FR3 start one codon later than the gap columns'.
+        let fr3 = genes[4].starts[4] + 3;
+        text += &record("V4*02", &format!(" fr3={fr3}"), &gapped[4]);
+
+        let mut v = GermlineSet::from_fasta(SegmentKind::V, &text).unwrap();
+        let mut j = j_set(chain, &mut rng);
+        let report = annotate(&mut v, Some(&mut j), AnnotateOptions::default());
+        assert!(
+            report
+                .summary()
+                .contains("IMGT numbering read from 45 gapped V alleles"),
+            "{}",
+            report.summary()
+        );
+        for (allele, gene) in v.alleles().iter().zip(&genes) {
+            assert_eq!(allele.anchor, Some(gene.anchor), "{}", allele.name);
+            assert_eq!(
+                allele.regions.values(),
+                gene.starts.map(Some),
+                "{}",
+                allele.name
+            );
+        }
+        let by_name = |name: &str| {
+            let id = v.alleles().iter().position(|a| a.name == name).unwrap();
+            (&v.alleles()[id], &report.v[id])
+        };
+        for name in ["V0*01", "V0*02", "V2*02", "V3*02", "V4*02"] {
+            assert_eq!(by_name(name).1.source, AnchorSource::ImgtGaps, "{name}");
+        }
+        let (allele, annotation) = by_name("V0*02");
+        assert_eq!(allele.anchor, Some(genes[0].anchor));
+        assert!(
+            annotation.notes.iter().any(|n| n == "IMGT 104 codon is S"),
+            "{annotation:?}"
+        );
+
+        let (allele, annotation) = by_name("V1*02");
+        assert_eq!(allele.anchor, None);
+        assert_eq!(annotation.source, AnchorSource::Missing);
+        assert_eq!(allele.regions.values(), genes[1].starts.map(Some));
+        assert!(
+            annotation
+                .notes
+                .iter()
+                .any(|n| n == "3′-partial: the IMGT numbering ends before Cys104"),
+            "{annotation:?}"
+        );
+
+        let (allele, _) = by_name("V2*02");
+        let [_, _, fr2, cdr2, fr3_start] = genes[2].starts;
+        assert_eq!(allele.anchor, Some(genes[2].anchor - lost));
+        assert_eq!(
+            allele.regions.values(),
+            [
+                None,
+                None,
+                Some(fr2 - lost),
+                Some(cdr2 - lost),
+                Some(fr3_start - lost)
+            ]
+        );
+
+        let (allele, annotation) = by_name("V3*02");
+        assert_eq!(allele.anchor, Some(genes[3].anchor - 1));
+        assert_eq!(allele.regions.values(), genes[3].starts.map(Some));
+        assert!(
+            annotation
+                .notes
+                .iter()
+                .any(|n| n == "IMGT frameshift marker in codon 84"),
+            "{annotation:?}"
+        );
+
+        let (allele, _) = by_name("V4*02");
+        assert_eq!(allele.regions.fr3, Some(fr3));
+        assert_eq!(allele.anchor, Some(genes[4].anchor));
+    }
+}
+
+/// A codon alignment written with `.` but not in IMGT columns (one extra
+/// gap codon in FR1 moves Cys23, Trp41 and Cys104 off IMGT 23, 41 and
+/// 104) is not read as IMGT numbering: annotation equals the ungapped run.
+#[test]
+fn non_imgt_gapped_alignment_is_ignored() {
+    let mut rng = Rng::new(33);
+    let genes: Vec<SyntheticV> = (0..40)
+        .map(|_| synthetic_v(ChainType::Heavy, &mut rng, 0))
+        .collect();
+    let (mut shifted, mut plain) = (String::new(), String::new());
+    for (g, gene) in genes.iter().enumerate() {
+        let mut columns = imgt_gapped(gene, ChainType::Heavy);
+        columns.splice(30..30, *b"...");
+        shifted += &record(&format!("V{g}*01"), "", &columns);
+        plain += &record(&format!("V{g}*01"), "", &gene.sequence);
+    }
+    let j = j_set(ChainType::Heavy, &mut rng);
+    let run = |text: &str| {
+        let mut v = GermlineSet::from_fasta(SegmentKind::V, text).unwrap();
+        let report = annotate(&mut v, Some(&mut j.clone()), AnnotateOptions::default());
+        (v, report)
+    };
+    let (v, report) = run(&shifted);
+    let (expected, expected_report) = run(&plain);
+    assert!(
+        report.summary().contains(
+            "gaps of 40 V alleles ignored, not IMGT numbering (0 of 40 gapped V alleles have C at IMGT 23)"
+        ),
+        "{}",
+        report.summary()
+    );
+    let pairs = v.alleles().iter().zip(&report.v);
+    let expected_pairs = expected.alleles().iter().zip(&expected_report.v);
+    for ((allele, annotation), (want, want_annotation)) in pairs.zip(expected_pairs) {
+        assert_eq!(allele.anchor, want.anchor, "{}", allele.name);
+        assert_eq!(allele.regions, want.regions, "{}", allele.name);
+        assert_eq!(annotation.source, want_annotation.source);
+        assert_eq!(annotation.notes, want_annotation.notes);
+    }
+}
