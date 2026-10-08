@@ -2,12 +2,18 @@
 
 use std::fmt;
 
-/// One FASTA record. `sequence` keeps the raw symbols (IMGT gap characters,
-/// whitespace and digits removed).
+/// One FASTA record. `sequence` keeps the alphabetic symbols; IMGT gap
+/// characters (`.`) are recorded in `gaps`, and whitespace, digits and every
+/// other symbol are dropped.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FastaRecord {
     pub header: String,
     pub sequence: Vec<u8>,
+    /// Runs of `.` as `(bases before the run, run length)`, in sequence
+    /// order; a run continues across line breaks. Empty (no allocation) for
+    /// an ungapped record. Germline loading reads IMGT numbering from them
+    /// ([`crate::germline::ImgtNumbering`]).
+    pub gaps: Vec<(u32, u32)>,
 }
 
 impl FastaRecord {
@@ -60,14 +66,23 @@ pub fn parse_fasta(text: &str) -> Result<Vec<FastaRecord>, FastaError> {
             records.push(FastaRecord {
                 header: header.trim().to_string(),
                 sequence: Vec::new(),
+                gaps: Vec::new(),
             });
         } else if !line.is_empty() {
             let record = records
                 .last_mut()
                 .ok_or(FastaError::SequenceBeforeHeader { line: index + 1 })?;
-            record
-                .sequence
-                .extend(line.bytes().filter(|b| b.is_ascii_alphabetic()));
+            for symbol in line.bytes() {
+                if symbol.is_ascii_alphabetic() {
+                    record.sequence.push(symbol);
+                } else if symbol == b'.' {
+                    let before = u32::try_from(record.sequence.len()).expect("record fits u32");
+                    match record.gaps.last_mut() {
+                        Some((at, run)) if *at == before => *run += 1,
+                        _ => record.gaps.push((before, 1)),
+                    }
+                }
+            }
         }
     }
     if let Some(last) = records.last()
@@ -86,13 +101,16 @@ mod tests {
 
     #[test]
     fn parses_records_attributes_and_gaps() {
-        let text = ">IGHV1-2*02 anchor=285\nCAG..GTG\nCAG\n>IGHJ4*02\nACTAC\n";
+        let text = ">IGHV1-2*02 anchor=285\n..CAG..GTG.\n..CA-G\n>IGHJ4*02\nACTAC\n";
         let records = parse_fasta(text).unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].id(), "IGHV1-2*02");
         assert_eq!(records[0].attribute("anchor"), Some("285"));
         assert_eq!(records[0].sequence, b"CAGGTGCAG");
+        // Runs are (bases before, length); one continues across the line break.
+        assert_eq!(records[0].gaps, [(0, 2), (3, 2), (6, 3)]);
         assert_eq!(records[1].sequence, b"ACTAC");
+        assert!(records[1].gaps.is_empty());
     }
 
     #[test]

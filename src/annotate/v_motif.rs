@@ -77,9 +77,10 @@ pub struct VSearch {
     pub cys23_prior: Option<(usize, usize)>,
     /// Trusted anchor (header or earlier pass): fixes frame and Cys104.
     pub fixed_anchor: Option<u32>,
-    /// FR3 length in codons once the chain type is known: CDR2 of 0–12 codons
-    /// then confines Trp41 → Cys104 to `[14 + L, 26 + L]`.
-    pub fr3_codons: Option<u32>,
+    /// Shortest and longest FR3 (codons) the database admits, once the
+    /// chain type or annotated alleles say: a CDR2 of 0–12 codons then
+    /// confines Trp41 → Cys104 to `[14 + L_lo, 26 + L_hi]`.
+    pub fr3_codons: Option<(u32, u32)>,
 }
 
 #[inline]
@@ -181,7 +182,7 @@ pub fn find_v(codes: &[u8], search: VSearch, frames: &mut [Vec<u8>; 3]) -> Optio
             }
             let k = cys104 as isize;
             let (near, far) = match search.fr3_codons {
-                Some(l) => (14 + l as isize, 26 + l as isize),
+                Some((lo, hi)) => (14 + lo as isize, 26 + hi as isize),
                 None => (
                     *TRP41_TO_CYS104.start() as isize,
                     *TRP41_TO_CYS104.end() as isize,
