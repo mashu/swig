@@ -54,9 +54,9 @@
 //! `max` is the score of a local path of `A`, and a local optimum is at
 //! least that and at least 0. ∎
 //!
-//! [`FramePath`] stores the prefix sums of `π`'s column scores, so `L`
-//! costs `O(|D|)`: the clipped sum plus a correction at the differing
-//! positions. The column scores are the DP's when `open ≤ extend` (a gap
+//! [`FramePath`] stores the prefix sums of `π`'s column scores per frame
+//! position, so `L` costs `O(|D|)`: the clipped sum plus a correction at
+//! the differing positions. The column scores are the DP's when `open ≤ extend` (a gap
 //! column extends a gap of its own kind and opens one otherwise); with
 //! `open > extend` the DP can score a path higher than this sum, and `L`
 //! stays a lower bound.
@@ -240,28 +240,27 @@ impl FamilyBoundTable {
     ) {
         out.first = alignment.r_start + self.placement[representative as usize].1;
         out.matched.clear();
-        out.column.clear();
-        out.prefix.clear();
-        out.prefix.push(0);
+        out.before.clear();
         let (mut q, mut r) = (alignment.q_start as usize, alignment.r_start as usize);
         let (mut total, mut previous) = (0, None);
-        for (column, &op) in (0..).zip(&alignment.ops) {
+        for &op in &alignment.ops {
             let gap = if previous == Some(op) {
                 gaps.extend
             } else {
                 gaps.open
             };
+            if op != Op::Ins {
+                out.before.push(total);
+            }
             total += match op {
                 Op::Match => {
                     let code = query[q];
                     out.matched.push(code);
-                    out.column.push(column);
                     (q, r) = (q + 1, r + 1);
                     profile.at(code, r - 1)
                 }
                 Op::Del => {
                     out.matched.push(DELETED);
-                    out.column.push(column);
                     r += 1;
                     gap
                 }
@@ -270,7 +269,6 @@ impl FamilyBoundTable {
                     gap
                 }
             };
-            out.prefix.push(total);
             previous = Some(op);
         }
         debug_assert!(
@@ -310,9 +308,10 @@ impl FamilyBoundTable {
             return Some(0);
         };
         let end = (start..hi).rfind(matched).expect("start is matched");
-        let mut score =
-            path.prefix[path.column[end] as usize + 1] - path.prefix[path.column[start] as usize];
         let profile_r = segment.profile(r);
+        // The clip's columns: up to and including the match at `end`.
+        let last = profile_r.at(path.matched[end], first + end - offset_r);
+        let mut score = path.before[end] + last - path.before[start];
         let (from, to) = self.diffs[self.pair(r, a).expect("frame_band holds")];
         for &f in &self.diff_positions[from as usize..to as usize] {
             let f = f as usize;
@@ -343,10 +342,9 @@ pub struct FramePath {
     /// Per frame position from `first`: the query code the path matches
     /// there, or [`DELETED`].
     matched: Vec<u8>,
-    /// Per frame position from `first`: the path column that consumes it.
-    column: Vec<u32>,
-    /// `prefix[k]`: the representative's score of the path's columns `..k`.
-    prefix: Vec<Score>,
+    /// Per frame position from `first`: the representative's score of the
+    /// path's columns before the one that consumes it.
+    before: Vec<Score>,
 }
 
 /// `cover[j] = Σ_{t < j} max(0, max_q s(q, t))`: the most a stretch of
@@ -719,7 +717,10 @@ mod tests {
                                 scoring.gaps,
                                 &mut path,
                             );
-                            assert_eq!(path.prefix.last(), Some(&alignment.score));
+                            // Clipped to its own allele, the path is whole: its
+                            // prefix sums add up to the alignment's score.
+                            let own = table.path_lower_bound(&path, r, r, &segment);
+                            assert_eq!(own, Some(alignment.score));
                         });
                         for a in &candidates {
                             let upper = table.upper_bound(r, a, scores[r.allele as usize]).unwrap();

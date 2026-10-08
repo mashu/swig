@@ -221,6 +221,8 @@ pub struct BatchScratch {
     lower: Vec<Score>,
     /// `(request, candidate index)` of the siblings aligned while ranking.
     early: Vec<(usize, u32)>,
+    /// Per request: where its next traceback wave starts, or [`DONE`].
+    cursors: Vec<usize>,
     /// Per gene id: the leader found so far in the current request.
     gene_leader: Vec<u32>,
     /// Alignments computed while ranking, consumed by traceback.
@@ -351,6 +353,9 @@ pub struct SegmentStage<R> {
 /// No candidate (a per-gene slot of [`BatchScratch`]'s leader search), or no
 /// cached alignment.
 const NONE: u32 = u32::MAX;
+
+/// A request whose traceback waves have ended.
+const DONE: usize = usize::MAX;
 
 /// Whether a local score enters the ranking: positive (an alignment exists)
 /// and at least the request's floor.
@@ -802,10 +807,14 @@ impl<R: Retriever> SegmentStage<R> {
         dp: &mut A::Workspace,
         batch: &mut BatchScratch,
     ) {
-        let mut cursors = vec![0usize; requests.len()];
+        batch.cursors.clear();
+        batch.cursors.resize(requests.len(), 0);
         loop {
             batch.owners.clear();
-            for (index, cursor) in cursors.iter_mut().enumerate() {
+            for (index, cursor) in batch.cursors.iter_mut().enumerate() {
+                if *cursor == DONE {
+                    continue;
+                }
                 let ranked = &batch.ranked[index];
                 batch.scores.clear();
                 batch.scores.extend(ranked.iter().map(|&(_, s)| s));
@@ -823,7 +832,8 @@ impl<R: Retriever> SegmentStage<R> {
                 batch
                     .owners
                     .extend(ranked[*cursor..end].iter().map(|&(c, _)| (index, c)));
-                *cursor = end;
+                // An empty wave changes nothing the next one depends on.
+                *cursor = if end == *cursor { DONE } else { end };
             }
             if batch.owners.is_empty() {
                 break;
