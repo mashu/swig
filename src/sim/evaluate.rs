@@ -615,17 +615,86 @@ impl PairedOutcome {
     }
 }
 
+/// The Brier score of two callers' posteriors on the same reads, compared
+/// read by read: the mean of `d = (p₂ − e₂)² − (p₁ − e₁)²`, with a paired
+/// t statistic `t = d̄ / (s_d / √n)`. Each caller's event `e` is its own
+/// (its reported names may differ).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PairedBrier {
+    pub reads: usize,
+    /// `Σ (p − e)²` of the first and the second caller.
+    pub first: f64,
+    pub second: f64,
+    /// `Σ d` and `Σ d²`.
+    pub difference: f64,
+    pub squared: f64,
+}
+
+impl PairedBrier {
+    /// One read: each caller's posterior and whether its event occurred.
+    pub fn add(&mut self, first: (f64, bool), second: (f64, bool)) {
+        let error = |(p, event): (f64, bool)| (p - f64::from(u8::from(event))).powi(2);
+        let (a, b) = (error(first), error(second));
+        self.reads += 1;
+        self.first += a;
+        self.second += b;
+        self.difference += b - a;
+        self.squared += (b - a).powi(2);
+    }
+
+    /// Brier score of the first and the second caller.
+    pub fn scores(&self) -> (f64, f64) {
+        let n = self.reads.max(1) as f64;
+        (self.first / n, self.second / n)
+    }
+
+    /// Mean difference `d̄`, second − first (negative: the second is better).
+    pub fn mean_difference(&self) -> f64 {
+        self.difference / self.reads.max(1) as f64
+    }
+
+    /// Standard error of [`Self::mean_difference`].
+    fn standard_error(&self) -> f64 {
+        let n = self.reads as f64;
+        if self.reads < 2 {
+            return f64::NAN;
+        }
+        let mean = self.difference / n;
+        ((self.squared - n * mean * mean).max(0.0) / (n - 1.0) / n).sqrt()
+    }
+
+    /// Half-width of the 95 % confidence interval of the mean difference.
+    pub fn half_width(&self) -> f64 {
+        1.96 * self.standard_error()
+    }
+
+    /// Paired t statistic; `|t| > 2.58` is a difference at p < 0.01.
+    pub fn t(&self) -> f64 {
+        self.mean_difference() / self.standard_error()
+    }
+}
+
+/// D remnant strata of the paired D allele table: below `min_d_match` (4 nt
+/// by default) a remnant cannot be found, so a call counted correct there
+/// rests on chance matches; 4–7 nt is short but detectable.
+pub const D_REMNANT_STRATA: [(usize, usize); 3] = [(1, 3), (4, 7), (8, usize::MAX)];
+
 /// Two callers compared read by read on the same simulated reads: allele
-/// equivalence of V, D and J (reads with that segment), no D call on reads
-/// without one (D allele accuracy alone rewards calling D everywhere), and
-/// junction exactness (reads with a templated junction).
+/// equivalence of V, D and J (reads with that segment), D by remnant length
+/// ([`D_REMNANT_STRATA`]), no D call on reads without one (D allele accuracy
+/// alone rewards calling D everywhere), junction exactness (reads with a
+/// templated junction), and the Brier scores of the D allele and D presence
+/// posteriors (reads where both callers report one).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Paired {
     pub v: PairedOutcome,
     pub d: PairedOutcome,
+    pub d_by_remnant: [PairedOutcome; D_REMNANT_STRATA.len()],
     pub no_d: PairedOutcome,
     pub j: PairedOutcome,
     pub junction: PairedOutcome,
+    pub d_brier: PairedBrier,
+    pub d_presence_brier: PairedBrier,
 }
 
 impl Paired {
@@ -648,9 +717,36 @@ impl Paired {
                 );
             }
         }
+        if let Some(segment) = truth.segment(Slot::D)
+            && let Some(stratum) = D_REMNANT_STRATA
+                .iter()
+                .position(|&(lo, hi)| (lo..=hi).contains(&truth.d_length))
+        {
+            self.d_by_remnant[stratum].add(
+                correct(first, Slot::D, segment),
+                correct(second, Slot::D, segment),
+            );
+        }
         if truth.segment(Slot::D).is_none() {
             let silent = |call: &Assignment| call.segment(Slot::D).is_none();
             self.no_d.add(silent(first), silent(second));
+        }
+        // The calibration events of [`Evaluation`]: some reported D name is
+        // equivalent to the truth; the read has a D.
+        let d_posterior = |call: &Assignment| {
+            let segment = call.segment(Slot::D)?;
+            let listed = call.rev_comp == truth.reverse_complemented
+                && truth
+                    .segment(Slot::D)
+                    .is_some_and(|t| segment.names.iter().any(|n| t.equivalent.contains(n)));
+            Some((segment.posterior?, listed))
+        };
+        if let (Some(a), Some(b)) = (d_posterior(first), d_posterior(second)) {
+            self.d_brier.add(a, b);
+        }
+        let has_d = truth.segment(Slot::D).is_some();
+        if let (Some(a), Some(b)) = (first.d_presence, second.d_presence) {
+            self.d_presence_brier.add((a, has_d), (b, has_d));
         }
         if let Some(junction) = &truth.junction {
             let exact = |call: &Assignment| {
@@ -668,9 +764,13 @@ impl fmt::Display for Paired {
             f,
             "metric       reads   first%  second%   Δ pp   ±95% CI   first only  second only  McNemar p"
         )?;
+        let [short, detectable, long] = &self.d_by_remnant;
         for (label, o) in [
             ("V allele", &self.v),
             ("D allele", &self.d),
+            ("D 1-3 nt", short),
+            ("D 4-7 nt", detectable),
+            ("D 8+ nt", long),
             ("no D call", &self.no_d),
             ("J allele", &self.j),
             ("junction", &self.junction),
@@ -687,6 +787,26 @@ impl fmt::Display for Paired {
                 o.first_only,
                 o.second_only,
                 o.p_value()
+            )?;
+        }
+        write!(
+            f,
+            "\nBrier             reads    first   second         Δ   ±95% CI   paired t"
+        )?;
+        for (label, b) in [
+            ("D allele", &self.d_brier),
+            ("D presence", &self.d_presence_brier),
+        ] {
+            let (first, second) = b.scores();
+            write!(
+                f,
+                "\n{label:<14}{:>9} {:>8.5} {:>8.5} {:>+9.5} {:>9.5} {:>10.2}",
+                b.reads,
+                first,
+                second,
+                b.mean_difference(),
+                b.half_width(),
+                b.t()
             )?;
         }
         Ok(())
@@ -716,6 +836,21 @@ mod tests {
         // Large and lopsided stays finite and tiny.
         let p = outcome(10, 400, 5000).p_value();
         assert!(p > 0.0 && p < 1e-90, "{p}");
+    }
+
+    #[test]
+    fn paired_brier_is_a_paired_t_on_squared_errors() {
+        let mut b = PairedBrier::default();
+        // Errors (first, second): (0.04, 0.01), (0.25, 0.09), (0.01, 0.01).
+        b.add((0.8, true), (0.9, true));
+        b.add((0.5, false), (0.3, false));
+        b.add((0.1, false), (0.9, true));
+        let (first, second) = b.scores();
+        assert!((first - 0.10).abs() < 1e-12 && (second - 0.11 / 3.0).abs() < 1e-12);
+        // d = −0.03, −0.16, 0: mean −0.0633, sd 0.0850, se 0.0491.
+        assert!((b.mean_difference() + 0.19 / 3.0).abs() < 1e-12);
+        assert!((b.t() + 1.2898).abs() < 1e-3, "{}", b.t());
+        assert!(PairedBrier::default().t().is_nan());
     }
 
     #[test]

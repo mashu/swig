@@ -31,7 +31,8 @@ pub mod synthetic;
 pub mod truth;
 
 pub use evaluate::{
-    Assignment, DPresence, Evaluation, Paired, PairedOutcome, SegmentCall, SegmentStats,
+    Assignment, D_REMNANT_STRATA, DPresence, Evaluation, Paired, PairedBrier, PairedOutcome,
+    SegmentCall, SegmentStats,
 };
 pub use params::{IlluminaError, SimParams};
 pub use random::{Count, GatedRate, Rate, Rng};

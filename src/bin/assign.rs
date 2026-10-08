@@ -39,7 +39,8 @@ an AIRR Rearrangement TSV from any tool against that truth (germline-
 equivalence-aware allele, gene, boundary, D-presence and junction accuracy).
 Given a second calls file, evaluate also compares the two read by read:
 accuracy difference with its 95 % confidence interval and an exact McNemar
-test on the reads only one of them gets right.
+test on the reads only one of them gets right (D also by remnant length),
+and the D allele and D-presence Brier scores with a paired t.
 
 Reads may be FASTA or FASTQ (detected from the first character); '-' reads
 stdin, so compressed input can be streamed: zcat reads.fastq.gz | vdj-assign ... -

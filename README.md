@@ -544,7 +544,10 @@ and J allele equivalence, D-free reads left without a D call, and junction
 exactness, it reports both accuracies, their difference with a 95 %
 interval, and an exact McNemar p-value from the reads only one caller gets
 right. D allele accuracy alone rewards calling D everywhere, so the D-free
-column belongs next to it. On 20,000 reads per preset, for example, the
+column belongs next to it. D is also split by the true remnant's length
+(1–3, 4–7, 8+ nt; below `min_d_match` = 4 a remnant cannot be found), and the
+D allele and D-presence posteriors are compared by Brier score with a paired
+t statistic. On 20,000 reads per preset, for example, the
 residual adjudicator gains +0.4–0.6 pp of D accuracy (p < 10⁻⁴) only by
 giving 21–25 pp more D-free reads a D; see
 [docs/ASSESSMENT.md §9.5](docs/ASSESSMENT.md) for the full table.

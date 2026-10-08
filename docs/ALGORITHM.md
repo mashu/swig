@@ -403,7 +403,11 @@ same reads, at least 20,000 per preset: for each metric, the accuracy
 difference with its 95 % interval (paired Wald) and an exact two-sided
 McNemar test on the discordant reads. D allele accuracy is always reported
 with the fraction of D-free reads left without a D call, since either can
-be raised at the other's expense.
+be raised at the other's expense, and split by the true remnant's length
+(1–3, 4–7, 8+ nt): a remnant shorter than `min_d_match` (4) cannot be found,
+so a call counted correct there rests on chance matches. Posteriors are
+compared by the paired Brier difference `(p₂ − e₂)² − (p₁ − e₁)²` per read,
+with its mean, 95 % interval and t statistic (D allele and D presence).
 
 **D error attribution** (`examples/d_errors.rs`). Every wrong or missing D
 call is attributed to where it arose: the true D lies outside the D windows
