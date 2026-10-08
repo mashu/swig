@@ -46,8 +46,8 @@ pub struct VSegmentConfig {
     pub accept: HitAcceptance,
     /// E-value gates (`None` = no significance floor and no anchoring).
     pub evalue: Option<EvalueGates>,
-    /// Skip score-only DP for same-gene siblings that cannot enter the top-N,
-    /// using a sound upper bound from the gene's representative.
+    /// Skip DP for same-frame siblings that cannot enter the top-N or whose
+    /// score their bounds pin (see [`crate::family_bound`]); lossless.
     pub family_delta: bool,
 }
 
@@ -60,6 +60,8 @@ pub struct JSegmentConfig {
     /// E-value gates (`None` = no significance floor and no anchoring).
     pub evalue: Option<EvalueGates>,
     pub window: DownstreamWindow,
+    /// Sibling bounds as for V, each gene one frame; lossless.
+    pub family_delta: bool,
 }
 
 /// D: L-mer prefilter, unbanded DP inside junction windows, admission gates.
@@ -246,6 +248,7 @@ impl Default for JSegmentConfig {
             accept: HitAcceptance::PERMISSIVE,
             evalue: Some(EvalueGates::default()),
             window: DownstreamWindow::default(),
+            family_delta: true,
         }
     }
 }
@@ -391,10 +394,17 @@ fn j_stage(set: GermlineSet, config: &JSegmentConfig) -> SegmentStage<Exhaustive
         .evalue
         .and_then(|gates| Significance::new(&set, &config.scoring, gates));
     let segment = PreparedSegment::new(set, &config.scoring, config.scoring.gaps);
+    // J bands are unbanded, which any placement of the alleles bounds.
+    let family_delta = config
+        .family_delta
+        .then(|| FamilyBoundTable::build(&segment));
     let mut stage = SegmentStage::new(Arc::new(segment), retriever, config.keep);
     stage.accept = config.accept;
     stage.significance = significance;
     stage.outer = OuterExtend::Suffix;
+    // Ties in retrieval (allele id) order, as J has always ranked them.
+    stage.ties = TieOrder::Retrieval;
+    stage.family_delta = family_delta;
     stage
 }
 
