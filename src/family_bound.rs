@@ -183,6 +183,15 @@ impl FamilyBoundTable {
         })
     }
 
+    /// Frame of `allele` (dense ids).
+    pub fn frame(&self, allele: AlleleId) -> u32 {
+        self.placement[allele as usize].0
+    }
+
+    pub fn frame_count(&self) -> usize {
+        self.frames.len()
+    }
+
     /// `Δ(R, A)` for two alleles of one frame; `None` across frames.
     pub fn delta(&self, representative: AlleleId, sibling: AlleleId) -> Option<Score> {
         self.pair(representative, sibling)

@@ -223,8 +223,11 @@ pub struct BatchScratch {
     early: Vec<(usize, u32)>,
     /// Per request: where its next traceback wave starts, or [`DONE`].
     cursors: Vec<usize>,
-    /// Per gene id: the leader found so far in the current request.
-    gene_leader: Vec<u32>,
+    /// Per candidate: its frame's representative for the sibling bounds,
+    /// the frame's strongest candidate (a gene leader is its frame's).
+    representatives: Vec<u32>,
+    /// Per gene or frame: the strongest candidate found so far.
+    group_best: Vec<u32>,
     /// Alignments computed while ranking, consumed by traceback.
     traced: Vec<Option<Alignment>>,
     /// Per candidate: its entry in `traced`, or [`NONE`].
@@ -258,6 +261,8 @@ impl BatchScratch {
         }
         self.leaders.clear();
         self.leaders.resize(total, 0);
+        self.representatives.clear();
+        self.representatives.resize(total, 0);
         self.exact.clear();
         self.exact.resize(total, 0);
         self.lower.clear();
@@ -345,8 +350,9 @@ pub struct SegmentStage<R> {
     pub outer: OuterExtend,
     /// Order of equal local scores in the ranking.
     pub ties: TieOrder,
-    /// Score one allele per gene first and skip same-frame siblings whose
-    /// upper bound cannot enter the top `keep.top` scores.
+    /// Score one allele per gene frame first, then skip the DP of
+    /// same-frame siblings whose bounds settle them (see
+    /// [`crate::family_bound`]); lossless.
     pub family_delta: Option<FamilyBoundTable>,
 }
 
@@ -469,8 +475,7 @@ impl<R: Retriever> SegmentStage<R> {
     }
 
     /// Each candidate's gene leader (see [`TieOrder::GeneLeadersFirst`]) as
-    /// a candidate index. `best` is per-gene scratch, all [`NONE`] on entry
-    /// and on return.
+    /// a candidate index.
     fn find_leaders(&self, candidates: &[Candidate], leaders: &mut [u32], best: &mut Vec<u32>) {
         debug_assert!(
             (1..candidates.len()).all(|i| candidates[..i]
@@ -479,23 +484,8 @@ impl<R: Retriever> SegmentStage<R> {
             "a request lists each allele once"
         );
         let set = self.segment.set();
-        if best.len() < set.gene_count() {
-            best.resize(set.gene_count(), NONE);
-        }
-        let gene = |c: &Candidate| set.allele(c.allele).gene as usize;
-        let strength = |c: &Candidate| (c.votes, std::cmp::Reverse(c.allele));
-        for (index, candidate) in (0..).zip(candidates) {
-            let slot = &mut best[gene(candidate)];
-            if *slot == NONE || strength(candidate) > strength(&candidates[*slot as usize]) {
-                *slot = index;
-            }
-        }
-        for (leader, candidate) in leaders.iter_mut().zip(candidates) {
-            *leader = best[gene(candidate)];
-        }
-        for candidate in candidates {
-            best[gene(candidate)] = NONE;
-        }
+        let gene = |allele| set.allele(allele).gene as usize;
+        strongest_per_group(candidates, set.gene_count(), gene, leaders, best);
     }
 
     /// Fill `batch.ranked[r]` with request `r`'s candidates ranked by local
@@ -514,7 +504,7 @@ impl<R: Retriever> SegmentStage<R> {
                 self.find_leaders(
                     request.candidates,
                     &mut batch.leaders[slots],
-                    &mut batch.gene_leader,
+                    &mut batch.group_best,
                 );
             } else {
                 let count = request.candidates.len() as u32;
@@ -571,8 +561,11 @@ impl<R: Retriever> SegmentStage<R> {
         }
     }
 
-    /// Family-delta ranking (see [`crate::family_bound`]), with each gene's
-    /// leader as its representative `R`:
+    /// Family-delta ranking (see [`crate::family_bound`]). Each frame's
+    /// strongest candidate (most votes, then lowest id) is its siblings'
+    /// representative `R`; a gene's leader is its frame's, so the
+    /// representatives are the gene leaders plus one per further frame.
+    /// They serve the bounds only: ties keep the stage's [`TieOrder`].
     ///
     /// 1. Score the representatives. A score below the floor still bounds.
     ///    The strongest one (most votes, then lowest id) is aligned instead:
@@ -614,9 +607,17 @@ impl<R: Retriever> SegmentStage<R> {
         batch.owners.clear();
         for (index, request) in requests.iter().enumerate() {
             if self.needs_scores(request) {
-                let leaders = &batch.leaders[batch.slots(index)];
+                let slots = batch.slots(index);
+                let frame = |allele| table.frame(allele) as usize;
+                strongest_per_group(
+                    request.candidates,
+                    table.frame_count(),
+                    frame,
+                    &mut batch.representatives[slots.clone()],
+                    &mut batch.group_best,
+                );
                 let representatives = (0..)
-                    .zip(leaders)
+                    .zip(&batch.representatives[slots])
                     .filter(|&(c, &leader)| c == leader)
                     .map(|(c, _)| c);
                 let strength = |&c: &u32| {
@@ -662,7 +663,7 @@ impl<R: Retriever> SegmentStage<R> {
                     .extend(batch.ranked[index].iter().map(|&(_, s)| s));
                 for (c, sibling) in (0..).zip(request.candidates) {
                     let slot = start + c as usize;
-                    if batch.leaders[slot] == c {
+                    if batch.representatives[slot] == c {
                         continue;
                     }
                     let lower = paths
@@ -689,13 +690,13 @@ impl<R: Retriever> SegmentStage<R> {
             };
             for (c, sibling) in (0..).zip(request.candidates) {
                 let slot = start + c as usize;
-                let leader = batch.leaders[slot];
-                if leader == c {
+                let representative = batch.representatives[slot];
+                if representative == c {
                     continue;
                 }
-                let representative = &request.candidates[leader as usize];
                 // No positive cell means the representative's optimum is 0.
-                let score = batch.exact[start + leader as usize];
+                let score = batch.exact[start + representative as usize];
+                let representative = &request.candidates[representative as usize];
                 let upper = table.upper_bound(representative, sibling, score);
                 let lower = batch.lower[slot];
                 let reaches = |bound: Score| cutoff.is_none_or(|cutoff| bound >= cutoff);
@@ -997,6 +998,34 @@ fn nth_largest(values: &mut [Score], n: usize) -> Option<Score> {
     Some(nth)
 }
 
+/// For each candidate, the strongest candidate of its group (most votes,
+/// then lowest allele id) as a candidate index. `best` is per-group scratch,
+/// all [`NONE`] on entry and on return.
+fn strongest_per_group(
+    candidates: &[Candidate],
+    groups: usize,
+    group: impl Fn(AlleleId) -> usize,
+    out: &mut [u32],
+    best: &mut Vec<u32>,
+) {
+    if best.len() < groups {
+        best.resize(groups, NONE);
+    }
+    let strength = |c: &Candidate| (c.votes, std::cmp::Reverse(c.allele));
+    for (index, candidate) in (0..).zip(candidates) {
+        let slot = &mut best[group(candidate.allele)];
+        if *slot == NONE || strength(candidate) > strength(&candidates[*slot as usize]) {
+            *slot = index;
+        }
+    }
+    for (strongest, candidate) in out.iter_mut().zip(candidates) {
+        *strongest = best[group(candidate.allele)];
+    }
+    for candidate in candidates {
+        best[group(candidate.allele)] = NONE;
+    }
+}
+
 /// An index into [`BatchScratch::traced`].
 fn entry(index: usize) -> u32 {
     u32::try_from(index).expect("traced alignments fit u32")
@@ -1262,8 +1291,8 @@ mod tests {
     }
 
     /// Two V genes in gene frames: SNP alleles, 5′ and 3′ truncations, a 5′
-    /// extension, an internal deletion (a frame of its own) and an exact
-    /// duplicate, which ties with its twin.
+    /// extension, an exact duplicate, which ties with its twin, and an
+    /// internal deletion with a SNP variant (a second frame of the gene).
     fn frame_family() -> (Arc<PreparedSegment>, GeneFrames) {
         let scoring = AffineScoring::new(2, -3, -9, -1);
         let mut next = crate::testing::rng(17);
@@ -1287,15 +1316,19 @@ mod tests {
             ("IGHV1-1*04", b[5..].to_vec()),
             ("IGHV1-1*05", snp(&b[..82], &[40])),
             ("IGHV1-1*06", extended),
-            ("IGHV1-1*07", deleted),
+            ("IGHV1-1*07", deleted.clone()),
             ("IGHV1-1*08", snp(&b, &[20])),
             ("IGHV2-1*01", c.clone()),
             ("IGHV2-1*02", snp(&c, &[30])),
             ("IGHV2-1*03", c[3..].to_vec()),
+            ("IGHV1-1*09", snp(&deleted, &[70])),
         ] {
             set.push(name, decode(&codes).as_bytes(), None).unwrap();
         }
         let frames = GeneFrames::build(&set, &crate::seed::SeedShape::contiguous(7));
+        let frame = |allele| frames.frame(allele);
+        assert!((1..6).chain([7]).all(|allele| frame(allele) == frame(0)));
+        assert!(frame(6) != frame(0) && frame(11) == frame(6));
         let segment = Arc::new(PreparedSegment::new(set, &scoring, scoring.gaps));
         (segment, frames)
     }
