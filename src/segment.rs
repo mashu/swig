@@ -217,6 +217,10 @@ pub struct BatchScratch {
     leaders: Vec<u32>,
     /// Per candidate: exact local score once known (0 = no positive cell).
     exact: Vec<Score>,
+    /// Per sibling: the lower bound `L` from the traced paths (0 = none).
+    lower: Vec<Score>,
+    /// `(request, candidate index)` of the siblings aligned while ranking.
+    early: Vec<(usize, u32)>,
     /// Per gene id: the leader found so far in the current request.
     gene_leader: Vec<u32>,
     /// Alignments computed while ranking, consumed by traceback.
@@ -254,6 +258,9 @@ impl BatchScratch {
         self.leaders.resize(total, 0);
         self.exact.clear();
         self.exact.resize(total, 0);
+        self.lower.clear();
+        self.lower.resize(total, 0);
+        self.early.clear();
         self.traced.clear();
         self.cached.clear();
         self.cached.resize(total, NONE);
@@ -570,16 +577,22 @@ impl<R: Retriever> SegmentStage<R> {
     ///    paths. The cutoff `c` is the `top`-th largest of one lower bound
     ///    per candidate that ranks — `S*(R)` of a representative, `L` of a
     ///    sibling — so `c ≤ T`, the `top`-th largest exact score.
-    /// 4. Score the siblings with `U ≥ floor` and `U ≥ c`. A pruned sibling
-    ///    scores below `T`, so it can enter neither the top `top` scores nor
-    ///    their ties, and the ranking from `T` up is that of full scoring.
+    /// 4. Decide each sibling, in this order:
+    ///    * *pruned* when `U < floor` or `U < c`: it scores below `T`, so
+    ///      it can enter neither the top `top` scores nor their ties, and
+    ///      the ranking from `T` up is that of full scoring;
+    ///    * *known* when `U = L`: that is its exact score, without DP;
+    ///    * *traced now* when `L ≥ c`: it likely reaches the traceback, so
+    ///      it is aligned instead of scored, its alignment's score is its
+    ///      exact score ([`Aligner`]'s contract) and traceback reuses it;
+    ///    * *scored* otherwise.
     ///
-    /// Steps 2 and the cutoff apply only under permissive acceptance
-    /// ([`HitAcceptance::is_permissive`]). Otherwise a rejected alignment makes
-    /// the traceback waves refill from below `T`, where a pruned sibling may
-    /// lie, so siblings are pruned only below the floor. A sibling without a
-    /// bound (another frame, or a band that is not its representative's
-    /// frame band) is always scored.
+    /// Step 2, the cutoff and early tracing apply only under permissive
+    /// acceptance ([`HitAcceptance::is_permissive`]). Otherwise a rejected
+    /// alignment makes the traceback waves refill from below `T`, where a
+    /// pruned sibling may lie, so siblings are pruned only below the floor.
+    /// A sibling without an upper bound (another frame, or a band that is
+    /// not its representative's frame band) is never pruned or known.
     fn rank_with_bounds<'a, A: Aligner>(
         &'a self,
         aligner: &A,
@@ -625,7 +638,8 @@ impl<R: Retriever> SegmentStage<R> {
                     .scores
                     .extend(batch.ranked[index].iter().map(|&(_, s)| s));
                 for (c, sibling) in (0..).zip(request.candidates) {
-                    if batch.leaders[start + c as usize] == c {
+                    let slot = start + c as usize;
+                    if batch.leaders[slot] == c {
                         continue;
                     }
                     let lower = paths
@@ -641,6 +655,7 @@ impl<R: Retriever> SegmentStage<R> {
                         })
                         .max()
                         .unwrap_or(0);
+                    batch.lower[slot] = lower;
                     if ranks(lower, floor) {
                         batch.scores.push(lower);
                     }
@@ -650,7 +665,8 @@ impl<R: Retriever> SegmentStage<R> {
                 None
             };
             for (c, sibling) in (0..).zip(request.candidates) {
-                let leader = batch.leaders[start + c as usize];
+                let slot = start + c as usize;
+                let leader = batch.leaders[slot];
                 if leader == c {
                     continue;
                 }
@@ -658,14 +674,53 @@ impl<R: Retriever> SegmentStage<R> {
                 // No positive cell means the representative's optimum is 0.
                 let score = batch.exact[start + leader as usize];
                 let upper = table.upper_bound(representative, sibling, score);
-                let pruned =
-                    upper.is_some_and(|u| u < floor || cutoff.is_some_and(|cutoff| u < cutoff));
-                if !pruned {
-                    batch.owners.push((index, c));
+                let lower = batch.lower[slot];
+                let reaches = |bound: Score| cutoff.is_none_or(|cutoff| bound >= cutoff);
+                match upper {
+                    Some(upper) if upper < floor || !reaches(upper) => {}
+                    Some(upper) if upper == lower => {
+                        batch.exact[slot] = upper;
+                        if ranks(upper, floor) {
+                            batch.ranked[index].push((c, upper));
+                        }
+                    }
+                    _ if cutoff.is_some() && reaches(lower) => batch.early.push((index, c)),
+                    _ => batch.owners.push((index, c)),
                 }
             }
         }
+        self.trace_early(aligner, requests, dp, batch);
         self.score_owners(aligner, requests, dp, batch);
+    }
+
+    /// Align the siblings in `batch.early`: record each exact score, rank
+    /// those that rank, and cache the alignments for traceback.
+    fn trace_early<'a, A: Aligner>(
+        &'a self,
+        aligner: &A,
+        requests: &[SegmentRequest<'a>],
+        dp: &mut A::Workspace,
+        batch: &mut BatchScratch,
+    ) {
+        if batch.early.is_empty() {
+            return;
+        }
+        let jobs: Vec<AlignJob<'a>> = batch
+            .early
+            .iter()
+            .map(|&(index, candidate)| self.job(&requests[index], candidate))
+            .collect();
+        aligner.align_batch(&jobs, dp, &mut batch.alignments);
+        for (&(index, candidate), alignment) in batch.early.iter().zip(batch.alignments.drain(..)) {
+            let slot = batch.starts[index] + candidate as usize;
+            let score = alignment.as_ref().map_or(0, |a| a.score);
+            batch.exact[slot] = score;
+            if ranks(score, self.floor(&requests[index])) {
+                batch.ranked[index].push((candidate, score));
+            }
+            batch.cached[slot] = entry(batch.traced.len());
+            batch.traced.push(alignment);
+        }
     }
 
     /// Align each scored request's best-scoring representatives (every tie;
@@ -1119,9 +1174,12 @@ mod tests {
         assert_eq!(placed(&stage(true), &candidates, &query), full);
     }
 
-    /// [`BandedGotoh`] that records the `(query, profile)` of every DP it runs.
+    /// The `(query, profile)` of a DP and whether it traced back.
+    type Run = (*const u8, *const SubstitutionProfile, bool);
+
+    /// [`BandedGotoh`] that records every DP it runs.
     #[derive(Default)]
-    struct Recording(std::cell::RefCell<Vec<(*const u8, *const SubstitutionProfile)>>);
+    struct Recording(std::cell::RefCell<Vec<Run>>);
 
     impl Aligner for Recording {
         type Workspace = <BandedGotoh as Aligner>::Workspace;
@@ -1134,7 +1192,7 @@ mod tests {
             band: Band,
             workspace: &mut Self::Workspace,
         ) -> Option<ScoreHit> {
-            self.0.borrow_mut().push((query.as_ptr(), profile));
+            self.0.borrow_mut().push((query.as_ptr(), profile, false));
             BandedGotoh.score(query, profile, gaps, band, workspace)
         }
 
@@ -1146,7 +1204,7 @@ mod tests {
             band: Band,
             workspace: &mut Self::Workspace,
         ) -> Option<Alignment> {
-            self.0.borrow_mut().push((query.as_ptr(), profile));
+            self.0.borrow_mut().push((query.as_ptr(), profile, true));
             BandedGotoh.align(query, profile, gaps, band, workspace)
         }
     }
@@ -1195,14 +1253,15 @@ mod tests {
     /// more candidates than `top + 1` (and some with fewer), shifted frame
     /// bands with either edge moved, unbanded requests, siblings with an
     /// inconsistent band, every `top` and `cap`, and both acceptance kinds;
-    /// and it skips the DP of some siblings entirely.
+    /// and it skips the DP of some siblings entirely and aligns others
+    /// without scoring them (known exactly, or traced early).
     #[test]
     fn bounded_ranking_equals_brute_force() {
         let (segment, frames) = frame_family();
         let table = FamilyBoundTable::with_frames(&segment, &frames);
         let alleles = segment.set().len() as AlleleId;
         let mut next = crate::testing::rng(23);
-        let mut pruned = 0;
+        let (mut pruned, mut unscored) = (0, 0);
         for case in 0..240 {
             let keep = KeepPolicy {
                 top: [1, 2, 3, 5][case % 4],
@@ -1293,29 +1352,121 @@ mod tests {
                 let mut outs = vec![Vec::new(); 3];
                 let (mut dp, mut batch) = (Default::default(), BatchScratch::default());
                 stage.place_many(aligner, &requests, &mut dp, &mut batch, &mut outs);
-                outs.iter()
+                let placed: Vec<Vec<_>> = outs
+                    .iter()
                     .map(|out| {
                         out.iter()
                             .map(|p| (p.alleles.clone(), p.alignment.clone()))
-                            .collect::<Vec<_>>()
+                            .collect()
                     })
-                    .collect::<Vec<_>>()
+                    .collect();
+                (placed, batch.ranked[..3].to_vec())
             };
             let (full, bounded) = (Recording::default(), Recording::default());
-            assert_eq!(run(true, &bounded), run(false, &full), "case {case}");
+            let (expected, all) = run(false, &full);
+            let (placed, ranked) = run(true, &bounded);
+            assert_eq!(placed, expected, "case {case}");
             let ran = bounded.0.into_inner();
             for (read, request) in candidates.iter().enumerate() {
                 if request.len() <= keep.top + 1 {
+                    assert_eq!(ranked[read], all[read], "case {case}");
                     continue;
                 }
+                // The bounded ranking is the full one, each entry with its
+                // exact score, less some entries below the `top`-th score
+                // (none under non-permissive acceptance).
+                let mut scores: Vec<Score> = all[read].iter().map(|&(_, s)| s).collect();
+                let cutoff = nth_largest(&mut scores, keep.top).unwrap_or(Score::MIN);
+                let mut rest = ranked[read].iter().peekable();
+                for entry in &all[read] {
+                    if rest.next_if_eq(&entry).is_none() {
+                        let permissive = accept.is_permissive();
+                        assert!(permissive && entry.1 < cutoff, "case {case} read {read}");
+                    }
+                }
+                assert_eq!(rest.next(), None, "case {case} read {read}");
                 let query = queries[read][starts[read]..].as_ptr();
-                pruned += request
-                    .iter()
-                    .filter(|c| !ran.contains(&(query, segment.profile(c.allele))))
-                    .count();
+                for candidate in request {
+                    let profile: *const _ = segment.profile(candidate.allele);
+                    let runs = |traced| ran.contains(&(query, profile, traced));
+                    pruned += usize::from(!runs(false) && !runs(true));
+                    unscored += usize::from(!runs(false) && runs(true));
+                }
             }
         }
         assert!(pruned > 100, "{pruned} siblings pruned");
+        assert!(unscored > 10, "{unscored} siblings aligned without scoring");
+    }
+
+    /// A request's placements do not depend on the schedule: on the other
+    /// requests of its batch and their order, or on bounding. Ties keep the
+    /// key: gene leaders first in a scored request, retrieval order in one
+    /// with at most `top + 1` candidates, which is traced without scoring.
+    #[test]
+    fn schedule_independence() {
+        let (segment, frames) = frame_family();
+        let table = FamilyBoundTable::with_frames(&segment, &frames);
+        let keep = KeepPolicy {
+            top: 2,
+            min_score: 1,
+            cap: 64,
+        };
+        // IGHV1-1*02 (allele 1) and its duplicate *08 (allele 7) tie.
+        let twin = segment.set().allele(1).codes.clone();
+        let other = segment.set().allele(9).codes.clone();
+        let queries = [
+            twin[10..80].to_vec(),
+            twin[..70].to_vec(),
+            other[5..85].to_vec(),
+        ];
+        let full = |alleles: &[(AlleleId, u32)]| -> Vec<Candidate> {
+            alleles
+                .iter()
+                .map(|&(allele, votes)| Candidate {
+                    allele,
+                    band: Band::Full,
+                    votes,
+                })
+                .collect()
+        };
+        let candidates = [
+            full(&[(7, 1), (0, 3), (1, 5), (2, 2), (8, 4)]),
+            full(&[(7, 1), (1, 5)]),
+            full(&[(9, 2), (8, 6), (10, 1), (3, 3), (5, 2)]),
+        ];
+        let place = |reads: &[usize], bounded: bool| {
+            let mut stage = SegmentStage::new(Arc::clone(&segment), EmptyRetriever, keep);
+            stage.ties = TieOrder::GeneLeadersFirst;
+            stage.family_delta = bounded.then(|| table.clone());
+            let requests: Vec<SegmentRequest<'_>> = reads
+                .iter()
+                .map(|&read| SegmentRequest {
+                    read,
+                    query: &queries[read],
+                    window: 0..queries[read].len(),
+                    candidates: &candidates[read],
+                })
+                .collect();
+            let mut outs = vec![Vec::new(); 3];
+            let (mut dp, mut batch) = (Default::default(), BatchScratch::default());
+            stage.place_many(&BandedGotoh, &requests, &mut dp, &mut batch, &mut outs);
+            outs.iter()
+                .map(|out| {
+                    out.iter()
+                        .map(|p| (p.alleles.clone(), p.alignment.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected = place(&[0, 1, 2], false);
+        for bounded in [false, true] {
+            assert_eq!(place(&[2, 1, 0], bounded), expected, "{bounded}");
+            for (read, expected) in expected.iter().enumerate() {
+                assert_eq!(&place(&[read], bounded)[read], expected, "{bounded}");
+            }
+        }
+        assert_eq!(expected[0][0].0, vec![1, 7]);
+        assert_eq!(expected[1][0].0, vec![7, 1]);
     }
 
     #[test]

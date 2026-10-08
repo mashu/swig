@@ -890,6 +890,11 @@ mod tests {
                     "{backend:?} alignment, batch {batch} job {k} band {:?}",
                     job.band
                 );
+                assert_eq!(
+                    hits[k].map(|hit| hit.score),
+                    alignments[k].as_ref().map(|a| a.score),
+                    "{backend:?} align vs score, batch {batch} job {k}"
+                );
             }
         }
     }
@@ -984,12 +989,16 @@ mod tests {
             };
             3
         ];
-        let mut out = Vec::new();
-        InterSequenceGotoh::new().score_batch(
-            &jobs,
-            &mut InterSequenceWorkspace::default(),
-            &mut out,
-        );
+        let (mut out, mut alignments) = (Vec::new(), Vec::new());
+        let mut ws = InterSequenceWorkspace::default();
+        InterSequenceGotoh::new().score_batch(&jobs, &mut ws, &mut out);
         assert!(out.iter().all(|hit| hit.map(|h| h.score) == Some(20_000)));
+        // The scalar fallback's traceback reports the same score.
+        InterSequenceGotoh::new().align_batch(&jobs, &mut ws, &mut alignments);
+        assert!(
+            alignments
+                .iter()
+                .all(|a| a.as_ref().map(|a| a.score) == Some(20_000))
+        );
     }
 }

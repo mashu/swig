@@ -454,12 +454,11 @@ mod tests {
                 naive_local_score(&query, &reference, &scoring),
                 "case {case}"
             );
+            // Traceback reports the score-only optimum, for any gap costs.
+            let aligned = BandedGotoh.align(&query, &profile, scoring.gaps, Band::Full, &mut ws);
+            assert_eq!(aligned.as_ref().map_or(0, |a| a.score), fast, "case {case}");
             // Column accounting ("consecutive gaps extend") is only defined for open <= extend.
-            if let Some(aln) = BandedGotoh
-                .align(&query, &profile, scoring.gaps, Band::Full, &mut ws)
-                .filter(|_| affine)
-            {
-                assert_eq!(aln.score, fast);
+            if let Some(aln) = aligned.filter(|_| affine) {
                 let mut rescored = 0;
                 let mut previous = None;
                 for (op, q, r) in aln.columns() {
