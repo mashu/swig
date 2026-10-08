@@ -44,6 +44,13 @@ impl HitAcceptance {
         min_identity: 0.0,
     };
 
+    /// Whether [`Self::allows`] admits every hit: no length and no identity
+    /// floor. Only then is the `top`-th best local score also the `top`-th
+    /// best *accepted* one, which is what cutoff pruning relies on.
+    pub fn is_permissive(&self) -> bool {
+        self.min_subst == 0 && self.min_identity <= 0.0
+    }
+
     pub fn allows(&self, evidence: &Evidence) -> bool {
         let subst = evidence.matches + evidence.mismatches;
         let columns = evidence.columns;
@@ -425,6 +432,11 @@ impl<R: Retriever> SegmentStage<R> {
     /// The cutoff can only rise as more alleles are scored, so a sibling below
     /// it can never enter the top scores. A sibling in another band than its
     /// representative has no bound and is always scored.
+    ///
+    /// The cutoff applies only under permissive acceptance
+    /// ([`HitAcceptance::is_permissive`]). Otherwise a rejected alignment makes
+    /// the traceback waves refill from below the `top`-th score, where a pruned
+    /// sibling may lie, so siblings are pruned only below the floor.
     fn rank_with_bounds<'a, A: Aligner>(
         &'a self,
         aligner: &A,
@@ -493,8 +505,13 @@ impl<R: Retriever> SegmentStage<R> {
                 }
             }
         }
+        let permissive = self.accept.is_permissive();
         let cutoffs: Vec<Option<Score>> = (0..requests.len())
-            .map(|index| top_score(&batch.ranked[index], self.keep.top, &mut batch.scores))
+            .map(|index| {
+                permissive
+                    .then(|| top_score(&batch.ranked[index], self.keep.top, &mut batch.scores))
+                    .flatten()
+            })
             .collect();
         let representative_jobs = std::mem::take(&mut batch.owners);
         for (index, candidate, job) in siblings {
@@ -643,7 +660,7 @@ fn top_score(ranked: &[(Candidate, Score)], top: usize, buffer: &mut Vec<Score>)
 mod tests {
     use super::*;
     use crate::align::BandedGotoh;
-    use crate::alphabet::encode;
+    use crate::alphabet::{decode, encode};
     use crate::band::Band;
     use crate::family_bound::FamilyBoundTable;
     use crate::retrieve::Retriever;
@@ -715,6 +732,97 @@ mod tests {
         }
         assert_eq!(placed[0], placed[1]);
         assert!(placed[0].contains(&0));
+    }
+
+    /// `(alleles, score)` of the placements `stage` keeps for `candidates`.
+    fn placed<R: Retriever>(
+        stage: &SegmentStage<R>,
+        candidates: &[Candidate],
+        query: &[u8],
+    ) -> Vec<(Vec<AlleleId>, Score)> {
+        let (mut dp, mut batch, mut out) =
+            (Default::default(), BatchScratch::default(), Vec::new());
+        stage.place_candidates(
+            &BandedGotoh,
+            candidates,
+            query,
+            0..query.len(),
+            &mut dp,
+            &mut batch,
+            &mut out,
+        );
+        out.iter().map(|p| (p.alleles.clone(), p.score())).collect()
+    }
+
+    /// The best representative outscores everything but fails acceptance,
+    /// and the allele that replaces it is a sibling whose bound lies below
+    /// that representative's score. Cutoff pruning would drop it, and the
+    /// traceback waves would settle on its weaker representative instead.
+    #[test]
+    fn non_permissive_acceptance_disables_cutoff() {
+        let scoring = AffineScoring::new(2, -3, -9, -1);
+        let mut next = crate::testing::rng(5);
+        let short = crate::testing::random_codes(&mut next, 20);
+        let sibling = crate::testing::random_codes(&mut next, 48);
+        let mut representative = sibling.clone();
+        representative[25] = (representative[25] + 1) % 4;
+        let mut set = GermlineSet::new(SegmentKind::V);
+        for (name, codes) in [
+            ("IGHV1-1*01", &short),
+            ("IGHV2-1*01", &representative),
+            ("IGHV2-1*02", &sibling),
+        ] {
+            set.push(name, decode(codes).as_bytes(), None).unwrap();
+        }
+        let segment = Arc::new(PreparedSegment::new(set, &scoring, scoring.gaps));
+        // An exact copy of the short allele (20 columns), then the sibling
+        // with every 4th base mutated (> 40 columns, identity ~ 3/4).
+        let mut query = short.clone();
+        query.extend(crate::testing::random_codes(&mut next, 10));
+        query.extend(
+            sibling
+                .iter()
+                .enumerate()
+                .map(|(i, &c)| if i % 4 == 2 { (c + 2) % 4 } else { c }),
+        );
+        let candidates = [(0, 50), (1, 40), (2, 30)].map(|(allele, votes)| Candidate {
+            allele,
+            band: Band::Full,
+            votes,
+        });
+        let keep = KeepPolicy {
+            top: 1,
+            min_score: 1,
+            cap: 8,
+        };
+        let stage = |family_delta: bool| {
+            let mut stage = SegmentStage::new(Arc::clone(&segment), EmptyRetriever, keep);
+            stage.accept = HitAcceptance {
+                min_subst: 30,
+                min_identity: 0.0,
+            };
+            stage.family_delta = family_delta.then(|| FamilyBoundTable::build(&segment));
+            stage
+        };
+        // Preconditions: the short allele is the best representative; the
+        // sibling's bound is below its score; it alone fails acceptance.
+        let score = |allele: AlleleId| {
+            BandedGotoh
+                .score(
+                    &query,
+                    segment.profile(allele),
+                    scoring.gaps,
+                    Band::Full,
+                    &mut Default::default(),
+                )
+                .map_or(0, |hit| hit.score)
+        };
+        let table = FamilyBoundTable::build(&segment);
+        let bound = table.upper_bound(1, 2, score(1)).unwrap();
+        assert!(score(0) > score(2) && score(2) > score(1) && bound < score(0));
+        let full = placed(&stage(false), &candidates, &query);
+        assert_eq!(full, vec![(vec![2], score(2))]);
+        assert_eq!(placed(&stage(true), &candidates, &query), full);
     }
 
     #[test]
