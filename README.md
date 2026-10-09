@@ -640,9 +640,9 @@ or identity acceptance floor, siblings are pruned only below the score floor.
   registers), WebAssembly `simd128` (16 in two registers, in builds with
   that feature) and portable Rust arrays (16) that the compiler vectorises
   for the target's baseline SIMD. `Backend::detect` chooses at run time;
-  on a target without baseline SIMD (WebAssembly without `simd128`), where
-  emulated lanes run about 4× slower than one scalar job, it chooses the
-  scalar kernel.
+  on WebAssembly without `simd128`, which has no SIMD to vectorise portable
+  lanes into and where emulated lanes run about 4× slower than one scalar
+  job, it chooses the scalar kernel.
 
 **Stage-wise batching across reads.** A read has only a few V, J and D
 candidates, too few to fill 16 lanes. So every stage runs over a chunk of 64

@@ -641,8 +641,8 @@ removes. The 12-base reclaim keeps this rare. With 24 bases, D accuracy was
   written once over a lane abstraction and compiled for AVX-512BW (32
   lanes), AVX2, NEON, WebAssembly `simd128` and portable lanes (16),
   chosen at run time (at build time for WebAssembly, which has no run-time
-  feature detection). Without a SIMD backend or baseline SIMD to vectorise
-  portable lanes into, the scalar kernel runs.
+  feature detection). WebAssembly without `simd128` has no SIMD to
+  vectorise portable lanes into, so there the scalar kernel runs.
   - Banded jobs use band-relative coordinates.
   - With uniform profiles, a cell's substitution is a code comparison;
     otherwise the five profile rows are selected by mask, which is exact for

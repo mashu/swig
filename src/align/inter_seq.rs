@@ -129,23 +129,19 @@ impl Backend {
     /// The fastest backend this CPU runs. AVX-512 is used only when the
     /// `avx512` preference is given ([`InterSequenceGotoh::with_backend`]):
     /// on many CPUs 512-bit instructions lower the clock of every core.
-    /// Without an explicit backend, portable lanes need SIMD registers in
-    /// the target's baseline to be vectorised into (SSE2, NEON, `simd128`);
-    /// elsewhere, such as WebAssembly without `simd128`, 16 emulated lanes
-    /// run several times slower than the scalar kernel, which is chosen.
+    /// Without an explicit backend, portable lanes, which the compiler
+    /// vectorises for the target's baseline SIMD. WebAssembly without
+    /// `simd128` has none, and there 16 emulated lanes run several times
+    /// slower than the scalar kernel, which is chosen instead.
     pub fn detect() -> Self {
-        let baseline_simd = cfg!(any(
-            target_feature = "sse2",
-            target_feature = "neon",
-            target_feature = "simd128"
-        ));
+        let emulated = cfg!(all(target_family = "wasm", not(target_feature = "simd128")));
         [Self::Avx2, Self::Neon, Self::Simd128]
             .into_iter()
             .find(|b| b.available())
-            .unwrap_or(if baseline_simd {
-                Self::Portable
-            } else {
+            .unwrap_or(if emulated {
                 Self::Scalar
+            } else {
+                Self::Portable
             })
     }
 
