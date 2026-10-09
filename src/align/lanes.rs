@@ -15,7 +15,8 @@
 //! | `Avx512` (x86-64 AVX-512BW) | 32 | one `zmm`, masks in `k` registers |
 //! | `Avx2` (x86-64 AVX2) | 16 | one `ymm` |
 //! | `Neon` (AArch64) | 16 | two `q` registers |
-//! | [`Portable`] (any target) | 16 | plain arrays; the compiler vectorises them for the target's baseline SIMD (SSE2, NEON, WebAssembly `simd128`, …) |
+//! | `Simd128` (WebAssembly `simd128` builds) | 16 | two `v128` registers |
+//! | [`Portable`] (any target) | 16 | plain arrays; the compiler vectorises them for the target's baseline SIMD (SSE2, NEON, `simd128`) |
 //!
 //! # Safety
 //!
@@ -469,4 +470,103 @@ mod arm {
     }
 
     kernel!(Neon, 16, "neon");
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+pub(super) use wasm::Simd128;
+
+/// WebAssembly has no run-time feature detection: an engine without SIMD
+/// rejects a module that uses it, so this backend exists only in builds
+/// with the `simd128` target feature, where every function may use it.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+mod wasm {
+    use super::{Kernel, LaneBest, Lanes, Shape};
+    use std::arch::wasm32::*;
+
+    /// WebAssembly `simd128`: 16 lanes in two `v128` registers; masks are
+    /// vectors.
+    #[derive(Clone, Copy, Debug)]
+    pub struct Simd128(v128, v128);
+
+    impl Lanes<16> for Simd128 {
+        type Mask = Simd128;
+
+        #[inline(always)]
+        unsafe fn load(v: &[i16; 16]) -> Self {
+            let p = v.as_ptr().cast::<v128>();
+            // SAFETY: `v` spans two `v128`s; `v128_load` needs no alignment.
+            unsafe { Self(v128_load(p), v128_load(p.add(1))) }
+        }
+        #[inline(always)]
+        unsafe fn store(self, v: &mut [i16; 16]) {
+            let p = v.as_mut_ptr().cast::<v128>();
+            // SAFETY: as for `load`.
+            unsafe {
+                v128_store(p, self.0);
+                v128_store(p.add(1), self.1);
+            }
+        }
+        #[inline(always)]
+        unsafe fn store_bytes(self, v: &mut [u8; 16]) {
+            // SAFETY: `v` spans one `v128`; `v128_store` needs no alignment.
+            unsafe { v128_store(v.as_mut_ptr().cast(), u8x16_narrow_i16x8(self.0, self.1)) }
+        }
+        #[inline(always)]
+        unsafe fn splat(x: i16) -> Self {
+            Self(i16x8_splat(x), i16x8_splat(x))
+        }
+        #[inline(always)]
+        unsafe fn adds(self, other: Self) -> Self {
+            Self(
+                i16x8_add_sat(self.0, other.0),
+                i16x8_add_sat(self.1, other.1),
+            )
+        }
+        #[inline(always)]
+        unsafe fn max(self, other: Self) -> Self {
+            Self(i16x8_max(self.0, other.0), i16x8_max(self.1, other.1))
+        }
+        #[inline(always)]
+        unsafe fn or(self, other: Self) -> Self {
+            Self(v128_or(self.0, other.0), v128_or(self.1, other.1))
+        }
+        #[inline(always)]
+        unsafe fn eq(self, other: Self) -> Self {
+            Self(i16x8_eq(self.0, other.0), i16x8_eq(self.1, other.1))
+        }
+        #[inline(always)]
+        unsafe fn gt(self, other: Self) -> Self {
+            Self(i16x8_gt(self.0, other.0), i16x8_gt(self.1, other.1))
+        }
+        #[inline(always)]
+        unsafe fn select(mask: Self, yes: Self, no: Self) -> Self {
+            Self(
+                v128_bitselect(yes.0, no.0, mask.0),
+                v128_bitselect(yes.1, no.1, mask.1),
+            )
+        }
+        #[inline(always)]
+        unsafe fn keep(self, mask: Self) -> Self {
+            Self(v128_and(self.0, mask.0), v128_and(self.1, mask.1))
+        }
+        #[inline(always)]
+        unsafe fn clear(self, mask: Self) -> Self {
+            // `v128_andnot(a, b)` is `a & !b`.
+            Self(v128_andnot(self.0, mask.0), v128_andnot(self.1, mask.1))
+        }
+        #[inline(always)]
+        unsafe fn mask_or(a: Self, b: Self) -> Self {
+            Self(v128_or(a.0, b.0), v128_or(a.1, b.1))
+        }
+        #[inline(always)]
+        unsafe fn mask_and(a: Self, b: Self) -> Self {
+            Self(v128_and(a.0, b.0), v128_and(a.1, b.1))
+        }
+        #[inline(always)]
+        unsafe fn none() -> Self {
+            Self(i16x8_splat(0), i16x8_splat(0))
+        }
+    }
+
+    kernel!(Simd128, 16);
 }

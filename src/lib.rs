@@ -9,7 +9,8 @@
 //! reads                            streaming FASTA / FASTQ reads
 //! seed → index → retrieve          candidate generation (k-mers as integers)
 //! band → align                     banded affine Smith–Waterman (Gotoh):
-//!                                  scalar kernel + AVX2 inter-sequence batches
+//!                                  scalar kernel + SIMD inter-sequence batches
+//!                                  (AVX-512, AVX2, NEON, WebAssembly simd128)
 //! clip / evidence / placement      O(1) clip-and-rescore, admission evidence
 //! segment                          retrieve → score-only DP → keep → traceback
 //! window / admission               where D is searched, which D hits count
