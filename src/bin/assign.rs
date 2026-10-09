@@ -81,6 +81,7 @@ options:
   --simd NAME          alignment kernel: avx512 | avx2 | neon | portable | scalar
                        (default: the fastest this CPU supports, avx512 excepted)
   --residual           ordinary commit-V/J-then-D adjudication instead of the DAG
+  -V, --version        the version
   -h, --help           this message";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -167,7 +168,14 @@ struct Args {
     shm: Option<String>,
 }
 
-fn parse_args() -> Result<Option<Args>, String> {
+/// What the command line asks for.
+enum Command {
+    Help,
+    Version,
+    Run(Box<Args>),
+}
+
+fn parse_args() -> Result<Command, String> {
     let mut input = std::env::args().skip(1).peekable();
     let mode = match input.peek().map(String::as_str) {
         Some("prepare") => Mode::Prepare,
@@ -185,7 +193,10 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut seen = HashSet::new();
     while let Some(arg) = input.next() {
         if arg == "-h" || arg == "--help" {
-            return Ok(None);
+            return Ok(Command::Help);
+        }
+        if arg == "-V" || arg == "--version" {
+            return Ok(Command::Version);
         }
         let Some(name) = arg.strip_prefix("--") else {
             let slot = match mode {
@@ -236,7 +247,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         };
         *slot = value;
     }
-    Ok(Some(args))
+    Ok(Command::Run(Box::new(args)))
 }
 
 /// Read the germline FASTA files and prepare the database, logging its
@@ -439,11 +450,15 @@ fn run_evaluate(args: &Args) -> Result<(), Box<dyn Error>> {
 
 fn main() -> ExitCode {
     match parse_args() {
-        Ok(None) => {
+        Ok(Command::Help) => {
             println!("{USAGE}");
             ExitCode::SUCCESS
         }
-        Ok(Some(args)) => {
+        Ok(Command::Version) => {
+            println!("vdj-assign {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
+        Ok(Command::Run(args)) => {
             let result = match args.mode {
                 Mode::Assign => run_assign(&args),
                 Mode::Prepare => run_prepare(&args),

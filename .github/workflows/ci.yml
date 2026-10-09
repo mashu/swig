@@ -1,8 +1,11 @@
 name: CI
 
 on:
+  # Branches only: a release tag runs this workflow from release.yml.
   push:
+    branches: ['**']
   pull_request:
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
