@@ -130,9 +130,10 @@ impl Backend {
     /// `avx512` preference is given ([`InterSequenceGotoh::with_backend`]):
     /// on many CPUs 512-bit instructions lower the clock of every core.
     /// Without an explicit backend, portable lanes, which the compiler
-    /// vectorises for the target's baseline SIMD. WebAssembly without
-    /// `simd128` has none, and there 16 emulated lanes run several times
-    /// slower than the scalar kernel, which is chosen instead.
+    /// vectorises where the target's baseline has SIMD. On WebAssembly
+    /// without `simd128`, where 16 emulated lanes were measured several
+    /// times slower than the scalar kernel, the scalar kernel is chosen
+    /// instead; other targets keep portable lanes.
     pub fn detect() -> Self {
         let emulated = cfg!(all(target_family = "wasm", not(target_feature = "simd128")));
         [Self::Avx2, Self::Neon, Self::Simd128]
@@ -841,7 +842,7 @@ mod tests {
     }
 
     /// Detection picks a backend this build runs, never the opt-in
-    /// AVX-512, and never emulated lanes where they cannot be vectorised.
+    /// AVX-512, and the scalar kernel on WebAssembly without `simd128`.
     #[test]
     fn detection_picks_a_vectorised_backend_or_the_scalar_kernel() {
         let detected = Backend::detect();

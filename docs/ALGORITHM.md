@@ -653,8 +653,10 @@ removes. The 12-base reclaim keeps this rare. With 24 bases, D accuracy was
 - **Exactness.** The scalar kernel equals a textbook Gotoh; every SIMD
   backend equals the scalar kernel (scores, end cells, tracebacks); the
   batched pipeline equals the per-read scalar pipeline, and output is
-  byte-identical across backends and across x86-64, AArch64 and
-  WebAssembly (`run.rs` holds the run all front ends share).
+  byte-identical across backends and across x86-64 and AArch64.
+  WebAssembly gives the same rows (`run.rs` holds the run all front ends
+  share), except that a posterior within a last-bit difference of `exp`
+  of a printed rounding tie can differ in that digit (2 of 260,000 rows).
 
 ## 7. Evaluation protocol
 

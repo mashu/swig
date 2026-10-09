@@ -4,7 +4,10 @@
 //!
 //! The module runs the library's [`Run`] exactly as the command line does:
 //! the same options by the same names, the same database preparation and
-//! the same AIRR rows, so its output is the command line's byte for byte.
+//! the same AIRR rows. A posterior can differ in its last printed digit
+//! where it lands within a last-bit difference of `exp` (this target's
+//! portable libm against the platform's) of a rounding tie: 2 of 260,000
+//! rows in a test, with every call identical.
 //!
 //! # Conventions
 //!

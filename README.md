@@ -9,9 +9,9 @@ search shortcut is either lossless or measured on simulated repertoires.
 
 Zero dependencies, Rust ≥ 1.89, edition 2024. The alignment kernel runs on
 AVX-512BW, AVX2, NEON, WebAssembly SIMD or portable lanes, chosen at run
-time; output is byte-identical across them and across x86-64, AArch64 and
-WebAssembly, so the same engine also runs in a browser (see *In the
-browser* below).
+time; output is byte-identical across them and across x86-64 and AArch64.
+The same engine also runs in a browser, with the same output up to a rare
+last-digit difference in a posterior (see *In the browser* below).
 
 - [docs/ALGORITHM.md](docs/ALGORITHM.md): the model, the search and its
   guarantees, structured for a methods section.
@@ -149,7 +149,8 @@ const vdj = await load();                     // browser or worker: fetches the 
 // Node.js cannot fetch file: URLs; give it the bytes:
 // const vdj = await load({ bytes: fs.readFileSync('web/vdj_assign_simd.wasm') });
 const run = vdj.createRun({ v, d, j, c, options: { profile: 'r', 'tandem-d': true } });
-const tsv = run.assign(fastqText);            // AIRR TSV, header included (one string)
+const tsv = run.assign(fastqText);            // AIRR TSV, header included, as one string;
+                                              // run.parts(reads) for any size (new Blob(parts))
 run.free();
 
 // In a browser, one run on Web Workers, rows in input order:
@@ -164,6 +165,10 @@ const file = new Blob(parts);                 // the AIRR TSV at any size: heade
   headless Chromium, its TSV equals the command line's byte for byte; CI
   checks both on every push (`web/test.mjs` in Node.js,
   `web/browser-test.mjs` for the page and `assignInWorkers` in Chromium).
+  A posterior can still differ in its last printed digit where it lands
+  within a last-bit difference of `exp` (WebAssembly's portable libm
+  against the platform's) of a rounding tie: 2 of 260,000 rows in a test,
+  with every call identical.
 - **Two modules.** WebAssembly has no run-time feature detection, so
   `vdj_assign_simd.wasm` uses the `simd128` kernel (every current browser,
   Node.js) and `vdj_assign.wasm` the scalar kernel; `load()` validates a
@@ -1074,7 +1079,7 @@ In order of expected value; reasons and measurements are in
    primary C allele anchored-equivalent ≥ 99.6 % from 16 nt, `c_posterior`
    ECE ≤ 0.18 %, 9 % of instructions with `--c`. See ASSESSMENT §11.
 7. ~~**WebAssembly.**~~ Done: a `simd128` kernel backend, a zero-dependency
-   module (`wasm/`) and a browser page (`web/`) whose output equals the
-   command line's byte for byte, at about 60 % of native AVX2 speed per
-   worker. Next on that line: shared-memory threads (one copy of the reads
+   module (`wasm/`) and a browser page (`web/`) whose calls equal the
+   command line's (rows byte for byte but for a rare last posterior digit),
+   at about 60 % of native AVX2 speed per worker. Next on that line: shared-memory threads (one copy of the reads
    for all workers), which need cross-origin isolation from the host.

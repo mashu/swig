@@ -2,8 +2,10 @@
 //
 // No dependencies and no build step. Runs in browsers, Web Workers and
 // Node.js 18 or later. The module computes what `vdj-assign` computes on the
-// command line, byte for byte: the same options by the same names, the same
-// database preparation, the same AIRR rows.
+// command line: the same options by the same names, the same database
+// preparation, the same AIRR rows. A posterior can differ in its last printed
+// digit where WebAssembly's `exp` and the platform's differ in the last bit
+// next to a rounding tie (2 of 260,000 rows in a test).
 //
 //   import { load } from './vdj-assign.js';
 //   const vdj = await load();            // the SIMD build where the engine has SIMD
@@ -165,18 +167,35 @@ export class VdjAssign {
           return vdj.#session(alive(), reads, worker, workers, block);
         },
         /**
-         * AIRR TSV of every read, header included, as one string: for
-         * outputs a string can hold (a few hundred thousand reads); stream
-         * larger ones with session().
+         * AIRR TSV of every read in pieces, header line first: `new
+         * Blob(parts)` is the file at any size.
          */
-        assign(reads) {
+        parts(reads) {
           const session = this.session(reads);
           try {
-            const parts = [header, '\n'];
+            const parts = [`${header}\n`];
             for (let next; (next = session.next()); ) parts.push(next.rows);
-            return parts.join('');
+            return parts;
           } finally {
             session.free();
+          }
+        },
+        /**
+         * AIRR TSV of every read, header included, as one string. An engine
+         * holds strings of about 2^29 characters (V8) to 2^30, some 250,000
+         * to 500,000 reads; use parts() or session() beyond.
+         */
+        assign(reads) {
+          const parts = this.parts(reads);
+          try {
+            return parts.join('');
+          } catch (error) {
+            if (!(error instanceof RangeError)) throw error;
+            const length = parts.reduce((sum, part) => sum + part.length, 0);
+            throw new RangeError(
+              `the AIRR TSV of ${length} characters is longer than this engine's strings; ` +
+                'take it in pieces with parts() or session()',
+            );
           }
         },
         free() {

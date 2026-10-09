@@ -68,6 +68,7 @@ run.free();
   assert.equal(whole.next(), null);
   whole.free();
   assert.equal(`${run.header}\n${only.rows}`, run.assign(demo['reads.fasta']));
+  assert.equal(run.parts(demo['reads.fasta']).join(''), run.assign(demo['reads.fasta']));
 
   // A row that begins with U+FEFF keeps it (a default TextDecoder drops it).
   const first = demo['reads.fasta'].split('\n').slice(0, 2).join('\n');
