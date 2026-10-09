@@ -1,0 +1,256 @@
+name: Release
+
+# A tag vX.Y.Z runs the whole CI, builds the command line for Linux, macOS
+# and Windows and the browser bundle, unpacks and tests every archive on its
+# own platform, and publishes them as the GitHub release vX.Y.Z with the
+# CHANGELOG.md section as its notes. A pull request that changes this file
+# or the changelog builds and tests the archives without publishing.
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - CHANGELOG.md
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: version
+        name: The tag, both crates and the changelog name one version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          wasm=$(sed -n 's/^version = "\(.*\)"$/\1/p' wasm/Cargo.toml | head -n 1)
+          if [ "$version" != "$wasm" ]; then
+            echo "::error::Cargo.toml is $version but wasm/Cargo.toml is $wasm"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the crate version $version"
+            exit 1
+          fi
+          if ! grep -q "^## \[$version\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no [$version] section"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  ci:
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/ci.yml
+
+  cli:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built on the oldest supported Ubuntu for the widest glibc reach.
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+          - { target: x86_64-apple-darwin, os: macos-15-intel }
+          - { target: aarch64-apple-darwin, os: macos-15 }
+          # The C runtime linked in, so no Visual C++ redistributable is needed.
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, rustflags: -C target-feature=+crt-static }
+    runs-on: ${{ matrix.os }}
+    env:
+      NAME: vdj-assign-${{ needs.version.outputs.version }}-${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --bin vdj-assign --target ${{ matrix.target }}
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+      - name: Package
+        shell: bash
+        run: |
+          exe=vdj-assign
+          if [ "$RUNNER_OS" = Windows ]; then exe=vdj-assign.exe; fi
+          mkdir -p "dist/$NAME"
+          cp "target/${{ matrix.target }}/release/$exe" README.md CHANGELOG.md "dist/$NAME/"
+          cd dist
+          if [ "$RUNNER_OS" = Windows ]; then
+            7z a -bd "$NAME.zip" "$NAME" > /dev/null
+          else
+            tar czf "$NAME.tar.gz" "$NAME"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: dist/${{ env.NAME }}.*
+          if-no-files-found: error
+
+  web:
+    needs: version
+    runs-on: ubuntu-latest
+    env:
+      NAME: vdj-assign-web-${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build the modules
+        run: wasm/build.sh
+      - name: Package
+        run: |
+          mkdir dist
+          cp -R web "dist/$NAME"
+          rm "dist/$NAME/test.mjs" "dist/$NAME/browser-test.mjs"
+          (cd dist && zip -qr "$NAME.zip" "$NAME")
+      # The archive as a user unpacks it, with the tests copied in so they
+      # load the packaged files.
+      - name: The packaged page and workers in Chromium
+        run: |
+          cargo build --release --locked --bin vdj-assign
+          mkdir unpacked
+          unzip -q "dist/$NAME.zip" -d unpacked
+          cp web/test.mjs web/browser-test.mjs "unpacked/$NAME/"
+          npm install --no-save --no-package-lock playwright@1.56.1
+          npx playwright install --with-deps chromium
+          node "unpacked/$NAME/browser-test.mjs" target/release/vdj-assign
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web
+          path: dist/${{ env.NAME }}.zip
+          if-no-files-found: error
+
+  # Every command-line archive, unpacked on its own platform, against the
+  # packaged WebAssembly modules: equal output on the same demo reads.
+  verify:
+    needs: [version, cli, web]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+          - { target: x86_64-apple-darwin, os: macos-15-intel }
+          - { target: aarch64-apple-darwin, os: macos-15 }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      NAME: vdj-assign-${{ needs.version.outputs.version }}-${{ matrix.target }}
+      WEB: vdj-assign-web-${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: web
+          path: dist
+      - name: Unpack
+        shell: bash
+        working-directory: dist
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            7z x -bd "$NAME.zip" > /dev/null
+            7z x -bd "$WEB.zip" > /dev/null
+          else
+            tar xzf "$NAME.tar.gz"
+            unzip -q "$WEB.zip"
+          fi
+      - name: The binary reports the release version
+        shell: bash
+        run: |
+          exe="dist/$NAME/vdj-assign"
+          if [ "$RUNNER_OS" = Windows ]; then exe="$exe.exe"; fi
+          reported=$("$exe" --version)
+          echo "$reported"
+          if [ "$reported" != "vdj-assign $VERSION" ]; then
+            echo "::error::expected 'vdj-assign $VERSION'"
+            exit 1
+          fi
+      - name: The packaged modules equal the packaged command line
+        shell: bash
+        run: |
+          exe="$PWD/dist/$NAME/vdj-assign"
+          if [ "$RUNNER_OS" = Windows ]; then exe=$(cygpath -w "$exe.exe"); fi
+          cp web/test.mjs "dist/$WEB/"
+          node "dist/$WEB/test.mjs" "$exe"
+
+  release:
+    if: github.event_name == 'push'
+    needs: [version, ci, cli, web, verify]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cli-*
+          merge-multiple: true
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: web
+          path: dist
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+      - name: Notes from the changelog
+        run: |
+          awk -v head="## [$VERSION]" '
+            index($0, head) == 1 { keep = 1; next }
+            keep && /^## \[/ { exit }
+            keep { print }
+          ' CHANGELOG.md > notes.md
+          test -s notes.md
+          cat >> notes.md <<'EOF'
+
+          ### Install and try
+
+          Unpack the archive for your platform and run `vdj-assign --version`;
+          `SHA256SUMS` verifies the downloads (`sha256sum --check --ignore-missing SHA256SUMS`).
+          The binaries are not signed; on macOS clear the quarantine flag first:
+          `xattr -d com.apple.quarantine vdj-assign`.
+
+          The browser build runs from any static HTTP server (not from `file:`):
+
+          ```sh
+          unzip vdj-assign-web-*.zip
+          python3 -m http.server -d vdj-assign-web-* 8000   # open http://localhost:8000, then "Use demo data"
+          ```
+
+          See the README's *Install* and *In the browser* sections for the JavaScript and Node.js API.
+          EOF
+          cat notes.md
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --verify-tag --title "vdj-assign $VERSION" --notes-file notes.md
+          fi

@@ -81,6 +81,7 @@ options:
   --simd NAME          alignment kernel: avx512 | avx2 | neon | portable | scalar
                        (default: the fastest this CPU supports, avx512 excepted)
   --residual           ordinary commit-V/J-then-D adjudication instead of the DAG
+  -V, --version        the version
   -h, --help           this message";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -438,6 +439,10 @@ fn run_evaluate(args: &Args) -> Result<(), Box<dyn Error>> {
 }
 
 fn main() -> ExitCode {
+    if matches!(std::env::args().nth(1).as_deref(), Some("-V" | "--version")) {
+        println!("vdj-assign {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     match parse_args() {
         Ok(None) => {
             println!("{USAGE}");

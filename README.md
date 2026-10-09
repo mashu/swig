@@ -21,6 +21,35 @@ last-digit difference in a posterior (see *In the browser* below).
 - [docs/REVIEW.md](docs/REVIEW.md): a code review of soundness and design,
   what it fixed, and the open findings ranked.
 
+## Install
+
+Each [release](https://github.com/mashu/vdj_assign/releases) ships the
+command line for Linux (x86-64, AArch64), macOS (Intel, Apple silicon) and
+Windows (x86-64), and the browser build; see [CHANGELOG.md](CHANGELOG.md)
+for the files. Every archive was unpacked and tested on its own platform
+before the release was published.
+
+```sh
+tar xzf vdj-assign-0.1.0-x86_64-unknown-linux-gnu.tar.gz
+vdj-assign-0.1.0-x86_64-unknown-linux-gnu/vdj-assign --version
+sha256sum --check --ignore-missing SHA256SUMS  # macOS: shasum -a 256 --check --ignore-missing SHA256SUMS
+```
+
+The binaries are not signed. macOS refuses a downloaded binary until its
+quarantine flag is cleared: `xattr -d com.apple.quarantine vdj-assign`.
+
+To try the browser build, serve the unpacked directory over HTTP (browsers
+do not run modules or workers from `file:` pages) and open the page; *Use
+demo data* fills in a synthetic database and reads:
+
+```sh
+unzip vdj-assign-web-0.1.0.zip
+python3 -m http.server -d vdj-assign-web-0.1.0 8000   # then open http://localhost:8000
+```
+
+From Node.js 18 or later, the same directory is a module
+(`load({ bytes })`, see *In the browser* below).
+
 ## Build and run
 
 ```sh
@@ -187,7 +216,8 @@ const file = new Blob(parts);                 // the AIRR TSV at any size: heade
   and simulated reads), reads as FASTA or FASTQ (gzip decompressed by the
   browser), every assignment option and a worker count; it gives the AIRR
   TSV, the prepared database files and a preview. CI uploads `web/` with
-  both modules as the `vdj-assign-web` artifact, ready for static hosting.
+  both modules as the `vdj-assign-web` artifact, and each release ships it
+  as `vdj-assign-web-<version>.zip`, ready for static hosting.
 
 ## Germline annotation and regions
 
