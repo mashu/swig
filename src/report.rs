@@ -475,30 +475,39 @@ impl AirrRecord {
         record.path_score = Some(path.score.score);
         record.d_presence_posterior = call.marginals.as_ref().map(|m| m.d_present());
 
-        let mut junctions = Vec::with_capacity(3);
-        for (i, called) in path.segments.iter().enumerate() {
-            if i > 0 {
-                let (from, to) = (path.segments[i - 1].span.q_hi, called.span.q_lo);
-                junctions.push(if to > from {
+        // The kind and exit of the previous segment, and the Ds placed so far.
+        let mut previous: Option<(SegmentKind, u32)> = None;
+        let mut ds = 0;
+        for called in &path.segments {
+            let kind = call.placements[called.placement].kind;
+            if let Some((before, from)) = previous {
+                let to = called.span.q_lo;
+                let bases = if to > from {
                     decode(&call.query[from as usize..to as usize])
                 } else {
                     String::new()
-                });
+                };
+                // AIRR names an N/P region by the segment it follows.
+                let np = match before {
+                    SegmentKind::V => &mut record.np1,
+                    SegmentKind::D if ds == 1 => &mut record.np2,
+                    SegmentKind::D => &mut record.np3,
+                    SegmentKind::J | SegmentKind::C => unreachable!("J ends every path"),
+                };
+                *np = Some(bases);
             }
             let report = segment_report(call, called, catalog, support);
-            let slot = match call.placements[called.placement].kind {
+            let slot = match kind {
                 SegmentKind::V => &mut record.v,
-                SegmentKind::D if record.d.is_none() => &mut record.d,
+                SegmentKind::D if ds == 0 => &mut record.d,
                 SegmentKind::D => &mut record.d2,
                 SegmentKind::J => &mut record.j,
                 SegmentKind::C => unreachable!("segment_report refuses C"),
             };
             *slot = report;
+            ds += usize::from(kind == SegmentKind::D);
+            previous = Some((kind, called.span.q_hi));
         }
-        let mut junctions = junctions.into_iter();
-        record.np1 = junctions.next();
-        record.np2 = junctions.next();
-        record.np3 = junctions.next();
         record
     }
 

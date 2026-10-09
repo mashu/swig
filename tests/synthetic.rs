@@ -272,6 +272,25 @@ fn junctions_without_d_do_not_invent_one() {
     );
 }
 
+/// AIRR names N/P regions by their neighbours: `np1` follows V, `np2` the
+/// first D and `np3` the second, so a read without V reports its D–J
+/// bases as `np2`.
+#[test]
+fn np_regions_are_named_by_their_neighbours() {
+    let db = Db::new();
+    let assigner = db.assigner(&EngineConfig::default());
+    let (d_name, d) = &db.d[7];
+    let (j_name, j) = &db.j[0];
+    let rec = record(&assigner, &format!("{d}GTA{j}"));
+    assert!(rec.v.is_none());
+    assert_eq!(first_label(&rec.d).as_deref(), Some(d_name.as_str()));
+    assert_eq!(first_label(&rec.j).as_deref(), Some(j_name.as_str()));
+    assert_eq!(
+        (rec.np1.as_deref(), rec.np2.as_deref()),
+        (None, Some("GTA"))
+    );
+}
+
 #[test]
 fn tandem_d_is_a_first_class_path() {
     let db = Db::new();
