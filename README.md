@@ -18,6 +18,8 @@ browser* below).
 - [docs/ASSESSMENT.md](docs/ASSESSMENT.md): the critical assessment behind
   the current design. It covers what was ad hoc, what replaced it, the measurements, and
   the remaining plan.
+- [docs/REVIEW.md](docs/REVIEW.md): a code review of soundness and design,
+  what it fixed, and the open findings ranked.
 
 ## Build and run
 
