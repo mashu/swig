@@ -25,8 +25,8 @@ use vdj_assign::reads::ReadReader;
 use vdj_assign::sim::{Assignment, Evaluation, Paired, Rng, SimParams, Simulator, Truth};
 
 const USAGE: &str = "\
-usage: vdj-assign --v V.fasta --j J.fasta [--d D.fasta] [options] <reads.fasta|reads.fastq|->
-       vdj-assign prepare --v V.fasta --j J.fasta [--d D.fasta] [--chain heavy|light] --out DIR
+usage: vdj-assign --v V.fasta --j J.fasta [--d D.fasta] [--c C.fasta] [options] <reads.fasta|reads.fastq|->
+       vdj-assign prepare --v V.fasta --j J.fasta [--d D.fasta] [--c C.fasta] [--chain heavy|light] --out DIR
        vdj-assign simulate --v V.fasta --j J.fasta [--d D.fasta] --out PREFIX
                   [--preset easy|mid|hard] [--reads N] [--seed S] [--rc P] [--shm RATE]
        vdj-assign evaluate --truth PREFIX.truth.tsv <calls.tsv> [other.tsv]
@@ -53,6 +53,12 @@ transfer from the closest sibling allele; milliseconds). Identical sequences
 are merged and reported under all their names. `prepare` writes the result as
 annotated FASTA plus annotation.tsv for review; header values always win.
 
+--c adds constant-region (isotype) calls: C base 0 is anchored within 3 bases
+of the called J's end and aligned to the read's end, and the c_ columns follow
+productive. Give one locus' C regions (coding CH1 onward, e.g. human IGHC):
+the gate counts every C gene in the file. prepare warns about C records that
+cannot be anchored (5'-truncated, genomic) and J records whose 3' end strays.
+
 options:
   --profile NAME       r (default) | truth | igblast | sensitive-d
                        r is Swig's r_optimized; also accepts r_optimized, truth_optimized, sensitive_d
@@ -70,6 +76,8 @@ options:
   --d-presence-rate R  D prior from the D search's own chance-hit count (alleles x
                        offsets x positions) at D-presence rate R, 0 < R < 1, instead
                        of genes x positions at even odds (docs/ALGORITHM.md 2.3)
+  --c-evalue E         call C when its anchored E-value, C genes x 7 start
+                       diagonals x e^(-lambda S), is at most E (default 1e-3)
   --simd NAME          alignment kernel: avx512 | avx2 | neon | portable | scalar
                        (default: the fastest this CPU supports, avx512 excepted)
   --residual           ordinary commit-V/J-then-D adjudication instead of the DAG
@@ -104,6 +112,8 @@ struct Args {
     v: Option<String>,
     d: Option<String>,
     j: Option<String>,
+    c: Option<String>,
+    c_evalue: Option<String>,
     out: Option<String>,
     reads: Option<String>,
     profile: Option<String>,
@@ -165,6 +175,10 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--v" if !evaluate => set_once(&mut args.v, "--v", value("--v")?)?,
             "--d" if !evaluate => set_once(&mut args.d, "--d", value("--d")?)?,
             "--j" if !evaluate => set_once(&mut args.j, "--j", value("--j")?)?,
+            "--c" if assign || prepare => set_once(&mut args.c, "--c", value("--c")?)?,
+            "--c-evalue" if assign => {
+                set_once(&mut args.c_evalue, "--c-evalue", value("--c-evalue")?)?
+            }
             "--out" if prepare || simulate => set_once(&mut args.out, "--out", value("--out")?)?,
             "--chain" if !evaluate => set_once(&mut args.chain, "--chain", value("--chain")?)?,
             "--profile" if assign => set_once(&mut args.profile, "--profile", value("--profile")?)?,
@@ -244,8 +258,16 @@ fn load_database(args: &Args) -> Result<PreparedDatabase, Box<dyn Error>> {
         "--j",
         args.j.as_deref().ok_or("--j is required")?,
     )?;
+    let c = args
+        .c
+        .as_deref()
+        .map(|path| load_set(SegmentKind::C, "--c", path))
+        .transpose()?;
     let started = Instant::now();
-    let database = prepare(v, d, j, AnnotateOptions { chain })?;
+    let mut database = prepare(v, d, j, AnnotateOptions { chain })?;
+    if let Some(c) = c {
+        database = database.with_constant(c)?;
+    }
     eprintln!(
         "vdj-assign: database prepared in {:.1} ms: {}",
         started.elapsed().as_secs_f64() * 1e3,
@@ -262,6 +284,9 @@ fn load_database(args: &Args) -> Result<PreparedDatabase, Box<dyn Error>> {
             database.annotation.uncertain()
         );
     }
+    for warning in database.constant_warnings(CSegmentConfig::default().spread) {
+        eprintln!("vdj-assign: warning: {warning}");
+    }
     Ok(database)
 }
 
@@ -275,7 +300,8 @@ fn stream<R: BufRead, T: VdjAssigner + AlleleCatalog + Sync>(
 ) -> Result<(usize, usize), Box<dyn Error>> {
     let mut reads = ReadReader::new(input);
     let mut out = BufWriter::new(io::stdout().lock());
-    writeln!(out, "{}", AirrRecord::tsv_header())?;
+    let constant = assigner.segment(SegmentKind::C).is_some();
+    writeln!(out, "{}", AirrRecord::tsv_header_with(constant))?;
     let (mut total, mut with_path) = (0, 0);
     let mut batch = Vec::with_capacity(BATCH);
     loop {
@@ -332,9 +358,14 @@ fn run_prepare(args: &Args) -> Result<(), Box<dyn Error>> {
     let database = load_database(args)?;
     database.write(Path::new(out))?;
     eprintln!(
-        "vdj-assign: wrote {out}/V.fasta, J.fasta{}, annotation.tsv",
+        "vdj-assign: wrote {out}/V.fasta, J.fasta{}{}, annotation.tsv",
         if database.d.is_some() {
             ", D.fasta"
+        } else {
+            ""
+        },
+        if database.c.is_some() {
+            ", C.fasta"
         } else {
             ""
         }
@@ -405,8 +436,21 @@ fn run_assign(args: &Args) -> Result<(), Box<dyn Error>> {
         KarlinAltschul::ungapped(&config.d.scoring),
         KarlinAltschul::ungapped(&config.j.scoring),
     ];
+    if let Some(text) = args.c_evalue.as_deref() {
+        if args.c.is_none() {
+            return Err("--c-evalue needs --c".into());
+        }
+        config.c.evalue = text
+            .parse::<f64>()
+            .ok()
+            .filter(|&evalue| evalue > 0.0)
+            .ok_or_else(|| format!("--c-evalue expects a positive number, got '{text}'"))?;
+    }
     let database = load_database(args)?;
-    let assigner = DefaultAssigner::from_config(&config, database.v, database.d, database.j)?;
+    let mut assigner = DefaultAssigner::from_config(&config, database.v, database.d, database.j)?;
+    if let Some(c) = database.c {
+        assigner = assigner.with_constant(c, &config.c)?;
+    }
 
     let started = Instant::now();
     let (total, with_path) = if args.residual {

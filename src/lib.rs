@@ -78,8 +78,8 @@ pub mod prelude {
     pub use crate::band::Band;
     pub use crate::batch::{assign_all, assign_map};
     pub use crate::config::{
-        BuildError, DPrior, DSearchSpace, DSegmentConfig, DefaultAssigner, EngineConfig,
-        JSegmentConfig, ObjectiveConfig, VSegmentConfig,
+        BuildError, CSegmentConfig, DPrior, DSearchSpace, DSegmentConfig, DefaultAssigner,
+        EngineConfig, JSegmentConfig, ObjectiveConfig, VSegmentConfig,
     };
     pub use crate::germline::{GermlineSet, SegmentKind};
     pub use crate::orient::{Orientation, OrientationPolicy, StrandIndex};

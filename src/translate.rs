@@ -65,6 +65,17 @@ pub fn translate_frames(codes: &[u8], frames: &mut [Vec<u8>; 3]) {
     }
 }
 
+/// The frames (0, 1, 2) whose translation has no stop codon except as its
+/// last codon: the possible reading frames of a coding sequence such as a
+/// constant region (`C` ends with its stop codon).
+pub fn open_frames(codes: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    (0..3).filter(move |&frame| {
+        let protein = translate(codes, frame);
+        let body = protein.split_last().map_or(&[][..], |(_, body)| body);
+        !body.contains(&STOP)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,5 +90,15 @@ mod tests {
         for (frame, translated) in frames.iter().enumerate() {
             assert_eq!(*translated, translate(&codes, frame));
         }
+    }
+
+    #[test]
+    fn open_frames_allow_a_terminal_stop_only() {
+        // Frame 0: M K * (terminal stop); frame 1: stop inside; frame 2: open.
+        let codes = encode(b"ATGAAATAA");
+        assert_eq!(open_frames(&codes).collect::<Vec<_>>(), vec![0, 2]);
+        // Frame 0: * * * (stops inside); frames 1 and 2: N N N and I I.
+        let frames: Vec<_> = open_frames(&encode(b"TAATAATAAT")).collect();
+        assert_eq!(frames, vec![1, 2]);
     }
 }
