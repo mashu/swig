@@ -543,8 +543,9 @@ impl GermlineSet {
     /// Merge identical sequences into the first allele carrying them (later
     /// names become aliases). Lossless for assignment: the merged alleles would
     /// always score identically, and reports list every name. The kept
-    /// allele takes what it lacks from later copies ([`Allele::absorb`]).
-    /// A name or alias used for two different sequences is an error.
+    /// allele takes from later copies what it lacks: an anchor, region
+    /// starts that fit it, an IMGT numbering; values it has are kept. A
+    /// name or alias used for two different sequences is an error.
     pub fn deduplicate(&mut self) -> Result<Vec<MergedDuplicate>, GermlineError> {
         let mut by_sequence: HashMap<Vec<u8>, usize> = HashMap::with_capacity(self.alleles.len());
         let mut by_name: HashMap<String, usize> = HashMap::with_capacity(self.alleles.len());
