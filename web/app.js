@@ -27,24 +27,38 @@ function notice(kind, text) {
   $('notices').append(p);
 }
 
-/** The text of `file`, decompressed when its name ends in .gz. */
-async function fileText(file) {
-  if (!file.name.endsWith('.gz')) return file.text();
-  return new Response(file.stream().pipeThrough(new DecompressionStream('gzip'))).text();
+/**
+ * `file` read by `read` (text or bytes) from a Response over its contents,
+ * decompressed when its name ends in .gz.
+ */
+async function contents(file, read) {
+  if (!file.name.endsWith('.gz')) return read(new Response(file));
+  try {
+    return await read(new Response(file.stream().pipeThrough(new DecompressionStream('gzip'))));
+  } catch (error) {
+    throw new Error(
+      `${file.name}: the browser could not decompress it (${error.message}). Its decompressor ` +
+        'reads one gzip member, so files of several (bgzip, concatenated lanes) need ' +
+        'decompressing first, for example with zcat.',
+    );
+  }
 }
 
-/** The bytes of `file`, decompressed when its name ends in .gz. */
-async function fileBytes(file) {
-  if (!file.name.endsWith('.gz')) return file.arrayBuffer();
-  return new Response(file.stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer();
-}
+const fileText = (file) => contents(file, (response) => response.text());
+const fileBytes = (file) => contents(file, (response) => response.arrayBuffer());
 
-/** Germline FASTA texts: chosen files, else the demo's. */
+/**
+ * Germline FASTA texts: the chosen files when any is chosen, else the
+ * demo's. A chosen database is never mixed with the demo's sets.
+ */
 async function germlines() {
+  const chosen = SEGMENTS.some((segment) => $(segment).files[0]);
   const texts = {};
   for (const segment of SEGMENTS) {
     const file = $(segment).files[0];
-    texts[segment] = file ? await fileText(file) : demo?.[`${segment.toUpperCase()}.fasta`];
+    texts[segment] = chosen
+      ? file && (await fileText(file))
+      : demo?.[`${segment.toUpperCase()}.fasta`];
   }
   return texts;
 }
@@ -71,9 +85,13 @@ function options() {
   return chosen;
 }
 
-/** A download link for `text` as `name`, its URL kept in `urls[group]`. */
-function download(name, text, group) {
-  const url = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
+/**
+ * A download link for `parts` (a string, or strings that form the file) as
+ * `name`, its URL kept in `urls[group]`.
+ */
+function download(name, parts, group) {
+  const blob = new Blob(Array.isArray(parts) ? parts : [parts], { type: 'text/plain' });
+  const url = URL.createObjectURL(blob);
   urls[group].push(url);
   const a = document.createElement('a');
   a.href = url;
@@ -82,9 +100,15 @@ function download(name, text, group) {
   return a;
 }
 
-/** The first rows of `tsv`, in the columns worth a glance. */
-function preview(tsv) {
-  const lines = tsv.split('\n', PREVIEW_ROWS + 1);
+/** The first rows of the TSV in `parts`, in the columns worth a glance. */
+function preview(parts) {
+  // Only as many parts as the preview needs are joined.
+  let start = '';
+  for (const part of parts) {
+    start += part;
+    if (start.split('\n').length > PREVIEW_ROWS + 1) break;
+  }
+  const lines = start.split('\n', PREVIEW_ROWS + 1);
   const header = lines[0].split('\t');
   const shown = PREVIEW_COLUMNS.map((name) => [name, header.indexOf(name)]).filter(([, i]) => i >= 0);
   const table = $('preview');
@@ -154,11 +178,11 @@ async function run() {
       `(${Math.round(result.reads / seconds)} reads/s on ${workers} worker${workers > 1 ? 's' : ''}, ` +
       `${info.backend} kernel). Database: ${info.summary}.`;
     const links = $('downloads');
-    links.replaceChildren(download('calls.tsv', result.tsv, 'results'));
+    links.replaceChildren(download('calls.tsv', result.parts, 'results'));
     for (const [name, text] of Object.entries(vdj.prepare(database))) {
       links.append(download(name, text, 'results'));
     }
-    preview(result.tsv);
+    preview(result.parts);
     $('preview-note').textContent =
       result.reads > PREVIEW_ROWS ? `The first ${PREVIEW_ROWS} of ${result.reads} rows; calls.tsv has them all.` : '';
     $('results').hidden = false;
@@ -176,9 +200,9 @@ function useDemo() {
   const preset = $('demo-preset').value;
   demo = vdj.demo({ seed: 1, reads: count, preset });
   $('demo-note').textContent =
-    `Synthetic IGH-like database and ${count} simulated ${preset} reads loaded; chosen files and pasted ` +
-    'reads take precedence. It is a test fixture: its V genes are random sequence around conserved ' +
-    'motifs, so most reads come out unproductive.';
+    `Synthetic IGH-like database and ${count} simulated ${preset} reads loaded. Chosen germline files ` +
+    'replace the whole demo database, and chosen or pasted reads its reads. It is a test fixture: its ' +
+    'V genes are random sequence around conserved motifs, so most reads come out unproductive.';
   revoke('demo');
   const links = document.createElement('span');
   links.className = 'links';
@@ -190,7 +214,6 @@ function useDemo() {
   $('demo-note').append(links);
 }
 
-if (location.protocol === 'file:') $('protocol').hidden = false;
 $('workers').value = String(Math.min(16, navigator.hardwareConcurrency || 1));
 try {
   module = await compile();

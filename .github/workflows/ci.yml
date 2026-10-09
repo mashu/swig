@@ -67,12 +67,20 @@ jobs:
         run: |
           cargo build --release
           node web/test.mjs target/release/vdj-assign
+      # Playwright is installed for this step only; the repository has no
+      # JavaScript dependencies.
+      - name: The page and Web Workers in Chromium
+        run: |
+          npm install --no-save --no-package-lock playwright@1.56.1
+          npx playwright install --with-deps chromium
+          node web/browser-test.mjs target/release/vdj-assign
       - uses: actions/upload-artifact@v4
         with:
           name: vdj-assign-web
           path: |
             web/
             !web/test.mjs
+            !web/browser-test.mjs
 
   msrv:
     runs-on: ubuntu-latest
