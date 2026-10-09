@@ -315,12 +315,16 @@ impl Allele {
     }
 
     /// Take what this allele lacks from `copy`, an identical sequence: its
-    /// anchor, its region starts (only as a whole, and only when they fit
-    /// this allele's anchor) and its IMGT numbering. Values this allele
-    /// has are kept.
+    /// anchor when this allele's region starts fit it, its region starts
+    /// (only as a whole, and only when they fit this allele's anchor) and
+    /// its IMGT numbering. Values this allele has are kept, so the allele
+    /// stays consistent ([`RegionStarts::check`]).
     fn absorb(&mut self, copy: Allele) {
-        self.anchor = self.anchor.or(copy.anchor);
-        if self.regions.is_empty() && copy.regions.check(self.anchor, self.codes.len()).is_ok() {
+        let len = self.codes.len();
+        if self.anchor.is_none() && self.regions.check(copy.anchor, len).is_ok() {
+            self.anchor = copy.anchor;
+        }
+        if self.regions.is_empty() && copy.regions.check(self.anchor, len).is_ok() {
             self.regions = copy.regions;
         }
         self.imgt = self.imgt.take().or(copy.imgt);
@@ -451,7 +455,8 @@ impl GermlineSet {
         codes: Vec<u8>,
         anchor: Option<u32>,
     ) -> Result<AlleleId, GermlineError> {
-        if anchor.is_some_and(|a| a as usize + 3 > codes.len()) {
+        // In u64: on 32-bit targets `a as usize + 3` can wrap.
+        if anchor.is_some_and(|a| u64::from(a) + 3 > codes.len() as u64) {
             return Err(GermlineError::BadRegions {
                 name: name.to_string(),
                 reason: "the anchor codon runs past the sequence end".to_string(),
@@ -543,9 +548,10 @@ impl GermlineSet {
     /// Merge identical sequences into the first allele carrying them (later
     /// names become aliases). Lossless for assignment: the merged alleles would
     /// always score identically, and reports list every name. The kept
-    /// allele takes from later copies what it lacks: an anchor, region
-    /// starts that fit it, an IMGT numbering; values it has are kept. A
-    /// name or alias used for two different sequences is an error.
+    /// allele takes from later copies what it lacks, as long as it stays
+    /// consistent: an anchor, region starts, an IMGT numbering; values it
+    /// has are kept. A name or alias used for two different sequences is
+    /// an error.
     pub fn deduplicate(&mut self) -> Result<Vec<MergedDuplicate>, GermlineError> {
         let mut by_sequence: HashMap<Vec<u8>, usize> = HashMap::with_capacity(self.alleles.len());
         let mut by_name: HashMap<String, usize> = HashMap::with_capacity(self.alleles.len());
@@ -775,7 +781,21 @@ mod tests {
         let mut set = GermlineSet::from_fasta(SegmentKind::V, &text).unwrap();
         set.deduplicate().unwrap();
         assert_eq!(set.allele(0).anchor, Some(9));
+        // A copy's anchor before the kept allele's region starts is left
+        // out, so the allele still passes the checks a reload applies.
+        let text = format!(">V1*01 fr1=0 cdr1=20\n{sequence}\n>V1*02 anchor=12\n{sequence}\n");
+        let mut set = GermlineSet::from_fasta(SegmentKind::V, &text).unwrap();
+        set.deduplicate().unwrap();
+        let kept = set.allele(0);
+        assert_eq!(kept.anchor, None);
+        assert!(kept.regions.check(kept.anchor, kept.codes.len()).is_ok());
+        let mut written = Vec::new();
+        set.write_fasta(&mut written, |_| None).unwrap();
+        let reloaded = String::from_utf8(written).unwrap();
+        assert!(GermlineSet::from_fasta(SegmentKind::V, &reloaded).is_ok());
+        // Anchors past the end are refused, also where `usize` is 32 bits.
         assert!(set.push("V*01", b"ACGTAC", Some(4)).is_err());
+        assert!(set.push("V*02", b"ACGTAC", Some(u32::MAX)).is_err());
     }
 
     /// A random IMGT-like gapped V record: 106 IMGT codons with Cys23,
