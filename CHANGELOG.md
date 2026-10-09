@@ -21,14 +21,17 @@ The first release.
   with a paired McNemar comparison of two tools on the same reads.
 - **Kernels**: AVX2, NEON or portable SIMD lanes, chosen at run time;
   AVX-512BW and the scalar kernel with `--simd`. Output is byte-identical
-  across them and across x86-64 and AArch64.
+  across them and across x86-64 and AArch64 Linux; on macOS and Windows,
+  as in the browser, a posterior can rarely differ in its last printed
+  digit where the platform's `exp` differs in the last bit.
 - `-V` / `--version` prints the version.
 
 ### WebAssembly
 
 - Two modules, `vdj_assign_simd.wasm` (WebAssembly SIMD) and
-  `vdj_assign.wasm` (scalar), with no imports; `vdj-assign.js` loads the
-  right one in browsers, Web Workers and Node.js 18 or later.
+  `vdj_assign.wasm` (scalar), with no imports. `vdj-assign.js` fetches the
+  right one in browsers and Web Workers; in Node.js 18 or later (the
+  bundle's `package.json` marks it an ES module) give `load()` the bytes.
 - A page (`index.html`) that assigns reads in the browser, on Web Workers,
   with demo data; nothing is uploaded. Its output equals the command line's
   up to a rare last-digit difference in a posterior.

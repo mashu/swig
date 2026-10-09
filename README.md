@@ -9,9 +9,10 @@ search shortcut is either lossless or measured on simulated repertoires.
 
 Zero dependencies, Rust ≥ 1.89, edition 2024. The alignment kernel runs on
 AVX-512BW, AVX2, NEON, WebAssembly SIMD or portable lanes, chosen at run
-time; output is byte-identical across them and across x86-64 and AArch64.
-The same engine also runs in a browser, with the same output up to a rare
-last-digit difference in a posterior (see *In the browser* below).
+time; output is byte-identical across them and across x86-64 and AArch64
+Linux. The same engine also runs on macOS, on Windows and in a browser, with
+the same output up to a rare last-digit difference in a posterior where the
+platform's `exp` differs in the last bit (see *In the browser* below).
 
 - [docs/ALGORITHM.md](docs/ALGORITHM.md): the model, the search and its
   guarantees, structured for a methods section.
@@ -30,13 +31,15 @@ for the files. Every archive was unpacked and tested on its own platform
 before the release was published.
 
 ```sh
+sha256sum --check --ignore-missing SHA256SUMS  # macOS: shasum -a 256 --check --ignore-missing SHA256SUMS
 tar xzf vdj-assign-0.1.0-x86_64-unknown-linux-gnu.tar.gz
 vdj-assign-0.1.0-x86_64-unknown-linux-gnu/vdj-assign --version
-sha256sum --check --ignore-missing SHA256SUMS  # macOS: shasum -a 256 --check --ignore-missing SHA256SUMS
 ```
 
-The binaries are not signed. macOS refuses a downloaded binary until its
-quarantine flag is cleared: `xattr -d com.apple.quarantine vdj-assign`.
+The binaries are not signed. On macOS, clear the quarantine flag before the
+first run: `xattr -dr com.apple.quarantine vdj-assign-0.1.0-aarch64-apple-darwin`
+(`vdj-assign-0.1.0-x86_64-apple-darwin` on Intel). On Windows, unzip
+`vdj-assign-0.1.0-x86_64-pc-windows-msvc.zip` and run `vdj-assign.exe`.
 
 To try the browser build, serve the unpacked directory over HTTP (browsers
 do not run modules or workers from `file:` pages) and open the page; *Use
@@ -47,8 +50,9 @@ unzip vdj-assign-web-0.1.0.zip
 python3 -m http.server -d vdj-assign-web-0.1.0 8000   # then open http://localhost:8000
 ```
 
-From Node.js 18 or later, the same directory is a module
-(`load({ bytes })`, see *In the browser* below).
+From Node.js 18 or later, the same directory is an ES module (its
+`package.json` says so); give `load()` the module's bytes (see *In the
+browser* below).
 
 ## Build and run
 
