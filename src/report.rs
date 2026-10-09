@@ -118,11 +118,14 @@ const SEGMENT_FIELDS: [&str; 12] = [
     "germline_alignment",
 ];
 
-/// A probability with six significant digits of its distance from 0 or 1,
-/// so `0.999999` and `0.9999999` stay distinguishable.
+/// A probability with six decimals, or ten when it lies within 10⁻⁴ of 0
+/// or 1, so `0.999999` and `0.9999999` stay distinguishable. A distance
+/// below 5·10⁻¹¹ rounds away at ten decimals, so it prints as an exact 0 or
+/// 1 does: a last-bit difference between platforms' `exp` cannot change
+/// the text.
 fn probability(p: f64) -> String {
     let tail = p.min(1.0 - p);
-    if tail > 0.0 && tail < 1e-4 {
+    if (5e-11..1e-4).contains(&tail) {
         format!("{p:.10}")
     } else {
         format!("{p:.6}")
@@ -622,5 +625,22 @@ impl AirrRecord {
             push_segment(&mut fields, &self.c);
         }
         fields.join("\t")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::probability;
+
+    #[test]
+    fn probabilities_show_their_tail_but_not_rounding_noise() {
+        assert_eq!(probability(0.5), "0.500000");
+        assert_eq!(probability(0.99999), "0.9999900000");
+        assert_eq!(probability(1e-7), "0.0000001000");
+        // Within rounding of 0 or 1, the text is that of 0 or 1.
+        assert_eq!(probability(1.0), "1.000000");
+        assert_eq!(probability(1.0 - f64::EPSILON), "1.000000");
+        assert_eq!(probability(0.0), "0.000000");
+        assert_eq!(probability(1e-17), "0.000000");
     }
 }
