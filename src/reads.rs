@@ -48,7 +48,8 @@ pub enum ReadError {
     MissingSeparator {
         header: String,
     },
-    /// A FASTQ sequence line holds something other than a letter.
+    /// A FASTQ sequence line holds whitespace or a control character, which
+    /// would split an output column.
     InvalidSymbol {
         line: usize,
         found: char,
@@ -270,8 +271,9 @@ impl<R: BufRead> ReadReader<R> {
                 break;
             }
             let line = self.buffer.trim();
-            // Unlike FASTA, nothing can be dropped: qualities count the bases.
-            if let Some(found) = line.chars().find(|c| !c.is_ascii_alphabetic()) {
+            // Unlike FASTA, nothing can be dropped: qualities count the
+            // bases. No-call symbols such as `.` and `-` read as N.
+            if let Some(found) = line.chars().find(|c| c.is_whitespace() || c.is_control()) {
                 return Err(ReadError::InvalidSymbol {
                     line: self.line,
                     found,
@@ -367,6 +369,10 @@ mod tests {
                 found: '\t'
             })
         ));
+        assert_eq!(
+            read_all(b"@r\nAC.T-\n+\nIIIII\n").unwrap(),
+            [record("r", "AC.T-")]
+        );
         assert!(matches!(
             read_all(b"ACGT\n"),
             Err(ReadError::UnknownFormat {

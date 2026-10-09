@@ -60,8 +60,9 @@ cargo run --release --example d_errors -- --v V.fasta --d D.fasta --j J.fasta --
 
 Reads may be FASTA or FASTQ. The format is detected from the first
 character; multi-line FASTQ is supported and qualities are validated, then
-ignored. FASTQ sequence lines must hold letters only (FASTA drops anything
-else, but a FASTQ quality counts each base). Reads are streamed in batches of 16,384, so memory stays bounded on
+ignored. FASTQ sequence lines may not hold spaces, tabs or control
+characters (FASTA drops them, but a FASTQ quality counts each base); no-call
+symbols such as `.` read as N. Reads are streamed in batches of 16,384, so memory stays bounded on
 large files, and `-` reads stdin. Gzip input is recognised and rejected with
 a `zcat` hint, since the crate has no dependencies.
 
