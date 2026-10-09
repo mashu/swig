@@ -207,7 +207,8 @@ fn parse_args() -> Result<Option<Args>, String> {
         let takes_value = mode
             .takes_value(name)
             .ok_or_else(|| format!("unknown option '{arg}' for {}", mode.name()))?;
-        if !seen.insert(name.to_string()) {
+        // A repeated value is ambiguous; a repeated flag changes nothing.
+        if takes_value && !seen.insert(name.to_string()) {
             return Err(format!("{arg} given more than once"));
         }
         let value = match takes_value {
