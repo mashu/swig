@@ -313,6 +313,18 @@ impl Allele {
     pub fn names(&self) -> impl Iterator<Item = &str> {
         std::iter::once(self.name.as_str()).chain(self.aliases.iter().map(String::as_str))
     }
+
+    /// Take what this allele lacks from `copy`, an identical sequence: its
+    /// anchor, its region starts (only as a whole, and only when they fit
+    /// this allele's anchor) and its IMGT numbering. Values this allele
+    /// has are kept.
+    fn absorb(&mut self, copy: Allele) {
+        self.anchor = self.anchor.or(copy.anchor);
+        if self.regions.is_empty() && copy.regions.check(self.anchor, self.codes.len()).is_ok() {
+            self.regions = copy.regions;
+        }
+        self.imgt = self.imgt.take().or(copy.imgt);
+    }
 }
 
 /// An identical sequence merged into an earlier allele.
@@ -439,6 +451,12 @@ impl GermlineSet {
         codes: Vec<u8>,
         anchor: Option<u32>,
     ) -> Result<AlleleId, GermlineError> {
+        if anchor.is_some_and(|a| a as usize + 3 > codes.len()) {
+            return Err(GermlineError::BadRegions {
+                name: name.to_string(),
+                reason: "the anchor codon runs past the sequence end".to_string(),
+            });
+        }
         let gene_name = Self::gene_of_name(name);
         let next_gene = GeneId::try_from(self.genes.len()).expect("gene count fits u32");
         let gene = *self
@@ -487,12 +505,6 @@ impl GermlineSet {
                     name: name.to_string(),
                     reason,
                 })?;
-            if anchor.is_some_and(|a| a as usize + 3 > record.sequence.len()) {
-                return Err(GermlineError::BadRegions {
-                    name: name.to_string(),
-                    reason: "the anchor codon runs past the sequence end".to_string(),
-                });
-            }
             let id = set.push(name, &record.sequence, anchor)?;
             let allele = &mut set.alleles[id as usize];
             allele.regions = regions;
@@ -531,39 +543,42 @@ impl GermlineSet {
     /// Merge identical sequences into the first allele carrying them (later
     /// names become aliases). Lossless for assignment: the merged alleles would
     /// always score identically, and reports list every name. The kept
-    /// allele takes the IMGT numbering of the first gapped copy when it has
-    /// none. A name used for two different sequences is an error.
+    /// allele takes what it lacks from later copies ([`Allele::absorb`]).
+    /// A name or alias used for two different sequences is an error.
     pub fn deduplicate(&mut self) -> Result<Vec<MergedDuplicate>, GermlineError> {
         let mut by_sequence: HashMap<Vec<u8>, usize> = HashMap::with_capacity(self.alleles.len());
         let mut by_name: HashMap<String, usize> = HashMap::with_capacity(self.alleles.len());
         let mut kept: Vec<Allele> = Vec::with_capacity(self.alleles.len());
         let mut merged = Vec::new();
         for allele in std::mem::take(&mut self.alleles) {
-            match by_sequence.get(&allele.codes) {
-                Some(&index) => {
-                    let target = &mut kept[index];
-                    for name in allele.names() {
-                        if name != target.name && !target.aliases.iter().any(|a| a == name) {
-                            target.aliases.push(name.to_string());
-                            merged.push(MergedDuplicate {
-                                kept: target.name.clone(),
-                                merged: name.to_string(),
-                            });
-                        }
-                    }
-                    by_name.entry(allele.name.clone()).or_insert(index);
-                    let target = &mut kept[index];
-                    target.imgt = target.imgt.take().or(allele.imgt);
-                }
-                None => {
-                    if by_name.contains_key(&allele.name) {
-                        return Err(GermlineError::ConflictingDuplicate { name: allele.name });
-                    }
-                    by_name.insert(allele.name.clone(), kept.len());
-                    by_sequence.insert(allele.codes.clone(), kept.len());
-                    kept.push(allele);
+            let index = by_sequence
+                .get(&allele.codes)
+                .copied()
+                .unwrap_or(kept.len());
+            if let Some(name) = allele
+                .names()
+                .find(|name| by_name.get(*name).is_some_and(|&at| at != index))
+            {
+                let name = name.to_string();
+                return Err(GermlineError::ConflictingDuplicate { name });
+            }
+            by_name.extend(allele.names().map(|name| (name.to_string(), index)));
+            if index == kept.len() {
+                by_sequence.insert(allele.codes.clone(), index);
+                kept.push(allele);
+                continue;
+            }
+            let target = &mut kept[index];
+            for name in allele.names() {
+                if name != target.name && !target.aliases.iter().any(|a| a == name) {
+                    target.aliases.push(name.to_string());
+                    merged.push(MergedDuplicate {
+                        kept: target.name.clone(),
+                        merged: name.to_string(),
+                    });
                 }
             }
+            target.absorb(allele);
         }
         let mut rebuilt = Self::new(self.kind);
         for allele in kept {
@@ -725,12 +740,41 @@ mod tests {
                 merged: "B*01".into()
             }]
         );
-        let mut conflict =
-            GermlineSet::from_fasta(SegmentKind::V, ">A*01\nACGT\n>A*01\nTTTT\n").unwrap();
-        assert!(matches!(
-            conflict.deduplicate(),
-            Err(GermlineError::ConflictingDuplicate { .. })
-        ));
+        let conflicts = [
+            ">A*01\nACGT\n>A*01\nTTTT\n",
+            // A*01 names X, then joins Y's allele as an alias.
+            ">A*01\nACGT\n>B*01\nTTTT\n>A*01\nTTTT\n",
+            ">A*01 aliases=C*01\nACGT\n>C*01\nTTTT\n",
+        ];
+        for text in conflicts {
+            let mut set = GermlineSet::from_fasta(SegmentKind::V, text).unwrap();
+            assert!(
+                matches!(
+                    set.deduplicate(),
+                    Err(GermlineError::ConflictingDuplicate { .. })
+                ),
+                "{text}"
+            );
+        }
+    }
+
+    /// A header value of a merged copy is kept: the copy is the same
+    /// sequence, so its anchor and region starts hold for the kept allele.
+    #[test]
+    fn deduplication_keeps_the_annotation_of_merged_copies() {
+        let sequence = "ACGTACGTACGTACGTACGTACGT";
+        let text = format!(">V1*01\n{sequence}\n>V1*02 anchor=12 fr1=0 cdr1=3\n{sequence}\n");
+        let mut set = GermlineSet::from_fasta(SegmentKind::V, &text).unwrap();
+        set.deduplicate().unwrap();
+        let kept = set.allele(0);
+        assert_eq!((kept.name.as_str(), kept.anchor), ("V1*01", Some(12)));
+        assert_eq!(kept.regions.values(), [Some(0), Some(3), None, None, None]);
+        // A value the kept allele has wins.
+        let text = format!(">V1*01 anchor=9\n{sequence}\n>V1*02 anchor=12\n{sequence}\n");
+        let mut set = GermlineSet::from_fasta(SegmentKind::V, &text).unwrap();
+        set.deduplicate().unwrap();
+        assert_eq!(set.allele(0).anchor, Some(9));
+        assert!(set.push("V*01", b"ACGTAC", Some(4)).is_err());
     }
 
     /// A random IMGT-like gapped V record: 106 IMGT codons with Cys23,
