@@ -136,6 +136,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         config.v.fallback =
             (fallback > 0).then(|| vdj_assign::seed::SeedShape::contiguous(fallback));
     }
+    // Primary V seed as a 0/1 pattern, e.g. a spaced seed `11101101111`.
+    if let Some(pattern) = value("--v-shape") {
+        config.v.primary = vdj_assign::seed::SeedShape::from_pattern(&pattern)?;
+    }
     if let Some(v) = list("--budget") {
         if v.len() != 3 {
             return Err("--budget expects base,max,z".into());
