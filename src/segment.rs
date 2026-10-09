@@ -469,9 +469,10 @@ impl<R: Retriever> SegmentStage<R> {
     }
 
     /// With at most `top + 1` candidates, tracing all of them is cheaper than
-    /// scoring all of them and then tracing `top`.
+    /// scoring all of them and then tracing `top`, unless `cap` would stop
+    /// the unranked traceback before the last of them.
     fn needs_scores(&self, request: &SegmentRequest<'_>) -> bool {
-        request.candidates.len() > self.keep.top.saturating_add(1)
+        request.candidates.len() > self.keep.top.saturating_add(1).min(self.keep.cap)
     }
 
     /// Each candidate's gene leader (see [`TieOrder::GeneLeadersFirst`]) as
@@ -1134,6 +1135,41 @@ mod tests {
             &mut out,
         );
         out.iter().map(|p| (p.alleles.clone(), p.score())).collect()
+    }
+
+    /// A request of `top + 1` candidates is ranked by score when `cap` binds
+    /// below it: traced unranked, in retrieval order, the last candidate
+    /// would never be aligned (the D stage keeps `top = cap = 32`).
+    #[test]
+    fn a_binding_cap_still_ranks_top_plus_one_candidates() {
+        let scoring = AffineScoring::new(2, -3, -13, -1);
+        let mut set = GermlineSet::new(SegmentKind::D);
+        set.push("IGHD1-1*01", b"GGTACAACTGGAACGAC", None).unwrap();
+        set.push("IGHD2-2*01", b"AGGATATTGTAGTAGTACCAGCTGCTATGCC", None)
+            .unwrap();
+        set.push("IGHD3-3*01", b"GTATTACGATTTTTGGAGTGGTTATTATACC", None)
+            .unwrap();
+        let segment = Arc::new(PreparedSegment::new(set, &scoring, scoring.gaps));
+        let keep = KeepPolicy {
+            top: 2,
+            min_score: 1,
+            cap: 2,
+        };
+        let stage = SegmentStage::new(segment, EmptyRetriever, keep);
+        let query = encode(b"CCCCGTATTACGATTTTTGGAGTGGTTATTATACCCCCC");
+        let candidates: Vec<Candidate> = (0..3)
+            .map(|allele| Candidate {
+                allele,
+                band: Band::Full,
+                votes: 0,
+            })
+            .collect();
+        let kept = placed(&stage, &candidates, &query);
+        assert_eq!(
+            kept.first().map(|(alleles, _)| alleles.as_slice()),
+            Some(&[2][..]),
+            "{kept:?}"
+        );
     }
 
     /// Three alleles in two genes align identically to the read; the tie

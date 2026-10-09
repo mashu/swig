@@ -118,11 +118,14 @@ const SEGMENT_FIELDS: [&str; 12] = [
     "germline_alignment",
 ];
 
-/// A probability with six significant digits of its distance from 0 or 1,
-/// so `0.999999` and `0.9999999` stay distinguishable.
+/// A probability with six decimals, or ten when it lies within 10⁻⁴ of 0
+/// or 1, so `0.999999` and `0.9999999` stay distinguishable. A distance
+/// below 5·10⁻¹¹ rounds away at ten decimals, so it prints as an exact 0 or
+/// 1 does: a last-bit difference between platforms' `exp` cannot change
+/// the text.
 fn probability(p: f64) -> String {
     let tail = p.min(1.0 - p);
-    if tail > 0.0 && tail < 1e-4 {
+    if (5e-11..1e-4).contains(&tail) {
         format!("{p:.10}")
     } else {
         format!("{p:.6}")
@@ -475,30 +478,39 @@ impl AirrRecord {
         record.path_score = Some(path.score.score);
         record.d_presence_posterior = call.marginals.as_ref().map(|m| m.d_present());
 
-        let mut junctions = Vec::with_capacity(3);
-        for (i, called) in path.segments.iter().enumerate() {
-            if i > 0 {
-                let (from, to) = (path.segments[i - 1].span.q_hi, called.span.q_lo);
-                junctions.push(if to > from {
+        // The kind and exit of the previous segment, and the Ds placed so far.
+        let mut previous: Option<(SegmentKind, u32)> = None;
+        let mut ds = 0;
+        for called in &path.segments {
+            let kind = call.placements[called.placement].kind;
+            if let Some((before, from)) = previous {
+                let to = called.span.q_lo;
+                let bases = if to > from {
                     decode(&call.query[from as usize..to as usize])
                 } else {
                     String::new()
-                });
+                };
+                // AIRR names an N/P region by the segment it follows.
+                let np = match before {
+                    SegmentKind::V => &mut record.np1,
+                    SegmentKind::D if ds == 1 => &mut record.np2,
+                    SegmentKind::D => &mut record.np3,
+                    SegmentKind::J | SegmentKind::C => unreachable!("J ends every path"),
+                };
+                *np = Some(bases);
             }
             let report = segment_report(call, called, catalog, support);
-            let slot = match call.placements[called.placement].kind {
+            let slot = match kind {
                 SegmentKind::V => &mut record.v,
-                SegmentKind::D if record.d.is_none() => &mut record.d,
+                SegmentKind::D if ds == 0 => &mut record.d,
                 SegmentKind::D => &mut record.d2,
                 SegmentKind::J => &mut record.j,
                 SegmentKind::C => unreachable!("segment_report refuses C"),
             };
             *slot = report;
+            ds += usize::from(kind == SegmentKind::D);
+            previous = Some((kind, called.span.q_hi));
         }
-        let mut junctions = junctions.into_iter();
-        record.np1 = junctions.next();
-        record.np2 = junctions.next();
-        record.np3 = junctions.next();
         record
     }
 
@@ -613,5 +625,22 @@ impl AirrRecord {
             push_segment(&mut fields, &self.c);
         }
         fields.join("\t")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::probability;
+
+    #[test]
+    fn probabilities_show_their_tail_but_not_rounding_noise() {
+        assert_eq!(probability(0.5), "0.500000");
+        assert_eq!(probability(0.99999), "0.9999900000");
+        assert_eq!(probability(1e-7), "0.0000001000");
+        // Within rounding of 0 or 1, the text is that of 0 or 1.
+        assert_eq!(probability(1.0), "1.000000");
+        assert_eq!(probability(1.0 - f64::EPSILON), "1.000000");
+        assert_eq!(probability(0.0), "0.000000");
+        assert_eq!(probability(1e-17), "0.000000");
     }
 }

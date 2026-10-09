@@ -14,7 +14,8 @@
 //! [`Aligner::align_batch`]) over independent [`AlignJob`]s. The default
 //! implementations loop over the single-job calls; [`InterSequenceGotoh`]
 //! overrides them with an inter-sequence SIMD kernel that aligns 16 or 32
-//! jobs at once on AVX-512, AVX2, NEON or portable lanes ([`Backend`]).
+//! jobs at once on AVX-512, AVX2, NEON, WebAssembly `simd128` or portable
+//! lanes ([`Backend`]).
 
 mod gotoh;
 mod inter_seq;

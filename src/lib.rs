@@ -6,28 +6,42 @@
 //!
 //! ```text
 //! alphabet / fasta / germline      germline data
+//! translate / annotate / prepare   codon table, anchors and region starts,
+//!                                  deduplicated and annotated databases
 //! reads                            streaming FASTA / FASTQ reads
+//! orient                           strand from germline k-mer support
+//! scoring                          substitution profiles and affine gaps
 //! seed → index → retrieve          candidate generation (k-mers as integers)
 //! band → align                     banded affine Smith–Waterman (Gotoh):
-//!                                  scalar kernel + AVX2 inter-sequence batches
+//!                                  scalar kernel + SIMD inter-sequence batches
+//!                                  (AVX-512, AVX2, NEON, WebAssembly simd128)
+//! segment / family_bound / flank   retrieve → score-only DP → keep → traceback
 //! clip / evidence / placement      O(1) clip-and-rescore, admission evidence
-//! segment                          retrieve → score-only DP → keep → traceback
 //! window / admission               where D is searched, which D hits count
 //! adjudicate                       placement DAG (VJ / VDJ / VDDJ) or residual
-//! refine                           winning-path polish
+//! constant                         C anchored at the J exit, after adjudication
 //! pipeline / config / profiles     stage-wise, chunk-batched composition and the
 //!                                  note's calling profiles
-//! report / stats / batch           AIRR output, E-values, parallel batches
+//! report / read_regions / stats    AIRR output, FR/CDR projection, E-values
+//! batch / run                      parallel batches; a whole run from named
+//!                                  options to AIRR TSV (CLI and WebAssembly)
+//! sim                              IgSim simulator and accuracy evaluation
 //! ```
 //!
-//! Quick start:
+//! Quick start: [`prepare`](prepare::prepare) deduplicates the germline sets
+//! and annotates their anchors and regions, which the assigner reads.
 //!
 //! ```ignore
 //! use vdj_assign::prelude::*;
-//! let assigner = DefaultAssigner::from_config(&CallingProfile::ROptimized.config(), v, Some(d), j)?;
+//! let database = prepare(v, Some(d), j, AnnotateOptions::default())?;
+//! let config = CallingProfile::ROptimized.config();
+//! let assigner = DefaultAssigner::from_config(&config, database.v, database.d, database.j)?;
 //! let mut ws = assigner.workspace();
 //! let call = assigner.assign(&encode(b"CAGGTGCAG..."), &mut ws);
 //! ```
+//!
+//! A whole run from FASTA text to AIRR TSV, as the command line performs
+//! it, is [`run::Run`].
 
 pub mod adjudicate;
 pub mod admission;
@@ -54,6 +68,7 @@ pub mod read_regions;
 pub mod reads;
 pub mod report;
 pub mod retrieve;
+pub mod run;
 pub mod scoring;
 pub mod seed;
 pub mod segment;
@@ -75,6 +90,7 @@ pub mod prelude {
     };
     pub use crate::align::{AlignJob, Aligner, BandedGotoh, InterSequenceGotoh};
     pub use crate::alphabet::{decode, encode};
+    pub use crate::annotate::{AnnotateOptions, ChainType};
     pub use crate::band::Band;
     pub use crate::batch::{assign_all, assign_map};
     pub use crate::config::{
@@ -84,10 +100,12 @@ pub mod prelude {
     pub use crate::germline::{GermlineSet, SegmentKind};
     pub use crate::orient::{Orientation, OrientationPolicy, StrandIndex};
     pub use crate::pipeline::{AlleleCatalog, Assigner, AssignerOptions, Call, VdjAssigner};
+    pub use crate::prepare::{GermlineTexts, PreparedDatabase, prepare};
     pub use crate::profiles::CallingProfile;
     pub use crate::reads::{ReadFormat, ReadReader, ReadRecord};
     pub use crate::report::{AirrRecord, SupportModels};
     pub use crate::retrieve::{Candidate, ExhaustiveRetriever, Retriever};
+    pub use crate::run::{Run, RunError, RunOptions, Tally};
     pub use crate::scoring::{AffineScoring, HotspotScoring};
     pub use crate::stats::KarlinAltschul;
     pub use crate::window::{

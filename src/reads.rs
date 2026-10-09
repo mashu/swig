@@ -48,6 +48,12 @@ pub enum ReadError {
     MissingSeparator {
         header: String,
     },
+    /// A FASTQ sequence line holds whitespace or a control character, which
+    /// would split an output column.
+    InvalidSymbol {
+        line: usize,
+        found: char,
+    },
     QualityLength {
         header: String,
         sequence: usize,
@@ -77,6 +83,9 @@ impl fmt::Display for ReadError {
             }
             Self::MissingSeparator { header } => {
                 write!(f, "FASTQ record '{header}' has no '+' separator line")
+            }
+            Self::InvalidSymbol { line, found } => {
+                write!(f, "line {line}: {found:?} in a FASTQ sequence line")
             }
             Self::QualityLength {
                 header,
@@ -125,6 +134,12 @@ impl<R: BufRead> ReadReader<R> {
             buffer: String::new(),
             pending_header: None,
         }
+    }
+
+    /// The underlying input, for instance to see how far a reader over an
+    /// in-memory cursor has got.
+    pub fn get_ref(&self) -> &R {
+        &self.input
     }
 
     /// Detected format, `None` for empty input.
@@ -255,7 +270,16 @@ impl<R: BufRead> ReadReader<R> {
             if self.buffer.starts_with('+') {
                 break;
             }
-            sequence.extend(self.buffer.trim().bytes());
+            let line = self.buffer.trim();
+            // Unlike FASTA, nothing can be dropped: qualities count the
+            // bases. No-call symbols such as `.` and `-` read as N.
+            if let Some(found) = line.chars().find(|c| c.is_whitespace() || c.is_control()) {
+                return Err(ReadError::InvalidSymbol {
+                    line: self.line,
+                    found,
+                });
+            }
+            sequence.extend(line.bytes());
         }
         let mut quality = 0;
         while quality < sequence.len() {
@@ -338,6 +362,17 @@ mod tests {
             read_all(b"@r\nACGT\n"),
             Err(ReadError::MissingSeparator { .. })
         ));
+        assert!(matches!(
+            read_all(b"@r\nAC\tG\n+\nIIII\n"),
+            Err(ReadError::InvalidSymbol {
+                line: 2,
+                found: '\t'
+            })
+        ));
+        assert_eq!(
+            read_all(b"@r\nAC.T-\n+\nIIIII\n").unwrap(),
+            [record("r", "AC.T-")]
+        );
         assert!(matches!(
             read_all(b"ACGT\n"),
             Err(ReadError::UnknownFormat {

@@ -7,6 +7,9 @@ description = "Seeded, banded affine V(D)J germline assignment with placement-DA
 
 [dependencies]
 
+[workspace]
+members = ["wasm"]
+
 [[bin]]
 name = "vdj-assign"
 path = "src/bin/assign.rs"
@@ -15,3 +18,10 @@ doc = false
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# The WebAssembly modules (`wasm/build.sh`): whole-program LTO and no symbol
+# names, for a smaller download.
+[profile.wasm]
+inherits = "release"
+lto = "fat"
+strip = true

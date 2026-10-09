@@ -1,0 +1,14 @@
+[package]
+name = "vdj_assign_wasm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "WebAssembly module of vdj_assign for browsers, Web Workers and Node.js"
+publish = false
+
+[lib]
+# `cdylib` is the .wasm module; `rlib` lets `cargo test` run its tests natively.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+vdj_assign = { path = ".." }

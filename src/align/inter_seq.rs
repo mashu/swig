@@ -12,7 +12,8 @@
 //!
 //! **Any CPU.** The kernel ([`fill`]) is written once over the [`Lanes`]
 //! abstraction and compiled per [`Backend`] — AVX-512BW (32 lanes), AVX2,
-//! NEON or portable Rust (16 lanes each) — chosen at run time.
+//! NEON, WebAssembly `simd128` or portable Rust (16 lanes each) — chosen at
+//! run time (at build time for WebAssembly).
 //!
 //! **Band-relative coordinates.** A diagonal band is stored as rows `i` ×
 //! offsets `k = (i − j) − lo`. Every lane walks the same `(row, k)` grid even
@@ -54,6 +55,8 @@
 use super::gotoh::{BandedGotoh, GotohWorkspace, traceback_with};
 #[cfg(target_arch = "aarch64")]
 use super::lanes::Neon;
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+use super::lanes::Simd128;
 #[cfg(target_arch = "x86_64")]
 use super::lanes::{Avx2, Avx512};
 use super::lanes::{Kernel, Lanes, Portable};
@@ -86,6 +89,9 @@ pub enum Backend {
     Avx2,
     /// AArch64 NEON: 16 lanes in two registers.
     Neon,
+    /// WebAssembly `simd128`: 16 lanes in two registers. Present only in
+    /// builds with the `simd128` target feature.
+    Simd128,
     /// Plain Rust lanes on any target, vectorised by the compiler for the
     /// target's baseline SIMD: 16 lanes.
     Portable,
@@ -94,15 +100,17 @@ pub enum Backend {
 }
 
 impl Backend {
-    pub const ALL: [Backend; 5] = [
+    pub const ALL: [Backend; 6] = [
         Self::Avx512,
         Self::Avx2,
         Self::Neon,
+        Self::Simd128,
         Self::Portable,
         Self::Scalar,
     ];
 
-    /// Whether this CPU can run the backend.
+    /// Whether this CPU can run the backend (for `Simd128`, whether this
+    /// build has it).
     pub fn available(self) -> bool {
         match self {
             #[cfg(target_arch = "x86_64")]
@@ -111,8 +119,9 @@ impl Backend {
             Self::Avx2 => std::arch::is_x86_feature_detected!("avx2"),
             #[cfg(target_arch = "aarch64")]
             Self::Neon => std::arch::is_aarch64_feature_detected!("neon"),
+            #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+            Self::Simd128 => true,
             Self::Portable | Self::Scalar => true,
-            #[allow(unreachable_patterns, reason = "per-architecture arms")]
             _ => false,
         }
     }
@@ -120,18 +129,28 @@ impl Backend {
     /// The fastest backend this CPU runs. AVX-512 is used only when the
     /// `avx512` preference is given ([`InterSequenceGotoh::with_backend`]):
     /// on many CPUs 512-bit instructions lower the clock of every core.
+    /// Without an explicit backend, portable lanes, which the compiler
+    /// vectorises where the target's baseline has SIMD. On WebAssembly
+    /// without `simd128`, where 16 emulated lanes were measured several
+    /// times slower than the scalar kernel, the scalar kernel is chosen
+    /// instead; other targets keep portable lanes.
     pub fn detect() -> Self {
-        [Self::Avx2, Self::Neon, Self::Portable]
+        let emulated = cfg!(all(target_family = "wasm", not(target_feature = "simd128")));
+        [Self::Avx2, Self::Neon, Self::Simd128]
             .into_iter()
             .find(|b| b.available())
-            .unwrap_or(Self::Portable)
+            .unwrap_or(if emulated {
+                Self::Scalar
+            } else {
+                Self::Portable
+            })
     }
 
     /// Jobs per register.
     pub fn lanes(self) -> usize {
         match self {
             Self::Avx512 => 32,
-            Self::Avx2 | Self::Neon | Self::Portable => 16,
+            Self::Avx2 | Self::Neon | Self::Simd128 | Self::Portable => 16,
             Self::Scalar => 1,
         }
     }
@@ -141,6 +160,7 @@ impl Backend {
             Self::Avx512 => "avx512",
             Self::Avx2 => "avx2",
             Self::Neon => "neon",
+            Self::Simd128 => "simd128",
             Self::Portable => "portable",
             Self::Scalar => "scalar",
         }
@@ -692,9 +712,12 @@ impl InterSequenceGotoh {
             Backend::Avx2 => run_groups::<Avx2, 16, TRACE>(jobs, ws, emit),
             #[cfg(target_arch = "aarch64")]
             Backend::Neon => run_groups::<Neon, 16, TRACE>(jobs, ws, emit),
+            #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+            Backend::Simd128 => run_groups::<Simd128, 16, TRACE>(jobs, ws, emit),
             Backend::Portable => run_groups::<Portable, 16, TRACE>(jobs, ws, emit),
-            #[allow(unreachable_patterns, reason = "per-architecture arms")]
-            _ => {}
+            Backend::Scalar => {}
+            // Construction admits only available backends.
+            backend => unreachable!("the {} kernel is not built for this target", backend.name()),
         }
     }
 }
@@ -816,6 +839,23 @@ mod tests {
         let names: Vec<_> = available.iter().map(|a| a.backend().name()).collect();
         eprintln!("backends tested: {names:?}");
         available
+    }
+
+    /// Detection picks a backend this build runs, never the opt-in
+    /// AVX-512, and the scalar kernel on WebAssembly without `simd128`.
+    #[test]
+    fn detection_picks_a_vectorised_backend_or_the_scalar_kernel() {
+        let detected = Backend::detect();
+        assert!(detected.available());
+        assert_ne!(detected, Backend::Avx512);
+        if cfg!(target_family = "wasm") {
+            let expected = if cfg!(target_feature = "simd128") {
+                Backend::Simd128
+            } else {
+                Backend::Scalar
+            };
+            assert_eq!(detected, expected);
+        }
     }
 
     #[test]

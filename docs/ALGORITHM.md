@@ -639,7 +639,10 @@ removes. The 12-base reclaim keeps this rare. With 24 bases, D accuracy was
   recurrence for a different job. Traceback codes are bit-identical to the
   scalar kernel's, so the same traceback walk serves both. The kernel is
   written once over a lane abstraction and compiled for AVX-512BW (32
-  lanes), AVX2, NEON and portable lanes (16), chosen at run time.
+  lanes), AVX2, NEON, WebAssembly `simd128` and portable lanes (16),
+  chosen at run time (at build time for WebAssembly, which has no run-time
+  feature detection). WebAssembly without `simd128` has no SIMD to
+  vectorise portable lanes into, so there the scalar kernel runs.
   - Banded jobs use band-relative coordinates.
   - With uniform profiles, a cell's substitution is a code comparison;
     otherwise the five profile rows are selected by mask, which is exact for
@@ -651,6 +654,9 @@ removes. The 12-base reclaim keeps this rare. With 24 bases, D accuracy was
   backend equals the scalar kernel (scores, end cells, tracebacks); the
   batched pipeline equals the per-read scalar pipeline, and output is
   byte-identical across backends and across x86-64 and AArch64.
+  WebAssembly gives the same rows (`run.rs` holds the run all front ends
+  share), except that a posterior within a last-bit difference of `exp`
+  of a printed rounding tie can differ in that digit (2 of 260,000 rows).
 
 ## 7. Evaluation protocol
 
