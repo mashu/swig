@@ -135,6 +135,12 @@ impl<R: BufRead> ReadReader<R> {
         }
     }
 
+    /// The underlying input, for instance to see how far a reader over an
+    /// in-memory cursor has got.
+    pub fn get_ref(&self) -> &R {
+        &self.input
+    }
+
     /// Detected format, `None` for empty input.
     pub fn format(&mut self) -> Result<Option<ReadFormat>, ReadError> {
         if !self.started {

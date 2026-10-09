@@ -371,6 +371,14 @@ impl Run {
         })
     }
 
+    /// The alignment kernel the run uses.
+    pub fn backend(&self) -> Backend {
+        match &self.engine {
+            Engine::Dag(assigner) => assigner.aligner.backend(),
+            Engine::Residual(assigner) => assigner.aligner.backend(),
+        }
+    }
+
     /// Whether rows carry the `c_` columns (a C database was given).
     pub fn has_constant(&self) -> bool {
         match &self.engine {
