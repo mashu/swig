@@ -834,7 +834,7 @@ and a portable backend), and so are allele rescoring along the gene frame
 (§9.6), calls from the per-read model (§9.8) and the annotation priors
 (§10). The D prior from the D search's own statistics is implemented and
 measured, and stays a switch (§9.9): the search's count is derived, the
-presence rate is not. C-segment assignment remains open.
+presence rate is not. C-segment assignment is done too (§11).
 
 ### 9.8 Calls from the per-read model
 
@@ -1141,3 +1141,187 @@ TRGV starts copied from an unflagged chain-default donor were silent.
 - **Pre-existing silent errors on stripped IGH alleles:**
   - IGHV3-41\*02's CDR2 start, transferred from IGHV3-7\*03 across an indel;
   - IGHV1/OR15-4\*01's FR2 start (stripped half only).
+
+## 11. The constant region (roadmap item 6)
+
+### 11.1 What was decided
+
+- **C is a segment kind, not a lattice kind.** `SegmentKind::C` exists for
+  databases, reports and placements, but adjudication iterates
+  `SegmentKind::REARRANGED` only, and debug assertions keep C placements out
+  of the lattice and the V(D)J report. A C kind in the DAG would let C
+  evidence move the J exit or the J allele (the prototype saw 10 J flips in
+  6,000 reads when a C's repeated `G` completed IGHJ6\*02/\*03), every read
+  would pay for it, and the read's SHM divergence does not apply to C.
+- **A stage after adjudication** (`constant.rs`) reads finished calls only:
+  V, D and J are unchanged by construction, and a run without `--c` does no
+  C work. The model, the anchor column that makes the anchored DP exact on
+  every kernel, the reach classes and the gate are in ALGORITHM.md §4b.
+- **The gate is derived, not tuned:** `E_C = N_C·(2s + 1)·e^(−λS) ≤ 10⁻³`,
+  the anchor gate of V and J.
+- **The prototype's accuracy metric was near-tautological.** Its truth
+  counted an allele equivalent when it *contained* the C part anywhere, and
+  its gene tally accepted any equivalent allele's gene. On IGHC a 16–32 nt C
+  part then spans 2.6 genes on average, so "100 % at 16 nt" mostly said that
+  the hit lay in the right prefix class. The truth is now *anchored* (the
+  allele's germline from its own splice offset equals the simulated bases),
+  and the table adds the first name's gene, exact gene sets, over-calls and
+  the oracle's resolution.
+- **Other corrections of the design review.** No sibling bound table for C
+  (its Δ sums over CH2/CH3, beyond any read's reach; reach classes already
+  remove the redundancy). The 16-bit lane limit depends on the longest C
+  record, not on read length, so `prepare --c` warns about records over
+  2 kb or without a stop-free frame (genomic C-GENE records). `s = 3` rests
+  on the measured histogram below. The truth gains `c_` columns only with
+  `--c`, so existing datasets stay byte-identical.
+
+### 11.2 Measurements
+
+**Datasets.** `simulate --c`, seed 7, 20,000 reads per preset, on the same
+V(D)J model and seeds as the six existing sets:
+- IMGT human IGH with abstar's human IGHC (88 records, 81 distinct, 10 genes,
+  codon-aligned: each record repeats the J's last base);
+- the synthetic database (seed 1) with its synthetic C (25 alleles, 14 genes
+  in 5 isotypes whose subclasses share CH1's opening; IMGT-style records).
+
+80 % of reads read into C, the whole 3′ flank for 60 % of those, else a
+uniform part of it. About 4,100 reads per set carry no C base.
+
+**Invariance (must hold).**
+- Without `--c`, AIRR output is byte-identical to the previous release on
+  all six existing sets, for each of the AVX-512, AVX2, portable and scalar
+  kernels; `simulate` without `--c` writes byte-identical reads and truth.
+- With `--c`, the V/D/J columns are byte-identical to the run without it on
+  the six existing sets (AVX2 and scalar) and on the six C sets.
+
+**C accuracy** (per C-length stratum, the range over easy/mid/hard; equivalence
+is anchored; gene set = the reported genes are exactly the equivalent ones;
+over-call = a reported name outside the equivalent set, per call):
+
+| Database | C part | Reads | Called | Primary equivalent | First name's gene | Gene set exact | Over-call | Genes listed / equivalent |
+|---|---|---|---|---|---|---|---|---|
+| IGH | none | 4109–4141 | 0.00–0.05 % | | | | | |
+| IGH | 1–7 nt | 508–550 | 1.0–2.6 % | 1.0–2.6 % | | | 0 | |
+| IGH | 8–15 nt | 592–643 | 90.3–91.9 % | 90.0–91.6 % | 60.3–61.5 % | 89.5–91.1 % | ≤ 0.37 % | 2.6 / 2.6 |
+| IGH | 16–31 nt | 1168–1246 | 99.8–100 % | 99.60–100 % | 66.5–68.7 % | 97.9–99.0 % | ≤ 0.40 % | 2.6 / 2.6 |
+| IGH | 32–63 nt | 3867–4330 | ≥ 99.95 % | 99.86–99.90 % | 90.3–90.5 % | 97.9–98.6 % | ≤ 0.28 % | 1.73 / 1.75 |
+| IGH | 64–127 nt | 7455–8347 | ≥ 99.88 % | 99.79–99.96 % | 94.2–95.1 % | 99.8–99.9 % | ≤ 0.12 % | 1.4 / 1.4 |
+| IGH | 128+ nt | 1051–1896 | ≥ 99.88 % | 99.82–99.95 % | 96.7–97.4 % | 99.8–100 % | ≤ 0.11 % | 1.1 / 1.1 |
+| synthetic | none | 4001–4138 | 0.02–0.05 % | | | | | |
+| synthetic | 8–15 nt | 575–649 | 78.4–81.6 % | 78.4–81.6 % | 28.7–30.7 % | 74.9–77.4 % | 0 | 2.9 / 3.0 |
+| synthetic | 16–31 nt | 1164–1272 | ≥ 99.84 % | 99.84–100 % | 50.5–52.2 % | 91.7–93.6 % | ≤ 0.26 % | 2.4 / 2.6 |
+| synthetic | 32–63 nt | 3846–4284 | ≥ 99.91 % | 99.81–99.93 % | 95.1–96.1 % | 98.9–99.0 % | ≤ 0.26 % | 1.14 / 1.15 |
+| synthetic | 64+ nt | 9231–9755 | ≥ 99.80 % | 99.75–100 % | 99.75–100 % | 99.7–100 % | ≤ 0.12 % | 1.0 / 1.0 |
+
+- **No C call on reads without C:** 0, 0, 2, 2, 2 and 1 false calls in about
+  4,100 C-free reads per set (≥ 99.95 %). On the six existing sets, whose
+  3′ flanks are random, 4–8 reads in 20,000 get a C call.
+- **Primary equivalent ≥ 99.6 % in every stratum from 16 nt.** The misses
+  are instrument errors that turn the true allele's base into another
+  allele's (8–14 per set) and, on hard reads, reads without a J call, a
+  correct orientation or a J exit next to C (16–23 per hard set).
+- **8–15 nt** is limited by the gate: `S ≥ 18` needs 9 exact bases on IGH
+  (10 genes), `S ≥ 19` needs 10 on the synthetic database (14 genes); every
+  call there is equivalent.
+- **Exact gene sets trail the anchored oracle** at 16–63 nt (IGH 97.9–99.0 %,
+  synthetic 91.7–99.0 %). Of the misses from 16 nt, 679 are on reads whose
+  C part is followed by other bases (2.2 % of 30,220 such reads), 34 on reads
+  ending in C (0.06 % of 58,239): a chance match after the C part extends some
+  alleles, which no read-level caller can tell from a C base. The oracle
+  knows where C ends; the read does not.
+- **The first name is a guess among genes for short C parts:** 61 % on IGH at
+  8–15 nt and 67–69 % at 16–31 nt, where the listed genes are right 98–99 %
+  of the time. Read the isotype from the gene set of `c_call`, not its
+  first name.
+
+**Against the local K·m·n gate** (same calls, kept when
+`K·m·n·e^(−λS) ≤ 10⁻³` with `m` the bases after the J exit and `n` the C
+database length; paired, exact McNemar):
+
+| Set | C allele, K·m·n → anchored | p | No C call | p |
+|---|---|---|---|---|
+| IGH easy / mid / hard | +3.93 / +4.06 / +4.25 pp | < 10⁻¹⁸⁷ | 0 / 0 / −0.05 pp | 1 / 1 / 0.5 |
+| synthetic easy / mid / hard | +3.01 / +3.00 / +3.18 pp | < 10⁻¹⁴² | −0.05 / −0.05 / −0.02 pp | 0.5 / 0.5 / 1 |
+
+**Calibration of `c_posterior`** (event: some reported name is
+anchored-equivalent): ECE 0.13–0.18 %, Brier 0.0002–0.0006 on every set.
+Only 7–14 reads per set have `c_posterior < 0.95`, too few to judge
+calibration below it: with C's own divergence near zero, ties are the only
+real ambiguity, and ties are listed.
+
+**Read content without `--c`** (C reads against the same reads without C,
+paired on the same V(D)J truth): V, D, no D call and junction are within
+noise everywhere. J allele is −0.01 / −0.10 / −0.52 pp on IGH easy / mid /
+hard (p = 0.5, 1·10⁻⁶, 5·10⁻³⁰) and within noise on the synthetic database. Every
+lost read is an IGHJ6\*02 or \*03 read called IGHJ6\*01 or \*04: those IMGT
+records are 3′-partial (one base short), and the base that follows them in a
+read through C (the C's `G`, which the record lacks) completes the longer
+alleles. It is a property of the reads and the J records, not of the C
+stage, and `--c` changes no J call.
+
+**Cost** (callgrind, 2,000 IGH C reads, one thread):
+
+| Reads | Without `--c` | With `--c` | C share | of which the stage / report / database |
+|---|---|---|---|---|
+| mid | 9,684,669,685 | 10,661,256,792 | 9.2 % | 742 M / 108 M / ≈ 100 M |
+| hard | 9,230,962,862 | 10,176,966,565 | 9.3 % | 710 M / 112 M / ≈ 100 M |
+
+The database part is a fixed cost per run: the gene frames behind `prepare`'s
+truncation warning. Without `--c` the C stage costs nothing: 9,230,582,300
+instructions on the standard 2,000 hard reads against 9,233,069,238 before
+the stage existed (and 9,330,252,064 before this item's kernel
+prerequisite, −1.1 %).
+
+**Where the J exit lies** (`x` minus the read position of C's germline
+base 0; IGH reads have `o = 1`, except after the 3′-partial IGHJ6\*02/\*03):
+
+| Set | −1 | 0 | +1 | +2 | other |
+|---|---|---|---|---|---|
+| IGH mid | 1 | 2,426 | 13,442 | 1 | 0 |
+| IGH hard | 5 | 2,334 | 13,520 | 16 | 7 (+91 to +100) |
+| synthetic mid | 4 | 15,850 | 8 | 0 | 0 |
+| synthetic hard | 31 | 15,922 | 22 | 1 | 3 (−23, +4, +10) |
+
+The IGH conventions take one base of the spread; SHM indels add one more,
+rarely two.
+
+**Sensitivity** (20,000 hard reads; false calls on about 4,000 C-free reads,
+equivalence at 8–15 nt and from 16 nt, exact gene set from 16 nt):
+
+| Set | s | E = 1 | 10⁻¹ | 10⁻² | 10⁻³ | 10⁻⁴ | 8–15 nt at 10⁻³ | ≥ 16 nt | gene set ≥ 16 nt |
+|---|---|---|---|---|---|---|---|---|---|
+| IGH | 1 | 928 | 104 | 19 | 1 | 0 | 91.1 % | 99.69 % | 99.21 % |
+| IGH | 3 | 812 | 101 | 16 | 2 | 0 | 90.8 % | 99.80 % | 99.30 % |
+| IGH | 6 | 967 | 107 | 14 | 3 | 0 | 78.5 % | 99.80 % | 99.29 % |
+| synthetic | 1 | 983 | 99 | 5 | 1 | 1 | 91.2 % | 99.78 % | 98.95 % |
+| synthetic | 3 | 639 | 92 | 7 | 1 | 0 | 78.4 % | 99.79 % | 98.94 % |
+| synthetic | 6 | 458 | 99 | 12 | 3 | 0 | 78.4 % | 99.80 % | 98.93 % |
+
+The equivalence from 16 nt does not depend on the gate between 1 and 10⁻⁴.
+False calls stay 2–6× below the bound `E` per read at every gate from 1 to
+10⁻³. `s = 1` misses the IGH reads two bases off (−0.11 pp from 16 nt on
+hard); `s = 6` adds start hypotheses, which raise the gate by a base at
+8–15 nt. `s = 3` costs the synthetic database's 10-base threshold at
+8–15 nt (78 % against 91 % at `s = 1`).
+
+**Deterministic null.** After every one of the 13 human IGHJ alleles, eight
+fixed tails (TruSeq read 1 and 2 adapters, Nextera, poly-A, poly-G, poly-T,
+and two splice donors with intron) score at most 7 against abstar's IGHC
+(clipped, any allele and start); the gate needs 18. `tests/robustness.rs`
+runs the same check on the synthetic database (best 4–6; a gate of E ≤ 10
+would call them).
+
+### 11.3 What is still weak
+
+- **The first `c_call` name** among genes sharing a short C part is
+  arbitrary. The gene set is right; the first name is not an isotype call.
+- **Bases after C extend some alleles by chance**, so the reported genes can
+  be fewer than the read's true ambiguity (2.2 % of C parts followed by
+  other bases, from 16 nt). `c_posterior` does not see it: the extension is
+  real evidence to the model.
+- **Short C parts** need 9–10 exact bases to pass the gate.
+- **Net indel drift** inside C beyond `s ∓ δ` truncates the C alignment.
+- **3′-partial J records** (IGHJ6\*02/\*03) lose J calls on reads that
+  continue into C, with or without `--c` (−0.52 pp J on hard IGH reads).
+- **`c_posterior` below 0.95** is too rare in simulation (≤ 14 reads per
+  20,000) to check its calibration there.

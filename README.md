@@ -28,15 +28,17 @@ target/release/vdj-assign --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta \
     [--profile r|truth|igblast|sensitive-d] [--threads N] [--tandem-d] \
     [--chain heavy|light] [--forward-only] [--no-anchor-window] [--no-posterior] [--residual] \
     [--calls per-read|fixed] [--d-allele map|max-marginal] [--d-presence-rate R] \
-    [--simd avx512|avx2|neon|portable|scalar] reads.fastq > calls.tsv
+    [--simd avx512|avx2|neon|portable|scalar] [--c IGHC.fasta [--c-evalue E]] \
+    reads.fastq > calls.tsv
 
 zcat reads.fastq.gz | target/release/vdj-assign --v V.fasta --d D.fasta --j J.fasta - > calls.tsv
 
 # optional: write the annotated database for review or curation
-target/release/vdj-assign prepare --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta --out prepared/
+target/release/vdj-assign prepare --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta [--c IGHC.fasta] \
+    --out prepared/
 
 # simulate reads with known truth (IgSim model), then score any tool's AIRR TSV against it
-target/release/vdj-assign simulate --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta \
+target/release/vdj-assign simulate --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta [--c IGHC.fasta] \
     --preset hard --reads 10000 --seed 1 --out sim          # sim.fasta + sim.truth.tsv
 target/release/vdj-assign --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta sim.fasta > calls.tsv
 target/release/vdj-assign evaluate --truth sim.truth.tsv calls.tsv   # works for IgBLAST etc. too
@@ -82,6 +84,19 @@ Region columns follow: `fwr1`–`fwr4`, `cdr1`–`cdr3`
 (sequence, `_start`, `_end`), `cdr3_aa`, `junction`, `junction_length`,
 `junction_aa`, `vj_in_frame`, `stop_codon` and `productive`. A read without a
 significant V or J (see *Significance* below) is written with empty calls.
+
+**Constant region (isotype).** With `--c C.fasta`, twelve `c_` columns
+follow `productive` (`c_call`, `c_score`, `c_identity`, `c_support`,
+`c_posterior`, `c_cigar`, sequence and germline coordinates and alignments);
+without it the output is unchanged. C's germline base 0 is anchored within 3
+bases of the called J's end and aligned exactly from there to the read's
+end; V, D and J calls never change. `c_support` is the anchored E-value
+`N_C·7·e^(−λS)` over the file's C genes and start diagonals, and C is called
+at `c_support ≤ 10⁻³` (`--c-evalue`). Give one locus' spliced coding C
+regions, CH1 onward (IMGT or codon-aligned records such as abstar's both
+work), since every gene in the file counts. `c_call` lists every co-optimal
+allele: for a short C part shared by several genes (IGHG1/2/4 open alike)
+the *first* name is any of them, so read the isotype from the genes listed.
 
 As a library:
 
@@ -252,14 +267,21 @@ Synthetic genes are built from heavy and light framework templates:
 ### `prepare`
 
 `vdj-assign prepare` writes `V.fasta`, `D.fasta` and `J.fasta` with every
-anchor and region start in the headers (plus `annotation=SOURCE`), and
-`annotation.tsv` with one row per allele:
+anchor and region start in the headers (plus `annotation=SOURCE`), `C.fasta`
+with `--c`, and `annotation.tsv` with one row per allele:
 
 - frame, anchor and its residue;
 - region starts, CDR1 and CDR2 lengths in codons;
 - source (`header`, `imgt-gaps`, `motif`, `consensus`, `transfer:NAME`,
   `low-confidence`, `missing`) and notes. The notes end with an
   `uncertain=cdr1,fr3`-style token naming the starts that may be wrong.
+
+With `--c`, `prepare` and assignment warn about database conventions that
+keep C from being called: a C allele missing more than 3 bases at its 5′ end
+against its gene, a C record over 2 kb or without a stop-free reading frame
+(a genomic record with introns, not the spliced coding region), and a J
+allele whose bases past its anchor differ from most J alleles' by more than 3
+(bases past the splice donor move the J exit off the splice).
 
 Reloading the written FASTA uses the headers as-is, so manual corrections
 stick. Assignment runs log a one-line summary. They warn when any allele is
@@ -274,7 +296,8 @@ no FR3 start, so that every FR3 start rests on one chain default.
                 ─► per read: J window right of V ─► J stage, whole chunk (every allele)
                 ─► per read: D windows from V/J geometry, D candidates (L-mer bitsets)
                 ─► D stage, whole chunk ─► per read: admission gates
-                ─► per read: placement DAG over VJ / VDJ / VDDJ ─► anchor check ─► Call ─► AIRR
+                ─► per read: placement DAG over VJ / VDJ / VDDJ ─► anchor check ─► Call
+                ─► with --c, whole chunk: C anchored at the J exit (one job per reach class) ─► AIRR
 ```
 
 Every per-read decision is taken per read. Batch aligners must answer
@@ -296,6 +319,7 @@ stages are the methods `stage_orient`, `stage_v`, `stage_j`, `stage_d` and
 | `segment`, `family_bound` | One search stage: score → sibling bounds along the gene frame → traceback waves → acceptance and E-value gates → outer extension |
 | `clip`, `evidence`, `placement` | O(1) clip-and-rescore at any cut; exact-run / identity evidence |
 | `window`, `admission` | Where J and D are searched; D evidence gates |
+| `constant`, `retrieve/reach` | Constant region after adjudication: splice window, anchor-column DP, anchored E-value and posterior; one candidate per class of alleles the read cannot reach apart |
 | `adjudicate/{lattice,dag,posterior,units,model,decode,residual}` | The placement lattice; Viterbi and forward–backward over it; the per-read model in integer units both read; grammar and log-odds path model; max-marginal D decoding; residual baseline |
 | `flank` | Outer-flank extension of V and J alignments |
 | `pipeline`, `config`, `profiles` | Stage-wise composition, declarative configuration, calling profiles |
@@ -335,6 +359,11 @@ The full description, with the guarantee of each search step, is in
 - **Significance.** A V or J hit is kept at E ≤ 1 against its database and
   window. A read is called only when its path contains an *anchor*, a V or J
   hit at E ≤ 10⁻³, so random sequence receives no call.
+- **Constant region.** C is spliced to J at a fixed phase, so C's base 0
+  lies within `s = 3` bases of the J's exit. A bonus column in front of C
+  turns every local aligner into an exact anchored one, and C is called at
+  an anchored E-value `N_C·(2s + 1)·e^(−λS) ≤ 10⁻³`, after adjudication, so
+  it never moves a V, D or J call.
 - **Posterior probabilities.** Read as a distribution, `P(path, cuts) ∝
   exp(nats)`, the same model gives calibrated probabilities by
   forward–backward over the same DAG; the other priors stay at their
@@ -608,13 +637,20 @@ model and the `easy`/`mid`/`hard` presets:
 - gated SHM with single-base indels, and Illumina substitutions;
 - optional tandem DD.
 
-It extends IgSim in three ways:
+It extends IgSim in four ways:
 - **Per-base germline origins.** Boundaries, junctions and germline-equivalent
   alleles are exact truth even across indels.
 - **Optional reverse complementation.**
+- **Optional constant region** (`simulate --c`). 80 % of reads continue
+  through the J–C splice into a C allele, from the base that follows the J
+  in the reading frame (so IMGT and codon-aligned C records both work), for
+  the whole 3′ flank or a uniform part of it. It draws from a random stream
+  of its own: without `--c`, reads and truth are byte-identical, and with it
+  their V(D)J part is.
 - **`SyntheticDatabase`.** An IGH-like germline with a family → gene → allele
-  similarity hierarchy and conserved anchors, for tests that cannot ship
-  IMGT-derived data.
+  similarity hierarchy and conserved anchors, plus constant regions whose
+  subclasses share CH1's opening, for tests that cannot ship IMGT-derived
+  data.
 
 `sim::Truth` holds one read's ground truth and reads and writes it as TSV.
 `sim::Assignment` is a call, built from an `AirrRecord` or from any tool's
@@ -625,7 +661,12 @@ expose both, so other callers can be scored on identical reads.
   trimmed, pre-mutation germline body (no read can separate such alleles);
 - *gene*, *listed* (truth among the reported names) and *exact*;
 - boundary errors, D presence by remnant length, junction exactness;
-- a random-read negative control.
+- a random-read negative control;
+- with C, by C length: calls on reads without C, the primary name's
+  *anchored* equivalence (the allele reads the simulated bases from its own
+  splice offset; containment anywhere would make almost any allele
+  equivalent to a short C part), the first name's gene, exact gene sets,
+  over-calls and the oracle's resolution.
 
 `sim::Paired` compares two callers read by read on the same truth: for V, D
 and J allele equivalence, D-free reads left without a D call, and junction
@@ -775,7 +816,17 @@ window; searching J over the whole read lets 0.05 % fall outside.
   intervals of ±1–4 pp and hide most regressions.
 - **Robustness (`tests/robustness.rs`):** empty, 1-base, all-N, IUPAC,
   low-complexity, 20 kb, chimeric reads and every prefix and suffix of a read
-  through every profile, with AIRR-record invariants.
+  through C, through every profile with the C stage, with AIRR-record
+  invariants; C without a J, V–J reads ending in nothing, one base or N, and
+  adapters, homopolymers and splice donors after every J are never called C.
+- **Constant region:** the anchor-column alignment equals a textbook anchored
+  Gotoh on 500 random cases through every backend; reach-class members align
+  identically; V, D and J calls, placements and posteriors are identical with
+  and without the C stage, and batched SIMD C calls equal per-read scalar
+  ones; anchored
+  truth, C-length strata and the simulator's reading frame are tested, and
+  `tests/simulated.rs` bounds C accuracy, false calls and `c_posterior`
+  calibration.
 - **Cross-architecture:** the suite passes on x86-64 and on AArch64 (CI runs
   both), and AArch64 output equals x86-64 output byte for byte.
 - **Synthetic calling (`tests/synthetic.rs`):** D genes, D-free junctions,
@@ -887,6 +938,18 @@ Each is a named field you can change.
   start without a flag. None occurred in the tests or the 13 loci.
 - **IUPAC codes.** Germline IUPAC codes are stored as N, and a written
   database spells them N.
+- **The constant region.**
+  - The first `c_call` name is arbitrary among genes that share a short C
+    part (IGHG1/2/4 open alike); the listed genes are right.
+  - Bases after the C part (adapter, primer) can extend some alleles by a
+    chance match and narrow the list: 2.2 % of simulated C parts from 16 nt
+    followed by other bases.
+  - A C part needs about 9 exact bases to pass the gate (10 human IGHC
+    genes), and net indel drift beyond 3 bases inside C truncates its
+    alignment.
+  - 3′-partial J records (IMGT IGHJ6\*02/\*03) lose J calls to their longer
+    siblings on reads that continue into C, whose first base completes them
+    (−0.5 pp J on hard simulated reads, with or without `--c`).
 
 ## Roadmap
 
@@ -920,4 +983,10 @@ In order of expected value; reasons and measurements are in
 5. ~~**Annotation.**~~ Done: IMGT gap numbering, FR3 from annotated relatives
    or a learned length, a learned Cys23 model, and structured `uncertain=`
    flags (see the assessment, §10).
-6. **C-segment assignment.**
+6. ~~**C-segment assignment.**~~ Done: `--c` anchors C's base 0 at the
+   called J's exit and aligns it exactly with any kernel, after
+   adjudication, so V/D/J output is byte-identical with and without it and
+   costs nothing without it. On 20,000 simulated reads per preset (human IGH
+   with abstar's IGHC; synthetic): ≤ 2 false calls on ~4,100 C-free reads,
+   primary C allele anchored-equivalent ≥ 99.6 % from 16 nt, `c_posterior`
+   ECE ≤ 0.18 %, 9 % of instructions with `--c`. See ASSESSMENT §11.

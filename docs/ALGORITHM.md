@@ -510,6 +510,93 @@ three junction fixtures under VJ, VDJ and VDDJ grammars, with and without an
 N/P cost, at `p̂` = 0.5 %, `δ` and 30 %: the call is a mode of the reported
 posterior.
 
+## 4b. Constant region (`constant.rs`)
+
+With a C database (`--c`), the constant region is assigned after
+adjudication, from finished calls only. V, D and J calls are unchanged by
+construction (tested on every backend and on 20,000-read sets), and a run
+without C does no C work.
+
+**Model.** J and C are joined by an RNA splice at a fixed phase: no N/P
+bases, no hypermutation, and C's germline base 0 lies next to the J's
+germline 3′ end. With `x` the called J's exit (taken only when J ends the
+path and bases follow it), hypothesis `H(a, δ)` puts base 0 of C allele `a`
+at read position `x + δ`, `|δ| ≤ s`, `s = 3`. Reference conventions differ by
+a base (IMGT CH1 records start after the J's last base, codon-aligned
+records such as abstar's repeat it, 3′-partial J records end a base early),
+and indels near the J's 3′ end move `x`; on 20,000 hard reads, `x` minus the
+true position of C's base 0 lies in `[−1, +2]` for all but 7 of 15,882 IGH
+reads (ASSESSMENT §11). C never enters the placement lattice: a C kind there
+would let C evidence move the J exit or the J allele.
+
+**Exact anchored DP with a local aligner.** An anchored alignment (start
+pinned to `C[0]` on one of `2s + 1` diagonals, free end) is a local alignment
+of `C′ = [N] + C` whose column 0 scores a bonus `B = matched·max|C| + 1`
+against any base (`scoring::AnchorColumn`). An alignment avoiding column 0
+scores at most `matched·max|C| < B`, and column 0 can only begin an
+alignment, so every optimal local alignment starts there and
+
+```text
+max local score = B + max over δ of the anchored score
+```
+
+Every kernel, scalar and SIMD, therefore returns the exact anchored optimum;
+stripping column 0 gives the alignment on `C`, which is then clipped to
+`[x, n)` so C explains only bases the J does not. The query window is
+`[x − s − 1, n)` with band `[0, 2s]`; the band is also the drift corridor:
+a C starting at `x + δ` admits `s + δ` net deletions and `s − δ` net
+insertions, beyond which the free end truncates the alignment. C records up
+to about 2 kb keep `B` and every score inside the 16-bit SIMD lanes; a
+longer (genomic) record runs on the exact scalar kernel, and `prepare`
+warns about it.
+
+**Candidates: reach classes** (`retrieve/reach.rs`). An anchored alignment
+reaches at most `R = (n − x) + s` bases of `C`. Alleles with equal reached
+sequences `a[..min(R, |a|)]` fill identical in-band cells, so one
+representative per class is aligned and its class joins the placement
+afterwards; this is exact for the hypothesis set. Classes are runs of the
+alleles sorted by sequence, split where the longest common prefix of
+neighbours is below `min(R, max(|a|, |b|))`. Human IGHC has 81 distinct
+alleles but 7 distinct 32-nt prefixes.
+
+**Significance.** Under random bases after `x`, the walk from one start
+`(gene, δ)` reaches score `S` with probability at most `e^(−λS)` (Lundberg's
+bound for a walk with `E[e^(λX)] = 1`; gaps are mildly anti-conservative, as
+for every E-value here). The union over the `N_C` genes and `2s + 1`
+diagonals gives
+
+```text
+E_C(S) = N_C · (2s + 1) · e^(−λS)
+```
+
+for the clipped score `S`, reported as `c_support`. C is called iff
+`E_C ≤ 10⁻³` (`--c-evalue`), the gate of a hit that must stand on its own:
+C is not implied by V(D)J. For `(2, −3)` that is `S ≥ 18` (nine exact
+bases) for the 10 human IGHC genes. `N_C` counts every gene of the file, so
+one C database per locus keeps the gate tight. On about 4,000 C-free reads
+per 20,000-read hard set, the false-call rate is 2–6× below the bound at
+every gate from 1 to 10⁻³ (ASSESSMENT §11).
+
+**Calls and posterior.** Placements are ranked by clipped score, then the
+longest exact run, matches and allele id; `c_call` lists the co-optimal
+names, as for V, D and J. For a C part within a run shared by several genes
+(`GCCTCCACCAAG` opens IGHG1, IGHG2 and IGHG4), the first name is any of
+them, so the isotype read from it alone is a guess: on IGH 16–31 nt remnants
+it names the simulated gene 67–69 % of the time, while the listed genes are
+the anchored-equivalent ones 98–99 % of the time. `c_posterior` weighs each
+kept placement by its log-odds at C's own divergence (C is not
+hypermutated, so the read's `p̂` does not apply), estimated from the called
+C's columns, `p_C = (mismatches + ½)/(informative columns + 1)` clamped to
+`[10⁻⁴, ½]`:
+
+```text
+w_p = exp(Σ_columns (λ_C·s + μ_C) + λ·S_gap)      (λ_C, μ_C) at p_C
+c_posterior = Σ_{p tied or carried} w_p / Σ_p w_p
+```
+
+It is the probability that the reported names include the read's C allele,
+given that the read reaches C; no C-presence probability is reported.
+
 ## 5. Search
 
 Each stage narrows the hypotheses the DAG sees. The table states what each
@@ -528,6 +615,7 @@ step can lose.
 | D windows | `window.rs` | bounded | `[best V end − 12, best J start + 12)` plus the conserved-anchor window `[V Cys104 + 3, J Trp/Phe118)`. |
 | D prefilter | `retrieve/lmer_mask.rs` | lossless w.r.t. gates | Shares ≥ 1 L-mer, with `L` derived from the gates (`min_d_match`; 4 with the optional distributed-D gate, by pigeonhole). |
 | D floor | `config.rs`, `adjudicate/model.rs` | lossless for the call | Only when the DAG computes no posteriors (`--no-posterior`; `--residual` turns posteriors off): score ≥ max(gate floor, `P_D + 1`). By Lemma 1 a D at or below `P_D` adds ≤ 0, and dropping it leaves its neighbours' cuts valid (exit ≤ entry), so the no-D path is at least as good (requires `ι = 0`, the default). With posteriors every admissible D is kept: a D below the floor cannot be called but carries mass `e^{s − P_D}`, and dropping it would bias `d_presence_posterior` down. |
+| C | `constant.rs`, `retrieve/reach.rs` | exact for `\|δ\| ≤ s` | One anchored job per reach class, window `[x − s − 1, n)`, band `[0, 2s]`; the anchor column makes the local optimum the anchored one. Net indel drift inside C beyond `s ∓ δ` truncates the alignment. |
 | D admission | `admission.rs` | defined | Exact run ≥ `min_d_match` = 4 (3, 5 and 6 are all worse). The note's distributed-evidence alternative is optional and off: it admitted no D that changed a call. |
 
 *Gene frames.* The alleles of a gene are placed in one coordinate system,
@@ -570,7 +658,12 @@ Reads come from the IgSim generative model (`sim/`): uniform allele choice,
 exonuclease trims, N additions, random flanks, gated SHM with single-base
 indels, and instrument substitutions. The presets are `easy` (no SHM), `mid`
 (IgM-like) and `hard` (IgG-like); half of the reads are reverse-complemented.
-Every read base carries its germline origin.
+Every read base carries its germline origin. With a C database, 80 % of the
+reads continue through the J–C splice: the 3′ flank becomes a uniformly drawn
+C allele, from the base that follows the J's last base in the reading frame,
+for the whole flank (60 %) or a uniform part of it, with instrument errors and
+no SHM. Those draws use a random stream of their own, so the reads and the
+truth without C are byte-identical, and with C their V(D)J part is.
 
 Metrics (`sim/evaluate.rs`):
 - **germline-equivalent** allele accuracy: the primary call contains the
@@ -581,6 +674,14 @@ Metrics (`sim/evaluate.rs`):
 - D presence by remnant length;
 - junction exactness;
 - a random-read negative control;
+- for reads simulated with C (`simulate --c`), C by the length of the C part
+  against **anchored** equivalence: an allele is equivalent when its germline
+  from its own splice offset equals the simulated C bases. Containment
+  anywhere, as for V, D and J, would make almost any allele equivalent to a
+  short remnant. Alongside the primary call's equivalence the table reports
+  the first name's gene, whether the reported genes are exactly the
+  equivalent ones, names outside the equivalent set, and calls on reads
+  without C;
 - **calibration** of any reported posterior: reads binned by posterior, the
   observed frequency of the event per bin, the expected calibration error
   (ECE, `Σ_bins n_b·|mean posterior − frequency| / n`) and the Brier score.

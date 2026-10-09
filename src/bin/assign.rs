@@ -58,6 +58,9 @@ of the called J's end and aligned to the read's end, and the c_ columns follow
 productive. Give one locus' C regions (coding CH1 onward, e.g. human IGHC):
 the gate counts every C gene in the file. prepare warns about C records that
 cannot be anchored (5'-truncated, genomic) and J records whose 3' end strays.
+simulate --c reads 80 % of reads through the J-C splice into a C allele and
+adds c_call, c_equivalent, c_start and c_end to the truth; evaluate then
+scores C by its length against anchored equivalence.
 
 options:
   --profile NAME       r (default) | truth | igblast | sensitive-d
