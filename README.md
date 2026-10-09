@@ -8,8 +8,10 @@ Every component is a replaceable, statically dispatched trait, and every
 search shortcut is either lossless or measured on simulated repertoires.
 
 Zero dependencies, Rust ≥ 1.89, edition 2024. The alignment kernel runs on
-AVX-512BW, AVX2, NEON or portable SIMD lanes, chosen at run time; output is
-byte-identical across them and across x86-64 and AArch64.
+AVX-512BW, AVX2, NEON, WebAssembly SIMD or portable lanes, chosen at run
+time; output is byte-identical across them and across x86-64, AArch64 and
+WebAssembly, so the same engine also runs in a browser (see *In the
+browser* below).
 
 - [docs/ALGORITHM.md](docs/ALGORITHM.md): the model, the search and its
   guarantees, structured for a methods section.
@@ -56,7 +58,8 @@ cargo run --release --example d_errors -- --v V.fasta --d D.fasta --j J.fasta --
 
 Reads may be FASTA or FASTQ. The format is detected from the first
 character; multi-line FASTQ is supported and qualities are validated, then
-ignored. Reads are streamed in batches of 16,384, so memory stays bounded on
+ignored. FASTQ sequence lines must hold letters only (FASTA drops anything
+else, but a FASTQ quality counts each base). Reads are streamed in batches of 16,384, so memory stays bounded on
 large files, and `-` reads stdin. Gzip input is recognised and rejected with
 a `zcat` hint, since the crate has no dependencies.
 
@@ -103,12 +106,75 @@ As a library:
 ```rust
 use vdj_assign::prelude::*;
 
+let database = prepare(v_set, Some(d_set), j_set, AnnotateOptions::default())?; // dedup + anchors
 let config = CallingProfile::ROptimized.config();
-let assigner = DefaultAssigner::from_config(&config, v_set, Some(d_set), j_set)?;
+let assigner = DefaultAssigner::from_config(&config, database.v, database.d, database.j)?;
 let mut workspace = assigner.workspace();                  // one per thread
 let call = assigner.assign(&encode(b"CAGGTG..."), &mut workspace);
 let calls = assign_all(&assigner, &queries, 0);            // parallel, input order
 ```
+
+or a whole run as the command line performs it, from FASTA text to AIRR TSV
+(`vdj_assign::run`; options by their command-line names):
+
+```rust
+let mut options = RunOptions::default();
+options.set("tandem-d", None)?;
+let texts = GermlineTexts { v: &v_fasta, d: Some(&d_fasta), j: &j_fasta, c: None };
+let database = PreparedDatabase::from_fasta(texts, options.annotate())?;
+let tally = Run::new(&options, database)?.write_airr(reads.as_bytes(), &mut out)?;
+```
+
+## In the browser (WebAssembly)
+
+`wasm/` compiles the engine to a WebAssembly module, and `web/` holds its
+JavaScript API, a Web Worker and a page that assigns reads in the browser.
+The page reads the files and runs the module locally; nothing is uploaded.
+
+```sh
+rustup target add wasm32-unknown-unknown
+wasm/build.sh                                 # web/vdj_assign_simd.wasm, web/vdj_assign.wasm
+python3 -m http.server -d web 8000            # then open http://localhost:8000
+node web/test.mjs target/release/vdj-assign   # the modules against the command line
+```
+
+```js
+import { load, assignInWorkers } from './vdj-assign.js';
+
+const vdj = await load();                     // the SIMD build where the engine has SIMD
+const run = vdj.createRun({ v, d, j, c, options: { profile: 'r', 'tandem-d': true } });
+const tsv = run.assign(fastqText);            // AIRR TSV, header included
+run.free();
+
+// In a browser, one run on Web Workers, rows in input order:
+const result = await assignInWorkers({ germlines: { v, d, j, options }, reads, workers: 4 });
+```
+
+- **Same engine, same output.** The module runs `run::Run`, as the command
+  line does: the same options by the same names (`profile`, `tandem-d`,
+  `c-evalue`, …), the same database preparation and warnings, the same
+  AIRR rows. On 45,000 rows (three presets, three option sets) and in
+  headless Chromium with four workers, its TSV equals the command line's
+  byte for byte; CI checks it on every push (`web/test.mjs`).
+- **Two modules.** WebAssembly has no run-time feature detection, so
+  `vdj_assign_simd.wasm` uses the `simd128` kernel (every current browser,
+  Node.js) and `vdj_assign.wasm` the scalar kernel; `load()` validates a
+  SIMD probe and fetches the right one. 0.9 MB each, 0.3 MB gzipped, no
+  imports.
+- **Speed.** With SIMD under V8, 1,100–1,450 reads/s per worker on
+  simulated reads, about 60 % of the native AVX2 kernel (1,850–1,970 on the
+  same hard-preset file, one thread). `assignInWorkers` gives each worker
+  every `n`-th block of 256 reads; workers share nothing, and each holds a
+  copy of the reads.
+- **Zero dependencies there too.** The module exposes a small C ABI over
+  linear memory (`wasm/src/lib.rs`), so it builds with `cargo` and the
+  `wasm32-unknown-unknown` target alone; `web/vdj-assign.js` wraps it, and
+  runs in browsers, Web Workers and Node.js 18 or later.
+- **The page.** Germline FASTA files (or demo data: a synthetic database
+  and simulated reads), reads as FASTA or FASTQ (gzip decompressed by the
+  browser), every assignment option and a worker count; it gives the AIRR
+  TSV, the prepared database files and a preview. CI uploads `web/` with
+  both modules as the `vdj-assign-web` artifact, ready for static hosting.
 
 ## Germline annotation and regions
 
@@ -323,6 +389,7 @@ stages are the methods `stage_orient`, `stage_v`, `stage_j`, `stage_d` and
 | `adjudicate/{lattice,dag,posterior,units,model,decode,residual}` | The placement lattice; Viterbi and forward–backward over it; the per-read model in integer units both read; grammar and log-odds path model; max-marginal D decoding; residual baseline |
 | `flank` | Outer-flank extension of V and J alignments |
 | `pipeline`, `config`, `profiles` | Stage-wise composition, declarative configuration, calling profiles |
+| `run` | A whole run, shared by the command line and the WebAssembly module: options by their command-line names, the assigner they build, reads streamed to AIRR TSV |
 | `report`, `batch` | AIRR output, parallel batches |
 | `sim/{random,params,simulate,synthetic,evaluate}` | IgSim port, synthetic germlines, accuracy evaluation |
 
@@ -567,8 +634,12 @@ or identity acceptance floor, siblings are pruned only below the score floor.
   compiled per backend inside a `#[target_feature]` entry point:
   AVX-512BW (32 lanes, opt-in with `--simd avx512` because 512-bit
   instructions lower the clock on many CPUs), AVX2 (16), NEON (16 in two
-  registers) and portable Rust arrays (16) that the compiler vectorises for
-  the target's baseline SIMD. `Backend::detect` chooses at run time.
+  registers), WebAssembly `simd128` (16 in two registers, in builds with
+  that feature) and portable Rust arrays (16) that the compiler vectorises
+  for the target's baseline SIMD. `Backend::detect` chooses at run time;
+  on a target without baseline SIMD (WebAssembly without `simd128`), where
+  emulated lanes run about 4× slower than one scalar job, it chooses the
+  scalar kernel.
 
 **Stage-wise batching across reads.** A read has only a few V, J and D
 candidates, too few to fill 16 lanes. So every stage runs over a chunk of 64
@@ -828,7 +899,11 @@ window; searching J over the whole read lets 0.05 % fall outside.
   `tests/simulated.rs` bounds C accuracy, false calls and `c_posterior`
   calibration.
 - **Cross-architecture:** the suite passes on x86-64 and on AArch64 (CI runs
-  both), and AArch64 output equals x86-64 output byte for byte.
+  both), and AArch64 output equals x86-64 output byte for byte. It also
+  passes on `wasm32-wasip1` with `simd128` under Wasmtime (CI), where the
+  kernel tests compare the `simd128`, portable and scalar kernels, and the
+  browser modules' output equals the native command line's
+  (`web/test.mjs`).
 - **Synthetic calling (`tests/synthetic.rs`):** D genes, D-free junctions,
   tandem VDDJ, hypermutated V, reverse complements, residual adjudicator.
 - **Batch consistency:** chunk-batched parallel output equals per-read
@@ -990,3 +1065,8 @@ In order of expected value; reasons and measurements are in
    with abstar's IGHC; synthetic): ≤ 2 false calls on ~4,100 C-free reads,
    primary C allele anchored-equivalent ≥ 99.6 % from 16 nt, `c_posterior`
    ECE ≤ 0.18 %, 9 % of instructions with `--c`. See ASSESSMENT §11.
+7. ~~**WebAssembly.**~~ Done: a `simd128` kernel backend, a zero-dependency
+   module (`wasm/`) and a browser page (`web/`) whose output equals the
+   command line's byte for byte, at about 60 % of native AVX2 speed per
+   worker. Next on that line: shared-memory threads (one copy of the reads
+   for all workers), which need cross-origin isolation from the host.
