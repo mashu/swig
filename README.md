@@ -139,26 +139,31 @@ rustup target add wasm32-unknown-unknown
 wasm/build.sh                                 # web/vdj_assign_simd.wasm, web/vdj_assign.wasm
 python3 -m http.server -d web 8000            # then open http://localhost:8000
 node web/test.mjs target/release/vdj-assign   # the modules against the command line
+node web/browser-test.mjs target/release/vdj-assign  # the page and workers in Chromium (needs playwright)
 ```
 
 ```js
 import { load, assignInWorkers } from './vdj-assign.js';
 
-const vdj = await load();                     // the SIMD build where the engine has SIMD
+const vdj = await load();                     // browser or worker: fetches the SIMD build where the engine has SIMD
+// Node.js cannot fetch file: URLs; give it the bytes:
+// const vdj = await load({ bytes: fs.readFileSync('web/vdj_assign_simd.wasm') });
 const run = vdj.createRun({ v, d, j, c, options: { profile: 'r', 'tandem-d': true } });
-const tsv = run.assign(fastqText);            // AIRR TSV, header included
+const tsv = run.assign(fastqText);            // AIRR TSV, header included (one string)
 run.free();
 
 // In a browser, one run on Web Workers, rows in input order:
-const result = await assignInWorkers({ germlines: { v, d, j, options }, reads, workers: 4 });
+const { parts, called } = await assignInWorkers({ germlines: { v, d, j, options }, reads, workers: 4 });
+const file = new Blob(parts);                 // the AIRR TSV at any size: header, then blocks
 ```
 
 - **Same engine, same output.** The module runs `run::Run`, as the command
   line does: the same options by the same names (`profile`, `tandem-d`,
   `c-evalue`, …), the same database preparation and warnings, the same
   AIRR rows. On 45,000 rows (three presets, three option sets) and in
-  headless Chromium with four workers, its TSV equals the command line's
-  byte for byte; CI checks it on every push (`web/test.mjs`).
+  headless Chromium, its TSV equals the command line's byte for byte; CI
+  checks both on every push (`web/test.mjs` in Node.js,
+  `web/browser-test.mjs` for the page and `assignInWorkers` in Chromium).
 - **Two modules.** WebAssembly has no run-time feature detection, so
   `vdj_assign_simd.wasm` uses the `simd128` kernel (every current browser,
   Node.js) and `vdj_assign.wasm` the scalar kernel; `load()` validates a

@@ -9,6 +9,8 @@
 //! translate / annotate / prepare   codon table, anchors and region starts,
 //!                                  deduplicated and annotated databases
 //! reads                            streaming FASTA / FASTQ reads
+//! orient                           strand from germline k-mer support
+//! scoring                          substitution profiles and affine gaps
 //! seed → index → retrieve          candidate generation (k-mers as integers)
 //! band → align                     banded affine Smith–Waterman (Gotoh):
 //!                                  scalar kernel + SIMD inter-sequence batches
