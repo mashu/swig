@@ -9,19 +9,16 @@
 //! vdj-assign evaluate --truth sim.truth.tsv calls.tsv
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use vdj_assign::align::Backend;
-use vdj_assign::annotate::{AnnotateOptions, ChainType};
 use vdj_assign::prelude::*;
-use vdj_assign::prepare::{PreparedDatabase, prepare};
-use vdj_assign::reads::ReadReader;
+use vdj_assign::prepare::DatabaseError;
 use vdj_assign::sim::{Assignment, C_STREAM, Evaluation, Paired, Rng, SimParams, Simulator, Truth};
 
 const USAGE: &str = "\
@@ -86,9 +83,6 @@ options:
   --residual           ordinary commit-V/J-then-D adjudication instead of the DAG
   -h, --help           this message";
 
-/// Reads assigned per streaming batch (bounds memory on large files).
-const BATCH: usize = 16_384;
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Mode {
     #[default]
@@ -107,272 +101,184 @@ impl Mode {
             Mode::Evaluate => "evaluate",
         }
     }
+
+    /// Whether option `name` of this mode takes a value; `None` when the
+    /// mode has no such option. Assignment takes every [`RunOptions`] name.
+    fn takes_value(self, name: &str) -> Option<bool> {
+        let germline = matches!(name, "v" | "d" | "j" | "c");
+        let own = match self {
+            Mode::Assign => germline,
+            Mode::Prepare => germline || matches!(name, "out" | "chain"),
+            Mode::Simulate => {
+                germline
+                    || matches!(
+                        name,
+                        "out" | "chain" | "preset" | "reads" | "seed" | "rc" | "shm"
+                    )
+            }
+            Mode::Evaluate => name == "truth",
+        };
+        match self {
+            _ if own => Some(true),
+            Mode::Assign => RunOptions::takes_value(name),
+            _ => None,
+        }
+    }
+}
+
+/// Germline FASTA paths.
+#[derive(Default)]
+struct Files {
+    v: Option<String>,
+    d: Option<String>,
+    j: Option<String>,
+    c: Option<String>,
+}
+
+impl Files {
+    /// The option and path of the `kind` database.
+    fn of(&self, kind: SegmentKind) -> (&'static str, &str) {
+        let (option, path) = match kind {
+            SegmentKind::V => ("--v", &self.v),
+            SegmentKind::D => ("--d", &self.d),
+            SegmentKind::J => ("--j", &self.j),
+            SegmentKind::C => ("--c", &self.c),
+            kind => unreachable!("no {} database is loaded", kind.label()),
+        };
+        (option, path.as_deref().unwrap_or_default())
+    }
 }
 
 #[derive(Default)]
 struct Args {
     mode: Mode,
-    v: Option<String>,
-    d: Option<String>,
-    j: Option<String>,
-    c: Option<String>,
-    c_evalue: Option<String>,
+    files: Files,
     out: Option<String>,
-    reads: Option<String>,
-    profile: Option<String>,
-    threads: Option<String>,
-    simd: Option<String>,
-    calls: Option<String>,
-    d_allele: Option<String>,
-    d_presence_rate: Option<String>,
-    chain: Option<String>,
-    tandem_d: bool,
-    forward_only: bool,
-    no_anchor_window: bool,
-    no_posterior: bool,
-    residual: bool,
+    /// Assignment: the reads; evaluate: the calls.
+    input: Option<String>,
+    /// Evaluate: a second calls file to compare against the first.
+    other: Option<String>,
+    truth: Option<String>,
+    run: RunOptions,
     preset: Option<String>,
     count: Option<String>,
     seed: Option<String>,
     rc: Option<String>,
     shm: Option<String>,
-    truth: Option<String>,
-    /// `evaluate`: a second calls file to compare against the first.
-    other: Option<String>,
-}
-
-/// Store `value` in `slot`, rejecting a second occurrence of the option.
-fn set_once(slot: &mut Option<String>, option: &str, value: String) -> Result<(), String> {
-    match slot.replace(value) {
-        Some(previous) => Err(format!(
-            "{option} given more than once ('{previous}' and '{}')",
-            slot.as_deref().unwrap_or_default()
-        )),
-        None => Ok(()),
-    }
 }
 
 fn parse_args() -> Result<Option<Args>, String> {
-    let mut args = Args::default();
     let mut input = std::env::args().skip(1).peekable();
-    args.mode = match input.peek().map(String::as_str) {
+    let mode = match input.peek().map(String::as_str) {
         Some("prepare") => Mode::Prepare,
         Some("simulate") => Mode::Simulate,
         Some("evaluate") => Mode::Evaluate,
         _ => Mode::Assign,
     };
-    if args.mode != Mode::Assign {
+    if mode != Mode::Assign {
         input.next();
     }
-    let mode = args.mode;
-    let (assign, prepare, simulate, evaluate) = (
-        mode == Mode::Assign,
-        mode == Mode::Prepare,
-        mode == Mode::Simulate,
-        mode == Mode::Evaluate,
-    );
+    let mut args = Args {
+        mode,
+        ..Args::default()
+    };
+    let mut seen = HashSet::new();
     while let Some(arg) = input.next() {
-        let mut value = |name: &str| input.next().ok_or_else(|| format!("{name} needs a value"));
-        match arg.as_str() {
-            "-h" | "--help" => return Ok(None),
-            "--v" if !evaluate => set_once(&mut args.v, "--v", value("--v")?)?,
-            "--d" if !evaluate => set_once(&mut args.d, "--d", value("--d")?)?,
-            "--j" if !evaluate => set_once(&mut args.j, "--j", value("--j")?)?,
-            "--c" if !evaluate => set_once(&mut args.c, "--c", value("--c")?)?,
-            "--c-evalue" if assign => {
-                set_once(&mut args.c_evalue, "--c-evalue", value("--c-evalue")?)?
-            }
-            "--out" if prepare || simulate => set_once(&mut args.out, "--out", value("--out")?)?,
-            "--chain" if !evaluate => set_once(&mut args.chain, "--chain", value("--chain")?)?,
-            "--profile" if assign => set_once(&mut args.profile, "--profile", value("--profile")?)?,
-            "--threads" if assign => set_once(&mut args.threads, "--threads", value("--threads")?)?,
-            "--simd" if assign => set_once(&mut args.simd, "--simd", value("--simd")?)?,
-            "--calls" if assign => set_once(&mut args.calls, "--calls", value("--calls")?)?,
-            "--d-allele" if assign => {
-                set_once(&mut args.d_allele, "--d-allele", value("--d-allele")?)?
-            }
-            "--d-presence-rate" if assign => set_once(
-                &mut args.d_presence_rate,
-                "--d-presence-rate",
-                value("--d-presence-rate")?,
-            )?,
-            "--tandem-d" if assign => args.tandem_d = true,
-            "--forward-only" if assign => args.forward_only = true,
-            "--no-anchor-window" if assign => args.no_anchor_window = true,
-            "--no-posterior" if assign => args.no_posterior = true,
-            "--residual" if assign => args.residual = true,
-            "--preset" if simulate => set_once(&mut args.preset, "--preset", value("--preset")?)?,
-            "--reads" if simulate => set_once(&mut args.count, "--reads", value("--reads")?)?,
-            "--seed" if simulate => set_once(&mut args.seed, "--seed", value("--seed")?)?,
-            "--rc" if simulate => set_once(&mut args.rc, "--rc", value("--rc")?)?,
-            "--shm" if simulate => set_once(&mut args.shm, "--shm", value("--shm")?)?,
-            "--truth" if evaluate => set_once(&mut args.truth, "--truth", value("--truth")?)?,
-            flag if flag.starts_with("--") => {
-                return Err(format!("unknown option '{flag}' for {}", mode.name()));
-            }
-            path if evaluate && args.reads.is_some() => {
-                set_once(&mut args.other, "a second calls file", path.to_string())?
-            }
-            path if assign || evaluate => {
-                set_once(&mut args.reads, "the reads or calls file", path.to_string())?
-            }
-            extra => {
-                return Err(format!(
-                    "{} takes no positional argument ('{extra}')",
-                    mode.name()
-                ));
-            }
+        if arg == "-h" || arg == "--help" {
+            return Ok(None);
         }
+        let Some(name) = arg.strip_prefix("--") else {
+            let slot = match mode {
+                Mode::Assign | Mode::Evaluate if args.input.is_none() => &mut args.input,
+                Mode::Evaluate if args.other.is_none() => &mut args.other,
+                Mode::Assign | Mode::Evaluate => {
+                    return Err(format!("unexpected argument '{arg}' for {}", mode.name()));
+                }
+                Mode::Prepare | Mode::Simulate => {
+                    return Err(format!(
+                        "{} takes no positional argument ('{arg}')",
+                        mode.name()
+                    ));
+                }
+            };
+            *slot = Some(arg);
+            continue;
+        };
+        let takes_value = mode
+            .takes_value(name)
+            .ok_or_else(|| format!("unknown option '{arg}' for {}", mode.name()))?;
+        if !seen.insert(name.to_string()) {
+            return Err(format!("{arg} given more than once"));
+        }
+        let value = match takes_value {
+            true => Some(input.next().ok_or_else(|| format!("{arg} needs a value"))?),
+            false => None,
+        };
+        let slot = match name {
+            "v" => &mut args.files.v,
+            "d" => &mut args.files.d,
+            "j" => &mut args.files.j,
+            "c" => &mut args.files.c,
+            "out" => &mut args.out,
+            "truth" => &mut args.truth,
+            "preset" => &mut args.preset,
+            "reads" => &mut args.count,
+            "seed" => &mut args.seed,
+            "rc" => &mut args.rc,
+            "shm" => &mut args.shm,
+            _ => {
+                args.run
+                    .set(name, value.as_deref())
+                    .map_err(|e| e.to_string())?;
+                continue;
+            }
+        };
+        *slot = value;
     }
     Ok(Some(args))
 }
 
-fn load_set(kind: SegmentKind, option: &str, path: &str) -> Result<GermlineSet, Box<dyn Error>> {
-    let text = fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-    if text.trim_start().starts_with('@') {
-        return Err(format!(
-            "{path}: looks like FASTQ, but {option} expects a germline FASTA database (reads go last, as a positional argument)"
-        )
-        .into());
-    }
-    Ok(GermlineSet::from_fasta(kind, &text).map_err(|e| format!("{path}: {e}"))?)
-}
-
-fn load_database(args: &Args) -> Result<PreparedDatabase, Box<dyn Error>> {
-    let chain = match args.chain.as_deref() {
-        Some(name) => Some(
-            ChainType::from_name(name)
-                .ok_or_else(|| format!("--chain expects heavy or light, got '{name}'"))?,
-        ),
-        None => None,
+/// Read the germline FASTA files and prepare the database, logging its
+/// summary and warnings.
+fn load_database(files: &Files, options: &RunOptions) -> Result<PreparedDatabase, Box<dyn Error>> {
+    let read = |path: &str| fs::read_to_string(path).map_err(|e| format!("{path}: {e}"));
+    let v = read(files.v.as_deref().ok_or("--v is required")?)?;
+    let j = read(files.j.as_deref().ok_or("--j is required")?)?;
+    let d = files.d.as_deref().map(read).transpose()?;
+    let c = files.c.as_deref().map(read).transpose()?;
+    let texts = GermlineTexts {
+        v: &v,
+        d: d.as_deref(),
+        j: &j,
+        c: c.as_deref(),
     };
-    let v = load_set(
-        SegmentKind::V,
-        "--v",
-        args.v.as_deref().ok_or("--v is required")?,
-    )?;
-    let d = args
-        .d
-        .as_deref()
-        .map(|path| load_set(SegmentKind::D, "--d", path))
-        .transpose()?;
-    let j = load_set(
-        SegmentKind::J,
-        "--j",
-        args.j.as_deref().ok_or("--j is required")?,
-    )?;
-    let c = args
-        .c
-        .as_deref()
-        .map(|path| load_set(SegmentKind::C, "--c", path))
-        .transpose()?;
     let started = Instant::now();
-    let mut database = prepare(v, d, j, AnnotateOptions { chain })?;
-    if let Some(c) = c {
-        database = database.with_constant(c)?;
-    }
+    let database = PreparedDatabase::from_fasta(texts, options.annotate()).map_err(|e| {
+        let (option, path) = files.of(e.kind());
+        match e {
+            DatabaseError::Fastq(_) => format!(
+                "{path}: looks like FASTQ, but {option} expects a germline FASTA database (reads go last, as a positional argument)"
+            ),
+            e => format!("{path}: {e}"),
+        }
+    })?;
     eprintln!(
         "vdj-assign: database prepared in {:.1} ms: {}",
         started.elapsed().as_secs_f64() * 1e3,
         database.summary()
     );
-    if database.annotation.fr3_warning() {
-        eprintln!(
-            "vdj-assign: warning: no V allele gives its FR3 start, and this locus' FR3 length varies by gene family; FR3 starts use one chain default and are marked uncertain. Add fr3= (and anchor=) to a few alleles per family, or use an IMGT-gapped V set"
-        );
-    }
-    if database.annotation.uncertain() > 0 {
-        eprintln!(
-            "vdj-assign: {} alleles have transferred, low-confidence or missing anchors; see `vdj-assign prepare` annotation.tsv",
-            database.annotation.uncertain()
-        );
-    }
-    for warning in database.constant_warnings(CSegmentConfig::default().spread) {
+    for warning in database.warnings(CSegmentConfig::default().spread) {
         eprintln!("vdj-assign: warning: {warning}");
     }
     Ok(database)
 }
 
-/// Stream reads in batches through any assigner (static dispatch per variant).
-fn stream<R: BufRead, T: VdjAssigner + AlleleCatalog + Sync>(
-    input: R,
-    source: &str,
-    assigner: &T,
-    threads: usize,
-    support: &SupportModels,
-) -> Result<(usize, usize), Box<dyn Error>> {
-    let mut reads = ReadReader::new(input);
-    let mut out = BufWriter::new(io::stdout().lock());
-    let constant = assigner.segment(SegmentKind::C).is_some();
-    writeln!(out, "{}", AirrRecord::tsv_header_with(constant))?;
-    let (mut total, mut with_path) = (0, 0);
-    let mut batch = Vec::with_capacity(BATCH);
-    loop {
-        batch.clear();
-        if reads
-            .read_batch(BATCH, &mut batch)
-            .map_err(|e| format!("{source}: {e}"))?
-            == 0
-        {
-            break;
-        }
-        let encoded: Vec<Vec<u8>> = batch.iter().map(|r| encode(&r.sequence)).collect();
-        let rows = assign_map(assigner, &encoded, threads, |i, call| {
-            let sequence = String::from_utf8_lossy(&batch[i].sequence);
-            let has_path = call.path.is_some();
-            (
-                AirrRecord::from_call(batch[i].id(), &sequence, &call, assigner, support).to_tsv(),
-                has_path,
-            )
-        });
-        for (row, has_path) in rows {
-            writeln!(out, "{row}")?;
-            with_path += usize::from(has_path);
-        }
-        total += batch.len();
-    }
-    out.flush()?;
-    Ok((total, with_path))
-}
-
-fn stream_input<T: VdjAssigner + AlleleCatalog + Sync>(
-    path: &str,
-    assigner: &T,
-    threads: usize,
-    support: &SupportModels,
-) -> Result<(usize, usize), Box<dyn Error>> {
-    match path {
-        "-" => stream(io::stdin().lock(), "stdin", assigner, threads, support),
-        _ => {
-            let file = File::open(path).map_err(|e| format!("{path}: {e}"))?;
-            stream(
-                BufReader::with_capacity(1 << 20, file),
-                path,
-                assigner,
-                threads,
-                support,
-            )
-        }
-    }
-}
-
 fn run_prepare(args: &Args) -> Result<(), Box<dyn Error>> {
     let out = args.out.as_deref().ok_or("prepare needs --out DIR")?;
-    let database = load_database(args)?;
+    let database = load_database(&args.files, &args.run)?;
     database.write(Path::new(out))?;
-    eprintln!(
-        "vdj-assign: wrote {out}/V.fasta, J.fasta{}{}, annotation.tsv",
-        if database.d.is_some() {
-            ", D.fasta"
-        } else {
-            ""
-        },
-        if database.c.is_some() {
-            ", C.fasta"
-        } else {
-            ""
-        }
-    );
+    let names: Vec<&str> = database.files().iter().map(|&(name, _)| name).collect();
+    eprintln!("vdj-assign: wrote {} into {out}", names.join(", "));
     Ok(())
 }
 
@@ -383,97 +289,32 @@ fn run_assign(args: &Args) -> Result<(), Box<dyn Error>> {
         );
     }
     let reads = args
-        .reads
+        .input
         .as_deref()
         .ok_or("a reads file (FASTA, FASTQ or '-') is required")?;
-    let profile = match args.profile.as_deref() {
-        Some(name) => {
-            CallingProfile::from_name(name).ok_or_else(|| format!("unknown profile '{name}'"))?
-        }
-        None => CallingProfile::ROptimized,
-    };
-    let threads = match args.threads.as_deref() {
-        Some(n) => n
-            .parse()
-            .map_err(|_| format!("--threads expects a number, got '{n}'"))?,
-        None => 0,
-    };
-    let mut config = profile.config();
-    if args.tandem_d {
-        config.grammar = VdjGrammar::TANDEM_D;
-    }
-    if args.forward_only {
-        config.options.orientation = OrientationPolicy::FORWARD_ONLY;
-    }
-    config.anchor_window = !args.no_anchor_window;
-    config.simd = args
-        .simd
-        .as_deref()
-        .map(|name| Backend::from_name(name).ok_or_else(|| format!("unknown --simd '{name}'")))
-        .transpose()?;
-    // The residual adjudicator computes no posteriors.
-    config.posterior = !args.no_posterior && !args.residual;
-    if let Some(name) = args.calls.as_deref() {
-        config.calls = match name {
-            "per-read" => CallModel::PerRead,
-            "fixed" => CallModel::FixedScale,
-            _ => return Err(format!("unknown --calls '{name}'").into()),
-        };
-    }
-    if let Some(name) = args.d_allele.as_deref() {
-        config.d_allele = match name {
-            "map" => DAlleleDecoding::Map,
-            "max-marginal" => DAlleleDecoding::MaxMarginal,
-            _ => return Err(format!("unknown --d-allele '{name}'").into()),
-        };
-    }
-    if let Some(rate) = args.d_presence_rate.as_deref() {
-        let presence = rate.parse::<f64>().unwrap_or(f64::NAN);
-        if !(presence > 0.0 && presence < 1.0) {
-            return Err(format!("--d-presence-rate expects a rate in (0, 1), got '{rate}'").into());
-        }
-        config.objective.d_prior = DPrior::search(presence);
-    }
-    let support: SupportModels = [
-        KarlinAltschul::ungapped(&config.v.scoring),
-        KarlinAltschul::ungapped(&config.d.scoring),
-        KarlinAltschul::ungapped(&config.j.scoring),
-    ];
-    if let Some(text) = args.c_evalue.as_deref() {
-        if args.c.is_none() {
-            return Err("--c-evalue needs --c".into());
-        }
-        config.c.evalue = text
-            .parse::<f64>()
-            .ok()
-            .filter(|&evalue| evalue > 0.0)
-            .ok_or_else(|| format!("--c-evalue expects a positive number, got '{text}'"))?;
-    }
-    let database = load_database(args)?;
-    let mut assigner = DefaultAssigner::from_config(&config, database.v, database.d, database.j)?;
-    if let Some(c) = database.c {
-        assigner = assigner.with_constant(c, &config.c)?;
-    }
-
+    let database = load_database(&args.files, &args.run)?;
+    let run = Run::new(&args.run, database)?;
     let started = Instant::now();
-    let (total, with_path) = if args.residual {
-        let residual = ResidualAdjudicator {
-            min_retained: config.min_retained,
-            ..ResidualAdjudicator::default()
-        };
-        stream_input(
-            reads,
-            &assigner.with_adjudicator(residual),
-            threads,
-            &support,
-        )?
-    } else {
-        stream_input(reads, &assigner, threads, &support)?
+    let mut out = BufWriter::new(io::stdout().lock());
+    let (source, written) = match reads {
+        "-" => ("stdin", run.write_airr(io::stdin().lock(), &mut out)),
+        path => {
+            let file = File::open(path).map_err(|e| format!("{path}: {e}"))?;
+            let input = BufReader::with_capacity(1 << 20, file);
+            (path, run.write_airr(input, &mut out))
+        }
     };
+    let tally = written.map_err(|e| match e {
+        RunError::Reads(e) => format!("{source}: {e}"),
+        e => e.to_string(),
+    })?;
+    out.flush()?;
     let seconds = started.elapsed().as_secs_f64();
     eprintln!(
-        "vdj-assign: {total} reads ({with_path} with a V(D)J path) in {seconds:.1} s ({:.0} reads/s)",
-        total as f64 / seconds.max(1e-9)
+        "vdj-assign: {} reads ({} with a V(D)J path) in {seconds:.1} s ({:.0} reads/s)",
+        tally.reads,
+        tally.called,
+        tally.reads as f64 / seconds.max(1e-9)
     );
     Ok(())
 }
@@ -503,7 +344,7 @@ fn run_simulate(args: &Args) -> Result<(), Box<dyn Error>> {
     }
     let count: usize = number(&args.count, "--reads", 10_000)?;
     let seed: u64 = number(&args.seed, "--seed", 1)?;
-    let database = load_database(args)?;
+    let database = load_database(&args.files, &args.run)?;
     let mut sim = Simulator::new(&database.v, database.d.as_ref(), &database.j, params)?;
     if let Some(c) = &database.c {
         sim = sim.with_constant(c)?;
@@ -548,7 +389,7 @@ fn run_evaluate(args: &Args) -> Result<(), Box<dyn Error>> {
         .as_deref()
         .ok_or("evaluate needs --truth PREFIX.truth.tsv")?;
     let calls_path = args
-        .reads
+        .input
         .as_deref()
         .ok_or("evaluate needs an AIRR TSV of calls")?;
     let calls = read_calls(calls_path)?;

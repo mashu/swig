@@ -1,16 +1,16 @@
 //! Database preparation: deduplicate, annotate, and optionally write out.
 //!
 //! [`prepare`] runs on every start (it takes milliseconds), so a database never
-//! *has* to be prepared. Writing the result ([`PreparedDatabase::write`])
-//! produces plain FASTA whose headers carry every anchor and region start,
-//! plus `annotation.tsv` with the provenance of each value — for review,
-//! manual curation, or sharing a fixed annotation. Header values always win
-//! over detection, so edits to the written FASTA are respected on reload.
+//! *has* to be prepared. Writing the result ([`PreparedDatabase::files`],
+//! [`PreparedDatabase::write`]) produces plain FASTA whose headers carry
+//! every anchor and region start, plus `annotation.tsv` with the provenance
+//! of each value — for review, manual curation, or sharing a fixed
+//! annotation. Header values always win over detection, so edits to the
+//! written FASTA are respected on reload.
 
 use std::collections::HashMap;
 use std::fmt;
-use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::io;
 use std::path::Path;
 
 use crate::annotate::{AlleleAnnotation, AnnotateOptions, DatabaseAnnotation, annotate};
@@ -29,6 +29,62 @@ fn label(annotations: &[AlleleAnnotation], id: u32) -> Option<String> {
     annotations
         .get(id as usize)
         .map(|a| format!("annotation={}", a.source.label()))
+}
+
+/// A germline set that could not be read or deduplicated.
+#[derive(Debug)]
+pub enum DatabaseError {
+    /// The text given for the set is FASTQ (reads), not germline FASTA.
+    Fastq(SegmentKind),
+    Germline(SegmentKind, GermlineError),
+}
+
+impl DatabaseError {
+    /// The germline set at fault.
+    pub fn kind(&self) -> SegmentKind {
+        match self {
+            Self::Fastq(kind) | Self::Germline(kind, _) => *kind,
+        }
+    }
+}
+
+impl fmt::Display for DatabaseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Fastq(kind) => write!(
+                f,
+                "the {} database looks like FASTQ reads, not a germline FASTA",
+                kind.label()
+            ),
+            Self::Germline(_, error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for DatabaseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Fastq(_) => None,
+            Self::Germline(_, error) => Some(error),
+        }
+    }
+}
+
+/// The FASTA text of each germline database (D and C optional).
+#[derive(Clone, Copy, Debug)]
+pub struct GermlineTexts<'a> {
+    pub v: &'a str,
+    pub d: Option<&'a str>,
+    pub j: &'a str,
+    pub c: Option<&'a str>,
+}
+
+/// Parse one germline set, rejecting reads given in its place.
+fn parse_set(kind: SegmentKind, text: &str) -> Result<GermlineSet, DatabaseError> {
+    if text.trim_start().starts_with('@') {
+        return Err(DatabaseError::Fastq(kind));
+    }
+    GermlineSet::from_fasta(kind, text).map_err(|e| DatabaseError::Germline(kind, e))
 }
 
 pub struct PreparedDatabase {
@@ -81,19 +137,59 @@ impl fmt::Display for ConstantWarning {
     }
 }
 
+/// Something about a prepared database that a run should report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DatabaseWarning {
+    /// No V allele gives its FR3 start in a locus whose FR3 length varies by
+    /// family, so every FR3 start rests on one chain default.
+    Fr3Default,
+    /// Alleles whose anchors were transferred, are low-confidence or missing.
+    Uncertain(usize),
+    /// A convention that keeps C from being called.
+    Constant(ConstantWarning),
+}
+
+impl fmt::Display for DatabaseWarning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Fr3Default => write!(
+                f,
+                "no V allele gives its FR3 start, and this locus' FR3 length varies by gene family; FR3 starts use one chain default and are marked uncertain. Add fr3= (and anchor=) to a few alleles per family, or use an IMGT-gapped V set"
+            ),
+            Self::Uncertain(count) => write!(
+                f,
+                "{count} alleles have transferred, low-confidence or missing anchors; review them in the prepared annotation.tsv"
+            ),
+            Self::Constant(warning) => write!(f, "{warning}"),
+        }
+    }
+}
+
+/// Deduplicate `set`, recording what was merged under its kind.
+fn deduplicate(
+    set: &mut GermlineSet,
+    merged: &mut Vec<(SegmentKind, MergedDuplicate)>,
+) -> Result<(), DatabaseError> {
+    let kind = set.kind();
+    let found = set
+        .deduplicate()
+        .map_err(|e| DatabaseError::Germline(kind, e))?;
+    merged.extend(found.into_iter().map(|m| (kind, m)));
+    Ok(())
+}
+
 pub fn prepare(
     mut v: GermlineSet,
     mut d: Option<GermlineSet>,
     mut j: GermlineSet,
     options: AnnotateOptions,
-) -> Result<PreparedDatabase, GermlineError> {
+) -> Result<PreparedDatabase, DatabaseError> {
     let mut merged = Vec::new();
     for set in [Some(&mut v), d.as_mut(), Some(&mut j)]
         .into_iter()
         .flatten()
     {
-        let kind = set.kind();
-        merged.extend(set.deduplicate()?.into_iter().map(|m| (kind, m)));
+        deduplicate(set, &mut merged)?;
     }
     let annotation = annotate(&mut v, Some(&mut j), options);
     Ok(PreparedDatabase {
@@ -107,14 +203,53 @@ pub fn prepare(
 }
 
 impl PreparedDatabase {
+    /// Parse every germline set from FASTA text, then [`prepare`] them and
+    /// add C ([`Self::with_constant`]).
+    pub fn from_fasta(
+        texts: GermlineTexts<'_>,
+        options: AnnotateOptions,
+    ) -> Result<Self, DatabaseError> {
+        let v = parse_set(SegmentKind::V, texts.v)?;
+        let d = texts
+            .d
+            .map(|text| parse_set(SegmentKind::D, text))
+            .transpose()?;
+        let j = parse_set(SegmentKind::J, texts.j)?;
+        let c = texts
+            .c
+            .map(|text| parse_set(SegmentKind::C, text))
+            .transpose()?;
+        let database = prepare(v, d, j, options)?;
+        match c {
+            Some(c) => database.with_constant(c),
+            None => Ok(database),
+        }
+    }
+
     /// Add a constant-region database, identical sequences merged as for V,
     /// D and J.
-    pub fn with_constant(mut self, mut c: GermlineSet) -> Result<Self, GermlineError> {
-        let kind = c.kind();
-        self.merged
-            .extend(c.deduplicate()?.into_iter().map(|m| (kind, m)));
+    pub fn with_constant(mut self, mut c: GermlineSet) -> Result<Self, DatabaseError> {
+        deduplicate(&mut c, &mut self.merged)?;
         self.c = Some(c);
         Ok(self)
+    }
+
+    /// Everything a run should report about the database, for C at splice
+    /// spread `spread`.
+    pub fn warnings(&self, spread: u32) -> Vec<DatabaseWarning> {
+        let mut warnings = Vec::new();
+        if self.annotation.fr3_warning() {
+            warnings.push(DatabaseWarning::Fr3Default);
+        }
+        if self.annotation.uncertain() > 0 {
+            warnings.push(DatabaseWarning::Uncertain(self.annotation.uncertain()));
+        }
+        warnings.extend(
+            self.constant_warnings(spread)
+                .into_iter()
+                .map(DatabaseWarning::Constant),
+        );
+        warnings
     }
 
     /// The conventions of the database that keep C from being called at
@@ -187,32 +322,44 @@ impl PreparedDatabase {
         format!("{text}; {}", self.annotation.summary())
     }
 
-    /// Write `V.fasta`, `D.fasta`, `J.fasta`, `C.fasta` and `annotation.tsv`
-    /// into `dir` (D and C when present).
+    /// The prepared database as `(file name, contents)`: `V.fasta`,
+    /// `D.fasta`, `J.fasta`, `C.fasta` (D and C when present) and
+    /// `annotation.tsv`.
+    pub fn files(&self) -> Vec<(&'static str, String)> {
+        fn text(write: impl FnOnce(&mut Vec<u8>) -> io::Result<()>) -> String {
+            let mut bytes = Vec::new();
+            write(&mut bytes).expect("writing to memory cannot fail");
+            String::from_utf8(bytes).expect("germline files are ASCII")
+        }
+        let (v_labels, j_labels) = (&self.annotation.v, &self.annotation.j);
+        let mut files = vec![(
+            "V.fasta",
+            text(|out| self.v.write_fasta(out, |id| label(v_labels, id))),
+        )];
+        if let Some(d) = &self.d {
+            files.push(("D.fasta", text(|out| d.write_fasta(out, |_| None))));
+        }
+        files.push((
+            "J.fasta",
+            text(|out| self.j.write_fasta(out, |id| label(j_labels, id))),
+        ));
+        if let Some(c) = &self.c {
+            files.push(("C.fasta", text(|out| c.write_fasta(out, |_| None))));
+        }
+        files.push((
+            "annotation.tsv",
+            text(|out| self.annotation.write_tsv(out, &self.v, Some(&self.j))),
+        ));
+        files
+    }
+
+    /// Write [`Self::files`] into `dir`.
     pub fn write(&self, dir: &Path) -> io::Result<()> {
         std::fs::create_dir_all(dir)?;
-        let v_labels = &self.annotation.v;
-        let j_labels = &self.annotation.j;
-        let mut out = BufWriter::new(File::create(dir.join("V.fasta"))?);
-        self.v.write_fasta(&mut out, |id| label(v_labels, id))?;
-        out.flush()?;
-        if let Some(d) = &self.d {
-            let mut out = BufWriter::new(File::create(dir.join("D.fasta"))?);
-            d.write_fasta(&mut out, |_| None)?;
-            out.flush()?;
+        for (name, contents) in self.files() {
+            std::fs::write(dir.join(name), contents)?;
         }
-        let mut out = BufWriter::new(File::create(dir.join("J.fasta"))?);
-        self.j.write_fasta(&mut out, |id| label(j_labels, id))?;
-        out.flush()?;
-        if let Some(c) = &self.c {
-            let mut out = BufWriter::new(File::create(dir.join("C.fasta"))?);
-            c.write_fasta(&mut out, |_| None)?;
-            out.flush()?;
-        }
-        let mut out = BufWriter::new(File::create(dir.join("annotation.tsv"))?);
-        self.annotation
-            .write_tsv(&mut out, &self.v, Some(&self.j))?;
-        out.flush()
+        Ok(())
     }
 }
 
