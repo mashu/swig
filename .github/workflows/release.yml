@@ -3,11 +3,14 @@ name: Release
 # A tag vX.Y.Z runs the whole CI, builds the command line for Linux, macOS
 # and Windows and the browser bundle, unpacks and tests every archive on its
 # own platform, and publishes them as the GitHub release vX.Y.Z with the
-# CHANGELOG.md section as its notes. A pull request that changes this file
-# or the changelog builds and tests the archives without publishing.
+# CHANGELOG.md section as its notes. Running the workflow by hand on main
+# (Actions > Release > Run workflow) does the same for the crate version and
+# creates its tag at that commit. A pull request that changes this file or
+# the changelog builds and tests the archives without publishing.
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
   pull_request:
     paths:
       - .github/workflows/release.yml
@@ -28,6 +31,8 @@ jobs:
       - uses: actions/checkout@v5
       - id: version
         name: The tag, both crates and the changelog name one version
+        env:
+          EVENT: ${{ github.event_name }}
         shell: bash
         run: |
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
@@ -40,6 +45,18 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME does not match the crate version $version"
             exit 1
           fi
+          # By hand: from main only, and an existing tag must name this commit.
+          if [ "$EVENT" = workflow_dispatch ]; then
+            if [ "$GITHUB_REF" != refs/heads/main ]; then
+              echo "::error::run the release by hand on main, not $GITHUB_REF"
+              exit 1
+            fi
+            tagged=$(git ls-remote --tags origin "refs/tags/v$version^{}" "refs/tags/v$version" | sort -k2 -r | head -n 1 | cut -f1)
+            if [ -n "$tagged" ] && [ "$tagged" != "$GITHUB_SHA" ]; then
+              echo "::error::v$version already tags $tagged, not $GITHUB_SHA"
+              exit 1
+            fi
+          fi
           if ! grep -q "^## \[$version\]" CHANGELOG.md; then
             echo "::error::CHANGELOG.md has no [$version] section"
             exit 1
@@ -47,7 +64,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
   ci:
-    if: github.event_name == 'push'
+    if: github.event_name != 'pull_request'
     uses: ./.github/workflows/ci.yml
 
   cli:
@@ -194,14 +211,14 @@ jobs:
           node "dist/$WEB/test.mjs" "$exe"
 
   release:
-    if: github.event_name == 'push'
+    if: github.event_name != 'pull_request'
     needs: [version, ci, cli, web, verify]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
       VERSION: ${{ needs.version.outputs.version }}
-      TAG: ${{ github.ref_name }}
+      TAG: v${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
@@ -250,8 +267,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # --target creates the tag at this commit when the run was started
+          # by hand; a pushed tag already exists and is used as it is.
           if gh release view "$TAG" > /dev/null 2>&1; then
             gh release upload "$TAG" dist/* --clobber
           else
-            gh release create "$TAG" dist/* --verify-tag --title "vdj-assign $VERSION" --notes-file notes.md
+            gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "vdj-assign $VERSION" --notes-file notes.md
           fi

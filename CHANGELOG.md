@@ -1,7 +1,8 @@
 # Changelog
 
 Each release's section is its GitHub release notes; the tag `vX.Y.Z` must
-match the crate version (`.github/workflows/release.yml`).
+match the crate version (`.github/workflows/release.yml`). Push the tag, or
+run the Release workflow by hand on `main`, which creates it.
 
 ## [0.1.0] - 2026-10-09
 
