@@ -12,7 +12,8 @@
 //   run.free();
 //
 // In a browser, assignInWorkers() spreads one run over Web Workers.
-// In Node.js, pass the module's bytes: load({ bytes: fs.readFileSync(path) }).
+// In Node.js, which cannot fetch file: URLs, pass the module's bytes:
+// load({ bytes: fs.readFileSync('web/vdj_assign_simd.wasm') }).
 
 const SIMD_FILE = 'vdj_assign_simd.wasm';
 const BASELINE_FILE = 'vdj_assign.wasm';
@@ -23,6 +24,20 @@ const SIMD_PROBE = Uint8Array.of(
   0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 123, 3, 2, 1, 0, 10, 10, 1, 8, 0, 65, 0, 253, 15,
   253, 98, 11,
 );
+
+const U32_MAX = 2 ** 32 - 1;
+/** The largest buffer one wasm32 allocation holds. */
+const MAX_BUFFER = 2 ** 31 - 1;
+/** The most reads demo() simulates (each holds several bytes per base). */
+const MAX_DEMO_READS = 200_000;
+
+/** `value` if it is an integer in [min, max]; otherwise a RangeError naming `name`. */
+function integer(name, value, min, max) {
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    throw new RangeError(`${name} must be an integer from ${min} to ${max}, got ${value}`);
+  }
+  return value;
+}
 
 /** Whether this engine runs WebAssembly SIMD (every current browser does). */
 export function simdSupported() {
@@ -58,7 +73,8 @@ export async function load({ module, bytes, ...options } = {}) {
 export class VdjAssign {
   #x;
   #encoder = new TextEncoder();
-  #decoder = new TextDecoder();
+  // Verbatim: a row may begin with U+FEFF, which a default decoder drops.
+  #decoder = new TextDecoder('utf-8', { ignoreBOM: true });
   #broken = null;
 
   constructor(exports) {
@@ -76,12 +92,15 @@ export class VdjAssign {
 
   /**
    * Demonstration data: a synthetic IGH-like database and `reads` reads
-   * simulated under IgSim preset `preset` (easy, mid, train or hard), half
-   * of them reverse-complemented. Returns { 'V.fasta', 'D.fasta', 'J.fasta',
-   * 'C.fasta', 'reads.fasta', 'truth.tsv' }. The synthetic database is a
-   * test fixture, not a real locus: most of its V genes carry stop codons.
+   * (at most 200,000) simulated under IgSim preset `preset` (easy, mid,
+   * train or hard), half of them reverse-complemented. Returns { 'V.fasta',
+   * 'D.fasta', 'J.fasta', 'C.fasta', 'reads.fasta', 'truth.tsv' }. The
+   * synthetic database is a test fixture, not a real locus: most of its V
+   * genes carry stop codons.
    */
   demo({ seed = 1, reads = 1000, preset = 'mid' } = {}) {
+    integer('seed', seed, 0, U32_MAX);
+    integer('reads', reads, 0, MAX_DEMO_READS);
     return this.#call(() => {
       this.#check(this.#withText(preset, (ptr, len) => this.#x.vdj_demo(seed, reads, ptr, len)));
       return JSON.parse(this.#output());
@@ -133,15 +152,23 @@ export class VdjAssign {
         /** The AIRR TSV header, without a line break. */
         header,
         /**
-         * A session over `reads` (FASTA or FASTQ, as text or bytes) that
-         * assigns block `worker`, `worker + workers`, … of `block` reads:
-         * one session per worker shares a run. next() returns { block,
-         * rows } (rows: AIRR lines, no header) or null at the end.
+         * A session over `reads` (FASTA or FASTQ, as text or bytes, under
+         * 2 GiB) that assigns block `worker`, `worker + workers`, … of
+         * `block` reads: one session per worker shares a run. next()
+         * returns { block, rows } (rows: AIRR lines, no header) or null at
+         * the end.
          */
         session(reads, { worker = 0, workers = 1, block = 256 } = {}) {
+          integer('workers', workers, 1, U32_MAX);
+          integer('worker', worker, 0, workers - 1);
+          integer('block', block, 1, U32_MAX);
           return vdj.#session(alive(), reads, worker, workers, block);
         },
-        /** AIRR TSV of every read, header included. */
+        /**
+         * AIRR TSV of every read, header included, as one string: for
+         * outputs a string can hold (a few hundred thousand reads); stream
+         * larger ones with session().
+         */
         assign(reads) {
           const session = this.session(reads);
           try {
@@ -242,7 +269,8 @@ export class VdjAssign {
   /** The module's output buffer as text. */
   #output() {
     const x = this.#x;
-    const bytes = new Uint8Array(x.memory.buffer, x.vdj_output_ptr(), x.vdj_output_len());
+    // Addresses are unsigned: above 2 GiB an i32 reads as negative.
+    const bytes = new Uint8Array(x.memory.buffer, x.vdj_output_ptr() >>> 0, x.vdj_output_len() >>> 0);
     return this.#decoder.decode(bytes);
   }
 
@@ -253,7 +281,10 @@ export class VdjAssign {
   /** `text` (a string or bytes) copied into a module buffer: [ptr, len]. */
   #buffer(text) {
     const bytes = typeof text === 'string' ? this.#encoder.encode(text) : new Uint8Array(text);
-    const ptr = this.#x.vdj_alloc(bytes.length);
+    if (bytes.length > MAX_BUFFER) {
+      throw new RangeError(`${bytes.length} bytes do not fit one WebAssembly buffer (at most 2 GiB)`);
+    }
+    const ptr = this.#x.vdj_alloc(bytes.length) >>> 0;
     // After the allocation: it may have grown, and so replaced, the memory.
     new Uint8Array(this.#x.memory.buffer, ptr, bytes.length).set(bytes);
     return [ptr, bytes.length];
@@ -271,11 +302,29 @@ export class VdjAssign {
 }
 
 /**
+ * Reads in `rows` (AIRR lines), and how many have a call: a call holds an
+ * anchor, a V or a J, so its `v_call` or `j_call` (column `v`, `j`) is set.
+ */
+function tally(rows, v, j) {
+  let reads = 0;
+  let called = 0;
+  for (const line of rows.split('\n')) {
+    if (!line) continue;
+    reads += 1;
+    const fields = line.split('\t');
+    if (fields[v] || fields[j]) called += 1;
+  }
+  return { reads, called };
+}
+
+/**
  * Assign `reads` with `germlines` (as for createRun) on `workers` Web Workers
  * (browsers only), each instantiating the module once and taking every
  * `workers`-th block of reads. Calls onInfo(run) once a worker has built
- * the run and onProgress(fraction) as blocks finish. Resolves to { tsv,
- * reads, called, info }: the AIRR TSV in input order, header included.
+ * the run and onProgress(fraction) as blocks finish. Resolves to { parts,
+ * reads, called, info }: `parts` is the AIRR TSV in input order, header
+ * line first, in pieces, so `new Blob(parts)` is the file at any size
+ * (`parts.join('')` is its text when a string can hold it).
  */
 export async function assignInWorkers({
   germlines,
@@ -286,12 +335,16 @@ export async function assignInWorkers({
   onInfo,
   onProgress,
 }) {
+  integer('workers', workers, 1, 1024);
+  integer('block', block, 1, U32_MAX);
   module ??= await compile();
   const bytes = typeof reads === 'string' ? new TextEncoder().encode(reads) : new Uint8Array(reads);
   const blocks = [];
   const progress = new Array(workers).fill(0);
   const threads = [];
+  const total = { reads: 0, called: 0 };
   let info;
+  let columns;
   const report = () => onProgress?.(progress.reduce((sum, p) => sum + p, 0) / workers);
   try {
     await Promise.all(
@@ -303,9 +356,18 @@ export async function assignInWorkers({
             threads.push(thread);
             thread.onmessage = ({ data }) => {
               if (data.type === 'ready') {
-                if (!info) onInfo?.((info = data.info));
+                if (!info) {
+                  info = data.info;
+                  const header = info.header.split('\t');
+                  columns = [header.indexOf('v_call'), header.indexOf('j_call')];
+                  onInfo?.(info);
+                }
               } else if (data.type === 'rows') {
+                // A worker reports ready before its rows, so `columns` is set.
                 blocks[data.block] = data.rows;
+                const counts = tally(data.rows, ...columns);
+                total.reads += counts.reads;
+                total.called += counts.called;
                 progress[worker] = data.progress;
                 report();
               } else if (data.type === 'done') {
@@ -324,17 +386,6 @@ export async function assignInWorkers({
   } finally {
     for (const thread of threads) thread.terminate();
   }
-  const rows = blocks.join('');
-  const columns = info.header.split('\t');
-  const [v, j] = [columns.indexOf('v_call'), columns.indexOf('j_call')];
-  let count = 0;
-  let called = 0;
-  for (const line of rows.split('\n')) {
-    if (!line) continue;
-    count += 1;
-    // A call holds an anchor, a V or a J, so its v_call or j_call is set.
-    const fields = line.split('\t');
-    if (fields[v] || fields[j]) called += 1;
-  }
-  return { tsv: `${info.header}\n${rows}`, reads: count, called, info };
+  // Every block index below the last was produced by exactly one worker.
+  return { parts: [`${info.header}\n`, ...blocks], ...total, info };
 }

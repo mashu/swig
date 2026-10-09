@@ -59,6 +59,41 @@ assert.equal(run.assign(fastq).trimEnd().split('\n').length, 2);
 assert.throws(() => run.assign('@r1\nAC GT\n+\nIIIII\n'), /line 2: ' ' in a FASTQ sequence line/);
 run.free();
 
+// One block of every read, however large the block size asked for.
+{
+  const run = simd.createRun(germlines);
+  const whole = run.session(demo['reads.fasta'], { block: 2 ** 32 - 1 });
+  const only = whole.next();
+  assert.equal(only.block, 0);
+  assert.equal(whole.next(), null);
+  whole.free();
+  assert.equal(`${run.header}\n${only.rows}`, run.assign(demo['reads.fasta']));
+
+  // A row that begins with U+FEFF keeps it (a default TextDecoder drops it).
+  const first = demo['reads.fasta'].split('\n').slice(0, 2).join('\n');
+  const reads = `${first}\n>\uFEFFbom\n${demo['reads.fasta'].split('\n')[1]}\n`;
+  const session = run.session(reads, { block: 1 });
+  session.next();
+  assert.ok(session.next().rows.startsWith('\uFEFFbom\t'));
+  session.free();
+
+  // FASTQ no-call symbols read as N.
+  assert.equal(run.assign('@r1\nAC.TACGTAC\n+\nIIIIIIIIII\n').trimEnd().split('\n').length, 2);
+  run.free();
+}
+
+// Bad numbers are exceptions before they reach the module.
+{
+  const run = simd.createRun(germlines);
+  for (const share of [{ block: -1 }, { block: 0 }, { block: 1.5 }, { workers: 0 }, { worker: 2, workers: 2 }]) {
+    assert.throws(() => run.session('>r\nACGT\n', share), RangeError, JSON.stringify(share));
+  }
+  assert.throws(() => simd.demo({ reads: -1 }), RangeError);
+  assert.throws(() => simd.demo({ reads: 200_001 }), RangeError);
+  assert.throws(() => simd.demo({ seed: 2 ** 32 }), RangeError);
+  run.free();
+}
+
 // Errors are exceptions, and the instance stays usable after them.
 assert.throws(() => simd.createRun({ ...germlines, options: { profile: 'best' } }), /--profile expects/);
 assert.throws(() => simd.createRun({ v: germlines.v }), /a J database is required/);

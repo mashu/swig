@@ -409,7 +409,8 @@ pub unsafe extern "C" fn vdj_session_new(
         let session = Session {
             run: Rc::clone(run),
             reader: ReadReader::new(Cursor::new(bytes)),
-            records: Vec::with_capacity(block),
+            // Grown by the reader: `block` comes from the host unbounded.
+            records: Vec::new(),
             len,
             next_block: 0,
             worker,
