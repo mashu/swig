@@ -8,6 +8,10 @@
 //! goes to [`VdjAssigner::assign_many`], which batches every pipeline stage
 //! across the chunk so SIMD aligners can fill their lanes. Results keep input
 //! order.
+//!
+//! The calling thread is one of the workers. Helpers are spawned for the
+//! others, and a target that cannot spawn threads (WebAssembly without
+//! shared memory) runs every chunk on the caller.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
@@ -31,35 +35,35 @@ where
     }
     .min(queries.len().div_ceil(CHUNK).max(1));
     let next = AtomicUsize::new(0);
+    let work = || {
+        let mut workspace = assigner.workspace();
+        let mut calls = Vec::with_capacity(CHUNK);
+        let mut done = Vec::new();
+        loop {
+            let start = next.fetch_add(CHUNK, Ordering::Relaxed);
+            if start >= queries.len() {
+                break done;
+            }
+            let end = (start + CHUNK).min(queries.len());
+            calls.clear();
+            assigner.assign_many(&queries[start..end], &mut workspace, &mut calls);
+            let outputs: Vec<O> = calls
+                .drain(..)
+                .enumerate()
+                .map(|(offset, call)| map(start + offset, call))
+                .collect();
+            done.push((start, outputs));
+        }
+    };
     let mut chunks: Vec<(usize, Vec<O>)> = thread::scope(|scope| {
-        let workers: Vec<_> = (0..threads)
-            .map(|_| {
-                scope.spawn(|| {
-                    let mut workspace = assigner.workspace();
-                    let mut calls = Vec::with_capacity(CHUNK);
-                    let mut done = Vec::new();
-                    loop {
-                        let start = next.fetch_add(CHUNK, Ordering::Relaxed);
-                        if start >= queries.len() {
-                            break done;
-                        }
-                        let end = (start + CHUNK).min(queries.len());
-                        calls.clear();
-                        assigner.assign_many(&queries[start..end], &mut workspace, &mut calls);
-                        let outputs = calls
-                            .drain(..)
-                            .enumerate()
-                            .map(|(offset, call)| map(start + offset, call))
-                            .collect();
-                        done.push((start, outputs));
-                    }
-                })
-            })
+        let helpers: Vec<_> = (1..threads)
+            .map_while(|_| thread::Builder::new().spawn_scoped(scope, work).ok())
             .collect();
-        workers
-            .into_iter()
-            .flat_map(|w| w.join().expect("assignment worker panicked"))
-            .collect()
+        let mut chunks = work();
+        for helper in helpers {
+            chunks.extend(helper.join().expect("assignment worker panicked"));
+        }
+        chunks
     });
     chunks.sort_unstable_by_key(|&(start, _)| start);
     chunks
