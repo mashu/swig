@@ -17,6 +17,12 @@
 //! 4. **Instrument** substitutions on body bases, rate ramping 5′ → 3′.
 //! 5. Optionally (not in IgSim) the emitted read is reverse-complemented.
 //!
+//! With a C database (not in IgSim), [`Simulator::append_constant`] then
+//! reads through the J–C splice: the start of the 3′ flank becomes the C
+//! allele's germline, from the base that follows the J's last base in the
+//! reading frame. It draws from a stream of its own, so the V(D)J part of
+//! every read is the same with and without C.
+//!
 //! Unlike IgSim, which labels bases by region only, every base here also
 //! carries its germline **origin** (position in its allele, or none for N,
 //! flank and inserted bases). That makes boundaries, junctions and
@@ -29,6 +35,11 @@ use super::params::SimParams;
 use super::random::{Count, Rng};
 use crate::alphabet::decode_base;
 use crate::germline::{GermlineSet, SegmentKind};
+use crate::translate::open_frames;
+
+/// The C stream's seed is the read stream's seed XOR this
+/// ([`Simulator::reads`]): C draws never shift V(D)J draws.
+pub const C_STREAM: u64 = 0x0C0C_0C0C_0C0C_0C0C;
 
 /// Where a read base came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -46,12 +57,18 @@ pub enum Region {
     /// D–J non-templated addition.
     N2,
     J,
+    /// Constant region, read through the J–C splice
+    /// ([`Simulator::append_constant`]).
+    C,
     Flank3,
 }
 
 impl Region {
+    /// The rearranged V(D)J bases, which carry SHM, indels and the
+    /// instrument ramp. C is spliced RNA: no SHM, no indels, instrument
+    /// errors at the 3′ rate.
     pub fn is_body(self) -> bool {
-        !matches!(self, Region::Flank5 | Region::Flank3)
+        !matches!(self, Region::Flank5 | Region::C | Region::Flank3)
     }
 }
 
@@ -87,12 +104,15 @@ pub struct SimulatedRead {
     /// Second D in read order (tandem DD).
     pub d2: Option<usize>,
     pub j: usize,
+    /// C allele, when the read reaches the constant region.
+    pub c: Option<usize>,
     pub trims: Trims,
     pub flank_5p: u32,
     pub flank_3p: u32,
     /// Sampled per-base SHM rate of this read.
     pub shm_rate: f64,
-    /// SHM substitutions, indels and instrument substitutions applied.
+    /// SHM substitutions, indels and instrument substitutions applied (C's
+    /// included).
     pub mutations: u32,
     pub indels: u32,
     pub instrument_errors: u32,
@@ -141,12 +161,15 @@ impl fmt::Display for SimError {
 
 impl std::error::Error for SimError {}
 
-/// Read generator over V, optional D, and J germline sets.
+/// Read generator over V, optional D, J and optional C germline sets.
 pub struct Simulator<'a> {
     v: Vec<Vec<u8>>,
     d: Vec<Vec<u8>>,
     j: Vec<Vec<u8>>,
-    sets: [Option<&'a GermlineSet>; 3],
+    c: Vec<Vec<u8>>,
+    /// Stop-free reading frame of each C allele.
+    c_frames: Vec<Option<usize>>,
+    sets: [Option<&'a GermlineSet>; 4],
     pub params: SimParams,
 }
 
@@ -164,6 +187,16 @@ fn ascii(set: &GermlineSet) -> Vec<Vec<u8>> {
         .collect()
 }
 
+fn check(set: &GermlineSet, kind: SegmentKind) -> Result<(), SimError> {
+    if set.kind() != kind {
+        return Err(SimError::WrongKind { expected: kind });
+    }
+    if set.is_empty() {
+        return Err(SimError::EmptySet(kind));
+    }
+    Ok(())
+}
+
 /// `sequence[t5 .. len − t3]` with positions, empty when the trims meet.
 fn trimmed(sequence: &[u8], t5: u32, t3: u32) -> Range<usize> {
     let len = sequence.len();
@@ -179,26 +212,51 @@ impl<'a> Simulator<'a> {
         j: &'a GermlineSet,
         params: SimParams,
     ) -> Result<Self, SimError> {
-        for (set, kind) in [
-            (Some(v), SegmentKind::V),
-            (d, SegmentKind::D),
-            (Some(j), SegmentKind::J),
-        ] {
-            let Some(set) = set else { continue };
-            if set.kind() != kind {
-                return Err(SimError::WrongKind { expected: kind });
-            }
-            if set.is_empty() {
-                return Err(SimError::EmptySet(kind));
-            }
+        check(v, SegmentKind::V)?;
+        if let Some(d) = d {
+            check(d, SegmentKind::D)?;
         }
+        check(j, SegmentKind::J)?;
         Ok(Self {
             v: ascii(v),
             d: d.map(ascii).unwrap_or_default(),
             j: ascii(j),
-            sets: [Some(v), d, Some(j)],
+            c: Vec::new(),
+            c_frames: Vec::new(),
+            sets: [Some(v), d, Some(j), None],
             params,
         })
+    }
+
+    /// Read into the constant regions of `c` ([`Self::append_constant`]).
+    pub fn with_constant(mut self, c: &'a GermlineSet) -> Result<Self, SimError> {
+        check(c, SegmentKind::C)?;
+        self.c = ascii(c);
+        self.c_frames = c
+            .alleles()
+            .iter()
+            .map(|a| open_frames(&a.codes).next())
+            .collect();
+        self.sets[SegmentKind::C.index()] = Some(c);
+        Ok(self)
+    }
+
+    /// `o`, the germline position of C allele `c` that follows the last
+    /// base of J allele `j`:
+    ///
+    /// ```text
+    /// o = (f_C + φ_J) mod 3      f_C: C's stop-free frame
+    ///                            φ_J = (|J| − anchor_J) mod 3: J bases past its last codon
+    /// ```
+    ///
+    /// so the splice keeps the reading frame. It is 0 for records that
+    /// start after the J's last base (IMGT CH1: `φ_J = 1`, `f_C = 2`) and 1
+    /// for codon-aligned records that repeat it (`f_C = 0`); 0 without a
+    /// frame or a J anchor.
+    pub fn constant_offset(&self, c: usize, j: usize) -> usize {
+        let j = self.sets[SegmentKind::J.index()].map(|set| set.allele(j as u32));
+        let phase = j.and_then(|j| Some((j.codes.len() - j.anchor? as usize) % 3));
+        self.c_frames[c].zip(phase).map_or(0, |(f, p)| (f + p) % 3)
     }
 
     /// The germline set a simulated allele index refers to.
@@ -219,10 +277,63 @@ impl<'a> Simulator<'a> {
         Some(&allele[trimmed(allele, t5, t3)])
     }
 
-    /// `n` reads from a fresh generator seeded with `seed`.
+    /// `n` reads from fresh generators seeded with `seed` (V(D)J) and
+    /// `seed ^` [`C_STREAM`] (C).
     pub fn reads(&self, n: usize, seed: u64) -> Result<Vec<SimulatedRead>, SimError> {
-        let mut rng = Rng::new(seed);
-        (0..n).map(|_| self.read(&mut rng)).collect()
+        let (mut rng, mut c_rng) = (Rng::new(seed), Rng::new(seed ^ C_STREAM));
+        (0..n)
+            .map(|_| {
+                let mut read = self.read(&mut rng)?;
+                self.append_constant(&mut read, &mut c_rng);
+                Ok(read)
+            })
+            .collect()
+    }
+
+    /// With probability `include_c`, read through the J–C splice: a C
+    /// allele drawn uniformly overwrites the start of the 3′ flank from
+    /// germline position `o` ([`Self::constant_offset`]), for the whole
+    /// flank with probability `c_whole_flank`, else for a length uniform in
+    /// `0..=flank`, and never past the allele's end; then instrument errors
+    /// at the 3′ rate. Draws only from `rng`, so call it with a stream of
+    /// its own; without a C database it does nothing.
+    pub fn append_constant(&self, read: &mut SimulatedRead, rng: &mut Rng) {
+        let p = &self.params;
+        if self.c.is_empty() || !rng.bernoulli(p.include_c) {
+            return;
+        }
+        let allele = rng.below(self.c.len());
+        let offset = self.constant_offset(allele, read.j);
+        let Some(flank) = read.span(Region::Flank3) else {
+            return;
+        };
+        let len = if rng.bernoulli(p.c_whole_flank) {
+            flank.len()
+        } else {
+            rng.range(0, flank.len() as u32) as usize
+        };
+        let germline = self.c[allele].get(offset..).unwrap_or_default();
+        let len = len.min(germline.len());
+        if len == 0 {
+            return;
+        }
+        let rate = p.illumina_error.p3;
+        for (k, at) in (flank.start..flank.start + len).enumerate() {
+            let mut base = germline[k];
+            if rate > 0.0 && rng.uniform() < rate {
+                base = rng.substitute(base);
+                read.instrument_errors += 1;
+            }
+            read.forward[at] = base;
+            read.regions[at] = Region::C;
+            read.origins[at] = (offset + k) as u32;
+        }
+        read.c = Some(allele);
+        read.sequence = if read.reverse_complemented {
+            reverse_complement(&read.forward)
+        } else {
+            read.forward.clone()
+        };
     }
 
     /// One read (IgSim's `gen(rng)`).
@@ -383,6 +494,7 @@ impl<'a> Simulator<'a> {
             d,
             d2,
             j,
+            c: None,
             trims,
             flank_5p,
             flank_3p,
@@ -529,5 +641,60 @@ mod tests {
         }
         assert!(rc > 60 && rc < 140);
         assert!(indels > 0);
+    }
+
+    #[test]
+    fn constant_regions_continue_the_reading_frame_and_leave_vdj_untouched() {
+        use crate::alphabet::encode;
+        use crate::sim::{SyntheticDatabase, SyntheticSpec};
+        use crate::translate::{STOP, translate};
+        for (aligned, offset) in [(false, 0), (true, 1)] {
+            let spec = SyntheticSpec {
+                c_codon_aligned: aligned,
+                ..SyntheticSpec::default()
+            };
+            let db = SyntheticDatabase::generate(&spec, 4);
+            let params = SimParams {
+                illumina_error: crate::sim::IlluminaError::NONE,
+                reverse_complement: 0.5,
+                ..SimParams::easy()
+            };
+            let plain = Simulator::new(&db.v, Some(&db.d), &db.j, params).unwrap();
+            let sim = Simulator::new(&db.v, Some(&db.d), &db.j, params)
+                .unwrap()
+                .with_constant(&db.c)
+                .unwrap();
+            let (without, with) = (plain.reads(300, 8).unwrap(), sim.reads(300, 8).unwrap());
+            let mut constant = 0;
+            for (a, b) in without.iter().zip(&with) {
+                let flank = a.span(Region::Flank3).unwrap();
+                assert_eq!(a.forward[..flank.start], b.forward[..flank.start]);
+                assert_eq!((a.v, a.d, a.j, a.trims), (b.v, b.d, b.j, b.trims));
+                let oriented = if b.reverse_complemented {
+                    reverse_complement(&b.sequence)
+                } else {
+                    b.sequence.clone()
+                };
+                assert_eq!(oriented, b.forward);
+                let Some(c) = b.c else {
+                    assert!(b.span(Region::C).is_none());
+                    continue;
+                };
+                constant += 1;
+                let span = b.span(Region::C).unwrap();
+                assert_eq!(span.start, flank.start);
+                assert_eq!(sim.constant_offset(c, b.j), offset);
+                assert_eq!(b.origins[span.start], offset as u32);
+                let germline = &db.c.allele(c as u32).codes[offset..offset + span.len()];
+                assert_eq!(encode(&b.forward[span.clone()]), germline);
+                // The splice keeps the J's reading frame: no stop from the
+                // J anchor through C.
+                let anchor = b.locate(Region::J, db.j.allele(b.j as u32).anchor.unwrap());
+                let spliced = encode(&b.forward[anchor.unwrap()..span.end]);
+                let protein = translate(&spliced, 0);
+                assert!(!protein[..protein.len() - 1].contains(&STOP), "{aligned}");
+            }
+            assert!((200..280).contains(&constant), "{constant}");
+        }
     }
 }

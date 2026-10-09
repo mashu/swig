@@ -22,12 +22,12 @@ use vdj_assign::annotate::{AnnotateOptions, ChainType};
 use vdj_assign::prelude::*;
 use vdj_assign::prepare::{PreparedDatabase, prepare};
 use vdj_assign::reads::ReadReader;
-use vdj_assign::sim::{Assignment, Evaluation, Paired, Rng, SimParams, Simulator, Truth};
+use vdj_assign::sim::{Assignment, C_STREAM, Evaluation, Paired, Rng, SimParams, Simulator, Truth};
 
 const USAGE: &str = "\
 usage: vdj-assign --v V.fasta --j J.fasta [--d D.fasta] [--c C.fasta] [options] <reads.fasta|reads.fastq|->
        vdj-assign prepare --v V.fasta --j J.fasta [--d D.fasta] [--c C.fasta] [--chain heavy|light] --out DIR
-       vdj-assign simulate --v V.fasta --j J.fasta [--d D.fasta] --out PREFIX
+       vdj-assign simulate --v V.fasta --j J.fasta [--d D.fasta] [--c C.fasta] --out PREFIX
                   [--preset easy|mid|hard] [--reads N] [--seed S] [--rc P] [--shm RATE]
        vdj-assign evaluate --truth PREFIX.truth.tsv <calls.tsv> [other.tsv]
 
@@ -175,7 +175,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--v" if !evaluate => set_once(&mut args.v, "--v", value("--v")?)?,
             "--d" if !evaluate => set_once(&mut args.d, "--d", value("--d")?)?,
             "--j" if !evaluate => set_once(&mut args.j, "--j", value("--j")?)?,
-            "--c" if assign || prepare => set_once(&mut args.c, "--c", value("--c")?)?,
+            "--c" if !evaluate => set_once(&mut args.c, "--c", value("--c")?)?,
             "--c-evalue" if assign => {
                 set_once(&mut args.c_evalue, "--c-evalue", value("--c-evalue")?)?
             }
@@ -501,13 +501,17 @@ fn run_simulate(args: &Args) -> Result<(), Box<dyn Error>> {
     let count: usize = number(&args.count, "--reads", 10_000)?;
     let seed: u64 = number(&args.seed, "--seed", 1)?;
     let database = load_database(args)?;
-    let sim = Simulator::new(&database.v, database.d.as_ref(), &database.j, params)?;
+    let mut sim = Simulator::new(&database.v, database.d.as_ref(), &database.j, params)?;
+    if let Some(c) = &database.c {
+        sim = sim.with_constant(c)?;
+    }
     let mut reads = BufWriter::new(File::create(format!("{out}.fasta"))?);
     let mut truth = BufWriter::new(File::create(format!("{out}.truth.tsv"))?);
-    writeln!(truth, "{}", Truth::tsv_header())?;
-    let mut rng = Rng::new(seed);
+    writeln!(truth, "{}", Truth::tsv_header_with(database.c.is_some()))?;
+    let (mut rng, mut c_rng) = (Rng::new(seed), Rng::new(seed ^ C_STREAM));
     for index in 0..count {
-        let read = sim.read(&mut rng)?;
+        let mut read = sim.read(&mut rng)?;
+        sim.append_constant(&mut read, &mut c_rng);
         let id = format!("sim{index}");
         writeln!(reads, ">{id}\n{}", String::from_utf8_lossy(&read.sequence))?;
         writeln!(truth, "{}", Truth::from_read(&sim, &read, &id).to_tsv())?;

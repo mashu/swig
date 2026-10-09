@@ -8,8 +8,8 @@
 //!   allele similarity hierarchy, for regression tests that cannot ship
 //!   IMGT-derived data;
 //! * [`truth`] — serialisable ground truth per read;
-//! * [`evaluate`] — allele, gene, boundary, D-presence and junction accuracy
-//!   of any tool's AIRR calls against the truth.
+//! * [`evaluate`] — allele, gene, boundary, D-presence, junction and
+//!   constant-region accuracy of any tool's AIRR calls against the truth.
 //!
 //! ```ignore
 //! use vdj_assign::sim::{SimParams, Simulator, Evaluation};
@@ -31,13 +31,13 @@ pub mod synthetic;
 pub mod truth;
 
 pub use evaluate::{
-    Assignment, D_REMNANT_STRATA, DPresence, Evaluation, Paired, PairedBrier, PairedOutcome,
-    SegmentCall, SegmentStats,
+    Assignment, C_LENGTH_BINS, ConstantStats, D_REMNANT_STRATA, DPresence, Evaluation, Paired,
+    PairedBrier, PairedOutcome, SegmentCall, SegmentStats,
 };
 pub use params::{IlluminaError, SimParams};
 pub use random::{Count, GatedRate, Rate, Rng};
 pub use simulate::{
-    NO_ORIGIN, Region, SimError, SimulatedRead, Simulator, Trims, reverse_complement,
+    C_STREAM, NO_ORIGIN, Region, SimError, SimulatedRead, Simulator, Trims, reverse_complement,
 };
 pub use synthetic::{SyntheticDatabase, SyntheticSpec};
 pub use truth::{Slot, TrueSegment, Truth};

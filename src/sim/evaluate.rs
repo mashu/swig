@@ -24,7 +24,18 @@
 //!   Brier score. A segment's event is "some reported name is
 //!   germline-equivalent to the truth"; D presence's event is "the read has
 //!   a simulated D", however short its remnant.
+//! * **Constant region**, when the reads were simulated with C, stratified
+//!   by the length of the C part ([`C_LENGTH_BINS`]) and scored against
+//!   *anchored* equivalence ([`super::truth`]). Short C remnants are shared
+//!   by several genes (`GCCTCCACCAAG` opens IGHG1, IGHG2 and IGHG4), so
+//!   allele equivalence alone says little about the isotype; the table adds
+//!   the gene of the first name (what a user reading the isotype off
+//!   `c_call` gets), whether the reported genes are exactly the equivalent
+//!   genes, over-calls (a reported name outside the equivalent set), and the
+//!   oracle's resolution (genes in the equivalent set). On reads without C,
+//!   a C call is a false call.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::ops::Range;
 
@@ -34,6 +45,11 @@ use crate::report::{AirrRecord, SegmentReport};
 
 fn gene(name: &str) -> &str {
     GermlineSet::gene_of_name(name)
+}
+
+/// The distinct genes of `names`.
+fn genes(names: &[String]) -> BTreeSet<&str> {
+    names.iter().map(|n| gene(n)).collect()
 }
 
 /// One called segment: reported allele names (primary first) and its read
@@ -51,7 +67,7 @@ pub struct SegmentCall {
 pub struct Assignment {
     pub rev_comp: bool,
     /// Indexed by [`Slot::index`].
-    pub segments: [Option<SegmentCall>; 4],
+    pub segments: [Option<SegmentCall>; 5],
     pub junction: Option<String>,
     /// Reported probability that the read contains a D.
     pub d_presence: Option<f64>,
@@ -73,6 +89,7 @@ impl Assignment {
                 segment(&record.d),
                 segment(&record.d2),
                 segment(&record.j),
+                segment(&record.c),
             ],
             junction: record.junction_sequence().map(str::to_string),
             d_presence: record.d_presence_posterior,
@@ -80,7 +97,7 @@ impl Assignment {
     }
 
     /// Parse one AIRR Rearrangement TSV row; returns `(sequence_id, assignment)`.
-    /// Only `sequence_id` is required. `{v,d,d2,j}_call` may list several
+    /// Only `sequence_id` is required. `{v,d,d2,j,c}_call` may list several
     /// comma-separated names (primary first); coordinates are AIRR 1-based closed.
     pub fn from_airr(header: &[&str], line: &str) -> Result<(String, Self), String> {
         let fields: Vec<&str> = line.split('\t').collect();
@@ -211,6 +228,74 @@ impl SegmentStats {
     }
 }
 
+/// C length strata: none, below the gate's reach, then doubling lengths.
+/// The gate needs a clipped score of about 18 (`S ≥ 18` for the 10 human
+/// IGHC genes), nine exact bases.
+pub const C_LENGTH_BINS: [(usize, usize); 7] = [
+    (0, 0),
+    (1, 7),
+    (8, 15),
+    (16, 31),
+    (32, 63),
+    (64, 127),
+    (128, usize::MAX),
+];
+
+/// Constant-region tallies of one C length stratum, against anchored
+/// equivalence. In the stratum without C, `called` counts false calls.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ConstantStats {
+    pub reads: usize,
+    /// Reads with a C call.
+    pub called: usize,
+    /// The primary name is equivalent.
+    pub equivalent: usize,
+    /// The primary name's gene is the simulated allele's gene.
+    pub first_gene: usize,
+    /// The reported genes are exactly the genes of the equivalent alleles.
+    pub gene_set: usize,
+    /// Calls reporting a name outside the equivalent alleles.
+    pub over_call: usize,
+    /// Distinct genes reported, summed over calls.
+    pub genes_listed: usize,
+    /// Distinct genes of the equivalent alleles, summed over reads with C.
+    pub genes_equivalent: usize,
+}
+
+impl ConstantStats {
+    fn add(&mut self, truth: Option<&TrueSegment>, call: Option<&SegmentCall>, oriented: bool) {
+        self.reads += 1;
+        if let Some(truth) = truth {
+            self.genes_equivalent += genes(&truth.equivalent).len();
+        }
+        let Some(call) = call else { return };
+        self.called += 1;
+        self.genes_listed += genes(&call.names).len();
+        let (Some(truth), Some(primary)) = (truth, call.names.first()) else {
+            return;
+        };
+        let listed_equivalent = call.names.iter().all(|n| truth.equivalent.contains(n));
+        self.over_call += usize::from(!oriented || !listed_equivalent);
+        if !oriented {
+            return;
+        }
+        self.equivalent += usize::from(primary_equivalent(truth, call));
+        self.first_gene += usize::from(gene(primary) == gene(&truth.allele));
+        self.gene_set += usize::from(genes(&call.names) == genes(&truth.equivalent));
+    }
+
+    fn merge(&mut self, other: &ConstantStats) {
+        self.reads += other.reads;
+        self.called += other.called;
+        self.equivalent += other.equivalent;
+        self.first_gene += other.first_gene;
+        self.gene_set += other.gene_set;
+        self.over_call += other.over_call;
+        self.genes_listed += other.genes_listed;
+        self.genes_equivalent += other.genes_equivalent;
+    }
+}
+
 /// D remnant length strata.
 pub const D_LENGTH_BINS: [(usize, usize); 6] =
     [(0, 0), (1, 3), (4, 7), (8, 11), (12, 15), (16, usize::MAX)];
@@ -289,16 +374,22 @@ pub struct PosteriorCalibration {
     pub d: Calibration,
     pub j: Calibration,
     pub d_presence: Calibration,
+    pub c: Calibration,
 }
 
 impl PosteriorCalibration {
-    fn targets(&self) -> [(&'static str, &Calibration); 4] {
-        [
+    /// The calibrations to show: C only when some read reported it.
+    fn targets(&self) -> Vec<(&'static str, &Calibration)> {
+        let mut targets = vec![
             ("V", &self.v),
             ("D", &self.d),
             ("J", &self.j),
             ("D presence", &self.d_presence),
-        ]
+        ];
+        if self.c.count() > 0 {
+            targets.push(("C", &self.c));
+        }
+        targets
     }
 }
 
@@ -325,6 +416,8 @@ pub struct Evaluation {
     /// Reads whose junction is templated at both anchors.
     pub junction_reads: usize,
     pub junction_exact: usize,
+    /// By [`C_LENGTH_BINS`]; empty unless the reads were simulated with C.
+    pub c: [ConstantStats; C_LENGTH_BINS.len()],
     pub calibration: PosteriorCalibration,
 }
 
@@ -361,10 +454,20 @@ impl Evaluation {
                 usize::from(oriented && call.junction.as_deref() == Some(junction.as_str()));
         }
 
+        if truth.constant {
+            let length = truth.segment(Slot::C).map_or(0, |c| c.span.len());
+            let bin = C_LENGTH_BINS
+                .iter()
+                .position(|&(lo, hi)| (lo..=hi).contains(&length))
+                .expect("bins cover every length");
+            self.c[bin].add(truth.segment(Slot::C), call.segment(Slot::C), oriented);
+        }
+
         for (slot, calibration) in [
             (Slot::V, &mut self.calibration.v),
             (Slot::D, &mut self.calibration.d),
             (Slot::J, &mut self.calibration.j),
+            (Slot::C, &mut self.calibration.c),
         ] {
             let Some(segment) = call.segment(slot) else {
                 continue;
@@ -415,12 +518,16 @@ impl Evaluation {
         }
         self.junction_reads += other.junction_reads;
         self.junction_exact += other.junction_exact;
+        for (a, b) in self.c.iter_mut().zip(&other.c) {
+            a.merge(b);
+        }
         self.calibration.v.merge(&other.calibration.v);
         self.calibration.d.merge(&other.calibration.d);
         self.calibration.j.merge(&other.calibration.j);
         self.calibration
             .d_presence
             .merge(&other.calibration.d_presence);
+        self.calibration.c.merge(&other.calibration.c);
     }
 
     pub fn junction_rate(&self) -> f64 {
@@ -493,16 +600,49 @@ impl fmt::Display for Evaluation {
                 pct(p.correct, p.reads)
             )?;
         }
+        if self.c.iter().any(|c| c.reads > 0) {
+            write!(
+                f,
+                "\nC length   reads  called%  equiv%  1st gene%  gene set%  over-call%  genes  oracle"
+            )?;
+            for (&(lo, hi), c) in C_LENGTH_BINS.iter().zip(&self.c) {
+                let label = match (lo, hi) {
+                    (0, 0) => "none".to_string(),
+                    (lo, usize::MAX) => format!("{lo}+"),
+                    (lo, hi) => format!("{lo}-{hi}"),
+                };
+                write!(
+                    f,
+                    "\n  {label:<8}{:>6} {:>8.2}",
+                    c.reads,
+                    pct(c.called, c.reads)
+                )?;
+                if lo == 0 {
+                    continue;
+                }
+                let mean = |sum: usize, n: usize| sum as f64 / n as f64;
+                write!(
+                    f,
+                    " {:>7.2} {:>10.2} {:>10.2} {:>11.2} {:>6.2} {:>7.2}",
+                    pct(c.equivalent, c.reads),
+                    pct(c.first_gene, c.reads),
+                    pct(c.gene_set, c.reads),
+                    pct(c.over_call, c.called),
+                    mean(c.genes_listed, c.called),
+                    mean(c.genes_equivalent, c.reads),
+                )?;
+            }
+        }
         let targets = self.calibration.targets();
         if targets.iter().all(|(_, c)| c.count() == 0) {
             return Ok(());
         }
         write!(f, "\nposterior   ")?;
-        for (label, _) in targets {
+        for (label, _) in &targets {
             write!(f, " {label:>22}")?;
         }
         write!(f, "\n  bin       ")?;
-        for _ in targets {
+        for _ in &targets {
             write!(f, " {:>8} {:>6} {:>6}", "n", "mean%", "obs%")?;
         }
         let mut lo = 0.0;
@@ -513,7 +653,7 @@ impl fmt::Display for Evaluation {
                 format!("{lo:.3}-1    ")
             };
             write!(f, "\n  {label:<10}")?;
-            for (_, c) in targets {
+            for (_, c) in &targets {
                 let b = &c.bins[i];
                 let mean = if b.count == 0 {
                     f64::NAN
@@ -531,11 +671,11 @@ impl fmt::Display for Evaluation {
             lo = hi;
         }
         write!(f, "\n  ECE %     ")?;
-        for (_, c) in targets {
+        for (_, c) in &targets {
             write!(f, " {:>22.3}", 100.0 * c.ece())?;
         }
         write!(f, "\n  Brier     ")?;
-        for (_, c) in targets {
+        for (_, c) in &targets {
             write!(f, " {:>22.5}", c.brier())?;
         }
         Ok(())
@@ -684,7 +824,8 @@ pub const D_REMNANT_STRATA: [(usize, usize); 3] = [(1, 3), (4, 7), (8, usize::MA
 /// ([`D_REMNANT_STRATA`]), no D call on reads without one (D allele accuracy
 /// alone rewards calling D everywhere), junction exactness (reads with a
 /// templated junction), and the Brier scores of the D allele and D presence
-/// posteriors (reads where both callers report one).
+/// posteriors (reads where both callers report one). Reads simulated with C
+/// add C allele equivalence (reads with C) and no C call (reads without).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Paired {
     pub v: PairedOutcome,
@@ -693,6 +834,8 @@ pub struct Paired {
     pub no_d: PairedOutcome,
     pub j: PairedOutcome,
     pub junction: PairedOutcome,
+    pub c: PairedOutcome,
+    pub no_c: PairedOutcome,
     pub d_brier: PairedBrier,
     pub d_presence_brier: PairedBrier,
 }
@@ -709,6 +852,7 @@ impl Paired {
             (Slot::V, &mut self.v),
             (Slot::D, &mut self.d),
             (Slot::J, &mut self.j),
+            (Slot::C, &mut self.c),
         ] {
             if let Some(segment) = truth.segment(slot) {
                 outcome.add(
@@ -727,9 +871,14 @@ impl Paired {
                 correct(second, Slot::D, segment),
             );
         }
+        let silent = |call: &Assignment, slot: Slot| call.segment(slot).is_none();
         if truth.segment(Slot::D).is_none() {
-            let silent = |call: &Assignment| call.segment(Slot::D).is_none();
-            self.no_d.add(silent(first), silent(second));
+            self.no_d
+                .add(silent(first, Slot::D), silent(second, Slot::D));
+        }
+        if truth.constant && truth.segment(Slot::C).is_none() {
+            self.no_c
+                .add(silent(first, Slot::C), silent(second, Slot::C));
         }
         // The calibration events of [`Evaluation`]: some reported D name is
         // equivalent to the truth; the read has a D.
@@ -765,7 +914,7 @@ impl fmt::Display for Paired {
             "metric       reads   first%  second%   Δ pp   ±95% CI   first only  second only  McNemar p"
         )?;
         let [short, detectable, long] = &self.d_by_remnant;
-        for (label, o) in [
+        let mut rows = vec![
             ("V allele", &self.v),
             ("D allele", &self.d),
             ("D 1-3 nt", short),
@@ -774,7 +923,11 @@ impl fmt::Display for Paired {
             ("no D call", &self.no_d),
             ("J allele", &self.j),
             ("junction", &self.junction),
-        ] {
+        ];
+        if self.c.reads() + self.no_c.reads() > 0 {
+            rows.extend([("C allele", &self.c), ("no C call", &self.no_c)]);
+        }
+        for (label, o) in rows {
             let (first, second) = o.rates();
             write!(
                 f,
@@ -860,5 +1013,45 @@ mod tests {
         assert!((o.difference() - 2.0).abs() < 1e-12);
         // sqrt((40/1000 − 0.02²) / 1000) · 1.96 = 1.233 pp.
         assert!((o.half_width() - 1.2334).abs() < 1e-3, "{}", o.half_width());
+    }
+
+    #[test]
+    fn constant_calls_are_scored_by_gene_set_and_first_name() {
+        let names = |list: &[&str]| list.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        let truth = TrueSegment {
+            allele: "G1*01".into(),
+            equivalent: names(&["G1*01", "G1*02", "G2*01"]),
+            span: 100..110,
+        };
+        let call = |list: &[&str]| SegmentCall {
+            names: names(list),
+            span: None,
+            posterior: None,
+        };
+        let mut stats = ConstantStats::default();
+        // Equivalent, but the first name is the other gene.
+        stats.add(Some(&truth), Some(&call(&["G2*01", "G1*01"])), true);
+        // Right gene first; a gene missing from the list.
+        stats.add(Some(&truth), Some(&call(&["G1*02"])), true);
+        // An over-call: G3 is not equivalent.
+        stats.add(
+            Some(&truth),
+            Some(&call(&["G1*01", "G2*01", "G3*01"])),
+            true,
+        );
+        // Misoriented calls are wrong; no call is not an over-call.
+        stats.add(Some(&truth), Some(&call(&["G1*01", "G2*01"])), false);
+        stats.add(Some(&truth), None, true);
+        let expected = ConstantStats {
+            reads: 5,
+            called: 4,
+            equivalent: 3,
+            first_gene: 2,
+            gene_set: 1,
+            over_call: 2,
+            genes_listed: 2 + 1 + 3 + 2,
+            genes_equivalent: 5 * 2,
+        };
+        assert_eq!(stats, expected);
     }
 }
