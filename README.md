@@ -27,15 +27,18 @@ cargo test --release -- --ignored              # + accuracy at scale: 20,000 rea
 target/release/vdj-assign --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta \
     [--profile r|truth|igblast|sensitive-d] [--threads N] [--tandem-d] \
     [--chain heavy|light] [--forward-only] [--no-anchor-window] [--no-posterior] [--residual] \
-    [--simd avx512|avx2|neon|portable|scalar] reads.fastq > calls.tsv
+    [--calls per-read|fixed] [--d-allele map|max-marginal] [--d-presence-rate R] \
+    [--simd avx512|avx2|neon|portable|scalar] [--c IGHC.fasta [--c-evalue E]] \
+    reads.fastq > calls.tsv
 
 zcat reads.fastq.gz | target/release/vdj-assign --v V.fasta --d D.fasta --j J.fasta - > calls.tsv
 
 # optional: write the annotated database for review or curation
-target/release/vdj-assign prepare --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta --out prepared/
+target/release/vdj-assign prepare --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta [--c IGHC.fasta] \
+    --out prepared/
 
 # simulate reads with known truth (IgSim model), then score any tool's AIRR TSV against it
-target/release/vdj-assign simulate --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta \
+target/release/vdj-assign simulate --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta [--c IGHC.fasta] \
     --preset hard --reads 10000 --seed 1 --out sim          # sim.fasta + sim.truth.tsv
 target/release/vdj-assign --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta sim.fasta > calls.tsv
 target/release/vdj-assign evaluate --truth sim.truth.tsv calls.tsv   # works for IgBLAST etc. too
@@ -82,6 +85,19 @@ Region columns follow: `fwr1`–`fwr4`, `cdr1`–`cdr3`
 `junction_aa`, `vj_in_frame`, `stop_codon` and `productive`. A read without a
 significant V or J (see *Significance* below) is written with empty calls.
 
+**Constant region (isotype).** With `--c C.fasta`, twelve `c_` columns
+follow `productive` (`c_call`, `c_score`, `c_identity`, `c_support`,
+`c_posterior`, `c_cigar`, sequence and germline coordinates and alignments);
+without it the output is unchanged. C's germline base 0 is anchored within 3
+bases of the called J's end and aligned exactly from there to the read's
+end; V, D and J calls never change. `c_support` is the anchored E-value
+`N_C·7·e^(−λS)` over the file's C genes and start diagonals, and C is called
+at `c_support ≤ 10⁻³` (`--c-evalue`). Give one locus' spliced coding C
+regions, CH1 onward (IMGT or codon-aligned records such as abstar's both
+work), since every gene in the file counts. `c_call` lists every co-optimal
+allele: for a short C part shared by several genes (IGHG1/2/4 open alike)
+the *first* name is any of them, so read the isotype from the genes listed.
+
 As a library:
 
 ```rust
@@ -103,13 +119,16 @@ the V region boundaries follow from three conserved residues:
 ```text
 FR1  = [frame start, Cys23 + 4 codons)      CDR1 = [Cys23 + 4, Trp41 − 2)
 FR2  = [Trp41 − 2, Trp41 + 15)              CDR2 = [Trp41 + 15, FR3 start)
-FR3  = [Cys104 − (L − 1), Cys104 + 1)       L = 38 codons heavy, 36 light
+FR3  = [Cys104 − (L − 1), Cys104 + 1)       L = FR3 length in codons
 CDR3 = [Cys104 + 1, J Trp/Phe118)           FR4  = [J Trp/Phe118, J end)
 junction = [Cys104, Trp/Phe118 + 1)         (both conserved codons included)
 ```
 
-These are the IMGT/AIRR definitions. FR2 has no IMGT gaps, and FR3 has
-constant gaps per locus (heavy: 73; kappa and lambda: 73, 81, 82).
+These are the IMGT/AIRR definitions. FR2 has no IMGT gaps. FR3 (IMGT 66–104)
+has no conserved residue at its start, and its length varies: 38 codons in
+IG heavy and 36 in kappa, but by gene family in lambda (36/38), TRA (32–34),
+TRB (37/38), TRG and TRD (37–39). The CDR2/FR3 boundary therefore comes from
+annotated relatives or a length learned from the database (below).
 
 ### Header keys
 
@@ -121,11 +140,29 @@ All positions are 0-based in the germline sequence; unknown keys are ignored.
 | `fr1=` `cdr1=` `fr2=` `cdr2=` `fr3=` | V region starts |
 | `aliases=A,B` | other names of this sequence |
 
+### IMGT-gapped input
+
+An IMGT-gapped V set (the IMGT reference format: `.` for the gap columns) is
+numbered from its gap columns. The FR1, CDR1, FR2, CDR2 and FR3 starts are
+IMGT columns 1, 79, 115, 166 and 196, and Cys104 is column 310.
+
+- The gaps are used only when most gapped alleles are codon-aligned and
+  carry Cys, Trp and Cys at IMGT 23, 41 and 104. Otherwise they are ignored
+  (a codon alignment in other columns) and the summary line says why.
+- A region that the numbering places before a 5′-partial sequence stays
+  empty; a motif hit cannot fill it.
+- An allele whose numbering ends before Cys104 gets no anchor (`3′-partial`).
+- A one- or two-column interior gap (an IMGT frameshift marker) is noted, and
+  the columns after it still map exactly.
+- Header keys win over the gap columns.
+- Ungapped alleles appended to a gapped set are annotated as below, and take
+  their FR3 start from their gapped relatives.
+
 ### Sources, in order of trust
 
 A header value is never overridden.
 
-1. **Header keys.**
+1. **Header keys**, then the **IMGT gap columns** (source `imgt-gaps`).
 2. **Motif search** on a one-pass three-frame translation. For V, Cys23, Trp41
    and Cys104 are placed jointly under spacing constraints, scored by
    conserved context: `[ST]C`; `W` with `Q`+3, `P`+5, `G`+6 (`WVRQAPG` /
@@ -134,13 +171,19 @@ A header value is never overridden.
    FR4.
 3. **Database consensus.** Once pass 1 has run, the chain type is voted:
    J `W`/`F` and Trp41 context `W.R`/`W.Q`. That turns the Trp41 → Cys104 window
-   into a CDR2-length constraint, `[14 + L, 26 + L]`. The dominant V 3′ tail
+   into a CDR2-length constraint, `[14 + L, 26 + L]`, over every FR3 length `L`
+   the chain default or the given FR3 starts admit. The dominant V 3′ tail
    (applied to confident alleles only when it holds ≥ 50 % of the database) and
    the Cys23 codon index of full-length alleles (only in their frame) become
    priors for a second pass.
 4. **Sibling alignment.**
-   - An ambiguous Cys23 in a 5′-truncated allele is taken from the most similar
-     unambiguous allele.
+   - An FR3 start that is not given is taken from the most similar allele
+     whose FR3 start is given. If the two share a Trp41 → Cys104 spacing, the
+     Cys104 → FR3 distance is copied; otherwise the FR3 start is mapped by
+     alignment, so a CDR2 indel stays in CDR2.
+   - A Cys23 window with several Cys codons, or none (a mutated Cys23, or a
+     5′-partial allele that starts after it), takes CDR1 from the most
+     similar allele whose Cys23 is settled, in any frame.
    - An allele whose motifs stay weak (pseudogene, mutated Cys) gets its anchor
      and every region start transferred by alignment from the most similar
      trusted allele.
@@ -152,7 +195,29 @@ A header value is never overridden.
      partial V alleles (IGHV4-31\*06–\*09, IGHV2-70\*02, …) had been given an
      out-of-frame TGT ~30 nt upstream, which shifted every junction they
      produced.
-5. **Low-confidence motif hit (no relative), or missing.** Both are reported.
+5. **Database models**, for alleles that no relative settles. Both are
+   learned once per database, with Jeffreys (½) pseudo-counts:
+   - *FR3 length.* Trp41 → Cys104 spans `d = 14 + c + L` codons for a CDR2 of
+     `c` and an FR3 of `L` codons. The model picks the `L` that maximises
+     `P(L) · P(c = d − 14 − L)`, both estimated from the given FR3 starts. `L`
+     ranges over the observed lengths ±1 codon, up to 39. Without any given
+     FR3 start, the chain default (38 heavy, 36 light) is used.
+   - *Cys23.* Each candidate codon is scored by the database's Cys23
+     nucleotide offsets, its CDR1 lengths and the two residues before
+     Cys23, against background frequencies. TRB Cys23 follows `R`, not the
+     IG `[ST]`. A mutated Cys23 is placed only at an offset the database
+     has, with posterior ≥ ½.
+6. **Low-confidence motif hit (no relative), or missing.** Both are reported.
+
+Every derived start that may be wrong is flagged in `annotation.tsv` as
+`uncertain=…`; given values never are. The flagged cases are:
+- every start of a low-confidence or missing anchor;
+- an FR3 length with model posterior below 0.95, or outside the model;
+- the chain default in a TR or IGL database without any given FR3 start
+  (`prepare` and `assign` also warn);
+- a CDR1 from an ambiguous Cys23 that no relative settled, or from no Cys23;
+- a CDR of unusual length;
+- a start transferred from a relative whose own start is flagged.
 
 ### Speed
 
@@ -160,11 +225,13 @@ A header value is never overridden.
   the 2-bit codon index.
 - **Candidate scoring:** a V allele costs a few dozen candidate scores per pass.
 - **Relative search:** an inverted 8-mer index (CSR over 65,536 keys, built
-  lazily) is searched only for the rare unresolved allele, touching only
-  alleles that share k-mers.
+  lazily) is searched only for an unresolved allele or an FR3 start that is
+  not given while others are, touching only alleles that share k-mers.
 
 | Database | Preparation time |
 |---|---|
+| Human IGH, IMGT-gapped (415 V) | 1.1 ms |
+| Human IGH, ungapped | 29 ms |
 | IGH-sized, anchors in headers | 0.8 ms |
 | IGH-sized, worst case (no recognisable motifs) | 1.3 ms |
 | 3,400 alleles, worst case | 11.7 ms |
@@ -187,8 +254,12 @@ Synthetic genes are built from heavy and light framework templates:
 | Test | Result |
 |---|---|
 | 300 heavy + 300 light alleles | every boundary exact |
-| 12,000 alleles over 40 databases | 0 anchor, FR2, CDR2 or FR3 errors |
-| CDR1 starts in the same 12,000 | 5 wrong, all flagged `Cys23 ambiguous` (truncated alleles without a sibling); 0 silent errors |
+| 12,000 alleles over 40 databases | every anchor and region start exact (3 flagged CDR1 errors before the Cys23 model) |
+| IMGT-gapped heavy and light sets with a Cys104 → Ser pseudogene, a 3′-partial, a 5′-partial starting in CDR1, a frameshift marker and a header override | every anchor and start exact; no FR1 or CDR1 before the sequence |
+| TRB (FR3 37/38) and TRA (34/32) sets, 3 headers per family | every boundary exact; without headers `fr3_warning` and every FR3 start flagged |
+| TRB and TRA sets with one header per family, 5′-truncated alleles | 0 errors (6 flagged CDR1 errors before the Cys23 model) |
+| Ungapped alleles appended to an IMGT-gapped 36/38 light set; a CDR2 deletion | FR3 from the gapped relative, exact |
+| Truncated TRB allele with an upstream `SC` decoy; Cys23 → Tyr; 5′-partial after Cys23 | CDR1 exact |
 | Pseudogene with Cys104 and Trp41 destroyed | anchor and all regions transferred exactly from its sibling |
 | 3′-partial allele ending inside Cys104, with an out-of-frame TGT decoy | no anchor, flagged `3′-partial` |
 | 200 simulated reads, half reverse-complemented | FR1–FR4, CDR1–CDR3, junction, frame, stop codon and productive flag exact |
@@ -196,17 +267,26 @@ Synthetic genes are built from heavy and light framework templates:
 ### `prepare`
 
 `vdj-assign prepare` writes `V.fasta`, `D.fasta` and `J.fasta` with every
-anchor and region start in the headers (plus `annotation=SOURCE`), and
-`annotation.tsv` with one row per allele:
+anchor and region start in the headers (plus `annotation=SOURCE`), `C.fasta`
+with `--c`, and `annotation.tsv` with one row per allele:
 
 - frame, anchor and its residue;
 - region starts, CDR1 and CDR2 lengths in codons;
-- source (`header`, `motif`, `consensus`, `transfer:NAME`, `low-confidence`,
-  `missing`) and notes.
+- source (`header`, `imgt-gaps`, `motif`, `consensus`, `transfer:NAME`,
+  `low-confidence`, `missing`) and notes. The notes end with an
+  `uncertain=cdr1,fr3`-style token naming the starts that may be wrong.
+
+With `--c`, `prepare` and assignment warn about database conventions that
+keep C from being called: a C allele missing more than 3 bases at its 5′ end
+against its gene, a C record over 2 kb or without a stop-free reading frame
+(a genomic record with introns, not the spliced coding region), and a J
+allele whose bases past its anchor differ from most J alleles' by more than 3
+(bases past the splice donor move the J exit off the splice).
 
 Reloading the written FASTA uses the headers as-is, so manual corrections
-stick. Assignment runs log a one-line summary and warn when any allele is
-transferred, low-confidence or missing.
+stick. Assignment runs log a one-line summary. They warn when any allele is
+transferred, low-confidence or missing, and when a TR or IGL database gives
+no FR3 start, so that every FR3 start rests on one chain default.
 
 ## Architecture
 
@@ -216,7 +296,8 @@ transferred, low-confidence or missing.
                 ─► per read: J window right of V ─► J stage, whole chunk (every allele)
                 ─► per read: D windows from V/J geometry, D candidates (L-mer bitsets)
                 ─► D stage, whole chunk ─► per read: admission gates
-                ─► per read: placement DAG over VJ / VDJ / VDDJ ─► anchor check ─► Call ─► AIRR
+                ─► per read: placement DAG over VJ / VDJ / VDDJ ─► anchor check ─► Call
+                ─► with --c, whole chunk: C anchored at the J exit (one job per reach class) ─► AIRR
 ```
 
 Every per-read decision is taken per read. Batch aligners must answer
@@ -228,17 +309,18 @@ stages are the methods `stage_orient`, `stage_v`, `stage_j`, `stage_d` and
 | Module | Responsibility |
 |---|---|
 | `alphabet`, `fasta`, `germline`, `reads` | 2-bit codes (N = 4), germline FASTA and sets with anchors, streaming FASTA/FASTQ |
-| `translate`, `annotate`, `prepare`, `read_regions` | Codon table, anchors and V regions (header > motif > consensus > sibling transfer), per-read FR/CDR/junction projection |
+| `translate`, `annotate`, `prepare`, `read_regions` | Codon table, anchors and V regions (header > IMGT gaps > motif > consensus > relatives > database models), per-read FR/CDR/junction projection |
 | `scoring`, `stats` | Log-odds substitution profiles (uniform or position-specific), affine gaps, Karlin–Altschul λ/K/E-values |
 | `orient` | Strand from germline k-mer presence on both strands, with a significance test |
 | `seed`, `index`, `retrieve/frames` | Rolling k-mers, CSR k-mer index over gene frames (alleles of a gene in one coordinate system) |
 | `retrieve/seed_vote`, `retrieve/budget` | Radix-sorted diagonal votes per frame, gene budget, candidate bands |
 | `retrieve/exhaustive`, `retrieve/lmer_mask`, `retrieve/ungapped` | J: every allele; D: lossless L-mer bitsets; optional ungapped pre-ranking |
 | `band`, `align/gotoh`, `align/inter_seq`, `align/lanes` | Diagonal bands; scalar banded Gotoh; inter-sequence Gotoh written once over a SIMD lane trait (AVX-512BW 32 lanes; AVX2, NEON, portable 16) |
-| `segment`, `family_bound` | One search stage: score → sibling upper bounds → traceback waves → acceptance and E-value gates → outer extension |
+| `segment`, `family_bound` | One search stage: score → sibling bounds along the gene frame → traceback waves → acceptance and E-value gates → outer extension |
 | `clip`, `evidence`, `placement` | O(1) clip-and-rescore at any cut; exact-run / identity evidence |
 | `window`, `admission` | Where J and D are searched; D evidence gates |
-| `adjudicate/{lattice,dag,posterior,model,residual}` | The placement lattice; Viterbi and forward–backward over it; grammar and log-odds path model; residual baseline |
+| `constant`, `retrieve/reach` | Constant region after adjudication: splice window, anchor-column DP, anchored E-value and posterior; one candidate per class of alleles the read cannot reach apart |
+| `adjudicate/{lattice,dag,posterior,units,model,decode,residual}` | The placement lattice; Viterbi and forward–backward over it; the per-read model in integer units both read; grammar and log-odds path model; max-marginal D decoding; residual baseline |
 | `flank` | Outer-flank extension of V and J alignments |
 | `pipeline`, `config`, `profiles` | Stage-wise composition, declarative configuration, calling profiles |
 | `report`, `batch` | AIRR output, parallel batches |
@@ -259,18 +341,35 @@ The full description, with the guarantee of each search step, is in
   exits at `x`, the later enters at `y ≥ x`, and the bases between are N/P).
   Ties go to fewer D, then to more germline support (the summed unclipped
   scores).
+- **Calls come from the read's own model.** Each path is valued at the read's
+  divergence `p̂`, estimated before adjudication from the V and J columns no
+  path contests: a match is worth `ln 4(1−p̂)` nats, a mismatch `ln(4p̂/3)`, a
+  D costs `P_D/2` matched D columns. Values are integers (1/2¹⁶ nat), so the
+  maximum is exact, and the posterior reads the same integers: the call is a
+  mode of the reported distribution. `--calls fixed` keeps the fixed scores,
+  of which the per-read model at 11.2 % divergence is an exact multiple.
 - **`P_D` is derived, not tuned.** A D is one of `N` genes at one of `L`
   junction positions. Including it pays off when `λ·S_D > ln(N·L) − ln(prior
-  odds)`, which gives 11 for human IGH (32 genes, L = 25, even odds) and 6
-  for TRB.
+  odds)`, which gives `P*_D` = 10.55 for human IGH (32 genes, L = 25, even
+  odds) and 6.17 for TRB, kept unrounded; on integer scores the fixed scale
+  charges `⌊P*_D⌋`, which decides `S > P*_D` exactly. `--d-presence-rate π`
+  counts what the D search tries instead (Karlin–Altschul `K·m·n_D` over
+  alleles × offsets × positions) at the D-presence rate `π`; the rate has to
+  come from the user, so it is not the default.
 - **Significance.** A V or J hit is kept at E ≤ 1 against its database and
   window. A read is called only when its path contains an *anchor*, a V or J
   hit at E ≤ 10⁻³, so random sequence receives no call.
+- **Constant region.** C is spliced to J at a fixed phase, so C's base 0
+  lies within `s = 3` bases of the J's exit. A bonus column in front of C
+  turns every local aligner into an exact anchored one, and C is called at
+  an anchored E-value `N_C·(2s + 1)·e^(−λS) ≤ 10⁻³`, after adjudication, so
+  it never moves a V, D or J call.
 - **Posterior probabilities.** Read as a distribution, `P(path, cuts) ∝
-  exp(nats)`, the objective gives calibrated probabilities by forward–backward
-  over the same DAG. Alignment evidence is read as log-odds at the read's own
-  divergence (a match is worth `ln 4(1−p̂)` nats, a mismatch `ln(4p̂/3)`); the
-  priors stay at their derivation λ.
+  exp(nats)`, the same model gives calibrated probabilities by
+  forward–backward over the same DAG; the other priors stay at their
+  derivation λ. `--d-allele max-marginal` reports the D allele of largest
+  posterior marginal instead of the call's (off by default: it gains only on
+  heavily mutated reads).
 
 ## Extension points
 
@@ -427,10 +526,25 @@ then runs in waves down the ranking until `top` alignments pass acceptance
 (plus ties), so a high score that fails the length/identity floor does not
 take a slot. With at most `top + 1` candidates the scoring pass is skipped.
 
-**Sibling upper bounds (`family_bound`).** After a gene's representative is
-scored, a same-length sibling satisfies `S*(A) ≤ S*(R) + Δ(R, A)`, where Δ
-sums the per-position maximum profile gain. Siblings whose bound cannot reach
-the current top-N cutoff are not scored.
+**Sibling bounds along the gene frame (`family_bound`).** The alleles of a
+gene share a frame (`frame position = allele position + offset`), and V and J
+score one representative per frame first. A sibling `A` aligned in the same
+frame diagonals as its representative `R` is bracketed exactly:
+
+- `S*(A) ≤ S*(R) + Δ(R, A)`, where Δ sums the best profile gain at each frame
+  position both cover and the best substitution score where only `A` does;
+- `S*(A) ≥ L`, the traceback of the request's best representative clipped to
+  `A`'s span and rescored with `A`'s profile, in `O(|D|)` from prefix sums
+  (`D`: the positions where the two profiles differ). Any traced path serves,
+  so the strongest representative is aligned instead of scored.
+
+The `top`-th largest lower bound (one per candidate) never exceeds the true
+`top`-th score, so a sibling whose upper bound falls below it is skipped; one
+whose bounds meet needs no DP; one whose lower bound reaches it is aligned
+outright and its traceback reused. The rest is scored. The ranking from the
+`top`-th score up is that of full scoring, so calls are byte-identical, at
+9.0 % fewer instructions on 2000 hard reads and 8.3 % on mid. Under a length
+or identity acceptance floor, siblings are pruned only below the score floor.
 
 **Inter-sequence SIMD (`align/inter_seq`).**
 - Each 16-bit lane holds the same cell of a *different* job. Every lane
@@ -483,8 +597,11 @@ admissible D (+1 % of instructions).
 of any sub-alignment between two query cuts in O(1), with exact affine gap
 accounting at the new edges.
 
-**One lattice, two semirings.** Viterbi (max-plus) and forward–backward
-(sum-product) run the same recursion over the same lattice: one slot per
+**One lattice, two semirings, one model.** Viterbi (max-plus) and
+forward–backward (sum-product) run the same recursion over the same lattice
+and read the same per-read integer values (each kind's affine
+log-odds map `s·u_r + v_r` quantised whole, priors as multiples of `u0`), so
+the call is exactly a mode of the posterior: one slot per
 placement, D count and first segment, with a value per canonical entry cut.
 Placements are visited by segment kind, then read start, so a D can precede
 a J whose alignment starts before it; only the cuts order them.
@@ -520,13 +637,20 @@ model and the `easy`/`mid`/`hard` presets:
 - gated SHM with single-base indels, and Illumina substitutions;
 - optional tandem DD.
 
-It extends IgSim in three ways:
+It extends IgSim in four ways:
 - **Per-base germline origins.** Boundaries, junctions and germline-equivalent
   alleles are exact truth even across indels.
 - **Optional reverse complementation.**
+- **Optional constant region** (`simulate --c`). 80 % of reads continue
+  through the J–C splice into a C allele, from the base that follows the J
+  in the reading frame (so IMGT and codon-aligned C records both work), for
+  the whole 3′ flank or a uniform part of it. It draws from a random stream
+  of its own: without `--c`, reads and truth are byte-identical, and with it
+  their V(D)J part is.
 - **`SyntheticDatabase`.** An IGH-like germline with a family → gene → allele
-  similarity hierarchy and conserved anchors, for tests that cannot ship
-  IMGT-derived data.
+  similarity hierarchy and conserved anchors, plus constant regions whose
+  subclasses share CH1's opening, for tests that cannot ship IMGT-derived
+  data.
 
 `sim::Truth` holds one read's ground truth and reads and writes it as TSV.
 `sim::Assignment` is a call, built from an `AirrRecord` or from any tool's
@@ -537,14 +661,22 @@ expose both, so other callers can be scored on identical reads.
   trimmed, pre-mutation germline body (no read can separate such alleles);
 - *gene*, *listed* (truth among the reported names) and *exact*;
 - boundary errors, D presence by remnant length, junction exactness;
-- a random-read negative control.
+- a random-read negative control;
+- with C, by C length: calls on reads without C, the primary name's
+  *anchored* equivalence (the allele reads the simulated bases from its own
+  splice offset; containment anywhere would make almost any allele
+  equivalent to a short C part), the first name's gene, exact gene sets,
+  over-calls and the oracle's resolution.
 
 `sim::Paired` compares two callers read by read on the same truth: for V, D
 and J allele equivalence, D-free reads left without a D call, and junction
 exactness, it reports both accuracies, their difference with a 95 %
 interval, and an exact McNemar p-value from the reads only one caller gets
 right. D allele accuracy alone rewards calling D everywhere, so the D-free
-column belongs next to it. On 20,000 reads per preset, for example, the
+column belongs next to it. D is also split by the true remnant's length
+(1–3, 4–7, 8+ nt; below `min_d_match` = 4 a remnant cannot be found), and the
+D allele and D-presence posteriors are compared by Brier score with a paired
+t statistic. On 20,000 reads per preset, for example, the
 residual adjudicator gains +0.4–0.6 pp of D accuracy (p < 10⁻⁴) only by
 giving 21–25 pp more D-free reads a D; see
 [docs/ASSESSMENT.md §9.5](docs/ASSESSMENT.md) for the full table.
@@ -644,8 +776,10 @@ window; searching J over the whole read lets 0.05 % fall outside.
   does the same with N/P costs of −4 and −8 per base across a 300-base V,
   `long_costly_gaps_keep_their_mass` across a 300-base gap that every path
   crosses, and `overlaps_beyond_the_f64_range_are_refused` checks that a
-  540-base overlap gets no posteriors; `posteriors_are_calibrated` bounds V/J
-  calibration error on IgM- and IgG-like reads.
+  540-base overlap gets no posteriors; `per_read_call_is_a_mode_of_the_posterior`
+  checks that with one integer model the marginals are those of `e^{units/F}`
+  and the Viterbi key their exhaustive maximum; `posteriors_are_calibrated`
+  bounds V/J calibration error on IgM- and IgG-like reads.
 - **DAG optimality:** `dag_equals_brute_force_over_all_paths_and_cuts` and
   `dag_equals_brute_force_on_hypermutated_igsim_reads` enumerate every
   VJ/VDJ/VDDJ path and every pair of canonical exit and entry cuts, with and
@@ -655,6 +789,11 @@ window; searching J over the whole read lets 0.05 % fall outside.
   (`two_cuts_leave_a_shared_mismatch_stretch_to_n`), an entry beyond the
   overlap (`entries_beyond_the_overlap_are_tried`), and a D before a J whose
   alignment starts earlier (`a_d_can_precede_a_j_that_starts_earlier`).
+  `per_read_dag_equals_exhaustive_enumeration` repeats the enumeration in the
+  per-read model's integer units at five divergences (800 optima, 135 of 640
+  not the fixed-scale path; at 11.2 % the fixed path exactly), and
+  `conditioned_dag_equals_exhaustive_enumeration` checks the masked,
+  topology-restricted pass behind max-marginal D decoding.
 - **Kernel exactness:**
   - The scalar kernel equals a textbook Gotoh across three gap regimes.
   - Every traceback rescores to its reported score.
@@ -677,7 +816,17 @@ window; searching J over the whole read lets 0.05 % fall outside.
   intervals of ±1–4 pp and hide most regressions.
 - **Robustness (`tests/robustness.rs`):** empty, 1-base, all-N, IUPAC,
   low-complexity, 20 kb, chimeric reads and every prefix and suffix of a read
-  through every profile, with AIRR-record invariants.
+  through C, through every profile with the C stage, with AIRR-record
+  invariants; C without a J, V–J reads ending in nothing, one base or N, and
+  adapters, homopolymers and splice donors after every J are never called C.
+- **Constant region:** the anchor-column alignment equals a textbook anchored
+  Gotoh on 500 random cases through every backend; reach-class members align
+  identically; V, D and J calls, placements and posteriors are identical with
+  and without the C stage, and batched SIMD C calls equal per-read scalar
+  ones; anchored
+  truth, C-length strata and the simulator's reading frame are tested, and
+  `tests/simulated.rs` bounds C accuracy, false calls and `c_posterior`
+  calibration.
 - **Cross-architecture:** the suite passes on x86-64 and on AArch64 (CI runs
   both), and AArch64 output equals x86-64 output byte for byte.
 - **Synthetic calling (`tests/synthetic.rs`):** D genes, D-free junctions,
@@ -697,15 +846,16 @@ The default is `r`. `r_optimized` is accepted as an alias.
 
 | Profile | V tuple | D tuple | J tuple | `min_d_match` | `P_D` (human IGH) |
 |---|---|---|---|---|---|
-| `r` (default) | (2,−3,−9,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 4 | derived, even odds: 11 |
-| `sensitive-d` | (2,−3,−9,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 4 | derived, odds 2: 9 |
+| `r` (default) | (2,−3,−9,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 4 | derived, even odds: 10.55 |
+| `sensitive-d` | (2,−3,−9,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 4 | derived, odds 2: 9.45 |
 | `truth` | (2,−3,−5,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 6 | 0 |
 | `igblast` | (2,−3,−5,−1) | (2,−4,−11,−1) | (2,−4,−13,−1) | 5 | 0 |
 
 Every profile gates V and J hits by E-value (accept 1, anchor 10⁻³) and
 stitches the co-linear V prefix and J suffix back onto the local alignment
-before ranking. A with-D path must strictly beat the no-D path; ties go to
-fewer D segments, then to more germline support.
+before ranking, and calls each read with its own model. A with-D path must
+strictly beat the no-D path; ties go to fewer D segments, then to more
+germline support.
 
 ## Assumptions and deviations from the method note
 
@@ -754,10 +904,12 @@ Each is a named field you can change.
   its window is not always its optimal *clipped* alignment at the chosen cut.
   The 12-base reclaim keeps this rare; see the assessment.
 - **Posteriors are conditional on the candidates.** An allele that retrieval
-  or the keep policy dropped gets no mass, and the call and the posterior use
-  different evidence scales (fixed vs per-read), so a reported posterior can
-  fall below 0.5. D-presence calibration is the weakest (ECE up to 2 %),
-  because the D prior counts genes × positions (see ALGORITHM.md §8).
+  or the keep policy dropped gets no mass. The call is a mode of the
+  posterior over paths and cuts, not the allele of largest marginal, so a
+  reported posterior can still fall below 0.5. D-presence calibration is the
+  weakest (ECE up to 1.4 % on human IGH, 3.3 % on the synthetic database):
+  one D cost per database cannot follow what the residual tracks, junction
+  length (see ALGORITHM.md §8).
 - **E-values** use exact *ungapped* λ and K and the total database length.
   Gapped scores are slightly higher (anti-conservative); near-identical alleles
   inflate the database length (conservative). They gate hits; they are not
@@ -766,34 +918,75 @@ Each is a named field you can change.
   the CLI cannot detect a D file passed as `--j`.
 - **Compressed input.** Gzip must be piped through `zcat`; there is no built-in
   decompression.
-- **FR3 length rule.** The CDR2/FR3 boundary uses the FR3 length (38 codons
-  heavy, 36 light). That length holds across human IGHV/IGKV/IGLV families
-  but is unverified for TR loci. Give `fr3=` in the header where it differs;
-  CDR2 lengths outside 0–12 codons are noted.
+- **FR3 starts need some annotated alleles.** The CDR2/FR3 boundary has no
+  conserved residue. Across 13 tcrdist3 loci, FR3 starts not given were
+  scored against IMGT:
+  - with no given FR3 start, the chain default is wrong for 539 of 1,695
+    alleles (32 %), all flagged but IGHV4-31\*05, whose FR3 lacks a codon;
+  - with `fr3=` on the \*01 alleles, 1 of 872 others is wrong, flagged;
+  - with `fr3=` on 10 %, 73 of 1,519 are wrong, all flagged, most of them
+    behind a low-confidence anchor.
+  Supply an IMGT-gapped V set, or `fr3=` on a few alleles per gene family.
 - **Chain type is one per database.** It is voted per database, so a mixed
   IGK + IGL database is fine, but a mixed heavy + light database needs
   `--chain` or separate runs.
 - **FR1 start.** FR1 starts at the first complete codon. A V sequence that
   includes a leader needs `fr1=` in the header.
-- **Ambiguous Cys23.** A 5′-truncated allele with no sibling and an adjacent
-  decoy Cys may get a wrong CDR1 start. This is always flagged in
-  `annotation.tsv`.
+- **A lone decoy Cys23.** When the Cys23 window holds exactly one Cys
+  codon, it is taken as Cys23. An allele whose Cys23 is mutated or cut
+  away, with a mutation-made Cys in the window, would get a wrong CDR1
+  start without a flag. None occurred in the tests or the 13 loci.
 - **IUPAC codes.** Germline IUPAC codes are stored as N, and a written
   database spells them N.
+- **The constant region.**
+  - The first `c_call` name is arbitrary among genes that share a short C
+    part (IGHG1/2/4 open alike); the listed genes are right.
+  - Bases after the C part (adapter, primer) can extend some alleles by a
+    chance match and narrow the list: 2.2 % of simulated C parts from 16 nt
+    followed by other bases.
+  - A C part needs about 9 exact bases to pass the gate (10 human IGHC
+    genes), and net indel drift beyond 3 bases inside C truncates its
+    alignment.
+  - 3′-partial J records (IMGT IGHJ6\*02/\*03) lose J calls to their longer
+    siblings on reads that continue into C, whose first base completes them
+    (−0.5 pp J on hard simulated reads, with or without `--c`).
 
 ## Roadmap
 
 In order of expected value; reasons and measurements are in
 [docs/ASSESSMENT.md](docs/ASSESSMENT.md).
 
-1. **Calls from the per-read model.** Viterbi with per-read evidence weights,
-   or maximum-posterior-marginal calls, so the call and its posterior agree.
-2. **D prior from the D search's statistics** (Karlin–Altschul `K·m·n` and a
-   D-inclusion rate), checked by D-presence calibration.
+1. ~~**Calls from the per-read model.**~~ Done: one integer model at the
+   read's divergence drives the Viterbi call and forward–backward, so the
+   call is a mode of its posterior. Paired on 20,000 reads per preset:
+   4.0–4.3 pp more D-free reads left without a D on mid sets, D-presence
+   Brier better on every set (t −5 to −24), D allele within noise for
+   remnants of 4 nt or more (the overall −0.3–0.4 pp on the synthetic
+   database lies in 1–3 nt remnants, below `min_d_match`). Max-marginal D
+   alleles are a switch (+0.25 pp on hard reads only). See ASSESSMENT §9.8.
+2. ~~**D prior from the D search's statistics.**~~ Done as a switch,
+   `--d-presence-rate π`: `P*_D = [ln(K·m·n_D) − ln(π/(1 − π))]/λ` counts
+   every distinct allele, offset and read position the search tries, and is
+   read per read like the default. At π = 0.9 it meets every criterion on
+   20,000 reads per preset (D-presence Brier better on all six sets, no D
+   call +0.77 pp on human hard, D on remnants of 4 nt or more within
+   noise), but that rate was found by measuring; at the simulator's own
+   rate (0.94) exact 5-mers win and D-free specificity falls 14–26 pp. The
+   default stays `ln(N·L)` at even odds. Next on that line: a prior on N/P
+   lengths, which the remaining miscalibration follows. See ASSESSMENT §9.9.
 3. ~~**Wider SIMD.**~~ Done: AVX-512BW, NEON and portable backends of one
    kernel. Next on that line: 8-bit lanes for D jobs (32 per AVX2 register).
-4. **Allele rescoring along the gene frame.** Score siblings along their
-   representative's traceback and run DP only where bounds straddle the cutoff.
-5. **Annotation.** A per-database FR3 length learned from header-annotated
-   alleles (TR loci). A consensus position prior for Cys23.
-6. **C-segment assignment.**
+4. ~~**Allele rescoring along the gene frame.**~~ Done: siblings are bounded
+   from both sides along their representative's traceback, and DP runs only
+   where the bounds straddle the cutoff (V and J); calls unchanged, 9 % fewer
+   instructions on hard reads.
+5. ~~**Annotation.**~~ Done: IMGT gap numbering, FR3 from annotated relatives
+   or a learned length, a learned Cys23 model, and structured `uncertain=`
+   flags (see the assessment, §10).
+6. ~~**C-segment assignment.**~~ Done: `--c` anchors C's base 0 at the
+   called J's exit and aligns it exactly with any kernel, after
+   adjudication, so V/D/J output is byte-identical with and without it and
+   costs nothing without it. On 20,000 simulated reads per preset (human IGH
+   with abstar's IGHC; synthetic): ≤ 2 false calls on ~4,100 C-free reads,
+   primary C allele anchored-equivalent ≥ 99.6 % from 16 nt, `c_posterior`
+   ECE ≤ 0.18 %, 9 % of instructions with `--c`. See ASSESSMENT §11.

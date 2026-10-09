@@ -38,6 +38,7 @@ pub mod band;
 pub mod batch;
 pub mod clip;
 pub mod config;
+pub mod constant;
 pub mod evidence;
 pub mod family_bound;
 pub mod fasta;
@@ -66,8 +67,8 @@ pub mod window;
 /// The names most programs need.
 pub mod prelude {
     pub use crate::adjudicate::{
-        Adjudicator, CallPath, CalledSegment, EngineeringObjective, Grammar, PathModel, PathScore,
-        PlacementDag, ResidualAdjudicator, VdjGrammar,
+        Adjudicator, CallModel, CallPath, CalledSegment, DAlleleDecoding, EngineeringObjective,
+        Grammar, PathModel, PathScore, PlacementDag, ResidualAdjudicator, VdjGrammar,
     };
     pub use crate::admission::{
         Admission, AdmitAll, AllOf, AnyOf, DistributedEvidence, ExactRunFloor,
@@ -77,8 +78,8 @@ pub mod prelude {
     pub use crate::band::Band;
     pub use crate::batch::{assign_all, assign_map};
     pub use crate::config::{
-        BuildError, DPrior, DSegmentConfig, DefaultAssigner, EngineConfig, JSegmentConfig,
-        ObjectiveConfig, VSegmentConfig,
+        BuildError, CSegmentConfig, DPrior, DSearchSpace, DSegmentConfig, DefaultAssigner,
+        EngineConfig, JSegmentConfig, ObjectiveConfig, VSegmentConfig,
     };
     pub use crate::germline::{GermlineSet, SegmentKind};
     pub use crate::orient::{Orientation, OrientationPolicy, StrandIndex};

@@ -5,7 +5,7 @@
 //! failure mode, which makes it a useful regression reference for the DAG.
 //! The V×J step uses the exact optimal cut when V and J overlap.
 
-use super::{Adjudicator, CallPath, CalledSegment, PathScore};
+use super::{Adjudicator, CallModel, CallPath, CalledSegment, PathScore, divergence};
 use crate::clip::ClipSpan;
 use crate::germline::SegmentKind;
 use crate::placement::Placement;
@@ -16,7 +16,8 @@ pub struct ResidualAdjudicator {
     pub pair_bonus: Score,
     /// V/J pairs overlapping by more query bases are rejected.
     pub max_vj_overlap: u32,
-    /// Minimum query bases per clipped segment, indexed by [`SegmentKind::index`].
+    /// Minimum query bases per clipped segment, per rearranged kind
+    /// ([`SegmentKind::REARRANGED`]), indexed by [`SegmentKind::index`].
     pub min_retained: [u32; 3],
 }
 
@@ -52,6 +53,7 @@ impl Pick {
             entry: self.entry,
             exit: self.exit,
             span: self.span,
+            by_marginal: false,
         }
     }
 }
@@ -126,6 +128,7 @@ impl Adjudicator for ResidualAdjudicator {
                 SegmentKind::V => v.push(i),
                 SegmentKind::D => d.push(i),
                 SegmentKind::J => j.push(i),
+                SegmentKind::C => {}
             }
         }
 
@@ -173,6 +176,8 @@ impl Adjudicator for ResidualAdjudicator {
             .map(Pick::segment)
             .collect();
         Some(CallPath {
+            divergence: divergence(placements),
+            model: CallModel::FixedScale,
             segments,
             score: PathScore {
                 score: flank_score + d_score,

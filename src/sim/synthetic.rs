@@ -17,7 +17,9 @@
 //! `WGXG`) are never mutated, so every allele has a known anchor. D genes
 //! follow the same family → gene → allele scheme at D lengths (11–37 nt), and
 //! J genes share one FR4 (`WGQGTLVTVSS`) after a gene-specific CDR3 part,
-//! like IGHJ1–6.
+//! like IGHJ1–6. Constant regions follow isotype → subclass → allele, with
+//! subclasses sharing most of CH1, as IGHG1–4 do: a short C remnant names
+//! the isotype, not the subclass.
 
 use super::random::Rng;
 use crate::germline::{GermlineSet, SegmentKind};
@@ -38,11 +40,19 @@ pub struct SyntheticSpec {
     pub d_families: usize,
     pub d_genes_per_family: usize,
     pub j_genes: usize,
+    pub c_isotypes: usize,
+    /// Subclass genes per isotype are uniform in `1..=c_subclasses`.
+    pub c_subclasses: usize,
+    /// Divergence of subclasses in CH1 (`gene_divergence` after it).
+    pub c_ch1_divergence: f64,
+    /// C records repeat the J's last base and start on a codon (abstar);
+    /// otherwise they start after it (IMGT CH1).
+    pub c_codon_aligned: bool,
 }
 
 impl Default for SyntheticSpec {
-    /// About 170 V, 35 D and 12 J alleles: IGH-like structure at a third of
-    /// the size, so tests stay fast.
+    /// About 170 V, 35 D, 12 J and 25 C alleles: IGH-like structure at a
+    /// third of the size, so tests stay fast.
     fn default() -> Self {
         Self {
             v_families: 7,
@@ -55,6 +65,10 @@ impl Default for SyntheticSpec {
             d_families: 7,
             d_genes_per_family: 4,
             j_genes: 6,
+            c_isotypes: 5,
+            c_subclasses: 4,
+            c_ch1_divergence: 0.02,
+            c_codon_aligned: false,
         }
     }
 }
@@ -64,6 +78,7 @@ pub struct SyntheticDatabase {
     pub v: GermlineSet,
     pub d: GermlineSet,
     pub j: GermlineSet,
+    pub c: GermlineSet,
 }
 
 /// IGHV protein template: FR1 (Cys23 at 21), CDR1, FR2 (Trp41 at 2), CDR2,
@@ -75,6 +90,26 @@ const V_CDR2: &[u8] = b"INAGNGNT";
 const V_FR3: &[u8] = b"KYSQKFQGRVTITRDTSASTAYMELSSLRSEDTAVYYC";
 const V_TAIL: &[u8] = b"AR";
 const J_FR4: &[u8] = b"WGQGTLVTVSS";
+/// Codons of a constant region (CH1–CH3, as IgG's) and of its CH1.
+const C_CODONS: usize = 330;
+const CH1_CODONS: usize = 98;
+/// Bases opening CH1 that every subclass of an isotype shares.
+const C_SHARED: usize = 12;
+
+fn is_stop(codon: &[u8]) -> bool {
+    matches!(codon, b"TAA" | b"TAG" | b"TGA")
+}
+
+/// Substitute base `at`, keeping its codon (frame 0) a sense codon.
+fn substitute_sense(sequence: &mut [u8], at: usize, rng: &mut Rng) {
+    let (original, codon) = (sequence[at], at / 3 * 3..at / 3 * 3 + 3);
+    loop {
+        sequence[at] = rng.substitute(original);
+        if !is_stop(&sequence[codon.clone()]) {
+            break;
+        }
+    }
+}
 
 fn back_translate(protein: &[u8], rng: &mut Rng) -> Vec<u8> {
     let mut out = Vec::with_capacity(3 * protein.len());
@@ -141,6 +176,7 @@ impl SyntheticDatabase {
             v: Self::v_set(spec, &mut rng),
             d: Self::d_set(spec, &mut rng),
             j: Self::j_set(spec, &mut rng),
+            c: Self::c_set(spec, &mut rng),
         }
     }
 
@@ -226,6 +262,59 @@ impl SyntheticDatabase {
         }
         set
     }
+
+    /// Per isotype a random coding ancestor whose first codon starts with
+    /// the J's last base `G`; subclasses diverge at `c_ch1_divergence` in
+    /// CH1 after its shared opening and at `gene_divergence` after CH1;
+    /// alleles add SNPs. Every codon stays a sense codon and a stop codon
+    /// ends the region, so frame 0 of the coding sequence is its stop-free
+    /// frame.
+    fn c_set(spec: &SyntheticSpec, rng: &mut Rng) -> GermlineSet {
+        let mutate =
+            |sequence: &mut [u8], rate: f64, range: std::ops::Range<usize>, rng: &mut Rng| {
+                for at in range {
+                    if rng.bernoulli(rate) {
+                        substitute_sense(sequence, at, rng);
+                    }
+                }
+            };
+        let (ch1, len) = (3 * CH1_CODONS, 3 * C_CODONS);
+        let mut set = GermlineSet::new(SegmentKind::C);
+        for isotype in 1..=spec.c_isotypes {
+            let mut ancestor = vec![b'G', rng.base(), rng.base()];
+            while ancestor.len() < len {
+                let codon = [rng.base(), rng.base(), rng.base()];
+                if !is_stop(&codon) {
+                    ancestor.extend(codon);
+                }
+            }
+            let subclasses = 1 + rng.below(spec.c_subclasses.max(1));
+            for subclass in 1..=subclasses {
+                let mut first = ancestor.clone();
+                mutate(&mut first, spec.c_ch1_divergence, C_SHARED..ch1, rng);
+                mutate(&mut first, spec.gene_divergence, ch1..len, rng);
+                let alleles = 1 + rng.below(spec.max_alleles.max(1));
+                for allele in 1..=alleles {
+                    let mut coding = first.clone();
+                    if allele > 1 {
+                        for _ in 0..1 + rng.below(spec.max_allele_snps.max(1)) {
+                            let at = C_SHARED + rng.below(len - C_SHARED);
+                            substitute_sense(&mut coding, at, rng);
+                        }
+                    }
+                    coding.extend(b"TGA");
+                    let record = if spec.c_codon_aligned {
+                        &coding[..]
+                    } else {
+                        &coding[1..]
+                    };
+                    let name = format!("IGHC{isotype}-{subclass}*{allele:02}");
+                    set.push(&name, record, None).expect("non-empty");
+                }
+            }
+        }
+        set
+    }
 }
 
 #[cfg(test)]
@@ -270,5 +359,52 @@ mod tests {
             "{same_family} vs {other_family}"
         );
         assert!(db.d.len() >= 28 && db.j.len() >= 6);
+    }
+
+    #[test]
+    fn constant_regions_have_one_frame_and_subclasses_share_their_start() {
+        use crate::translate::open_frames;
+        for (aligned, frame) in [(false, 2), (true, 0)] {
+            let spec = SyntheticSpec {
+                c_codon_aligned: aligned,
+                ..SyntheticSpec::default()
+            };
+            let db = SyntheticDatabase::generate(&spec, 5);
+            assert!(db.c.len() >= 10 && db.c.gene_count() > spec.c_isotypes);
+            for allele in db.c.alleles() {
+                let frames: Vec<usize> = open_frames(&allele.codes).collect();
+                assert_eq!(frames, vec![frame], "{}", allele.name);
+            }
+            // Subclasses of one isotype share their opening, not their CH1.
+            let isotype = |name: &str| name.split('-').next().unwrap().to_string();
+            let start = C_SHARED - usize::from(!aligned);
+            for a in db.c.alleles() {
+                for b in db.c.alleles() {
+                    let shared = a.codes[..start] == b.codes[..start];
+                    let same = a.codes[..3 * CH1_CODONS - 1] == b.codes[..3 * CH1_CODONS - 1];
+                    if isotype(&a.name) == isotype(&b.name) {
+                        assert!(shared);
+                    }
+                    if GermlineSet::gene_of_name(&a.name) != GermlineSet::gene_of_name(&b.name) {
+                        assert!(!same, "{} {}", a.name, b.name);
+                    }
+                }
+            }
+        }
+        // C is drawn last: V, D and J do not depend on it.
+        let plain = SyntheticDatabase::generate(&SyntheticSpec::default(), 5);
+        let other = SyntheticSpec {
+            c_isotypes: 2,
+            ..SyntheticSpec::default()
+        };
+        let db = SyntheticDatabase::generate(&other, 5);
+        for (a, b) in [(&plain.v, &db.v), (&plain.d, &db.d), (&plain.j, &db.j)] {
+            assert!(
+                a.alleles()
+                    .iter()
+                    .zip(b.alleles())
+                    .all(|(x, y)| x.codes == y.codes)
+            );
+        }
     }
 }

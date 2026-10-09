@@ -8,6 +8,15 @@
 //!
 //! Coordinates are 0-based half-open on the read *in germline sense*, which
 //! is the oriented query of a caller that orients the read correctly.
+//!
+//! Reads simulated with a C database also carry the constant region, and
+//! their TSV gains `c_call`, `c_equivalent`, `c_start` and `c_end` after the
+//! other columns; without one the TSV is unchanged. C equivalence is
+//! *anchored*: an allele is equivalent when its germline from its own
+//! splice offset `o` ([`Simulator::constant_offset`]) equals the simulated
+//! C bases. Containment anywhere, as for V, D and J, would call almost any
+//! allele of a short C remnant equivalent, while the C stage aligns only
+//! from the splice.
 
 use std::ops::Range;
 
@@ -22,10 +31,14 @@ pub enum Slot {
     /// Second D of a tandem DD.
     D2,
     J,
+    /// Constant region.
+    C,
 }
 
 impl Slot {
-    pub const ALL: [Slot; 4] = [Slot::V, Slot::D, Slot::D2, Slot::J];
+    pub const ALL: [Slot; 5] = [Slot::V, Slot::D, Slot::D2, Slot::J, Slot::C];
+    /// The slots of the V(D)J rearrangement.
+    pub const REARRANGED: [Slot; 4] = [Slot::V, Slot::D, Slot::D2, Slot::J];
 
     pub fn index(self) -> usize {
         self as usize
@@ -37,6 +50,7 @@ impl Slot {
             Slot::D => "d",
             Slot::D2 => "d2",
             Slot::J => "j",
+            Slot::C => "c",
         }
     }
 
@@ -46,6 +60,7 @@ impl Slot {
             Slot::D => Region::D,
             Slot::D2 => Region::D2,
             Slot::J => Region::J,
+            Slot::C => Region::C,
         }
     }
 
@@ -54,6 +69,7 @@ impl Slot {
             Slot::V => SegmentKind::V,
             Slot::D | Slot::D2 => SegmentKind::D,
             Slot::J => SegmentKind::J,
+            Slot::C => SegmentKind::C,
         }
     }
 }
@@ -64,7 +80,8 @@ pub struct TrueSegment {
     /// The simulated allele.
     pub allele: String,
     /// Every allele name (aliases included) whose sequence contains the
-    /// trimmed, pre-mutation germline body: no read can separate them.
+    /// trimmed, pre-mutation germline body: no read can separate them. For
+    /// C, whose sequence from its splice offset equals it.
     pub equivalent: Vec<String>,
     /// Labelled read interval.
     pub span: Range<usize>,
@@ -76,7 +93,10 @@ pub struct Truth {
     /// The emitted read is the reverse complement of the germline-sense read.
     pub reverse_complemented: bool,
     /// Indexed by [`Slot::index`].
-    pub segments: [Option<TrueSegment>; 4],
+    pub segments: [Option<TrueSegment>; 5],
+    /// Simulated with a C database: the read may carry C, and the TSV has
+    /// the `c_` columns.
+    pub constant: bool,
     /// Junction (V Cys104 … J Trp/Phe118, inclusive) when both anchor codons
     /// are templated in the read, as germline-sense nucleotides.
     pub junction: Option<String>,
@@ -99,6 +119,28 @@ fn equivalent_names(set: &GermlineSet, body: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// Names of the C alleles whose germline from their splice offset after J
+/// allele `j` starts with the `len` bases of C allele `c` from its own.
+fn anchored_names(
+    sim: &Simulator<'_>,
+    set: &GermlineSet,
+    j: usize,
+    c: usize,
+    len: usize,
+) -> Vec<String> {
+    let spliced = |allele: usize| {
+        let codes = &set.alleles()[allele].codes;
+        codes
+            .get(sim.constant_offset(allele, j)..)
+            .unwrap_or_default()
+    };
+    let body = &spliced(c)[..len];
+    (0..set.len())
+        .filter(|&b| spliced(b).starts_with(body))
+        .flat_map(|b| set.alleles()[b].names().map(str::to_string))
+        .collect()
+}
+
 impl Truth {
     pub fn from_read(sim: &Simulator<'_>, read: &SimulatedRead, id: &str) -> Self {
         let allele = |slot: Slot| match slot {
@@ -106,15 +148,20 @@ impl Truth {
             Slot::D => read.d,
             Slot::D2 => read.d2,
             Slot::J => Some(read.j),
+            Slot::C => read.c,
         };
         let segments = Slot::ALL.map(|slot| {
             let set = sim.set(slot.kind())?;
             let index = allele(slot)?;
-            let body = sim.germline_body(read, slot.region())?;
+            let span = read.span(slot.region())?;
+            let equivalent = match slot {
+                Slot::C => anchored_names(sim, set, read.j, index, span.len()),
+                _ => equivalent_names(set, sim.germline_body(read, slot.region())?),
+            };
             Some(TrueSegment {
                 allele: set.alleles()[index].name.clone(),
-                equivalent: equivalent_names(set, body),
-                span: read.span(slot.region())?,
+                equivalent,
+                span,
             })
         });
         let anchor = |kind: SegmentKind, index: usize| sim.set(kind)?.alleles()[index].anchor;
@@ -133,6 +180,7 @@ impl Truth {
             id: id.to_string(),
             reverse_complemented: read.reverse_complemented,
             segments,
+            constant: sim.set(SegmentKind::C).is_some(),
             junction,
             d_length: read.span(Region::D).map_or(0, |s| s.len()),
             shm_rate: read.shm_rate,
@@ -143,46 +191,54 @@ impl Truth {
         self.segments[slot.index()].as_ref()
     }
 
-    /// Column names of [`Truth::to_tsv`].
+    /// Column names of [`Truth::to_tsv`] without C.
     pub fn tsv_header() -> String {
-        let mut columns = vec!["sequence_id".to_string(), "rev_comp".to_string()];
-        for slot in Slot::ALL {
+        Self::tsv_header_with(false)
+    }
+
+    /// Column names of [`Truth::to_tsv`]; with C (`constant`) the `c_`
+    /// columns follow the others.
+    pub fn tsv_header_with(constant: bool) -> String {
+        let segment = |slot: Slot| {
             let p = slot.label();
-            columns.extend([
-                format!("{p}_call"),
-                format!("{p}_equivalent"),
-                format!("{p}_start"),
-                format!("{p}_end"),
-            ]);
-        }
+            ["call", "equivalent", "start", "end"].map(|key| format!("{p}_{key}"))
+        };
+        let mut columns = vec!["sequence_id".to_string(), "rev_comp".to_string()];
+        columns.extend(Slot::REARRANGED.into_iter().flat_map(segment));
         columns.extend(["junction", "d_length", "shm_rate"].map(str::to_string));
+        if constant {
+            columns.extend(segment(Slot::C));
+        }
         columns.join("\t")
     }
 
     /// One TSV row; spans are 0-based half-open on the germline-sense read.
     pub fn to_tsv(&self) -> String {
+        let segment = |slot: Slot| match self.segment(slot) {
+            Some(s) => [
+                s.allele.clone(),
+                s.equivalent.join(","),
+                s.span.start.to_string(),
+                s.span.end.to_string(),
+            ],
+            None => Default::default(),
+        };
         let mut fields = vec![
             self.id.clone(),
             (if self.reverse_complemented { "T" } else { "F" }).to_string(),
         ];
-        for segment in &self.segments {
-            match segment {
-                Some(s) => fields.extend([
-                    s.allele.clone(),
-                    s.equivalent.join(","),
-                    s.span.start.to_string(),
-                    s.span.end.to_string(),
-                ]),
-                None => fields.extend(std::iter::repeat_n(String::new(), 4)),
-            }
-        }
+        fields.extend(Slot::REARRANGED.into_iter().flat_map(segment));
         fields.push(self.junction.clone().unwrap_or_default());
         fields.push(self.d_length.to_string());
         fields.push(self.shm_rate.to_string());
+        if self.constant {
+            fields.extend(segment(Slot::C));
+        }
         fields.join("\t")
     }
 
-    /// Parse a row written by [`Truth::to_tsv`] (columns located by `header`).
+    /// Parse a row written by [`Truth::to_tsv`] (columns located by `header`;
+    /// the `c_` columns are optional).
     pub fn from_tsv(header: &[&str], line: &str) -> Result<Self, String> {
         let fields: Vec<&str> = line.split('\t').collect();
         let get = |name: &str| -> Result<&str, String> {
@@ -197,8 +253,12 @@ impl Truth {
                 .parse()
                 .map_err(|_| format!("bad {name} '{}'", get(name).unwrap_or("")))
         };
-        let mut segments: [Option<TrueSegment>; 4] = Default::default();
+        let constant = header.contains(&"c_call");
+        let mut segments: [Option<TrueSegment>; 5] = Default::default();
         for slot in Slot::ALL {
+            if slot == Slot::C && !constant {
+                continue;
+            }
             let p = slot.label();
             let allele = get(&format!("{p}_call"))?;
             if allele.is_empty() {
@@ -219,6 +279,7 @@ impl Truth {
             id: get("sequence_id")?.to_string(),
             reverse_complemented: get("rev_comp")? == "T",
             segments,
+            constant,
             junction: (!junction.is_empty()).then(|| junction.to_string()),
             d_length: number("d_length")?,
             shm_rate: get("shm_rate")?
@@ -251,5 +312,59 @@ mod tests {
                 (truth.junction, truth.d_length)
             );
         }
+    }
+
+    #[test]
+    fn constant_truth_is_anchored_and_its_columns_are_optional() {
+        let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 2);
+        let params = SimParams::mid().with_reverse_complement(0.5);
+        let sim = Simulator::new(&db.v, Some(&db.d), &db.j, params)
+            .unwrap()
+            .with_constant(&db.c)
+            .unwrap();
+        let plain = Truth::tsv_header();
+        let header = Truth::tsv_header_with(true);
+        assert_eq!(
+            header,
+            format!("{plain}\tc_call\tc_equivalent\tc_start\tc_end")
+        );
+        let columns: Vec<&str> = header.split('\t').collect();
+        let (mut short, mut long) = (0.0, 0.0);
+        let (mut n_short, mut n_long) = (0, 0);
+        for (i, read) in sim.reads(200, 3).unwrap().iter().enumerate() {
+            let truth = Truth::from_read(&sim, read, &format!("r{i}"));
+            assert!(truth.constant);
+            let back = Truth::from_tsv(&columns, &truth.to_tsv()).unwrap();
+            assert_eq!(back, truth);
+            let Some(c) = truth.segment(Slot::C) else {
+                continue;
+            };
+            assert!(c.equivalent.contains(&c.allele));
+            // Every equivalent allele reads the same bases from its splice,
+            // and no other does.
+            let spliced = |b: usize| {
+                let from = sim.constant_offset(b, read.j);
+                db.c.alleles()[b].codes.get(from..from + c.span.len())
+            };
+            for (b, allele) in db.c.alleles().iter().enumerate() {
+                let same = spliced(b) == spliced(read.c.unwrap());
+                assert_eq!(c.equivalent.contains(&allele.name), same);
+            }
+            let genes = c.equivalent.iter().map(|n| GermlineSet::gene_of_name(n));
+            let genes = genes.collect::<std::collections::BTreeSet<_>>().len() as f64;
+            if c.span.len() < 12 {
+                (short, n_short) = (short + genes, n_short + 1);
+            } else if c.span.len() > 100 {
+                (long, n_long) = (long + genes, n_long + 1);
+            }
+        }
+        // A remnant within the shared opening names its isotype only.
+        assert!(short / f64::from(n_short) > 1.5 && long / f64::from(n_long) < 1.1);
+        // Without C, the row and the header are the V(D)J ones.
+        let sim = Simulator::new(&db.v, Some(&db.d), &db.j, params).unwrap();
+        let truth = Truth::from_read(&sim, &sim.reads(1, 3).unwrap()[0], "r");
+        assert!(!truth.constant);
+        let fields = truth.to_tsv().split('\t').count();
+        assert_eq!(fields, plain.split('\t').count());
     }
 }

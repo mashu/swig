@@ -195,6 +195,12 @@ impl<B: CandidateBudget> SeedVoteRetriever<B> {
         })
     }
 
+    /// The gene frames the index is built over; candidate bands are their
+    /// frame's diagonals shifted by each allele's offset.
+    pub fn frames(&self) -> &GeneFrames {
+        &self.frames
+    }
+
     pub fn params(&self) -> &SeedVoteParams {
         &self.params
     }

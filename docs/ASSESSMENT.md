@@ -108,7 +108,10 @@ Each change was measured on the same reads before it was kept.
    positions, so `P_D = (ln(N·L) − ln odds)/λ`: 11 for human IGH, which is the
    note's constant recovered from first principles, and 6 for TRB. A per-read
    `L` was tried and traced the same curve, so the simpler constant per
-   database was kept.
+   database was kept. It is now kept unrounded (`P*_D` = 10.55 for human
+   IGH): the fixed scale charges `⌊P*_D⌋`, which decides `S > P*_D` exactly
+   on integer scores, the posterior `P*_D` itself, and the per-read call
+   reads it at the read's scale (§9.8).
 5. **Gene frames + radix-sorted votes** (`retrieve/frames.rs`,
    `retrieve/seed_vote.rs`). Postings and votes now scale with genes. Joining a
    frame requires position-consistent seeds: a first version let an allele
@@ -389,29 +392,32 @@ work.
    there (ECE 16 %): when retrieval misses the true gene, no candidate can
    carry its mass. The 16-gene cap binds at that divergence; raising it
    helped only the synthetic database.
-2. **D presence on D-free junctions.** 12–24 % of reads with no D receive one,
-   because a 9-nt chance match is indistinguishable from a 9-nt D remnant.
+2. **D presence on D-free junctions.** 13–26 % of reads with no D receive one
+   (19 % on human mid reads, 4 pp fewer since calls use the per-read model,
+   §9.8), because a 9-nt chance match is indistinguishable from a 9-nt D
+   remnant.
    `P_D` sets the trade-off, and the prior odds are the single knob.
    Precision/recall curves, not one number, belong in the paper; the
    reported `d_presence_posterior` now carries this uncertainty per read.
-   The derivation itself undercounts the search: `ln(N·L)` counts genes ×
-   read positions, but a local alignment tries every allele, allele offset
-   and read position (Karlin–Altschul `K·m·n ≈ e^{10}` against `e^{6.7}` for
-   human IGH; ~0.26 expected chance 9-mer matches per junction, in line with
-   the 22 % false-positive rate on mid). Even prior odds understate IgSim's
-   99 % D inclusion, and the two errors roughly cancel there. Both terms
-   should be estimated, not assumed.
-3. **Calls and posteriors use different evidence scales.** The Viterbi call
-   reads scores at the fixed λ, the posterior at the read's divergence, so
-   the posterior's mode can disagree with the call (a short exact D against
-   a longer one with a mismatch on an unmutated read). Measured on 4000
-   reads per preset: taking D presence *and* allele from the posterior
-   (maximum marginal) gains 0.2–0.8 pp of D accuracy but raises the D-free
-   false-positive rate by 13–16 pp, so total D errors do not fall (mid 287
-   vs 271, hard 681 vs 685). Keeping the Viterbi presence decision and
-   taking only the allele from the posterior gains 0.1–0.3 pp at an
-   unchanged false-positive rate; it is not adopted because the reported
-   alignment would then need a second, conditioned Viterbi pass.
+   The derivation undercounts the search: `ln(N·L)` counts genes × read
+   positions, but a local alignment tries every allele, allele offset and
+   read position (`K·m·n_D = e^{9.0}` against `e^{6.6}` for human IGH), and
+   even prior odds understate IgSim's D inclusion; the two errors cancel.
+   The search's own count is now a switch, `--d-presence-rate` (§9.9). It
+   cannot replace the default: no presence rate follows from the search,
+   at the simulator's rate exact 5-mers win (no-D −14 to −26 pp), and every
+   constant cost moves along the same curve of D accuracy against D-free
+   specificity. What the residual miscalibration tracks is junction length,
+   a matter for an N/P length prior.
+3. ~~**Calls and posteriors use different evidence scales.**~~ Resolved
+   (§9.8): one integer model at the read's divergence drives both, so the
+   call is a mode of its posterior. What remains is the gap between a mode
+   and a marginal. Taking D presence from the posterior gives a D to a
+   third of D-free reads (−35 pp on 20,000 reads), so presence stays the
+   call's. Taking only the D allele from it, with a conditioned Viterbi pass
+   for the reported alignment, is now a switch (`--d-allele max-marginal`):
+   on top of per-read calls it gains +0.25 pp on human hard reads and is
+   within noise elsewhere, so it is off by default.
 4. **One alignment per D allele and window.** A D's optimal local alignment
    in its window is not always its optimal clipped alignment at the chosen
    cuts; the 12-base reclaim keeps this rare. It is the one remaining
@@ -439,29 +445,33 @@ work.
     they also keep every admissible D in the lattice. No slot is negligible
     (every admissible D scores ≥ 8 against `P_D` 11), so pruning would be
     an approximation; a single-precision pass is the remaining option.
-11. **Anchors without a relative.** Seven V alleles of the human IGH set
-    (pseudogenes and ORFs) keep a low-confidence motif anchor. One of them,
-    IGHV1-38-4\*01 (Cys104 → Tyr), is placed on a TGT in another frame;
-    without a relative there is no evidence to place it better, so it is
-    reported as low-confidence rather than silently trusted.
+11. **Anchors without a relative.** Read without its gap columns, the
+    human IGH set leaves seven V alleles (pseudogenes and ORFs) with a
+    low-confidence motif anchor. One of them, IGHV1-38-4\*01 (Cys104 → Tyr),
+    is placed on a TGT in another frame. Without a relative there is no
+    evidence to place it better, so it is reported as low-confidence rather
+    than silently trusted. IMGT-gapped input numbers all of them exactly
+    (§10).
 
 ## 6. Plan
 
 In order of expected value:
 
-1. ~~**Posterior decoding**~~ — done (§3, item 12). Next on that line:
-   calls from the per-read model (limitation 3) and a D prior from the D
-   search's own statistics (limitation 2).
+1. ~~**Posterior decoding**~~ — done (§3, item 12), and calls from the
+   per-read model (§9.8). The D prior from the D search's own statistics is
+   a switch (§9.9). Next on that line: a prior on N/P lengths, which the
+   D-presence residual points to (short junctions are D-free more often than
+   the model allows).
 2. ~~**Two cuts per overlap with N/P between**~~ — done (§3, item 11).
 3. ~~**Sensitivity analysis**~~ — done (§7).
 4. **Cross-tool benchmark.** IgBLAST done (§8). partis and Swig remain, at
    several SHM levels, with precision/recall curves for D.
 5. ~~**AVX-512BW (32 lanes) and NEON**~~ — done (§9.4), with a portable
    backend for every other target.
-6. **Allele rescoring along the gene frame.** Trace one representative per
-   frame, rescore siblings along its path, and run DP only where bounds
-   straddle the top-N cutoff. Most of the remaining V time is siblings of the
-   top gene.
+6. ~~**Allele rescoring along the gene frame.**~~ — done (§9.6): siblings
+   are bracketed by an upper bound from their frame representative's score
+   and a lower bound from its traceback, and DP runs only where the bounds
+   straddle the top-N cutoff, for V and J. Calls are byte-identical.
 7. **Calibrated statistics.** Fit gapped λ/K and an effective database size
    by simulation.
 
@@ -780,13 +790,538 @@ Remaining opportunities, in order of expected gain: (1) 8-bit lanes for D
 jobs — D scores fit in `i8`, so AVX2 would run 32 D jobs per register;
 (2) a single-precision posterior pass; (3) banded J from J seeds when the V
 is unmutated (exhaustive J is the safe default under SHM); (4) overlapping
-input parsing with assignment; (5) allele rescoring along the gene frame
-(plan item 6).
+input parsing with assignment.
+
+*Allele rescoring along the gene frame (plan item 6), done.* Every sibling
+of a frame representative is bracketed, `L ≤ S*(A) ≤ S*(R) + Δ(R, A)`
+(`family_bound`): the upper bound now holds across a gene frame, not only
+at equal length, and the lower bound rescores the representative's
+traceback along the sibling. The top-N cutoff is taken over the lower
+bounds, so it prunes more, siblings whose bounds meet need no DP, and those
+that will be traced are aligned once instead of scored and then aligned.
+J gets the same bounds. Instructions on 2000 reads, one thread, each step
+byte-identical to the last on the 20,000-read sets:
+
+| Step | hard | mid |
+|---|---|---|
+| main | 10,549 M | 10,967 M |
+| cutoff only under permissive acceptance, explicit tie key | 10,556 M | 10,976 M |
+| Δ across the gene frame | 10,488 M | 10,966 M |
+| traced lower bounds, cutoff over them, traceback reuse | 10,064 M | 10,550 M |
+| known and early-traced siblings | 9,953 M | 10,436 M |
+| J bounds | 9,708 M | 10,165 M |
+| bookkeeping | 9,705 M | 10,162 M |
+| strongest representative aligned, not scored | 9,655 M | 10,112 M |
+| one representative per frame | 9,627 M | 10,082 M |
+| representative ties toward the frame's medoid | 9,606 M | 10,057 M |
+
+In all −9.0 % (hard) and −8.3 % (mid): V and J DP fell from 4.04 G to
+3.21 G instructions on hard, while the stage's own bookkeeping rose from
+0.02 G to 0.05 G (frame paths 12 M, the table 6 M, lower bounds 3 M). Two
+experiments
+did not lower the count and were dropped: gene-frame placement for J (J's
+unbanded bounds accept any placement), and raising the cutoff with the
+early-traced siblings' exact scores before scoring the rest. The cutoff
+applies only when acceptance has no length or identity floor: a rejected
+alignment makes traceback refill from below the N-th score, where a pruned
+sibling may lie (with V acceptance of 60 columns and 93 % identity, main's
+bounds changed the allele set of 1 of 20,000 hard reads).
 
 ### 9.7 Roadmap status
 
 Of the roadmap in the README, the wider-SIMD item is done (AVX-512BW, NEON
-and a portable backend). Calls from the per-read model, a D prior from the D
-search's own statistics, allele rescoring along the gene frame, annotation
-priors and C-segment assignment remain open; §9.5 shows the D prior is the
-one with the clearest measured need.
+and a portable backend), and so are allele rescoring along the gene frame
+(§9.6), calls from the per-read model (§9.8) and the annotation priors
+(§10). The D prior from the D search's own statistics is implemented and
+measured, and stays a switch (§9.9): the search's count is derived, the
+presence rate is not. C-segment assignment is done too (§11).
+
+### 9.8 Calls from the per-read model
+
+The Viterbi call used the fixed `(2, −3)` scores and the posterior the
+read's own log-odds, so the reported probabilities belonged to a model that
+had not made the call. Now one integer model at the read's divergence `p̂`
+drives both (ALGORITHM §4, *Values*): substitution columns `s·u_r + v_r`
+(each kind's affine log-odds map quantised whole, 1/2¹⁶ nat), gaps and priors
+as multiples of `u0 = round(2¹⁶·λ)`, and a D cost of `P*_D/m` matched D
+columns. The fixed scale is the exact special case at 11.2 %, and stays as
+`--calls fixed`. `p̂` is estimated before adjudication from the V and J
+columns no path contests, so the call is one Viterbi pass. Exhaustive oracles
+check the integer DAG (800 optima on mid and hard IgSim placements, 135 of
+640 off the fixed path) and that its key is the maximum of the posterior's
+`e^{units/F}`.
+
+The fixed scale had hidden a second D penalty: it undervalues an exact
+match at low divergence (2λ = 1.27 nats against `ln 4(1 − p̂)` = 1.38), so
+an exact 5-mer tied `P_D` = 10 and lost on the "fewer D" rule. Read at the
+read's scale, a constant D cost in nats lets those 5-mers in (a prototype
+gave 12–22 pp more D-free reads a D); the cost `c_D(p̂)` keeps the fixed
+scale's exact-run classes at every `p̂` instead.
+
+Default (per-read call) against main, paired on 20,000 reads per preset (Δ
+pp, exact McNemar p; D split by the true remnant's length, of which 1–3 nt
+is below `min_d_match` = 4 and cannot be found):
+
+| Set | V | D allele | D 1–3 nt | D 4–7 nt | D 8+ nt | no D | J | Junction |
+|---|---|---|---|---|---|---|---|---|
+| igh.easy | 0 | −0.01 (1.0) | — | +1.45 (1.0) | −0.01 (0.69) | −0.96 (0.5) | 0 | 0 |
+| igh.mid | 0 (1.0) | −0.12 (0.10) | −6.51 (2e−8) | +0.48 (0.46) | +0.05 (0.31) | **+4.29** (2e−10) | +0.01 (0.61) | −0.01 (1.0) |
+| igh.hard | +0.01 (0.75) | −0.01 (1.0) | −0.48 (0.63) | +0.07 (1.0) | +0.01 (1.0) | 0 (1.0) | +0.02 (0.45) | +0.01 (1.0) |
+| syn.easy | +0.01 (1.0) | −0.01 (1.0) | — | — | −0.01 (1.0) | 0 | −0.01 (1.0) | 0 |
+| syn.mid | 0 | −0.39 (4e−5) | −7.34 (1e−18) | +1.02 (0.024) | −0.09 (0.13) | **+3.99** (2e−15) | **+0.07** (0.003) | 0 |
+| syn.hard | +0.02 (0.45) | −0.33 (1e−5) | −2.52 (1e−6) | −0.47 (0.12) | −0.12 (0.09) | +0.31 (0.44) | 0 (1.0) | +0.03 (0.5) |
+
+(igh.easy's no-D change is 2 of 209 reads.) Calibration, main → default:
+
+| Set | D presence Brier (paired t) | D presence ECE % | D allele ECE % | D allele Brier t |
+|---|---|---|---|---|
+| igh.easy | 0.00065 → 0.00035 (−6.2) | 0.15 → 0.10 | 0.31 → 0.32 | −1.1 |
+| igh.mid | 0.02810 → 0.02462 (−13.3) | 2.23 → 1.36 | 1.02 → 0.66 | −3.6 |
+| igh.hard | 0.02261 → 0.02168 (−5.3) | 0.99 → 0.47 | 0.98 → 0.87 | +1.3 |
+| syn.easy | 0.00062 → 0.00029 (−6.4) | 0.16 → 0.12 | 0.58 → 0.59 | +0.8 |
+| syn.mid | 0.05266 → 0.04547 (−23.7) | 4.89 → 3.27 | 2.43 → 1.67 | −4.5 |
+| syn.hard | 0.04353 → 0.04079 (−12.8) | 2.99 → 1.82 | 1.68 → 1.50 | −1.9 |
+
+V and J ECE move by at most 0.05 (human hard V 0.33 → 0.37, J 0.35 → 0.37).
+
+The steps separately, each paired against the one before:
+
+- *Unrounded `P*_D` in the posterior* (the call uses `⌊P*_D⌋`, which equals
+  the old rounding on both databases): calls identical; D-presence Brier t
+  −6.9 / −15.2 / −7.6 (human easy / mid / hard), −6.9 / −26.3 / −18.0
+  (synthetic).
+- *`p̂` before adjudication* (fixed-scale call): calls identical; D-presence
+  Brier +0.00003 to +0.00011 (t +1.1 to +4.7), V / D / J ECE within 0.04.
+- *Per-read call*: the tables above.
+
+Why it is the default: no D-free read set gets more D calls (two sets get
+4 pp fewer), D-presence Brier improves on every set, V, J and junction lose
+nothing, and D allele accuracy on remnants of 4 nt or more is within noise
+on every set. The overall D allele drop on the synthetic database (−0.39
+and −0.33 pp) is significant only in the 1–3 nt stratum, remnants that
+`min_d_match` = 4 makes undetectable, so a call counted correct there rests
+on chance matches; the per-read call simply calls fewer of them. The one
+doubtful number: on syn.hard the strata of 4 nt and more lose 29 reads
+together (p 0.016), not significant at 0.01 but not clearly zero.
+
+**Max-marginal D allele** (`--d-allele max-marginal`), paired against the
+per-read call: D allele +0.05 (p 0.12), **+0.25** (6e−5), +0.04 (0.24),
++0.14 (0.017) on human mid / hard and synthetic mid / hard, all of it on
+remnants of 8 nt or more; no D-free read changes; D allele Brier +0.00004 to
++0.00035 (t ≤ 2.2). On the fixed-scale call it gains +0.20 (p 7e−4) and
++0.27 (p 2e−4) on human mid and hard: the per-read call is already the mode
+of the same posterior, which leaves less to gain. Significant on one set
+only, it stays off by default.
+
+Instructions on 2000 hard reads: main 10.550 G; per-read call (default)
+10.659 G (+1.0 %); fixed-scale call 10.605 G; per-read call with
+max-marginal D 10.713 G (+1.5 %).
+
+### 9.9 A D prior from the D search's statistics
+
+`P*_D = [ln(N·L) − ln π_odds]/λ` counts genes × positions at even odds.
+`DPrior::Search` (`--d-presence-rate π`) counts what the search tries
+instead (ALGORITHM §2.3): `P*_D = [ln(K·m·n_D) − ln(π/(1 − π))]/λ`, the
+score at which `π/(1 − π)` chance hits are expected, with the lattice
+`K = 0.408` and `λ = 0.634` of `(2, −3)`, `m = 25` positions and
+`n_D = Σ_a (L_a − 3)⁺`, the offsets of the distinct D alleles at which an
+exact run of 4 can start: 802 for the 37 human alleles and 659 for the 36
+synthetic ones. `ln(K·m·n_D)` is 9.01 and 8.81 nats, against `ln(N·L)` =
+6.62 and 6.55. The per-read reading (`P*_D/2` matched D columns, §9.8) is
+unchanged.
+
+**The count against brute force** (random 25-base windows against the
+human alleles, best ungapped hit per allele, the exact-run gate; 1500
+windows):
+
+| S | 10 | 11 | 12 | 13 | 14 |
+|---|---|---|---|---|---|
+| chance hits ≥ S, brute force | 10.85 | 4.17 | 3.06 | 1.13 | 0.79 |
+| `K·m·n_D·e^{−λS}` | 14.49 | 7.69 | 4.08 | 2.17 | 1.15 |
+
+Exact runs carry 85–95 % of the chance hits at even scores, so the
+closed form is high by 1.35 there and by 1.85 at odd scores; BLAST's
+length adjustment would make it low by 0.55. A unit test checks the bracket
+on random alleles.
+
+**What the posterior wants**, measured offline on the default's output by
+moving the D cost with the calls held: P*_D + 0.25 to + 0.5 improves
+D-presence ECE and Brier on all six sets; the Brier optimum is + 1.1 (human
+mid), + 0.25 (human hard), + 1.5 (synthetic mid), + 0.75 (synthetic hard).
+By junction length, junctions of up to 8 nt want 1.1–1.7 nats more (up to
+12 nt on the mid sets) and those of 17 nt or more want less: IgSim's D-free
+reads have short junctions. By `p̂`, the mid sets want a flat shift and the hard sets more
+cost at high `p̂`.
+
+**What the calls allow**, paired against the default on 20,000 reads per
+preset:
+
+- A constant + 0.5 (P*_D 10.95 and 10.84): D-presence Brier better on all
+  six sets, but D on 4–7 nt remnants −0.56 pp on human hard (p 0.008) and
+  −0.39 pp on synthetic hard (p 0.002). Every discordant read moves one
+  way: the same D accuracy against D-free specificity curve as every prior
+  change before.
+- The count with the read's own D window, `m = W` (π = 0.94): Brier worse
+  on all six sets (t + 6 to + 23), and 8.9–9.8 pp fewer D-free synthetic
+  reads without a D. Long junctions carry a D more often than the window's
+  larger chance-hit count allows for.
+- The count at the simulator's rate, π = 0.94 (P*_D 9.88 and 9.57, below
+  10): exact 5-mers win. No D call −24.0 / −14.5 / −26.3 / −18.4 pp (human
+  mid / hard, synthetic mid / hard), Brier worse on all six sets.
+- The count at π = 0.9 (P*_D 10.75 and 10.44):
+
+| Set | V | D allele | D 1–3 nt | D 4–7 nt | D 8+ nt | no D | J | Junction |
+|---|---|---|---|---|---|---|---|---|
+| igh.easy | 0 | 0 | — | 0 | 0 | 0 | 0 | 0 |
+| igh.mid | 0 | −0.05 (0.002) | −1.17 (0.016) | −0.14 (0.5) | −0.01 (1.0) | +0.18 (0.5) | 0 | 0 |
+| igh.hard | 0 | −0.09 (2e−5) | −1.77 (0.001) | −0.21 (0.25) | −0.02 (0.25) | **+0.77** (0.008) | 0 | 0 |
+| syn.easy | 0 | 0 | — | — | 0 | 0 | 0 | 0 |
+| syn.mid | 0 | −0.02 (0.12) | −0.17 (0.5) | −0.08 (0.5) | 0 | +0.15 (0.25) | 0 | 0 |
+| syn.hard | 0 | −0.03 (0.06) | −0.34 (0.12) | −0.04 (1.0) | 0 | +0.20 (0.12) | 0 | 0 |
+
+| Set | D presence Brier (paired t) | D presence ECE % | D allele ECE % | D allele Brier t |
+|---|---|---|---|---|
+| igh.easy | 0.00035 → 0.00029 (−5.2) | 0.10 → 0.09 | 0.32 → 0.32 | −1.4 |
+| igh.mid | 0.02462 → 0.02398 (−9.1) | 1.36 → 1.13 | 0.66 → 0.63 | −5.9 |
+| igh.hard | 0.02168 → 0.02158 (−1.5) | 0.47 → 0.39 | 0.87 → 0.78 | −5.8 |
+| syn.easy | 0.00029 → 0.00027 (−5.5) | 0.12 → 0.12 | 0.59 → 0.59 | +6.7 |
+| syn.mid | 0.04547 → 0.04485 (−20.0) | 3.27 → 3.08 | 1.67 → 1.63 | −13.9 |
+| syn.hard | 0.04079 → 0.04041 (−11.9) | 1.82 → 1.60 | 1.50 → 1.44 | −11.0 |
+
+(The synthetic easy D allele Brier moves by less than 10⁻⁵.) V, J and the
+junction do not change; V and J ECE move by at most 0.01.
+
+At π = 0.9 the switch meets every adoption criterion: D-presence
+calibration better on all six sets, no D call and D on remnants of 4 nt or
+more nowhere worse, the overall D allele loss on human mid and hard all in
+1–3 nt remnants (undetectable under `min_d_match` = 4) or within noise.
+
+**Why it is not the default.** The count is derived from the search, the
+rate is not, and the rate decides. 0.9 was found by measuring on the
+simulator; the rate a user would know or estimate breaks specificity. An
+EM estimate over the batch, offline, recovers IgSim's rate (0.942 against
+0.944 on human mid, 0.899 against 0.901 on synthetic mid, 0.934 / 0.948
+and 0.872 / 0.902 on the hard sets) and is batch-dependent; with it the
+count admits exact 5-mers as above. What passes is a band, P*_D from 10.45
+to about 10.8, while the count is uncertain by more than that: the mean D
+window is 52–58 positions, not 25, and Σ L_a instead of `n_D` adds 0.13
+nats, together 1.4 score units. So the default stays the per-read
+model's `ln(N·L)` at even odds; `--d-presence-rate` serves a user who
+knows the repertoire's rate. The posterior's residual tracks junction
+length, which a prior on N/P lengths would model.
+
+Instructions on 2000 hard reads: 9.715 G with the default and with
+`--d-presence-rate 0.9` (the prior is one constant per database).
+
+## 10. Annotation priors (roadmap item 5)
+
+### 10.1 What was wrong
+
+- **The harness's own germline set was misread.** `IGHV.fasta` is
+  IMGT-gapped, and the parser dropped the dots. With them went the
+  numbering that fixes every region start and Cys104. Twelve V alleles got a
+  wrong anchor:
+  - IGHV1-68\*01–03, IGHV3-30-2/-33/-52, IGHV3-32, IGHV3-33-2 and IGHV1-38-4
+    were pseudogenes placed on a TGT two codons upstream;
+  - three 3′-partial IGHV1/OR16 alleles got an anchor they do not hold.
+- **The truth inherited those errors.** The simulator's junction truth uses
+  the same annotation, so the harness scored those reads' junctions as right
+  (ALGORITHM.md §7).
+- **FR3 starts in TR and lambda loci came from one chain default.** A whole
+  family whose FR3 length differs (TRA 32–34, TRB 37/38, TRG/TRD 37–39,
+  lambda 36/38 codons) was wrong without a flag.
+- **"Flagged" had no definition.** The tests and the scoring scripts used
+  different notes.
+
+### 10.2 What replaced it
+
+- **IMGT gap numbering.** The parser keeps the gap runs, and `ImgtNumbering`
+  maps the IMGT columns onto bases.
+  - Each start is known, before the sequence, or unknown.
+  - Frameshift markers are accepted.
+  - The policy lives in `annotate()`: the gaps are used only when most
+    gapped alleles are codon-aligned with C/W/C at IMGT 23/41/104.
+  - Header keys win over the gaps.
+- **FR3 starts that are not given** come from:
+  1. the nearest relative with a given FR3 start;
+  2. else `Fr3Model`, a Jeffreys posterior over FR3 and CDR2 lengths
+     (ALGORITHM.md §3a);
+  3. else the chain default.
+
+  The provenance note is written after the merge, only for the value kept.
+- **Cys23 when the window holds several `C` or none** comes from the nearest
+  relative with a settled Cys23, in any frame, else from `Cys23Model`.
+- **A structured `uncertain` bit per region start**, written as
+  `uncertain=…`. Tests and scripts count an error as silent only when the
+  bit is clear.
+
+### 10.3 Measurements
+
+Annotation is scored against IMGT's gap columns: the human IGH set, and 13
+tcrdist3 loci (human and mouse TRA/TRB/TRG/TRD where present, IGH, IGK and
+IGL). "Main" is the code before this item.
+
+| Check | Main | Now |
+|---|---|---|
+| Gapped human IGH (415 V): anchors | 370 right, 9 wrong, 3 spurious | 379 right, 0 wrong; the 36 without one are 3′-partial |
+| — CDR1 / CDR2 / FR3 starts | 373 / 389 / 399 right of 413 / 412 / 412 | all right |
+| — preparation | 28 ms | 1.0 ms |
+| Same set, dots stripped from every non-\*01 / half / 90 % of alleles: silent anchor, CDR1 or FR3 errors among them | — | 0 / 0 / 0 |
+| — CDR1 missing among them | 22 / 18 / 38 | 1 / 4 / 16 |
+| IGH without dots, 13 loci without headers | — | anchor, frame, FR1, FR2, CDR2, FR3 and source identical; 29 CDR1 starts missing → right, none wrong |
+| Headers on \*01 alleles: FR3 of the others | 190 silent, 5 flagged | 0 silent, 1 flagged |
+| Headers on 10 %: FR3 of the others | 341 silent, 74 flagged, 1082 right | 0 silent, 73 flagged, 1432 right |
+| — CDR1 missing (\*01 / 10 %) | 17 / 64 | 5 / 50 |
+| A gapped set with dots moved one codon in FR1 (not IMGT) | — | falls back, `annotation.tsv` identical to the ungapped run |
+| `every_error_is_flagged` (12,000 alleles) | 3 flagged CDR1 errors | 0 errors |
+
+Wherever headers are given, anchor, frame, FR1, FR2 and CDR2 are
+byte-identical to main.
+
+Without any given FR3 start, 539 of 1,695 FR3 starts are wrong (32 %). All
+but one are flagged; the exception is IGHV4-31\*05, whose FR3 lacks a codon
+and which the gapped set numbers correctly.
+
+**Why the FR3 flag sits at p < 0.95, not ½.** With 10 % of alleles
+annotated, model values were right as follows:
+
+| Posterior | Right |
+|---|---|
+| `p ≥ 0.95` | 309 of 309 |
+| `0.8 ≤ p < 0.95` | 102 of 115 |
+| `p < 0.8` | 11 of 22 |
+
+Relatives were right 721 of 721 times. At ½, 14 errors would stay silent:
+TRGV1–8 at `p` = 0.58–0.92, when only TRGV9–11 carry labels, and
+TRAV2/40 at 0.84. A transferred start now inherits its donor's flag. Before, 12 mouse
+TRGV starts copied from an unflagged chain-default donor were silent.
+
+**Reads** (20,000 per preset, `measure.sh`, paired with exact McNemar):
+
+- **Allele calls.** V, D and J have 0 discordant reads. "No D call" differs
+  on 1 hard read (87.22 → 87.13 %, p = 1.0). Every read whose call text
+  changed comes from one of the 12 re-anchored alleles: mostly reordered
+  D ties.
+- **Junctions.** The truth was regenerated with the new build (seed 7,
+  reads byte-identical), and both builds were scored on it:
+
+  | Preset | Main | Now | Reads that moved | McNemar p |
+  |---|---|---|---|---|
+  | easy | 97.76 % | 100.00 % | 409 | 1.5e−123 |
+  | mid | 97.50 % | 99.99 % | 368 | 3.3e−111 |
+  | hard | 96.94 % | 99.84 % | 246 | 1.8e−74 |
+
+  Every moved read went from wrong to right. On the stored truth, the same
+  outputs read 100.00 → 97.00, 99.99 → 96.26 and 99.82 → 92.96 %. That gap
+  is the relabelling, not a loss: §9.5's junction column was scored on the
+  old truth.
+- **Synthetic database.** Outputs are byte-identical.
+- **Calibration** is unchanged (ECE %, V / D / J / D presence): mid
+  0.09 / 1.02 / 0.16 / 2.23, hard 0.33 / 0.98 / 0.35 / 0.99.
+- **Speed.** Per read: 1933 / 1967 vs 1932 / 1994 reads/s/thread, hard, two
+  runs each.
+
+**Database preparation** (best of 7–15 runs):
+
+| Database | Main | Now |
+|---|---|---|
+| Gapped IGH | 28 ms | 1.0 ms |
+| Ungapped IGH | 26 ms | 29 ms |
+| Mouse TRA, 10 % headers | 16–17 ms | 18–19 ms |
+| Human TRB, 10 % headers | 4.8 ms | 7.0 ms |
+| 3,000 synthetic alleles (test; bound 200 ms) | ~40 ms | 43–79 ms |
+
+### 10.4 What is still weak
+
+- **An FR3 family with no label is extrapolated.** It is flagged, but at
+  `p < 0.95` about one model value in ten is wrong.
+- **One `C` in the Cys23 window is taken as Cys23 without question.** A
+  mutated Cys23 next to a mutation-made decoy would be a silent CDR1 error.
+  None was seen.
+- **Pre-existing silent errors on stripped IGH alleles:**
+  - IGHV3-41\*02's CDR2 start, transferred from IGHV3-7\*03 across an indel;
+  - IGHV1/OR15-4\*01's FR2 start (stripped half only).
+
+## 11. The constant region (roadmap item 6)
+
+### 11.1 What was decided
+
+- **C is a segment kind, not a lattice kind.** `SegmentKind::C` exists for
+  databases, reports and placements, but adjudication iterates
+  `SegmentKind::REARRANGED` only, and debug assertions keep C placements out
+  of the lattice and the V(D)J report. A C kind in the DAG would let C
+  evidence move the J exit or the J allele (the prototype saw 10 J flips in
+  6,000 reads when a C's repeated `G` completed IGHJ6\*02/\*03), every read
+  would pay for it, and the read's SHM divergence does not apply to C.
+- **A stage after adjudication** (`constant.rs`) reads finished calls only:
+  V, D and J are unchanged by construction, and a run without `--c` does no
+  C work. The model, the anchor column that makes the anchored DP exact on
+  every kernel, the reach classes and the gate are in ALGORITHM.md §4b.
+- **The gate is derived, not tuned:** `E_C = N_C·(2s + 1)·e^(−λS) ≤ 10⁻³`,
+  the anchor gate of V and J.
+- **The prototype's accuracy metric was near-tautological.** Its truth
+  counted an allele equivalent when it *contained* the C part anywhere, and
+  its gene tally accepted any equivalent allele's gene. On IGHC a 16–32 nt C
+  part then spans 2.6 genes on average, so "100 % at 16 nt" mostly said that
+  the hit lay in the right prefix class. The truth is now *anchored* (the
+  allele's germline from its own splice offset equals the simulated bases),
+  and the table adds the first name's gene, exact gene sets, over-calls and
+  the oracle's resolution.
+- **Other corrections of the design review.** No sibling bound table for C
+  (its Δ sums over CH2/CH3, beyond any read's reach; reach classes already
+  remove the redundancy). The 16-bit lane limit depends on the longest C
+  record, not on read length, so `prepare --c` warns about records over
+  2 kb or without a stop-free frame (genomic C-GENE records). `s = 3` rests
+  on the measured histogram below. The truth gains `c_` columns only with
+  `--c`, so existing datasets stay byte-identical.
+
+### 11.2 Measurements
+
+**Datasets.** `simulate --c`, seed 7, 20,000 reads per preset, on the same
+V(D)J model and seeds as the six existing sets:
+- IMGT human IGH with abstar's human IGHC (88 records, 81 distinct, 10 genes,
+  codon-aligned: each record repeats the J's last base);
+- the synthetic database (seed 1) with its synthetic C (25 alleles, 14 genes
+  in 5 isotypes whose subclasses share CH1's opening; IMGT-style records).
+
+80 % of reads read into C, the whole 3′ flank for 60 % of those, else a
+uniform part of it. About 4,100 reads per set carry no C base.
+
+**Invariance (must hold).**
+- Without `--c`, AIRR output is byte-identical to the previous release on
+  all six existing sets, for each of the AVX-512, AVX2, portable and scalar
+  kernels; `simulate` without `--c` writes byte-identical reads and truth.
+- With `--c`, the V/D/J columns are byte-identical to the run without it on
+  the six existing sets (AVX2 and scalar) and on the six C sets.
+
+**C accuracy** (per C-length stratum, the range over easy/mid/hard; equivalence
+is anchored; gene set = the reported genes are exactly the equivalent ones;
+over-call = a reported name outside the equivalent set, per call):
+
+| Database | C part | Reads | Called | Primary equivalent | First name's gene | Gene set exact | Over-call | Genes listed / equivalent |
+|---|---|---|---|---|---|---|---|---|
+| IGH | none | 4109–4141 | 0.00–0.05 % | | | | | |
+| IGH | 1–7 nt | 508–550 | 1.0–2.6 % | 1.0–2.6 % | | | 0 | |
+| IGH | 8–15 nt | 592–643 | 90.3–91.9 % | 90.0–91.6 % | 60.3–61.5 % | 89.5–91.1 % | ≤ 0.37 % | 2.6 / 2.6 |
+| IGH | 16–31 nt | 1168–1246 | 99.8–100 % | 99.60–100 % | 66.5–68.7 % | 97.9–99.0 % | ≤ 0.40 % | 2.6 / 2.6 |
+| IGH | 32–63 nt | 3867–4330 | ≥ 99.95 % | 99.86–99.90 % | 90.3–90.5 % | 97.9–98.6 % | ≤ 0.28 % | 1.73 / 1.75 |
+| IGH | 64–127 nt | 7455–8347 | ≥ 99.88 % | 99.79–99.96 % | 94.2–95.1 % | 99.8–99.9 % | ≤ 0.12 % | 1.4 / 1.4 |
+| IGH | 128+ nt | 1051–1896 | ≥ 99.88 % | 99.82–99.95 % | 96.7–97.4 % | 99.8–100 % | ≤ 0.11 % | 1.1 / 1.1 |
+| synthetic | none | 4001–4138 | 0.02–0.05 % | | | | | |
+| synthetic | 8–15 nt | 575–649 | 78.4–81.6 % | 78.4–81.6 % | 28.7–30.7 % | 74.9–77.4 % | 0 | 2.9 / 3.0 |
+| synthetic | 16–31 nt | 1164–1272 | ≥ 99.84 % | 99.84–100 % | 50.5–52.2 % | 91.7–93.6 % | ≤ 0.26 % | 2.4 / 2.6 |
+| synthetic | 32–63 nt | 3846–4284 | ≥ 99.91 % | 99.81–99.93 % | 95.1–96.1 % | 98.9–99.0 % | ≤ 0.26 % | 1.14 / 1.15 |
+| synthetic | 64+ nt | 9231–9755 | ≥ 99.80 % | 99.75–100 % | 99.75–100 % | 99.7–100 % | ≤ 0.12 % | 1.0 / 1.0 |
+
+- **No C call on reads without C:** 0, 0, 2, 2, 2 and 1 false calls in about
+  4,100 C-free reads per set (≥ 99.95 %). On the six existing sets, whose
+  3′ flanks are random, 4–8 reads in 20,000 get a C call.
+- **Primary equivalent ≥ 99.6 % in every stratum from 16 nt.** The misses
+  are instrument errors that turn the true allele's base into another
+  allele's (8–14 per set) and, on hard reads, reads without a J call, a
+  correct orientation or a J exit next to C (16–23 per hard set).
+- **8–15 nt** is limited by the gate: `S ≥ 18` needs 9 exact bases on IGH
+  (10 genes), `S ≥ 19` needs 10 on the synthetic database (14 genes); every
+  call there is equivalent.
+- **Exact gene sets trail the anchored oracle** at 16–63 nt (IGH 97.9–99.0 %,
+  synthetic 91.7–99.0 %). Of the misses from 16 nt, 679 are on reads whose
+  C part is followed by other bases (2.2 % of 30,220 such reads), 34 on reads
+  ending in C (0.06 % of 58,239): a chance match after the C part extends some
+  alleles, which no read-level caller can tell from a C base. The oracle
+  knows where C ends; the read does not.
+- **The first name is a guess among genes for short C parts:** 61 % on IGH at
+  8–15 nt and 67–69 % at 16–31 nt, where the listed genes are right 98–99 %
+  of the time. Read the isotype from the gene set of `c_call`, not its
+  first name.
+
+**Against the local K·m·n gate** (same calls, kept when
+`K·m·n·e^(−λS) ≤ 10⁻³` with `m` the bases after the J exit and `n` the C
+database length; paired, exact McNemar):
+
+| Set | C allele, K·m·n → anchored | p | No C call | p |
+|---|---|---|---|---|
+| IGH easy / mid / hard | +3.93 / +4.06 / +4.25 pp | < 10⁻¹⁸⁷ | 0 / 0 / −0.05 pp | 1 / 1 / 0.5 |
+| synthetic easy / mid / hard | +3.01 / +3.00 / +3.18 pp | < 10⁻¹⁴² | −0.05 / −0.05 / −0.02 pp | 0.5 / 0.5 / 1 |
+
+**Calibration of `c_posterior`** (event: some reported name is
+anchored-equivalent): ECE 0.13–0.18 %, Brier 0.0002–0.0006 on every set.
+Only 7–14 reads per set have `c_posterior < 0.95`, too few to judge
+calibration below it: with C's own divergence near zero, ties are the only
+real ambiguity, and ties are listed.
+
+**Read content without `--c`** (C reads against the same reads without C,
+paired on the same V(D)J truth): V, D, no D call and junction are within
+noise everywhere. J allele is −0.01 / −0.10 / −0.52 pp on IGH easy / mid /
+hard (p = 0.5, 1·10⁻⁶, 5·10⁻³⁰) and within noise on the synthetic database. Every
+lost read is an IGHJ6\*02 or \*03 read called IGHJ6\*01 or \*04: those IMGT
+records are 3′-partial (one base short), and the base that follows them in a
+read through C (the C's `G`, which the record lacks) completes the longer
+alleles. It is a property of the reads and the J records, not of the C
+stage, and `--c` changes no J call.
+
+**Cost** (callgrind, 2,000 IGH C reads, one thread):
+
+| Reads | Without `--c` | With `--c` | C share | of which the stage / report / database |
+|---|---|---|---|---|
+| mid | 9,684,669,685 | 10,661,256,792 | 9.2 % | 742 M / 108 M / ≈ 100 M |
+| hard | 9,230,962,862 | 10,176,966,565 | 9.3 % | 710 M / 112 M / ≈ 100 M |
+
+The database part is a fixed cost per run: the gene frames behind `prepare`'s
+truncation warning. Without `--c` the C stage costs nothing: 9,230,582,300
+instructions on the standard 2,000 hard reads against 9,233,069,238 before
+the stage existed (and 9,330,252,064 before this item's kernel
+prerequisite, −1.1 %).
+
+**Where the J exit lies** (`x` minus the read position of C's germline
+base 0; IGH reads have `o = 1`, except after the 3′-partial IGHJ6\*02/\*03):
+
+| Set | −1 | 0 | +1 | +2 | other |
+|---|---|---|---|---|---|
+| IGH mid | 1 | 2,426 | 13,442 | 1 | 0 |
+| IGH hard | 5 | 2,334 | 13,520 | 16 | 7 (+91 to +100) |
+| synthetic mid | 4 | 15,850 | 8 | 0 | 0 |
+| synthetic hard | 31 | 15,922 | 22 | 1 | 3 (−23, +4, +10) |
+
+The IGH conventions take one base of the spread; SHM indels add one more,
+rarely two.
+
+**Sensitivity** (20,000 hard reads; false calls on about 4,000 C-free reads,
+equivalence at 8–15 nt and from 16 nt, exact gene set from 16 nt):
+
+| Set | s | E = 1 | 10⁻¹ | 10⁻² | 10⁻³ | 10⁻⁴ | 8–15 nt at 10⁻³ | ≥ 16 nt | gene set ≥ 16 nt |
+|---|---|---|---|---|---|---|---|---|---|
+| IGH | 1 | 928 | 104 | 19 | 1 | 0 | 91.1 % | 99.69 % | 99.21 % |
+| IGH | 3 | 812 | 101 | 16 | 2 | 0 | 90.8 % | 99.80 % | 99.30 % |
+| IGH | 6 | 967 | 107 | 14 | 3 | 0 | 78.5 % | 99.80 % | 99.29 % |
+| synthetic | 1 | 983 | 99 | 5 | 1 | 1 | 91.2 % | 99.78 % | 98.95 % |
+| synthetic | 3 | 639 | 92 | 7 | 1 | 0 | 78.4 % | 99.79 % | 98.94 % |
+| synthetic | 6 | 458 | 99 | 12 | 3 | 0 | 78.4 % | 99.80 % | 98.93 % |
+
+The equivalence from 16 nt does not depend on the gate between 1 and 10⁻⁴.
+False calls stay 2–6× below the bound `E` per read at every gate from 1 to
+10⁻³. `s = 1` misses the IGH reads two bases off (−0.11 pp from 16 nt on
+hard); `s = 6` adds start hypotheses, which raise the gate by a base at
+8–15 nt. `s = 3` costs the synthetic database's 10-base threshold at
+8–15 nt (78 % against 91 % at `s = 1`).
+
+**Deterministic null.** After every one of the 13 human IGHJ alleles, eight
+fixed tails (TruSeq read 1 and 2 adapters, Nextera, poly-A, poly-G, poly-T,
+and two splice donors with intron) score at most 7 against abstar's IGHC
+(clipped, any allele and start); the gate needs 18. `tests/robustness.rs`
+runs the same check on the synthetic database (best 4–6; a gate of E ≤ 10
+would call them).
+
+### 11.3 What is still weak
+
+- **The first `c_call` name** among genes sharing a short C part is
+  arbitrary. The gene set is right; the first name is not an isotype call.
+- **Bases after C extend some alleles by chance**, so the reported genes can
+  be fewer than the read's true ambiguity (2.2 % of C parts followed by
+  other bases, from 16 nt). `c_posterior` does not see it: the extension is
+  real evidence to the model.
+- **Short C parts** need 9–10 exact bases to pass the gate.
+- **Net indel drift** inside C beyond `s ∓ δ` truncates the C alignment.
+- **3′-partial J records** (IGHJ6\*02/\*03) lose J calls on reads that
+  continue into C, with or without `--c` (−0.52 pp J on hard IGH reads).
+- **`c_posterior` below 0.95** is too rare in simulation (≤ 14 reads per
+  20,000) to check its calibration there.

@@ -3,7 +3,9 @@
 //! Every field is a distribution, sampled once per read (trims, lengths,
 //! rates) or once per base (substitutions and indels at the sampled rate).
 //! The presets reproduce IgSim.jl's `train_params`, `easy_params`,
-//! `mid_params` and `hard_params` exactly, parameter for parameter.
+//! `mid_params` and `hard_params` exactly, parameter for parameter; IgSim
+//! has no constant region, so `include_c` and `c_whole_flank` are this
+//! crate's, the same in every preset.
 
 use super::random::{Count, GatedRate, Rate};
 
@@ -53,6 +55,12 @@ pub struct SimParams {
     /// germline-sense reads only (0.0); the assigner orients reads itself, so
     /// evaluations usually set this to 0.5.
     pub reverse_complement: f64,
+    /// Probability that the read reaches the constant region, when the
+    /// simulator has a C database ([`super::Simulator::append_constant`]).
+    pub include_c: f64,
+    /// Probability that C fills the whole 3′ flank; otherwise its length is
+    /// uniform in `0..=flank`.
+    pub c_whole_flank: f64,
 }
 
 /// IgSim `shm_igm()`: 40 % of reads mutated at a rate uniform in 0.5–7 %.
@@ -106,6 +114,10 @@ impl SimParams {
             max_length: 900,
             max_retries: 32,
             reverse_complement: 0.0,
+            // A fifth of the reads stop before C: they test that C-free
+            // reads get no C call.
+            include_c: 0.8,
+            c_whole_flank: 0.6,
         }
     }
 

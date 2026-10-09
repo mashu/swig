@@ -22,12 +22,12 @@ use vdj_assign::annotate::{AnnotateOptions, ChainType};
 use vdj_assign::prelude::*;
 use vdj_assign::prepare::{PreparedDatabase, prepare};
 use vdj_assign::reads::ReadReader;
-use vdj_assign::sim::{Assignment, Evaluation, Paired, Rng, SimParams, Simulator, Truth};
+use vdj_assign::sim::{Assignment, C_STREAM, Evaluation, Paired, Rng, SimParams, Simulator, Truth};
 
 const USAGE: &str = "\
-usage: vdj-assign --v V.fasta --j J.fasta [--d D.fasta] [options] <reads.fasta|reads.fastq|->
-       vdj-assign prepare --v V.fasta --j J.fasta [--d D.fasta] [--chain heavy|light] --out DIR
-       vdj-assign simulate --v V.fasta --j J.fasta [--d D.fasta] --out PREFIX
+usage: vdj-assign --v V.fasta --j J.fasta [--d D.fasta] [--c C.fasta] [options] <reads.fasta|reads.fastq|->
+       vdj-assign prepare --v V.fasta --j J.fasta [--d D.fasta] [--c C.fasta] [--chain heavy|light] --out DIR
+       vdj-assign simulate --v V.fasta --j J.fasta [--d D.fasta] [--c C.fasta] --out PREFIX
                   [--preset easy|mid|hard] [--reads N] [--seed S] [--rc P] [--shm RATE]
        vdj-assign evaluate --truth PREFIX.truth.tsv <calls.tsv> [other.tsv]
 
@@ -39,7 +39,8 @@ an AIRR Rearrangement TSV from any tool against that truth (germline-
 equivalence-aware allele, gene, boundary, D-presence and junction accuracy).
 Given a second calls file, evaluate also compares the two read by read:
 accuracy difference with its 95 % confidence interval and an exact McNemar
-test on the reads only one of them gets right.
+test on the reads only one of them gets right (D also by remnant length),
+and the D allele and D-presence Brier scores with a paired t.
 
 Reads may be FASTA or FASTQ (detected from the first character); '-' reads
 stdin, so compressed input can be streamed: zcat reads.fastq.gz | vdj-assign ... -
@@ -52,6 +53,15 @@ transfer from the closest sibling allele; milliseconds). Identical sequences
 are merged and reported under all their names. `prepare` writes the result as
 annotated FASTA plus annotation.tsv for review; header values always win.
 
+--c adds constant-region (isotype) calls: C base 0 is anchored within 3 bases
+of the called J's end and aligned to the read's end, and the c_ columns follow
+productive. Give one locus' C regions (coding CH1 onward, e.g. human IGHC):
+the gate counts every C gene in the file. prepare warns about C records that
+cannot be anchored (5'-truncated, genomic) and J records whose 3' end strays.
+simulate --c reads 80 % of reads through the J-C splice into a C allele and
+adds c_call, c_equivalent, c_start and c_end to the truth; evaluate then
+scores C by its length against anchored equivalence.
+
 options:
   --profile NAME       r (default) | truth | igblast | sensitive-d
                        r is Swig's r_optimized; also accepts r_optimized, truth_optimized, sensitive_d
@@ -61,6 +71,16 @@ options:
   --forward-only       do not try the reverse complement
   --no-anchor-window   do not add the conserved-anchor D window
   --no-posterior       skip posterior probabilities (*_posterior columns; ~30 % faster)
+  --calls MODEL        the model the call maximises: per-read (each read's own, the
+                       model its posteriors come from) | fixed (the (2, -3) scores)
+  --d-allele RULE      the reported D allele: map (the call's) | max-marginal (largest
+                       posterior marginal given the call's D presence and topology;
+                       needs posteriors, so --no-posterior and --residual report map)
+  --d-presence-rate R  D prior from the D search's own chance-hit count (alleles x
+                       offsets x positions) at D-presence rate R, 0 < R < 1, instead
+                       of genes x positions at even odds (docs/ALGORITHM.md 2.3)
+  --c-evalue E         call C when its anchored E-value, C genes x 7 start
+                       diagonals x e^(-lambda S), is at most E (default 1e-3)
   --simd NAME          alignment kernel: avx512 | avx2 | neon | portable | scalar
                        (default: the fastest this CPU supports, avx512 excepted)
   --residual           ordinary commit-V/J-then-D adjudication instead of the DAG
@@ -95,11 +115,16 @@ struct Args {
     v: Option<String>,
     d: Option<String>,
     j: Option<String>,
+    c: Option<String>,
+    c_evalue: Option<String>,
     out: Option<String>,
     reads: Option<String>,
     profile: Option<String>,
     threads: Option<String>,
     simd: Option<String>,
+    calls: Option<String>,
+    d_allele: Option<String>,
+    d_presence_rate: Option<String>,
     chain: Option<String>,
     tandem_d: bool,
     forward_only: bool,
@@ -153,11 +178,24 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--v" if !evaluate => set_once(&mut args.v, "--v", value("--v")?)?,
             "--d" if !evaluate => set_once(&mut args.d, "--d", value("--d")?)?,
             "--j" if !evaluate => set_once(&mut args.j, "--j", value("--j")?)?,
+            "--c" if !evaluate => set_once(&mut args.c, "--c", value("--c")?)?,
+            "--c-evalue" if assign => {
+                set_once(&mut args.c_evalue, "--c-evalue", value("--c-evalue")?)?
+            }
             "--out" if prepare || simulate => set_once(&mut args.out, "--out", value("--out")?)?,
             "--chain" if !evaluate => set_once(&mut args.chain, "--chain", value("--chain")?)?,
             "--profile" if assign => set_once(&mut args.profile, "--profile", value("--profile")?)?,
             "--threads" if assign => set_once(&mut args.threads, "--threads", value("--threads")?)?,
             "--simd" if assign => set_once(&mut args.simd, "--simd", value("--simd")?)?,
+            "--calls" if assign => set_once(&mut args.calls, "--calls", value("--calls")?)?,
+            "--d-allele" if assign => {
+                set_once(&mut args.d_allele, "--d-allele", value("--d-allele")?)?
+            }
+            "--d-presence-rate" if assign => set_once(
+                &mut args.d_presence_rate,
+                "--d-presence-rate",
+                value("--d-presence-rate")?,
+            )?,
             "--tandem-d" if assign => args.tandem_d = true,
             "--forward-only" if assign => args.forward_only = true,
             "--no-anchor-window" if assign => args.no_anchor_window = true,
@@ -223,18 +261,34 @@ fn load_database(args: &Args) -> Result<PreparedDatabase, Box<dyn Error>> {
         "--j",
         args.j.as_deref().ok_or("--j is required")?,
     )?;
+    let c = args
+        .c
+        .as_deref()
+        .map(|path| load_set(SegmentKind::C, "--c", path))
+        .transpose()?;
     let started = Instant::now();
-    let database = prepare(v, d, j, AnnotateOptions { chain })?;
+    let mut database = prepare(v, d, j, AnnotateOptions { chain })?;
+    if let Some(c) = c {
+        database = database.with_constant(c)?;
+    }
     eprintln!(
         "vdj-assign: database prepared in {:.1} ms: {}",
         started.elapsed().as_secs_f64() * 1e3,
         database.summary()
     );
+    if database.annotation.fr3_warning() {
+        eprintln!(
+            "vdj-assign: warning: no V allele gives its FR3 start, and this locus' FR3 length varies by gene family; FR3 starts use one chain default and are marked uncertain. Add fr3= (and anchor=) to a few alleles per family, or use an IMGT-gapped V set"
+        );
+    }
     if database.annotation.uncertain() > 0 {
         eprintln!(
             "vdj-assign: {} alleles have transferred, low-confidence or missing anchors; see `vdj-assign prepare` annotation.tsv",
             database.annotation.uncertain()
         );
+    }
+    for warning in database.constant_warnings(CSegmentConfig::default().spread) {
+        eprintln!("vdj-assign: warning: {warning}");
     }
     Ok(database)
 }
@@ -249,7 +303,8 @@ fn stream<R: BufRead, T: VdjAssigner + AlleleCatalog + Sync>(
 ) -> Result<(usize, usize), Box<dyn Error>> {
     let mut reads = ReadReader::new(input);
     let mut out = BufWriter::new(io::stdout().lock());
-    writeln!(out, "{}", AirrRecord::tsv_header())?;
+    let constant = assigner.segment(SegmentKind::C).is_some();
+    writeln!(out, "{}", AirrRecord::tsv_header_with(constant))?;
     let (mut total, mut with_path) = (0, 0);
     let mut batch = Vec::with_capacity(BATCH);
     loop {
@@ -306,9 +361,14 @@ fn run_prepare(args: &Args) -> Result<(), Box<dyn Error>> {
     let database = load_database(args)?;
     database.write(Path::new(out))?;
     eprintln!(
-        "vdj-assign: wrote {out}/V.fasta, J.fasta{}, annotation.tsv",
+        "vdj-assign: wrote {out}/V.fasta, J.fasta{}{}, annotation.tsv",
         if database.d.is_some() {
             ", D.fasta"
+        } else {
+            ""
+        },
+        if database.c.is_some() {
+            ", C.fasta"
         } else {
             ""
         }
@@ -353,13 +413,47 @@ fn run_assign(args: &Args) -> Result<(), Box<dyn Error>> {
         .transpose()?;
     // The residual adjudicator computes no posteriors.
     config.posterior = !args.no_posterior && !args.residual;
+    if let Some(name) = args.calls.as_deref() {
+        config.calls = match name {
+            "per-read" => CallModel::PerRead,
+            "fixed" => CallModel::FixedScale,
+            _ => return Err(format!("unknown --calls '{name}'").into()),
+        };
+    }
+    if let Some(name) = args.d_allele.as_deref() {
+        config.d_allele = match name {
+            "map" => DAlleleDecoding::Map,
+            "max-marginal" => DAlleleDecoding::MaxMarginal,
+            _ => return Err(format!("unknown --d-allele '{name}'").into()),
+        };
+    }
+    if let Some(rate) = args.d_presence_rate.as_deref() {
+        let presence = rate.parse::<f64>().unwrap_or(f64::NAN);
+        if !(presence > 0.0 && presence < 1.0) {
+            return Err(format!("--d-presence-rate expects a rate in (0, 1), got '{rate}'").into());
+        }
+        config.objective.d_prior = DPrior::search(presence);
+    }
     let support: SupportModels = [
         KarlinAltschul::ungapped(&config.v.scoring),
         KarlinAltschul::ungapped(&config.d.scoring),
         KarlinAltschul::ungapped(&config.j.scoring),
     ];
+    if let Some(text) = args.c_evalue.as_deref() {
+        if args.c.is_none() {
+            return Err("--c-evalue needs --c".into());
+        }
+        config.c.evalue = text
+            .parse::<f64>()
+            .ok()
+            .filter(|&evalue| evalue > 0.0)
+            .ok_or_else(|| format!("--c-evalue expects a positive number, got '{text}'"))?;
+    }
     let database = load_database(args)?;
-    let assigner = DefaultAssigner::from_config(&config, database.v, database.d, database.j)?;
+    let mut assigner = DefaultAssigner::from_config(&config, database.v, database.d, database.j)?;
+    if let Some(c) = database.c {
+        assigner = assigner.with_constant(c, &config.c)?;
+    }
 
     let started = Instant::now();
     let (total, with_path) = if args.residual {
@@ -410,13 +504,17 @@ fn run_simulate(args: &Args) -> Result<(), Box<dyn Error>> {
     let count: usize = number(&args.count, "--reads", 10_000)?;
     let seed: u64 = number(&args.seed, "--seed", 1)?;
     let database = load_database(args)?;
-    let sim = Simulator::new(&database.v, database.d.as_ref(), &database.j, params)?;
+    let mut sim = Simulator::new(&database.v, database.d.as_ref(), &database.j, params)?;
+    if let Some(c) = &database.c {
+        sim = sim.with_constant(c)?;
+    }
     let mut reads = BufWriter::new(File::create(format!("{out}.fasta"))?);
     let mut truth = BufWriter::new(File::create(format!("{out}.truth.tsv"))?);
-    writeln!(truth, "{}", Truth::tsv_header())?;
-    let mut rng = Rng::new(seed);
+    writeln!(truth, "{}", Truth::tsv_header_with(database.c.is_some()))?;
+    let (mut rng, mut c_rng) = (Rng::new(seed), Rng::new(seed ^ C_STREAM));
     for index in 0..count {
-        let read = sim.read(&mut rng)?;
+        let mut read = sim.read(&mut rng)?;
+        sim.append_constant(&mut read, &mut c_rng);
         let id = format!("sim{index}");
         writeln!(reads, ">{id}\n{}", String::from_utf8_lossy(&read.sequence))?;
         writeln!(truth, "{}", Truth::from_read(&sim, &read, &id).to_tsv())?;
