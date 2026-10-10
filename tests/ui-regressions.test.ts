@@ -316,7 +316,12 @@ test("post-analysis skipping, richer lineage rows, CLI export, and lazy lineage 
   assert.match(lineageStudy,/Representative CDR3/);
   assert.match(lineageStudy,/Samples and read counts/);
   assert.match(standalone,/with \{ type: "file" \}/);
-  assert.match(standalone,/runCli\(\{wasmPath,referencePackPath\}\)/);
+  assert.match(standalone,/runCli\(\{wasmPath,referencePackPath,nativeAlignerPath\}\)/);
+  assert.match(standalone,/import nativeAlignerPath from "\.\.\/native\/swig" with \{ type: "file" \}/);
+  assert.match(release,/needs: \[wasm, aligner\]/);
+  assert.match(release,/aligner: swig-aligner-windows-x64\.exe/);
+  // Bun 1.4.2 closes node:readline under a paused consumer ("readline was closed"); stay on 1.3.14.
+  assert.match(release,/bun-version: 1\.3\.14/);
   assert.match(release,/Build release WebAssembly core/);
   assert.match(release,/release-swig-wasm/);
   assert.match(release,/build-swig-wasm\.sh/);

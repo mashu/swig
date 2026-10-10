@@ -372,6 +372,14 @@ the message in the error buffer. Results stay readable until the next call.
   registers. Swig ships only this build, so a host without WebAssembly SIMD
   cannot instantiate it; a build without `simd128` would use the scalar
   kernel, since emulated lanes there run several times slower.
+- **swig-cli runs the native binary.** Since Swig 0.39.1 each standalone
+  `swig-cli` executable embeds the native `swig` for its platform, extracts it
+  to the user cache and streams records through it (stdin FASTA/FASTQ/AIRR,
+  stdout AIRR TSV, `--threads N`, the same option names). `Run::write_airr`
+  flushes the rows of every `BATCH` (16,384 records) as soon as they are
+  assigned, so the CLI keeps more than that many records in flight. The
+  WebAssembly module stays the fallback and the route for the double-D
+  sidecar; the rows are byte-identical.
 - **Threads.** `wasm32-unknown-unknown` has none: `assign_map` runs every
   chunk on the calling thread, and Swig parallelises by running one
   instance per worker. In the standalone project's measurements, one

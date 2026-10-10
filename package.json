@@ -1,13 +1,13 @@
 {
   "name": "swig-cli",
-  "version": "0.39.0",
+  "version": "0.39.1",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "npm run check && npm run build:cli && vite build",
     "build:cli": "node scripts/build-cli.mjs",
-    "build:cli:standalone": "bun build cli-src/swig-cli-standalone.mjs cli-src/swig-worker.mjs cli-src/post-analysis-worker.mjs cli-src/chmmairra-worker.mjs --compile --minify --target=bun --outfile=release/swig-cli",
+    "build:cli:standalone": "node scripts/stage-native-aligner.mjs && bun build cli-src/swig-cli-standalone.mjs cli-src/swig-worker.mjs cli-src/post-analysis-worker.mjs cli-src/chmmairra-worker.mjs --compile --minify --target=bun --outfile=release/swig-cli",
     "preview": "vite preview",
     "check": "tsc --noEmit",
     "test": "npm run test:stream && npm run test:store && npm run test:germline && npm run test:alignment && npm run test:post && npm run test:wasm && npm run test:cli",

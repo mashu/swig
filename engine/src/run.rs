@@ -50,7 +50,8 @@ use crate::stats::KarlinAltschul;
 use crate::window::{ExpandedResidual, WithAnchorWindow};
 
 /// Reads assigned per batch by [`Run::write_airr`] (bounds memory on large
-/// inputs).
+/// inputs). swig-cli keeps more records than this in flight when it streams
+/// through the binary (`ENGINE_BATCH` in cli-src/native-aligner.mjs).
 pub const BATCH: usize = 16_384;
 
 /// Rows [`Run`] keeps for sequences it may see again.
@@ -723,6 +724,12 @@ impl Run {
                 }
             }
             tally += rows.tally;
+            // A batch's rows reach a reader as soon as they are assigned:
+            // swig-cli streams records through a pipe and waits for them.
+            out.flush().map_err(RunError::Output)?;
+            if let Some(sidecar) = double_d.as_mut() {
+                sidecar.flush().map_err(RunError::Output)?;
+            }
         }
     }
 }

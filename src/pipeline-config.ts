@@ -51,6 +51,8 @@ export interface CliAnnotationConfig {
   strand: 0 | 1 | 2;
   /** Re-run the aligner on AIRR `sequence`, or trust the existing AIRR calls. */
   airrMode: "reannotate" | "preserve";
+  /** swig-cli only: the native aligner where the executable carries it ("auto"), or one route. */
+  aligner?: "auto" | "native" | "wasm";
   doubleD: DoubleDScreenOptions;
 }
 

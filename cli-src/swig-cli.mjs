@@ -55,8 +55,9 @@ import {
   validateFastqQualityFilter,
 } from "../src/sequence-stream.ts";
 import { annotateAirrBatch, annotateDoubleDBatch, stableDatasetSeed } from "../src/study-design.ts";
+import { ALIGNER_MODES, NativePool, resolveNativeAligner } from "./native-aligner.mjs";
 
-const VERSION="0.39.0";
+const VERSION="0.39.1";
 const CLI_STREAM_HIGH_WATER_MARK=8*1024*1024;
 const CLI_GZIP_CHUNK_SIZE=1024*1024;
 const CLI_DIRECTORY=dirname(fileURLToPath(import.meta.url));
@@ -70,7 +71,8 @@ function usage(){
   return `swig-cli ${VERSION}\n\n`+
     `Run a complete non-phylogenetic Swig pipeline:\n`+
     `  swig-cli run reads.fastq.gz --out swig-output\n`+
-    `  swig-cli run --config swig.config.json [--out DIRECTORY] [--workers N] [--airr-compression none|gzip]\n\n`+
+    `  swig-cli run --config swig.config.json [--out DIRECTORY] [--workers N] [--airr-compression none|gzip]\n`+
+    `      [--aligner auto|native|wasm]\n\n`+
     `Experimental joint inherited/SHM model: swig-cli joint-germline --help\n\nInfer personalized V alleles from lineage-assigned AIRR:\n  swig-cli personalized-germline --airr processed.airr.tsv.gz --v-reference V.fasta --out germline\n\nRun only streaming V(D)J assignment (AIRR outfmt 19):\n`+
     `  swig-cli --vdj -query reads.fasta -germline_db_V V.fasta -germline_db_D D.fasta \\\n`+
     `    -germline_db_J J.fasta -out calls.airr.tsv\n\n`+
@@ -84,6 +86,9 @@ function usage(){
     `Single-input metadata options:\n`+
     `  --sample SAMPLE_ID  --donor SUBJECT_ID  --dataset DATASET_ID\n\n`+
     `Samples with the same subjectId/--donor are treated as the same donor.\n`+
+    `The aligner runs natively where this executable carries the platform's binary (--aligner auto,\n`+
+    `the default), else as WebAssembly; --aligner wasm forces WebAssembly, --aligner native fails\n`+
+    `instead of falling back. Double-D screening always uses WebAssembly.\n`+
     `Lineage phylogenetics is intentionally not run by swig-cli.`;
 }
 
@@ -128,9 +133,11 @@ function vdjUsage(){
     `  --match-mode MODE           Metadata transfer only: strict, permissive, best-guess\n`+
     `  --best-guess                Disable metadata-transfer identity floors (not read mapping)\n`+
     `Execution:\n`+
-    `  -num_threads N          Exact worker count; --workers N overrides it\n`+
-    `  --workers N             Exact workers with no CLI cap; 0 chooses up to 8\n`+
-    `  --batch-records N       Records per bounded WASM batch; 0/omitted selects 2000, 1000,\n`+
+    `  -num_threads N          Exact thread count; --workers N overrides it\n`+
+    `  --workers N             Exact threads (or WebAssembly workers); 0 or omitted uses every core\n`+
+    `  --aligner MODE          auto (default): the native aligner this executable carries, else\n`+
+    `                          WebAssembly; native: fail instead of falling back; wasm: WebAssembly\n`+
+    `  --batch-records N       Records per bounded batch; 0/omitted selects 2000, 1000,\n`+
     `                          or 500 according to worker count\n`+
     `  --calling-profile NAME  r_optimized (default), sensitive_d, truth_optimized or igblast_compatible\n`+
     `    r_optimized: 4-nt D exact-run floor; a D pays its prior cost, derived from the D genes of\n`+
@@ -191,7 +198,7 @@ function parseVdjArguments(rawArgs,context="vdj"){
     "-num_alignments_D","-num_alignments_J","-D_penalty","-J_penalty",
     "--prepared-reference","--match-mode","--nearest-candidates",
     "--v-same-gene-min-identity","--v-nearest-min-identity",
-    "--j-same-gene-min-identity","--j-nearest-min-identity",
+    "--j-same-gene-min-identity","--j-nearest-min-identity","--aligner",
   ]);
   const flags=new Set(["--swigannots","-show_translation","--best-guess","--require-complete"]);
   const options={};
@@ -343,7 +350,10 @@ class WasmPool {
       else{worker.on("message",receive);worker.on("error",fail);}
       this.workers.push(worker);
     }
-    await Promise.all(this.workers.map((worker)=>this.request(worker,{type:"init",...this.init})));
+    // One compilation shared by every worker: per-worker compiles compete with the workers for the
+    // CPU (under Bun 1.3, four workers ran no faster than two).
+    const module=await WebAssembly.compile(readFileSync(this.init.wasmPath));
+    await Promise.all(this.workers.map((worker)=>this.request(worker,{type:"init",...this.init,module})));
     this.available.push(...this.workers);
   }
   request(worker,message,release=false){
@@ -920,11 +930,19 @@ async function runPipeline(config,base,assets){
   const needsAnnotation=config.inputs.some((input)=>detectFormat(input.path,input.format)!=="airr"||config.annotation.airrMode==="reannotate");
   const annotationBatchRecords=config.annotation.batchRecords||automaticBatchRecords(config.annotation.workers);
   const settings={callingProfile:config.annotation.callingProfile,minimumIdentity:config.annotation.minimumIdentity,minimumConstantPrefixIdentity:config.annotation.minimumConstantPrefixIdentity,strand:config.annotation.strand,doubleD:config.annotation.doubleD};
-  const pool=needsAnnotation?new WasmPool(config.annotation.workers,workerInitialization(assets.wasmPath,references,settings)):null;
-  if(pool){
-    process.stderr.write(`Starting the aligner pool (${config.annotation.workers} worker${config.annotation.workers===1?"":"s"}; ${annotationBatchRecords.toLocaleString()} records/batch).\n`);
-    await pool.start();
-  }
+  const init=workerInitialization(assets.wasmPath,references,settings);
+  const mode=config.annotation.aligner;
+  let nativeBinary=needsAnnotation?chooseNativeAligner(mode,assets,config.annotation.doubleD.mode!=="off"?"the double-D screen":""):null;
+  let pool=null;
+  const wasmPool=async()=>{
+    if(!pool){
+      process.stderr.write(`Starting the WebAssembly aligner pool (${config.annotation.workers} worker${config.annotation.workers===1?"":"s"}; ${annotationBatchRecords.toLocaleString()} records/batch).\n`);
+      pool=new WasmPool(config.annotation.workers,init);await pool.start();
+    }
+    return pool;
+  };
+  if(nativeBinary)process.stderr.write(`Using the native aligner (${config.annotation.workers} thread${config.annotation.workers===1?"":"s"}; ${annotationBatchRecords.toLocaleString()} records/batch).\n`);
+  else if(needsAnnotation)await wasmPool();
   const annotatedName=airrOutputName(prefix,"annotated",config.output.airrCompression);
   const annotatedOutput=config.output.writeAnnotatedAirr?createVdjOutput(join(outputDirectory,annotatedName)):null;
   const annotatedStream=annotatedOutput?.stream??null;
@@ -940,6 +958,22 @@ async function runPipeline(config,base,assets){
       process.stderr.write(`${preserveAirr?"Loading existing AIRR calls from":"Annotating"} ${input.inputName||basename(input.path)} (${input.sampleId}; donor ${input.subjectId})…\n`);
       const preprocessingState={inputRecords:0,eligibleRecords:0,selectedRecords:0,fastqFilter:emptyFastqQualityFilterStats(false,false)};
       const pending=[];
+      let datasetPool=null;
+      if(needsAnnotation&&!preserveAirr){
+        if(nativeBinary){
+          // One child per dataset: the engine detects FASTA, FASTQ or AIRR once per stream.
+          const native=new NativePool(nativeBinary,config.annotation.workers,init,annotationBatchRecords);
+          try{await native.start();datasetPool=native;}
+          catch(error){
+            await native.close().catch(()=>{});
+            if(mode==="native"||/database/i.test(error.message))throw error;
+            process.stderr.write(`The native aligner did not start (${error.message}); using WebAssembly.\n`);
+            nativeBinary=null;
+          }
+        }
+        datasetPool??=await wasmPool();
+      }
+      const window=datasetPool instanceof NativePool?datasetPool.window:Math.max(2,config.annotation.workers*2);
       const consume=async(item)=>{
         const result=await item.promise;
         const manifest={datasetId:input.datasetId,inputName:input.inputName||basename(input.path),sampleId:input.sampleId,subjectId:input.subjectId,cohort:input.cohort,timepoint:input.timepoint,compartment:input.compartment};
@@ -965,14 +999,20 @@ async function runPipeline(config,base,assets){
         }
         annotatedRecords+=table.rows.length;
       };
-      for await(const batch of sequenceBatches(input,annotationBatchRecords,config.preprocessing,config.annotation.airrMode,datasetIndex,preprocessingState)){
-        const promise=batch.format==="airr"&&config.annotation.airrMode==="preserve"
-          ? Promise.resolve({direct:true,header:batch.header,body:batch.body,doubleDHeader:"",doubleDBody:""})
-          : pool.run(workerAnnotation(batch.text,batch.count));
-        pending.push({promise,count:batch.count});
-        if(pending.length>=Math.max(2,config.annotation.workers*2))await consume(pending.shift());
+      try{
+        for await(const batch of sequenceBatches(input,annotationBatchRecords,config.preprocessing,config.annotation.airrMode,datasetIndex,preprocessingState)){
+          const promise=batch.format==="airr"&&config.annotation.airrMode==="preserve"
+            ? Promise.resolve({direct:true,header:batch.header,body:batch.body,doubleDHeader:"",doubleDBody:""})
+            : datasetPool.run(workerAnnotation(batch.text,batch.count));
+          pending.push({promise,count:batch.count});
+          if(datasetPool instanceof NativePool)await datasetPool.ready();
+          if(pending.length>=window)await consume(pending.shift());
+        }
+        if(datasetPool instanceof NativePool)datasetPool.finishInput();
+        while(pending.length)await consume(pending.shift());
+      }finally{
+        if(datasetPool instanceof NativePool)await datasetPool.close();
       }
-      while(pending.length)await consume(pending.shift());
       inputRecords+=preprocessingState.inputRecords;eligibleRecords+=preprocessingState.eligibleRecords;
       fastqFilterStats=addFastqQualityFilterStats(fastqFilterStats,preprocessingState.fastqFilter);
     }
@@ -1086,6 +1126,32 @@ function vdjTuning(options){
   return tuning;
 }
 
+/** "auto", "native" or "wasm"; SWIG_CLI_ALIGNER sets the default. */
+function alignerMode(value){
+  const mode=String(value??process.env.SWIG_CLI_ALIGNER??"auto").toLowerCase();
+  if(!ALIGNER_MODES.includes(mode))throw new Error(`--aligner must be ${ALIGNER_MODES.join(", ")}.`);
+  return mode;
+}
+
+/**
+ * The native aligner binary for `mode`, or null for WebAssembly (saying why on stderr in auto
+ * mode). `unsupported` names a setting only the WebAssembly route carries.
+ */
+function chooseNativeAligner(mode,assets,unsupported=""){
+  if(mode==="wasm")return null;
+  if(unsupported){
+    if(mode==="native")throw new Error(`--aligner native: ${unsupported} runs only on WebAssembly.`);
+    process.stderr.write(`Using the WebAssembly aligner: ${unsupported} runs only on it.\n`);
+    return null;
+  }
+  const notes=[];const binary=resolveNativeAligner(assets,VERSION,notes);
+  if(binary)return binary;
+  const reason=notes.length?notes.join("; "):"this build carries no native aligner";
+  if(mode==="native")throw new Error(`--aligner native: ${reason}.`);
+  process.stderr.write(`Using the WebAssembly aligner (${reason}).\n`);
+  return null;
+}
+
 async function runVdj(rawArgs,assets){
   const options=parseVdjArguments(rawArgs);
   if(options.help){process.stdout.write(`${vdjUsage()}\n`);return;}
@@ -1102,9 +1168,10 @@ async function runVdj(rawArgs,assets){
   const minimumIdentity=options["--minimum-identity"]===undefined?0.6:parseFiniteOption(options["--minimum-identity"],"--minimum-identity");
   if(minimumIdentity<0||minimumIdentity>1)throw new Error("--minimum-identity must be between 0 and 1.");
   const threadValue=options["--workers"]??options["-num_threads"];
-  let workers=threadValue===undefined?Math.max(1,Math.min(4,availableParallelism())):parseIntegerOption(threadValue,options["--workers"]!==undefined?"--workers":"-num_threads",{minimum:0});
+  let workers=threadValue===undefined?0:parseIntegerOption(threadValue,options["--workers"]!==undefined?"--workers":"-num_threads",{minimum:0});
   if(options["--workers"]===undefined&&threadValue!==undefined&&workers===0)throw new Error("-num_threads must be at least 1; use --workers 0 for automatic selection.");
-  if(workers===0)workers=Math.max(1,Math.min(8,availableParallelism()));
+  if(workers===0)workers=Math.max(1,availableParallelism());
+  const mode=alignerMode(options["--aligner"]);
   const requestedBatchRecords=options["--batch-records"]===undefined?0:parseIntegerOption(options["--batch-records"],"--batch-records",{minimum:0});
   const batchRecords=requestedBatchRecords||automaticBatchRecords(workers);
   const callingProfile=String(options["--calling-profile"]??"r_optimized");
@@ -1117,15 +1184,28 @@ async function runVdj(rawArgs,assets){
   const tuning=vdjTuning(options);
   const minimumConstantPrefixIdentity=options["--minimum-c-prefix-identity"]===undefined?null:parseFiniteOption(options["--minimum-c-prefix-identity"],"--minimum-c-prefix-identity");
   if(minimumConstantPrefixIdentity!==null&&(minimumConstantPrefixIdentity<0||minimumConstantPrefixIdentity>1))throw new Error("--minimum-c-prefix-identity must be between 0 and 1.");
-  const pool=new WasmPool(workers,workerInitialization(assets.wasmPath,prepared.references,{callingProfile,minimumIdentity,minimumConstantPrefixIdentity,strand,tuning}));
-  await pool.start();
+  const init=workerInitialization(assets.wasmPath,prepared.references,{callingProfile,minimumIdentity,minimumConstantPrefixIdentity,strand,tuning});
+  const nativeBinary=chooseNativeAligner(mode,assets);
+  let pool=nativeBinary?new NativePool(nativeBinary,workers,init,batchRecords):new WasmPool(workers,init);
+  try{await pool.start();}
+  catch(error){
+    await pool.close().catch(()=>{});
+    // Germline errors would stop WebAssembly too; anything else falls back to it.
+    if(!nativeBinary||mode==="native"||/database/i.test(error.message))throw error;
+    process.stderr.write(`The native aligner did not start (${error.message}); using WebAssembly.\n`);
+    pool=new WasmPool(workers,init);await pool.start();
+  }
+  const native=pool instanceof NativePool;
+  const window=native?pool.window:Math.max(2,workers*2);
+  // Rows go straight to the output as bytes unless -auxiliary_data rewrites FWR4.
+  const bytes=native&&!Object.keys(prepared.fwr4EndOffsets).length;
   const outputHandle=outputPath==="-"?null:createVdjOutput(outputPath);
   const output=outputHandle?.stream??process.stdout;
   let outputHeader=null;let records=0;let completed=false;
   try{
     if(outputHandle)await outputHandle.opened;
     const profileLabel=callingProfile==="r_optimized"?"R-optimized":callingProfile==="sensitive_d"?"Sensitive-D":callingProfile==="igblast_compatible"?"IgBLAST-agreement":"truth-optimized";
-    process.stderr.write(`Streaming Swig aligner V(D)J assignments (${prepared.mode}; ${workers} worker${workers===1?"":"s"}; ${batchRecords.toLocaleString()} records/batch; ${profileLabel} profile) to ${outputPath}.\n`);
+    process.stderr.write(`Streaming Swig aligner V(D)J assignments (${native?"native aligner":"WebAssembly aligner"}; ${prepared.mode}; ${workers} ${native?"thread":"worker"}${workers===1?"":"s"}; ${batchRecords.toLocaleString()} records/batch; ${profileLabel} profile) to ${outputPath}.\n`);
     const state={inputRecords:0,eligibleRecords:0,selectedRecords:0,fastqFilter:emptyFastqQualityFilterStats(false,false)};
     const pending=[];
     const consume=async(item)=>{
@@ -1138,9 +1218,11 @@ async function runVdj(rawArgs,assets){
     const preprocessing={fastqFilter:{...DEFAULT_CLI_CONFIG.preprocessing.fastqFilter,trim3Prime:{...DEFAULT_CLI_CONFIG.preprocessing.fastqFilter.trim3Prime}},subsample:{...DEFAULT_CLI_CONFIG.preprocessing.subsample,enabled:false}};
     const input={path:queryPath,format:"fasta"};
     for await(const batch of sequenceBatches(input,batchRecords,preprocessing,"reannotate",0,state)){
-      pending.push({promise:pool.run(workerAnnotation(batch.text,batch.count))});
-      if(pending.length>=Math.max(2,workers*2))await consume(pending.shift());
+      pending.push({promise:pool.run({...workerAnnotation(batch.text,batch.count),bytes})});
+      if(native)await pool.ready();
+      if(pending.length>=window)await consume(pending.shift());
     }
+    if(native)pool.finishInput();
     while(pending.length)await consume(pending.shift());
     if(outputHandle)await outputHandle.finish();
     completed=true;
@@ -1178,9 +1260,13 @@ export async function runCli(assets=defaultCliAssets()){
   if(commandOutput)raw.output={...(raw.output??{}),directory:commandOutput};
   const commandWorkers=argumentValue(rest,"--workers");
   if(commandWorkers!==undefined)raw.annotation={...(raw.annotation??{}),workers:parseIntegerOption(commandWorkers,"--workers",{minimum:0})};
+  const commandAligner=argumentValue(rest,"--aligner");
+  if(commandAligner!==undefined)raw.annotation={...(raw.annotation??{}),aligner:commandAligner};
   const commandCompression=argumentValue(rest,"--airr-compression");
   if(commandCompression!==undefined){if(!["none","gzip"].includes(commandCompression))throw new Error("--airr-compression must be none or gzip.");raw.output={...(raw.output??{}),airrCompression:commandCompression};}
   const config=normalizeCliConfig(raw);
+  // An explicit --aligner or annotation.aligner wins over SWIG_CLI_ALIGNER.
+  config.annotation.aligner=alignerMode(raw.annotation?.aligner);
   if(!isCallingProfile(config.annotation.callingProfile)){
     throw new Error(`annotation.callingProfile must be ${CALLING_PROFILES.join(", ")}.`);
   }

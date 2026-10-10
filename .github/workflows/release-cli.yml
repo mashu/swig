@@ -84,7 +84,7 @@ jobs:
 
   build:
     name: ${{ matrix.label }}
-    needs: wasm
+    needs: [wasm, aligner]
     strategy:
       fail-fast: false
       matrix:
@@ -93,26 +93,32 @@ jobs:
             target: bun-linux-x64-baseline
             label: Linux x86-64 baseline
             artifact: swig-cli-linux-x64
+            aligner: swig-aligner-linux-x64
           - os: ubuntu-latest
             target: bun-linux-x64-modern
             label: Linux x86-64 modern (Haswell/AVX2)
             artifact: swig-cli-linux-x64-modern
+            aligner: swig-aligner-linux-x64
           - os: ubuntu-24.04-arm
             target: bun-linux-arm64
             label: Linux ARM64
             artifact: swig-cli-linux-arm64
+            aligner: swig-aligner-linux-arm64
           - os: macos-15-intel
             target: bun-darwin-x64
             label: macOS Intel
             artifact: swig-cli-macos-x64
+            aligner: swig-aligner-macos-x64
           - os: macos-14
             target: bun-darwin-arm64
             label: macOS Apple silicon
             artifact: swig-cli-macos-arm64
+            aligner: swig-aligner-macos-arm64
           - os: ubuntu-latest
             target: bun-windows-x64-baseline
             label: Windows x86-64
             artifact: swig-cli-windows-x64.exe
+            aligner: swig-aligner-windows-x64.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -120,6 +126,18 @@ jobs:
         with:
           name: release-swig-wasm
           path: public
+      # The executable embeds its platform's native aligner as native/swig; swig-cli
+      # extracts it to the user cache and runs it, with WebAssembly as the fallback.
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.aligner }}
+          path: native-download
+      - name: Stage the native aligner
+        shell: bash
+        run: |
+          mkdir -p native
+          mv "native-download/${{ matrix.aligner }}" native/swig
+          chmod +x native/swig
       - uses: actions/setup-node@v4
         with:
           node-version: 24
