@@ -1,0 +1,27 @@
+[package]
+name = "vdj_assign"
+version = "0.1.1"
+edition = "2024"
+rust-version = "1.89"
+description = "Seeded, banded affine V(D)J germline assignment with placement-DAG adjudication"
+
+[dependencies]
+
+[workspace]
+members = ["wasm"]
+
+[[bin]]
+name = "vdj-assign"
+path = "src/bin/assign.rs"
+doc = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# The WebAssembly modules (`wasm/build.sh`): whole-program LTO and no symbol
+# names, for a smaller download.
+[profile.wasm]
+inherits = "release"
+lto = "fat"
+strip = true

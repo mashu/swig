@@ -1,0 +1,140 @@
+<!doctype html>
+<!-- The page's source. wasm/build.sh writes index.html from it: app.js,
+     vdj-assign.js, worker.js and both WebAssembly modules inlined in place of
+     the module script at the end, so index.html is one file that runs opened
+     from disk or from any static host, with no server. Served over HTTP next
+     to the built modules, this file also runs as it is (development). -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vdj_assign in the browser</title>
+<meta name="description" content="V(D)J germline assignment of immune receptor reads, in WebAssembly: nothing leaves your browser.">
+<style>
+:root {
+  --bg: #fbfbfa; --panel: #ffffff; --ink: #1d232a; --muted: #5d6670; --line: #d9dde1;
+  --accent: #2459a6; --accent-ink: #ffffff; --warn: #8a5a00; --warn-bg: #fff6e0; --bad: #a32020; --bad-bg: #fdeaea;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171b; --panel: #1c2026; --ink: #e5e8eb; --muted: #9aa3ad; --line: #333a43;
+    --accent: #6e9fe6; --accent-ink: #0b1220; --warn: #f0c063; --warn-bg: #2c2414; --bad: #f08a8a; --bad-bg: #2e1717;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header, main, footer { max-width: 1100px; margin: 0 auto; padding: 0 16px; }
+header { padding-top: 24px; }
+h1 { font-size: 1.5rem; margin: 0 0 4px; }
+h2 { font-size: 1.05rem; margin: 0 0 12px; }
+p { margin: 0 0 8px; }
+.lede { color: var(--muted); max-width: 70ch; }
+.badge { display: inline-block; padding: 1px 8px; border: 1px solid var(--line); border-radius: 999px; font-size: 0.8rem; color: var(--muted); }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin: 16px 0; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px 16px; }
+label { display: flex; flex-direction: column; gap: 4px; font-size: 0.9rem; color: var(--muted); }
+label.check { flex-direction: row; align-items: center; gap: 8px; color: var(--ink); }
+input[type=file], select, input[type=number], textarea { font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; min-width: 0; width: 100%; }
+textarea { min-height: 7em; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.85rem; }
+button { font: inherit; border-radius: 6px; padding: 8px 16px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); cursor: pointer; }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+button:disabled { opacity: 0.55; cursor: default; }
+.row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+.hint { font-size: 0.85rem; color: var(--muted); }
+progress { width: 100%; height: 10px; }
+.notice { border-radius: 6px; padding: 8px 12px; margin: 8px 0 0; font-size: 0.9rem; }
+.notice.warn { background: var(--warn-bg); color: var(--warn); }
+.notice.bad { background: var(--bad-bg); color: var(--bad); }
+.table { overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; }
+table { border-collapse: collapse; width: 100%; font-size: 0.82rem; }
+th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { position: sticky; top: 0; background: var(--panel); }
+td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.links a { margin-right: 12px; }
+a { color: var(--accent); }
+footer { color: var(--muted); font-size: 0.85rem; padding-bottom: 32px; }
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>vdj_assign <span class="badge" id="engine">loading…</span></h1>
+  <p class="lede">V(D)J germline assignment of immune receptor reads, compiled to WebAssembly.
+    It computes what the <code>vdj-assign</code> command line computes, and nothing leaves your
+    browser.</p>
+</header>
+<main>
+  <section>
+    <h2>Germline database</h2>
+    <div class="grid">
+      <label>V (FASTA, required)<input type="file" id="v" accept=".fa,.fasta,.fna,.txt"></label>
+      <label>D (FASTA, heavy chain and TRB/TRD)<input type="file" id="d" accept=".fa,.fasta,.fna,.txt"></label>
+      <label>J (FASTA, required)<input type="file" id="j" accept=".fa,.fasta,.fna,.txt"></label>
+      <label>C (FASTA, optional: isotype calls)<input type="file" id="c" accept=".fa,.fasta,.fna,.txt"></label>
+    </div>
+    <p class="hint">IMGT reference sets work as they are, gapped or not; anchors and regions are annotated on load.</p>
+    <div class="row">
+      <button id="demo">Use demo data</button>
+      <label>Preset<select id="demo-preset"><option>easy</option><option selected>mid</option><option>hard</option></select></label>
+      <label>Reads<input type="number" id="demo-reads" value="2000" min="1" max="200000" step="1"></label>
+      <span class="hint" id="demo-note"></span>
+    </div>
+  </section>
+
+  <section>
+    <h2>Reads</h2>
+    <div class="grid">
+      <label>FASTA or FASTQ file (.gz is decompressed here)<input type="file" id="reads" accept=".fa,.fasta,.fq,.fastq,.gz,.txt"></label>
+    </div>
+    <label>…or paste reads<textarea id="reads-text" spellcheck="false" placeholder=">read1&#10;CAGGTGCAGCTGGTGCAGTCTGGG…"></textarea></label>
+  </section>
+
+  <section>
+    <h2>Options</h2>
+    <div class="grid">
+      <label>Profile<select id="profile">
+        <option value="r">r (default)</option><option value="sensitive-d">sensitive-d</option>
+        <option value="truth">truth</option><option value="igblast">igblast</option></select></label>
+      <label>Chain<select id="chain"><option value="">voted from the database</option>
+        <option value="heavy">heavy</option><option value="light">light</option></select></label>
+      <label>Calls<select id="calls"><option value="">per-read (default)</option><option value="fixed">fixed</option></select></label>
+      <label>D allele<select id="d-allele"><option value="">map (default)</option><option value="max-marginal">max-marginal</option></select></label>
+      <label>D presence rate (optional)<input type="number" id="d-presence-rate" min="0.001" max="0.999" step="0.01" placeholder="genes × positions, even odds"></label>
+      <label>C E-value gate<input type="number" id="c-evalue" min="0" step="any" placeholder="0.001"></label>
+      <label>Workers<input type="number" id="workers" min="1" max="64" step="1"></label>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <label class="check"><input type="checkbox" id="tandem-d"> tandem D (VDDJ)</label>
+      <label class="check"><input type="checkbox" id="no-posterior"> no posteriors (faster)</label>
+      <label class="check"><input type="checkbox" id="forward-only"> forward strand only</label>
+      <label class="check"><input type="checkbox" id="no-anchor-window"> no anchor D window</label>
+      <label class="check"><input type="checkbox" id="residual"> residual adjudicator</label>
+    </div>
+  </section>
+
+  <section>
+    <div class="row">
+      <button class="primary" id="run" disabled>Assign</button>
+      <span id="status" class="hint"></span>
+    </div>
+    <progress id="progress" value="0" max="1" hidden></progress>
+    <div id="notices"></div>
+  </section>
+
+  <section id="results" hidden>
+    <h2>Results</h2>
+    <p id="summary"></p>
+    <p class="links" id="downloads"></p>
+    <div class="table"><table id="preview"></table></div>
+    <p class="hint" id="preview-note"></p>
+  </section>
+</main>
+<footer>
+  <p>vdj_assign: seeded, banded affine V(D)J assignment with placement-DAG adjudication. Output is an
+    AIRR Rearrangement TSV with 1-based coordinates on the oriented read.</p>
+</footer>
+<script type="module" src="app.js"></script>
+</body>
+</html>
