@@ -29,4 +29,4 @@ The D decision change does not reinstate the old trimming bug. Rejected D hypoth
 
 Three strictly serial one-worker repetitions found no meaningful regression versus 0.38.1 R-optimized. Median CPU time changed from 29.874 seconds to 29.440 seconds for 0.38.3 R-optimized and 29.804 seconds for Sensitive-D on IgM-like (−1.45% and −0.23%). On IgG-like it changed from 52.449 seconds to 52.869 and 52.810 seconds (+0.80% and +0.69%). R-optimized and Sensitive-D are effectively speed-equivalent because the threshold change adds no search or alignment pass.
 
-See [`BENCHMARK_SENSITIVE_D_0.38.3.md`](BENCHMARK_SENSITIVE_D_0.38.3.md) for the scoring rule, threshold sweep, full call/detection tables, endpoint distributions, supplied-fixture results, and repeated timing.
+See [`BENCHMARK_SENSITIVE_D_0.38.3.md`](https://github.com/mashu/swig/blob/a08a2c3fb2d42dba9dd1ac97e6fda783089b5b3f/BENCHMARK_SENSITIVE_D_0.38.3.md) for the scoring rule, threshold sweep, full call/detection tables, endpoint distributions, supplied-fixture results, and repeated timing.

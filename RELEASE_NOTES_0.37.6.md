@@ -20,4 +20,4 @@
 
 ## Important limitation
 
-AER-R increased D calls on simulated records retaining fewer than six true D bases from 2.36% to 4.32%. The simulator is a development stress test, not held-out biological validation. AER-R therefore remains opt-in; use ordinary RIAT-MP/AER when preserving released behavior is more important than testing the new robustness tradeoff. Full methods and measurements are in [`BENCHMARK_AER_ROBUST_0.37.6.md`](BENCHMARK_AER_ROBUST_0.37.6.md).
+AER-R increased D calls on simulated records retaining fewer than six true D bases from 2.36% to 4.32%. The simulator is a development stress test, not held-out biological validation. AER-R therefore remains opt-in; use ordinary RIAT-MP/AER when preserving released behavior is more important than testing the new robustness tradeoff. Full methods and measurements are in [`BENCHMARK_AER_ROBUST_0.37.6.md`](https://github.com/mashu/swig/blob/a08a2c3fb2d42dba9dd1ac97e6fda783089b5b3f/BENCHMARK_AER_ROBUST_0.37.6.md).

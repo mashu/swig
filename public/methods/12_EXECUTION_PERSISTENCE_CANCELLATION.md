@@ -48,11 +48,13 @@ Study-metadata re-indexing is one IndexedDB read/write transaction. Cancellation
 
 The browser assignment card reports three scheduler-level quantities without changing assignment or storage behavior:
 
-- **Queries / s** is a time-aware exponential moving average with a two-second time constant, sampled no more than twice per second. Its numerator is the number of AIRR records acknowledged after the browser has appended their batch to the result store. It therefore measures end-to-end committed throughput, including output/indexing backpressure, rather than only SwiftIG kernel speed.
-- **Active workers** is the exact number of compute-worker slots currently executing an annotation batch, shown against the effective worker-pool size. During per-dataset initialization it instead indicates that the concurrently launched workers are instantiating SwiftIG and building their own germline indexes. It is not an operating-system CPU-utilization estimate.
+- **Queries / s** is a time-aware exponential moving average with a two-second time constant, sampled no more than twice per second. Its numerator is the number of AIRR records acknowledged after the browser has appended their batch to the result store. It therefore measures end-to-end committed throughput, including output/indexing backpressure, rather than only the aligner's kernel speed.
+- **Active workers** is the exact number of compute-worker slots currently executing an annotation batch, shown against the effective worker-pool size. During per-dataset initialization it instead indicates that the concurrently launched workers are instantiating the aligner module and preparing their own germline databases (annotation and seed indexes). It is not an operating-system CPU-utilization estimate.
 - **Assignment state** distinguishes per-dataset initialization, concurrent input streaming, draining already-dispatched final batches, and result-index finalization. A falling active-worker count during draining is expected; a sustained low count while streaming identifies scheduler or result-store backpressure for follow-up profiling.
 
 The browser creates a fresh compute pool for each dataset. Compiling the shared WebAssembly module and concurrently constructing each worker's germline index can therefore produce a brief all-core burst at every dataset boundary before steady-state query processing begins. The telemetry exposes that burst as initialization rather than counting it as assignment throughput.
+
+The aligner module (`swig.wasm`, compiled from the Rust crate in `engine/` with WebAssembly SIMD128) is instantiated with no imports: it needs no WASI or other host interface. WASI, through a browser shim, is used only by the separate Alivibe MSA module of the lineage-alignment workbench.
 
 ## Portable sessions and linked AIRR
 

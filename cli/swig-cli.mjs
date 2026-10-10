@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { _ as annotateDoubleDBatch, a as deduplicate, c as parseFasta$2, d as runDenoisePartitionJob, f as runExactDedupJob, g as annotateAirrBatch, h as DEFAULT_PIPELINE_PLAN, i as createExactDedupPlan, l as prepareReferenceMsa, n as assignLineages, o as finishExactDedupPlan, p as sequenceFingerprint, s as normalizeNt, t as DenoiseAccumulator, v as datasetScopeValue, y as stableDatasetSeed } from "./chunks/post-analysis-core-CuBDaqFF.mjs";
+import { _ as annotateDoubleDBatch, a as deduplicate, c as parseFasta$2, d as runDenoisePartitionJob, f as runExactDedupJob, g as annotateAirrBatch, h as DEFAULT_PIPELINE_PLAN, i as createExactDedupPlan, l as prepareReferenceMsa, n as assignLineages, o as finishExactDedupPlan, p as sequenceFingerprint, s as normalizeNt, t as DenoiseAccumulator, v as datasetScopeValue, y as stableDatasetSeed } from "./chunks/post-analysis-core-DJA1I-YZ.mjs";
+import { n as CALLING_PROFILES, r as isCallingProfile } from "./chunks/aligner-engine-DxPuuP9Z.mjs";
 import { createReadStream, createWriteStream, readFileSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createGunzip, createGzip, gunzipSync, gzipSync } from "node:zlib";
@@ -9360,7 +9361,7 @@ function adaptiveNeighbourOdds(readShm, options) {
 	return Math.min(cap, baseline + somaticOdds);
 }
 /**
-* Converts a literal SwiftIG call into a sparse, database-aware evidence row.
+* Converts a literal aligner call into a sparse, database-aware evidence row.
 * Co-optimal calls start at exactly equal weight. Unreported nucleotide
 * neighbours receive geometric leakage; this is an explicit evidence kernel,
 * not a claim that the affine alignment score is a calibrated read likelihood.
@@ -11330,7 +11331,6 @@ const DEFAULT_CLI_CONFIG = {
 		workers: 0,
 		batchRecords: 0,
 		callingProfile: "r_optimized",
-		assignerStrategy: "aer_robust",
 		minimumIdentity: .6,
 		minimumConstantPrefixIdentity: null,
 		strand: 0,
@@ -11442,15 +11442,15 @@ function normalizeCliConfig(value) {
 			compartment: input.compartment ?? ""
 		};
 	});
+	const { assignerStrategy: _strategy, ...given } = value.annotation ?? {};
 	const annotation = {
 		...DEFAULT_CLI_CONFIG.annotation,
-		...value.annotation,
+		...given,
 		doubleD: {
 			...DEFAULT_CLI_CONFIG.annotation.doubleD,
-			...value.annotation?.doubleD
+			...given.doubleD
 		}
 	};
-	if (value.annotation?.callingProfile === void 0 && annotation.assignerStrategy !== "aer_robust") annotation.callingProfile = "truth_optimized";
 	annotation.workers = Math.max(0, Math.floor(finite(annotation.workers, 0)));
 	annotation.batchRecords = Math.max(0, Math.floor(finite(annotation.batchRecords, 0)));
 	annotation.minimumIdentity = Math.max(0, Math.min(1, finite(annotation.minimumIdentity, .6)));
@@ -12079,7 +12079,7 @@ function assertChainLocus(name, locus, chain, chainLoci, source) {
 }
 /**
 * Perform the FASTA preparation done by IgBLAST's `edit_imgt_file.pl` where it
-* is relevant to SwiftIG: canonicalize the germline identifier and remove IMGT
+* is relevant to the aligner: canonicalize the germline identifier and remove IMGT
 * alignment gaps before indexing. Existing SWIGMETA is deliberately removed.
 */
 function prepareIgblastStyleGermlineFasta(text, segment, allowedLoci = LOCI) {
@@ -12845,14 +12845,14 @@ var ShmAccumulator = class {
 };
 //#endregion
 //#region cli-src/swig-cli.mjs
-const VERSION = "0.38.11";
+const VERSION = "0.39.0";
 const CLI_STREAM_HIGH_WATER_MARK = 8388608;
 const CLI_GZIP_CHUNK_SIZE = 1048576;
 const CLI_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 function defaultCliAssets() {
 	const directory = join(CLI_DIRECTORY, "assets");
 	return {
-		wasmPath: join(directory, "swiftig.wasm"),
+		wasmPath: join(directory, "swig.wasm"),
 		referencePackPath: join(directory, "imgt-reference-pack.json.gz")
 	};
 }
@@ -12863,7 +12863,7 @@ function prepareReferenceUsage() {
 	return `swig-cli ${VERSION} prepare-reference\n\nInfer, validate, and persist reusable SWIGMETA germline annotations.\n\nRequired:\n  -germline_db_V FASTA  -germline_db_J FASTA  --out-prefix PREFIX\n\nOptional references and exact metadata:\n  -germline_db_D FASTA  -c_region_db FASTA\n  -custom_internal_data FILE  -auxiliary_data FILE  -d_frame_data FILE\n  -organism NAME (default human)  -ig_seqtype Ig|TCR (default Ig)\n\nMatching controls:\n  --match-mode strict|permissive|best-guess  (default strict)\n  --best-guess             Alias for --match-mode best-guess; disables identity floors\n  --nearest-candidates N   Non-gene candidates aligned after named candidates fail\n  --v-same-gene-min-identity X  --v-nearest-min-identity X\n  --j-same-gene-min-identity X  --j-nearest-min-identity X\n  --require-complete       Exit nonzero if any V/J record remains unresolved\n\nOutputs are PREFIX.V/D/J/C.fasta, PREFIX.swig-reference.json, and\nPREFIX.annotation-diagnostics.tsv. The manifest can be passed directly to\nswig-cli --vdj with --prepared-reference.`;
 }
 function vdjUsage() {
-	return `swig-cli ${VERSION} --vdj\n\nLow-overhead, streaming SwiftIG V(D)J assignment with IgBLAST-style option names.\n\nRequired:\n  -out AIRR_TSV, plus either --prepared-reference MANIFEST or\n  -germline_db_V FASTA and -germline_db_J FASTA\n\nInput and optional references:\n  -query FASTA            Query FASTA or '-' for stdin (default '-')\n  -germline_db_D FASTA    D germline FASTA\n  -c_region_db FASTA      Constant-region FASTA\n\nAnnotation modes (default: assignments only; CDR/FWR fields remain empty):\n  -custom_internal_data FILE  IgBLAST V .ndm.imgt data (1-based inclusive intervals)\n  -auxiliary_data FILE        IgBLAST J .aux data (0-based frame/CDR3 stop)\n  -d_frame_data FILE          IgBLAST D frame-one starts\n  --swigannots                Infer/validate metadata as in Swig Web\n\n  --prepared-reference FILE   Reuse a prepare-reference manifest and its FASTAs\n  --match-mode MODE           Metadata transfer only: strict, permissive, best-guess\n  --best-guess                Disable metadata-transfer identity floors (not read mapping)\nExecution:\n  -num_threads N          Exact worker count; --workers N overrides it\n  --workers N             Exact workers with no CLI cap; 0 chooses up to 8\n  --batch-records N       Records per bounded WASM batch; 0/omitted selects 2000, 1000,\n                          or 500 according to worker count\n  --assigner NAME         aer_robust (default), riat_mp, aer, or standard\n  --calling-profile NAME  r_optimized (default), truth_optimized or sensitive_d\n                          (AER-R only), igblast_balanced, or igblast_compatible\n    r_optimized: 4-nt D signal floor; joint D cost 12, evidence-relaxed to 10\n    sensitive_d: same signal floor and scores; fixed joint D cost 10 (a bare 4-mer scores 8)\n  C calls use calibrated post-J evidence; short 5'-anchored C tracts can pass without a fixed 30-nt floor\n  --minimum-c-prefix-identity X  Optional 0..1 identity gate over the complete covered C prefix\n  -strand both|plus|minus -outfmt 19 -organism NAME -ig_seqtype Ig|TCR\n\nThe germline options take FASTA files, not makeblastdb binary prefixes. Output is SwiftIG AIRR,\nnot IgBLAST pairwise/tabular formatting. The output path is mandatory and is written incrementally;\na path ending in .gz is gzip-compressed.`;
+	return `swig-cli ${VERSION} --vdj\n\nLow-overhead, streaming V(D)J assignment by the Swig aligner with IgBLAST-style option names.\n\nRequired:\n  -out AIRR_TSV, plus either --prepared-reference MANIFEST or\n  -germline_db_V FASTA and -germline_db_J FASTA\n\nInput and optional references:\n  -query FASTA            Query FASTA or '-' for stdin (default '-')\n  -germline_db_D FASTA    D germline FASTA\n  -c_region_db FASTA      Constant-region FASTA\n\nAnnotation modes (default: the aligner's own annotation from conserved motifs and annotated\nrelatives of the ungapped FASTA; v_annotation_source and j_annotation_source name each source):\n  -custom_internal_data FILE  IgBLAST V .ndm.imgt data (1-based inclusive intervals)\n  -auxiliary_data FILE        IgBLAST J .aux data (0-based frame/CDR3 stop)\n  -d_frame_data FILE          IgBLAST D frame-one starts\n  --swigannots                Infer/validate metadata as in Swig Web\n\n  --prepared-reference FILE   Reuse a prepare-reference manifest and its FASTAs\n  --match-mode MODE           Metadata transfer only: strict, permissive, best-guess\n  --best-guess                Disable metadata-transfer identity floors (not read mapping)\nExecution:\n  -num_threads N          Exact worker count; --workers N overrides it\n  --workers N             Exact workers with no CLI cap; 0 chooses up to 8\n  --batch-records N       Records per bounded WASM batch; 0/omitted selects 2000, 1000,\n                          or 500 according to worker count\n  --calling-profile NAME  r_optimized (default), sensitive_d, truth_optimized or igblast_compatible\n    r_optimized: 4-nt D exact-run floor; a D pays its prior cost, derived from the D genes of\n                 the read's locus (10.55 score units for human IGH)\n    sensitive_d: the same scores with a D twice as likely a priori (9.45 for human IGH)\n  C is anchored at the called J's end and called at an anchored E-value of at most 1e-3\n  --minimum-c-prefix-identity X  Optional 0..1 identity gate over the complete covered C prefix\n  --minimum-identity X    Drop V, D and J hits below identity X (default 0.6)\n  -min_D_match N  -D_penalty S  -J_penalty S  -min_J_length N   override the profile's D/J settings\n  -num_alignments_D/J N   accepted for IgBLAST compatibility; every admissible D and the best J\n                          alignments enter adjudication, and near-tied alleles are in *_alternatives\n  -strand both|plus|minus -outfmt 19 -organism NAME -ig_seqtype Ig|TCR\n\nThe germline options take FASTA files, not makeblastdb binary prefixes. Output is Swig AIRR,\nnot IgBLAST pairwise/tabular formatting. The output path is mandatory and is written incrementally;\na path ending in .gz is gzip-compressed.`;
 }
 function thirdPartyNotices() {
 	return "Bundled IMGT/GENE-DB reference data\n\nSource: IMGT/GENE-DB release 202632-7, retrieved 2026-08-08.\nCopyright © 1995-2026 IMGT®, the international ImMunoGeneTics information system®.\nAttribution: IMGT®, the international ImMunoGeneTics information system®, https://www.imgt.org/, Institute of Human Genetics, Université de Montpellier and CNRS.\nLicense: CC BY 4.0, https://creativecommons.org/licenses/by/4.0/\nTerms: https://www.imgt.org/about/termsofuse.php\nCitation: Giudicelli V, Chaume D, Lefranc M-P. Nucleic Acids Research. 2005;33:D593-D597. https://doi.org/10.1093/nar/gki010\n\nSwig modifies the source data by selecting and reorganizing IG/TR V/D/J/C records, normalizing and ungapping nucleotide sequences, deriving compact coordinate metadata, selecting one source sequence per allele identifier, and joining selected coding IGH/TR constant exons. Membrane-only and untranslated constant exons are omitted. IMGT, Université de Montpellier, and CNRS do not endorse Swig or warrant the modified pack or its use.";
@@ -12933,7 +12933,6 @@ function parseVdjArguments(rawArgs, context = "vdj") {
 		"--batch-records",
 		"--minimum-identity",
 		"--minimum-c-prefix-identity",
-		"--assigner",
 		"--calling-profile",
 		"-min_D_match",
 		"-min_J_length",
@@ -13244,7 +13243,7 @@ var WasmPool = class {
 		});
 	}
 	async close() {
-		const error = /* @__PURE__ */ new Error("SwiftIG worker pool closed before queued work completed.");
+		const error = /* @__PURE__ */ new Error("The aligner's worker pool closed before queued work completed.");
 		while (this.queued.length) this.queued.shift().reject(error);
 		for (const worker of this.workers) await worker.terminate();
 		this.workers = [];
@@ -13410,45 +13409,22 @@ var ChmmPool = class {
 		this.available = [];
 	}
 };
-function workerInitialization(wasmPath, references, callingProfile, assignerStrategy, tuning, minimumConstantPrefixIdentity = null) {
+function workerInitialization(wasmPath, references, settings) {
 	return {
 		wasmPath,
-		referenceV: references.V,
-		referenceD: references.D,
-		referenceJ: references.J,
-		referenceC: references.C,
-		callingProfile,
-		assignerStrategy,
-		minimumConstantPrefixIdentity,
-		hasTuning: Boolean(tuning),
-		aerRProfile: Boolean(tuning?.aerRProfile),
-		tuningDMatch: tuning?.dMatch ?? 0,
-		tuningDMismatch: tuning?.dMismatch ?? 0,
-		tuningDGapOpen: tuning?.dGapOpen ?? 0,
-		tuningDGapExtend: tuning?.dGapExtend ?? 0,
-		tuningTopD: tuning?.topD ?? 0,
-		tuningMinDMatch: tuning?.minDMatch ?? 0,
-		tuningJMatch: tuning?.jMatch ?? 0,
-		tuningJMismatch: tuning?.jMismatch ?? 0,
-		tuningJGapOpen: tuning?.jGapOpen ?? 0,
-		tuningJGapExtend: tuning?.jGapExtend ?? 0,
-		tuningTopJ: tuning?.topJ ?? 0,
-		tuningMinJLength: tuning?.minJLength ?? 0
+		references: {
+			V: references.V ?? "",
+			D: references.D ?? "",
+			J: references.J ?? "",
+			C: references.C ?? ""
+		},
+		settings
 	};
 }
-function workerAnnotation(text, count, format, minimumIdentity, strand, doubleD) {
+function workerAnnotation(text, count) {
 	return {
 		text,
-		count,
-		format,
-		minimumIdentity,
-		strand,
-		doubleDMode: doubleD.mode,
-		doubleDMinimumVjSpan: doubleD.minimumVjSpan ?? 0,
-		doubleDSeedLength: doubleD.seedLength ?? 0,
-		doubleDPseudoTrim: doubleD.pseudoTrim ?? 0,
-		doubleDMaximumPseudoMismatches: doubleD.maximumPseudoMismatches ?? 0,
-		doubleDMinimumScoreGain: doubleD.minimumScoreGain ?? 0
+		count
 	};
 }
 function automaticBatchRecords(workers) {
@@ -14274,7 +14250,6 @@ async function writeLineageStudy(path, manifestPath, headers, rows, activeMask, 
 				compartment: input.compartment
 			})),
 			callingProfile: config.annotation.callingProfile,
-			assignerStrategy: config.annotation.assignerStrategy,
 			minimumIdentity: config.annotation.minimumIdentity,
 			strand: config.annotation.strand,
 			lineage: {
@@ -14306,9 +14281,16 @@ async function runPipeline(config, base, assets) {
 	if (config.annotation.airrMode === "preserve" && config.annotation.doubleD.mode !== "off" && config.inputs.some((input) => detectFormat(input.path, input.format) === "airr")) throw new Error("Double-D screening of AIRR input requires annotation.airrMode = \"reannotate\".");
 	const needsAnnotation = config.inputs.some((input) => detectFormat(input.path, input.format) !== "airr" || config.annotation.airrMode === "reannotate");
 	const annotationBatchRecords = config.annotation.batchRecords || automaticBatchRecords(config.annotation.workers);
-	const pool = needsAnnotation ? new WasmPool(config.annotation.workers, workerInitialization(assets.wasmPath, references, config.annotation.callingProfile, config.annotation.assignerStrategy, void 0, config.annotation.minimumConstantPrefixIdentity)) : null;
+	const settings = {
+		callingProfile: config.annotation.callingProfile,
+		minimumIdentity: config.annotation.minimumIdentity,
+		minimumConstantPrefixIdentity: config.annotation.minimumConstantPrefixIdentity,
+		strand: config.annotation.strand,
+		doubleD: config.annotation.doubleD
+	};
+	const pool = needsAnnotation ? new WasmPool(config.annotation.workers, workerInitialization(assets.wasmPath, references, settings)) : null;
 	if (pool) {
-		process.stderr.write(`Starting SwiftIG pool (${config.annotation.workers} worker${config.annotation.workers === 1 ? "" : "s"}; ${annotationBatchRecords.toLocaleString()} records/batch).\n`);
+		process.stderr.write(`Starting the aligner pool (${config.annotation.workers} worker${config.annotation.workers === 1 ? "" : "s"}; ${annotationBatchRecords.toLocaleString()} records/batch).\n`);
 		await pool.start();
 	}
 	const annotatedName = airrOutputName(prefix, "annotated", config.output.airrCompression);
@@ -14377,7 +14359,7 @@ async function runPipeline(config, base, assets) {
 					body: batch.body,
 					doubleDHeader: "",
 					doubleDBody: ""
-				}) : pool.run(workerAnnotation(batch.text, batch.count, batch.format === "fasta" ? 1 : batch.format === "fastq" ? 2 : 3, config.annotation.minimumIdentity, config.annotation.strand, config.annotation.doubleD));
+				}) : pool.run(workerAnnotation(batch.text, batch.count));
 				pending.push({
 					promise,
 					count: batch.count
@@ -14583,46 +14565,21 @@ async function runPipeline(config, base, assets) {
 	await writeFile(join(outputDirectory, `${prefix}.resolved-config.json`), JSON.stringify(config, null, 2));
 	process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
 }
-function vdjTuning(options, callingProfile) {
-	if (![
-		"-min_D_match",
-		"-min_J_length",
-		"-num_alignments_D",
-		"-num_alignments_J",
-		"-D_penalty",
-		"-J_penalty"
-	].some((key) => options[key] !== void 0)) return void 0;
-	const agreement = callingProfile === "igblast_compatible" || callingProfile === "igblast_balanced";
-	const aerRProfile = callingProfile === "r_optimized" || callingProfile === "sensitive_d";
-	const minD = options["-min_D_match"] === void 0 ? aerRProfile ? 4 : agreement ? 5 : 6 : parseIntegerOption(options["-min_D_match"], "-min_D_match", { minimum: 4 });
-	const minJ = options["-min_J_length"] === void 0 ? 10 : parseIntegerOption(options["-min_J_length"], "-min_J_length", { minimum: 0 });
-	const topD = options["-num_alignments_D"] === void 0 ? agreement ? 3 : 2 : parseIntegerOption(options["-num_alignments_D"], "-num_alignments_D", {
+function vdjTuning(options) {
+	const tuning = {};
+	if (options["-min_D_match"] !== void 0) tuning.minimumDMatch = parseIntegerOption(options["-min_D_match"], "-min_D_match", { minimum: 4 });
+	if (options["-min_J_length"] !== void 0) tuning.minimumJLength = parseIntegerOption(options["-min_J_length"], "-min_J_length", { minimum: 0 });
+	for (const [option, key] of [["-D_penalty", "dMismatch"], ["-J_penalty", "jMismatch"]]) {
+		if (options[option] === void 0) continue;
+		const value = parseFiniteOption(options[option], option);
+		if (!Number.isInteger(value) || value >= 0) throw new Error(`${option} must be a negative integer.`);
+		tuning[key] = value;
+	}
+	for (const option of ["-num_alignments_D", "-num_alignments_J"]) if (options[option] !== void 0) parseIntegerOption(options[option], option, {
 		minimum: 1,
 		allowZero: false
 	});
-	const topJ = options["-num_alignments_J"] === void 0 ? 2 : parseIntegerOption(options["-num_alignments_J"], "-num_alignments_J", {
-		minimum: 1,
-		allowZero: false
-	});
-	const dMismatch = options["-D_penalty"] === void 0 ? agreement ? -4 : -3 : parseFiniteOption(options["-D_penalty"], "-D_penalty");
-	const jMismatch = options["-J_penalty"] === void 0 ? agreement ? -4 : -3 : parseFiniteOption(options["-J_penalty"], "-J_penalty");
-	if (options["-D_penalty"] !== void 0 && (!Number.isInteger(dMismatch) || dMismatch <= -5 || dMismatch >= 0)) throw new Error("-D_penalty must be an integer greater than -5 and less than 0.");
-	if (options["-J_penalty"] !== void 0 && (!Number.isInteger(jMismatch) || jMismatch <= -5 || jMismatch >= 0)) throw new Error("-J_penalty must be an integer greater than -5 and less than 0.");
-	return {
-		dMatch: 2,
-		dMismatch,
-		dGapOpen: agreement ? -11 : -13,
-		dGapExtend: -1,
-		topD,
-		minDMatch: minD,
-		jMatch: 2,
-		jMismatch,
-		jGapOpen: agreement ? -13 : -17,
-		jGapExtend: agreement ? -1 : -2,
-		topJ,
-		minJLength: Math.max(1, minJ),
-		aerRProfile
-	};
+	return tuning;
 }
 async function runVdj(rawArgs, assets) {
 	const options = parseVdjArguments(rawArgs);
@@ -14651,31 +14608,23 @@ async function runVdj(rawArgs, assets) {
 	if (options["--workers"] === void 0 && threadValue !== void 0 && workers === 0) throw new Error("-num_threads must be at least 1; use --workers 0 for automatic selection.");
 	if (workers === 0) workers = Math.max(1, Math.min(8, availableParallelism()));
 	const batchRecords = (options["--batch-records"] === void 0 ? 0 : parseIntegerOption(options["--batch-records"], "--batch-records", { minimum: 0 })) || automaticBatchRecords(workers);
-	const assigner = String(options["--assigner"] ?? "aer_robust");
-	if (![
-		"standard",
-		"riat_mp",
-		"aer",
-		"aer_robust"
-	].includes(assigner)) throw new Error("--assigner must be standard, riat_mp, aer, or aer_robust.");
-	const callingProfile = String(options["--calling-profile"] ?? (assigner === "aer_robust" ? "r_optimized" : "truth_optimized"));
-	if (![
-		"truth_optimized",
-		"igblast_compatible",
-		"igblast_balanced",
-		"r_optimized",
-		"sensitive_d"
-	].includes(callingProfile)) throw new Error("--calling-profile must be truth_optimized, r_optimized, sensitive_d, igblast_compatible, or igblast_balanced.");
-	if ((callingProfile === "r_optimized" || callingProfile === "sensitive_d") && assigner !== "aer_robust") throw new Error(`--calling-profile ${callingProfile} requires --assigner aer_robust.`);
+	const callingProfile = String(options["--calling-profile"] ?? "r_optimized");
+	if (!isCallingProfile(callingProfile)) throw new Error(`--calling-profile must be ${CALLING_PROFILES.join(", ")}.`);
 	const queryValue = String(options["-query"] ?? "-");
 	const queryPath = queryValue === "-" ? "-" : resolve(queryValue);
 	const outputPath = String(outputValue) === "-" ? "-" : resolve(String(outputValue));
 	if (outputPath !== "-") await mkdir(dirname(outputPath), { recursive: true });
 	const prepared = await prepareVdjReferences(options, assets);
-	const tuning = vdjTuning(options, callingProfile);
+	const tuning = vdjTuning(options);
 	const minimumConstantPrefixIdentity = options["--minimum-c-prefix-identity"] === void 0 ? null : parseFiniteOption(options["--minimum-c-prefix-identity"], "--minimum-c-prefix-identity");
 	if (minimumConstantPrefixIdentity !== null && (minimumConstantPrefixIdentity < 0 || minimumConstantPrefixIdentity > 1)) throw new Error("--minimum-c-prefix-identity must be between 0 and 1.");
-	const pool = new WasmPool(workers, workerInitialization(assets.wasmPath, prepared.references, callingProfile, assigner, tuning, minimumConstantPrefixIdentity));
+	const pool = new WasmPool(workers, workerInitialization(assets.wasmPath, prepared.references, {
+		callingProfile,
+		minimumIdentity,
+		minimumConstantPrefixIdentity,
+		strand,
+		tuning
+	}));
 	await pool.start();
 	const outputHandle = outputPath === "-" ? null : createVdjOutput(outputPath);
 	const output = outputHandle?.stream ?? process.stdout;
@@ -14684,9 +14633,8 @@ async function runVdj(rawArgs, assets) {
 	let completed = false;
 	try {
 		if (outputHandle) await outputHandle.opened;
-		const assignerLabel = assigner === "riat_mp" ? "RIAT-MP" : assigner === "aer" ? "AER" : assigner === "aer_robust" ? "AER-R (experimental)" : "standard SwiftIG";
-		const profileLabel = callingProfile === "r_optimized" ? "R-optimized" : callingProfile === "sensitive_d" ? "Sensitive-D" : callingProfile === "igblast_balanced" ? "IgBLAST-balanced" : callingProfile === "igblast_compatible" ? "IgBLAST-agreement" : "truth-optimized";
-		process.stderr.write(`Streaming SwiftIG V(D)J assignments (${prepared.mode}; ${workers} worker${workers === 1 ? "" : "s"}; ${batchRecords.toLocaleString()} records/batch; ${assignerLabel}; ${profileLabel} profile) to ${outputPath}.\n`);
+		const profileLabel = callingProfile === "r_optimized" ? "R-optimized" : callingProfile === "sensitive_d" ? "Sensitive-D" : callingProfile === "igblast_compatible" ? "IgBLAST-agreement" : "truth-optimized";
+		process.stderr.write(`Streaming Swig aligner V(D)J assignments (${prepared.mode}; ${workers} worker${workers === 1 ? "" : "s"}; ${batchRecords.toLocaleString()} records/batch; ${profileLabel} profile) to ${outputPath}.\n`);
 		const state = {
 			inputRecords: 0,
 			eligibleRecords: 0,
@@ -14699,7 +14647,7 @@ async function runVdj(rawArgs, assets) {
 			if (outputHeader === null) {
 				outputHeader = result.header;
 				await writeChunk(output, `${outputHeader}\n`);
-			} else if (result.header !== outputHeader) throw new Error("SwiftIG changed the AIRR schema between V(D)J batches.");
+			} else if (result.header !== outputHeader) throw new Error("The aligner changed the AIRR schema between V(D)J batches.");
 			const body = trimAuxiliaryFwr4(result.header, result.body, prepared.fwr4EndOffsets, prepared.jLengths);
 			await writeChunk(output, body);
 			records += result.count;
@@ -14719,7 +14667,7 @@ async function runVdj(rawArgs, assets) {
 			format: "fasta"
 		};
 		for await (const batch of sequenceBatches(input, batchRecords, preprocessing, "reannotate", 0, state)) {
-			pending.push({ promise: pool.run(workerAnnotation(batch.text, batch.count, 1, minimumIdentity, strand, { mode: "off" })) });
+			pending.push({ promise: pool.run(workerAnnotation(batch.text, batch.count)) });
 			if (pending.length >= Math.max(2, workers * 2)) await consume(pending.shift());
 		}
 		while (pending.length) await consume(pending.shift());
@@ -14818,20 +14766,7 @@ async function runCli(assets = defaultCliAssets()) {
 		};
 	}
 	const config = normalizeCliConfig(raw);
-	if (![
-		"standard",
-		"riat_mp",
-		"aer",
-		"aer_robust"
-	].includes(config.annotation.assignerStrategy)) throw new Error("annotation.assignerStrategy must be standard, riat_mp, aer, or aer_robust.");
-	if (![
-		"truth_optimized",
-		"igblast_compatible",
-		"igblast_balanced",
-		"r_optimized",
-		"sensitive_d"
-	].includes(config.annotation.callingProfile)) throw new Error("annotation.callingProfile must be truth_optimized, r_optimized, sensitive_d, igblast_compatible, or igblast_balanced.");
-	if ((config.annotation.callingProfile === "r_optimized" || config.annotation.callingProfile === "sensitive_d") && config.annotation.assignerStrategy !== "aer_robust") throw new Error(`annotation.callingProfile ${config.annotation.callingProfile} requires annotation.assignerStrategy aer_robust.`);
+	if (!isCallingProfile(config.annotation.callingProfile)) throw new Error(`annotation.callingProfile must be ${CALLING_PROFILES.join(", ")}.`);
 	if (config.annotation.workers === 0) config.annotation.workers = Math.max(1, Math.min(8, availableParallelism()));
 	config.inputs = config.inputs.map((input) => ({
 		...input,

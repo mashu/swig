@@ -45,7 +45,8 @@ test("the web entry point exposes three focused workflows and keeps UCA trees ob
   assert.match(app, /Single lineage analysis/);
   assert.match(app, /Swig runs on your machine\. Your sequence data are not uploaded/);
   assert.doesNotMatch(app, /Local annotation of/);
-  assert.match(app, /useState<AssignerStrategy>\("aer_robust"\)/);
+  assert.match(app, /useState<CallingProfile>\("r_optimized"\)/);
+  assert.doesNotMatch(app, /AssignerStrategy|assignerStrategy/);
   assert.match(app, /!focusedWebMode && <section className=\{`analysis-card pipeline-card/);
   assert.match(app, /directLineage=\{session\.webMode === "lineage"\}/);
   assert.match(styles, /\.workflow-choice-grid[\s\S]*grid-template-columns: repeat\(3/);
@@ -127,8 +128,8 @@ test("personalized germline inference is isolated beside missing-V diagnostics a
 
 test("assignment progress uses stable geometry and live scheduler telemetry", () => {
   const app = fs.readFileSync(new URL("../src/swig-app.tsx", import.meta.url), "utf8");
-  const scheduler = fs.readFileSync(new URL("../src/swiftig-worker.ts", import.meta.url), "utf8");
-  const runtime = fs.readFileSync(new URL("../src/swiftig-runtime.ts", import.meta.url), "utf8");
+  const scheduler = fs.readFileSync(new URL("../src/aligner-worker.ts", import.meta.url), "utf8");
+  const runtime = fs.readFileSync(new URL("../src/aligner-runtime.ts", import.meta.url), "utf8");
   const styles = fs.readFileSync(new URL("../src/globals.css", import.meta.url), "utf8");
 
   assert.match(app, /Live assignment telemetry/);
@@ -157,29 +158,23 @@ test("assignment is one progressive action page while independent result tools r
   const css = fs.readFileSync(new URL("../src/globals.css", import.meta.url), "utf8");
   const cli = fs.readFileSync(new URL("../cli-src/swig-cli.mjs", import.meta.url), "utf8");
   const cliWorker = fs.readFileSync(new URL("../cli-src/swig-worker.mjs", import.meta.url), "utf8");
-  const adapter = fs.readFileSync(new URL("../wasm/src/web_adapter.cpp", import.meta.url), "utf8");
+  const computeWorker = fs.readFileSync(new URL("../src/aligner-compute-worker.ts", import.meta.url), "utf8");
+  const aligner = fs.readFileSync(new URL("../src/aligner-engine.ts", import.meta.url), "utf8");
 
   assert.match(app, /analysis-layout single-action-layout/);
   assert.doesNotMatch(app, /AnalysisWorkspace|analysisWorkspace|Analysis setup sections/);
   assert.doesNotMatch(app, /settings-strip/);
   assert.match(app, /<b>Advanced options<\/b>/);
-  assert.match(app, /value="r_optimized" disabled=\{assignerStrategy!=="aer_robust"\}/);
-  assert.match(app, /R-optimized · AER-R only/);
-  assert.match(app, /value="sensitive_d" disabled=\{assignerStrategy!=="aer_robust"\}/);
-  assert.match(app, /Sensitive-D · AER-R only/);
-  assert.match(app, /same 4-nt signal floor/);
-  assert.match(app, /bare four-base exact seed scores only 8/);
-  assert.match(app, /V uses \+2\/−3\/−9\/−1/);
-  assert.match(app, /12-point D-presence cost relaxed to 10/);
-  assert.match(app, /at least two distinct exact template sequences/);
-  assert.match(cli, /agreement\?\-4:\-3/);
-  assert.match(cliWorker, /callingProfile==="sensitive_d"\?3/);
-  assert.match(cliWorker, /swig_set_v_tuning_options\(2,\-3,\-9,\-1,1\)/);
-  assert.match(cliWorker, /callingProfile==="sensitive_d"\?10:12/);
-  assert.match(cliWorker, /callingProfile==="sensitive_d"\?0:2/);
-  assert.match(cliWorker, /swig_set_aer_r_profile_decision_tuning_v2/);
-  assert.match(adapter, /export_name\("swig_set_aer_r_profile_decision_tuning"\)/);
-  assert.match(adapter, /export_name\("swig_set_aer_r_profile_decision_tuning_v2"\)/);
+  assert.match(app, /<option value="r_optimized">R-optimized · default<\/option>/);
+  assert.match(app, /<option value="sensitive_d">Sensitive-D<\/option>/);
+  assert.match(app, /one placement DAG/);
+  assert.match(app, /V \+2\/−3\/−9\/−1, D \+2\/−3\/−13\/−1 with a 4-nt exact-run floor/);
+  assert.match(cli, /vdjTuning\(options\)/);
+  // Browser and command-line workers share one wrapper of the Rust module.
+  assert.match(cliWorker, /import \{ AlignerEngine \} from "\.\.\/src\/aligner-engine\.ts"/);
+  assert.match(computeWorker, /AlignerEngine\.create\(/);
+  assert.match(aligner, /\["profile", settings\.callingProfile\]/);
+  assert.match(aligner, /WebAssembly\.instantiate\(module, \{\}\)/);
   assert.match(app, /Customize individual loci, V\/D\/J\/C sources, or allele inclusion/);
   assert.match(app, /aria-label="Sequence result panels"/);
   assert.match(app, /setSequenceWorkspace\("detail"\)/);
@@ -323,8 +318,9 @@ test("post-analysis skipping, richer lineage rows, CLI export, and lazy lineage 
   assert.match(standalone,/with \{ type: "file" \}/);
   assert.match(standalone,/runCli\(\{wasmPath,referencePackPath\}\)/);
   assert.match(release,/Build release WebAssembly core/);
-  assert.match(release,/release-swiftig-wasm/);
-  assert.match(release,/build-swiftig-wasm\.sh/);
+  assert.match(release,/release-swig-wasm/);
+  assert.match(release,/build-swig-wasm\.sh/);
+  assert.match(release,/wasm32-unknown-unknown/);
   for(const target of ["bun-linux-x64-baseline","bun-linux-arm64","bun-darwin-x64","bun-darwin-arm64","bun-windows-x64-baseline"]){assert.match(release,new RegExp(target));}
   assert.match(release,/Smoke-test the actual executable/);
 });

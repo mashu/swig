@@ -12,4 +12,4 @@ The optimized 0.13.2 WebAssembly core is unchanged. The balanced evidence rule i
 
 The truth-optimized profile remains the default and is unchanged. The agreement-only profile also remains independently selectable and unchanged.
 
-See `BENCHMARK_IGBLAST_BALANCED_0.13.3.md` for scoring definitions, complete results and limitations.
+See [`BENCHMARK_IGBLAST_BALANCED_0.13.3.md`](https://github.com/mashu/swig/blob/a08a2c3fb2d42dba9dd1ac97e6fda783089b5b3f/BENCHMARK_IGBLAST_BALANCED_0.13.3.md) for scoring definitions, complete results and limitations.

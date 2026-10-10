@@ -2,7 +2,7 @@ import type { LineageSummary } from "./post-analysis-core.ts";
 import type { CompiledReferences, ScopeKey } from "./reference-pack.ts";
 import type { ShmMetricKey } from "./shm-analysis.ts";
 import type { DatasetManifestEntry, DatasetScope } from "./study-design.ts";
-import type { AssignerStrategy, CallingProfile } from "./swiftig-runtime.ts";
+import type { CallingProfile } from "./aligner-engine.ts";
 
 export const SWIG_LINEAGE_STUDY_SCHEMA = 1 as const;
 
@@ -46,7 +46,6 @@ export interface LineageStudyManifest {
     references: CompiledReferences;
     datasets: DatasetManifestEntry[];
     callingProfile: CallingProfile;
-    assignerStrategy: AssignerStrategy;
     minimumIdentity: number;
     strand: 0|1|2;
     lineage: {

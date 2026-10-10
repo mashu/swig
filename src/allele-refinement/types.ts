@@ -35,7 +35,7 @@ export interface AlleleRefinementOptions {
   maximumShm: number;
   /** Maximum reference-graph edit radius retained in each sparse row. */
   neighbourRadius: number;
-  /** Converts SwiftIG score differences into relative evidence for retained near-tied hits. */
+  /** Converts aligner score differences into relative evidence for retained near-tied hits. */
   alternativeScoreTemperature: number;
   /** Fallback evidence weight when a retained alternative lacks a usable score. */
   unscoredAlternativeWeight: number;

@@ -20,4 +20,4 @@ No score, threshold, candidate limit, search fallback, alignment tie, boundary d
 - The resulting AIRR files were byte-for-byte identical to 0.38.9.
 - The permanent optimized/reference WASM oracle and a new cross-batch FASTQ cache regression require exact output equality.
 
-See `BENCHMARK_AER_R_SPEED_0.38.10.md` for timings, hashes, and scope.
+See [`BENCHMARK_AER_R_SPEED_0.38.10.md`](https://github.com/mashu/swig/blob/a08a2c3fb2d42dba9dd1ac97e6fda783089b5b3f/BENCHMARK_AER_R_SPEED_0.38.10.md) for timings, hashes, and scope.

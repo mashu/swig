@@ -17,4 +17,4 @@ Ordinary AER, RIAT-MP, standard assignment, and their output are unchanged. AER-
 - Six alternating warmed one-worker runs measured +2.0% on 5,000 clean reads and +1.3% on a difficult 5,000-read SHM/indel cohort versus pinned 0.37.6. The rejected unconditional safety-pool scan was about 44% slower on clean reads and is not shipped.
 - The all-reference candidate oracle now has precise naming in code and documentation: it removes candidate-count pruning but retains the production biological evidence gates.
 
-See [`BENCHMARK_AER_ROBUST_0.37.7.md`](BENCHMARK_AER_ROBUST_0.37.7.md) for the complete audit, controls, and reproduction commands.
+See [`BENCHMARK_AER_ROBUST_0.37.7.md`](https://github.com/mashu/swig/blob/a08a2c3fb2d42dba9dd1ac97e6fda783089b5b3f/BENCHMARK_AER_ROBUST_0.37.7.md) for the complete audit, controls, and reproduction commands.

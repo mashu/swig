@@ -47,7 +47,7 @@ test("the CLI pipeline runs annotation through lazy lineage-study export",async(
       assert.match(gunzipSync(compressed).toString("utf8"),/^sequence_id\t/);
     }
     const resolved=JSON.parse(await readFile(join(output,"smoke.resolved-config.json"),"utf8"));
-    assert.equal(resolved.annotation.assignerStrategy,"aer_robust");
+    assert.equal(resolved.annotation.assignerStrategy,undefined);
     assert.equal(resolved.annotation.callingProfile,"r_optimized");
     assert.equal(resolved.output.airrCompression,"gzip");
     const airr=await readFile(join(output,"smoke.lineages.airr.tsv"));
@@ -219,10 +219,10 @@ test("pipeline CLI requires an explicit output directory and command-line worker
     assert.match(missing.stderr,/requires an explicit output directory/);
 
     const invalidProfilePath=join(temporary,"invalid-profile.json");
-    await writeFile(invalidProfilePath,JSON.stringify({inputs:[{path:input}],annotation:{workers:1,callingProfile:"r_optimized",assignerStrategy:"riat_mp"},output:{directory:join(temporary,"invalid-profile")}}));
+    await writeFile(invalidProfilePath,JSON.stringify({inputs:[{path:input}],annotation:{workers:1,callingProfile:"igblast_balanced"},output:{directory:join(temporary,"invalid-profile")}}));
     const invalidProfile=runCli(root,invalidProfilePath);
     assert.notEqual(invalidProfile.status,0);
-    assert.match(invalidProfile.stderr,/requires annotation.assignerStrategy aer_robust/);
+    assert.match(invalidProfile.stderr,/annotation\.callingProfile must be r_optimized, truth_optimized, igblast_compatible, sensitive_d/);
 
     const output=join(temporary,"out"),configPath=join(temporary,"config.json");
     await writeFile(configPath,JSON.stringify({inputs:[{path:input}],annotation:{workers:1},pipeline:{collapse:{enabled:false},lineage:{enabled:false},shm:{enabled:false}},output:{directory:output,prefix:"workers"}}));
@@ -241,8 +241,9 @@ test("--vdj streams assignment-only, IgBLAST-data, and Swig-annotation modes wit
   try{
     const help=runRawCli(root,["--vdj","--help"]);
     assert.equal(help.status,0,help.stderr);
-    assert.match(help.stdout,/r_optimized: 4-nt D signal floor; joint D cost 12, evidence-relaxed to 10/);
-    assert.match(help.stdout,/sensitive_d: same signal floor and scores; fixed joint D cost 10 \(a bare 4-mer scores 8\)/);
+    assert.match(help.stdout,/r_optimized: 4-nt D exact-run floor; a D pays its prior cost/);
+    assert.match(help.stdout,/sensitive_d: the same scores with a D twice as likely a priori/);
+    assert.doesNotMatch(help.stdout,/--assigner/);
     const pack=JSON.parse(gunzipSync(await readFile(join(root,"public/references/imgt-202632-7-swig-0.7.json.gz"))).toString("utf8"));
     const human=pack.species.find((entry)=>entry.name==="Homo sapiens");
     const v=human.loci.IGH.V.find((entry)=>entry[2]?.slice(2,12).every((value)=>value>=0));
@@ -266,16 +267,17 @@ test("--vdj streams assignment-only, IgBLAST-data, and Swig-annotation modes wit
 
     const plainPath=join(temporary,"plain.airr.tsv");
     const plain=runRawCli(root,[...common,"-out",plainPath]);
-    assert.equal(plain.status,0,plain.stderr);assert.match(plain.stderr,/assignments-only; 1 worker/);assert.match(plain.stderr,/AER-R/);assert.match(plain.stderr,/R-optimized profile/);
+    assert.equal(plain.status,0,plain.stderr);assert.match(plain.stderr,/assignments-only; 1 worker/);assert.match(plain.stderr,/Swig aligner/);assert.match(plain.stderr,/R-optimized profile/);
     const plainRow=await readRow(plainPath);
-    assert.equal(plainRow.v_call,v[0]);assert.equal(plainRow.j_call,j[0]);assert.equal(plainRow.cdr1,"");assert.equal(plainRow.cdr3,"");assert.equal(plainRow.region_definition,"");
-    // Support is optional for scoring schemes without a calibrated E-value model.
-    for(const field of ["v_support","d_support","j_support"])assert.ok(plainRow[field]===""||(Number.isFinite(Number(plainRow[field]))&&Number(plainRow[field])>=0));
-    const legacyPath=join(temporary,"legacy.airr.tsv");
-    const legacy=runRawCli(root,[...common,"--assigner","riat_mp","--calling-profile","truth_optimized","-out",legacyPath]);
-    assert.equal(legacy.status,0,legacy.stderr);
-    const legacyRow=await readRow(legacyPath);
-    for(const field of ["v_support","d_support","j_support"])assert.ok(legacyRow[field]&&Number.isFinite(Number(legacyRow[field]))&&Number(legacyRow[field])>=0);
+    assert.equal(plainRow.v_call,v[0]);assert.equal(plainRow.j_call,j[0]);
+    // Without annotation input the aligner annotates the germlines itself.
+    assert.ok(plainRow.cdr1);assert.ok(plainRow.cdr3);
+    for(const field of ["v_support","d_support","j_support"])assert.ok(plainRow[field]&&Number.isFinite(Number(plainRow[field]))&&Number(plainRow[field])>=0);
+    const truthPath=join(temporary,"truth.airr.tsv");
+    const truth=runRawCli(root,[...common,"--calling-profile","truth_optimized","-out",truthPath]);
+    assert.equal(truth.status,0,truth.stderr);
+    const truthRow=await readRow(truthPath);
+    for(const field of ["v_support","d_support","j_support"])assert.ok(truthRow[field]&&Number.isFinite(Number(truthRow[field]))&&Number(truthRow[field])>=0);
     assert.equal(plainRow.c_support,"");
 
     const gzipPath=join(temporary,"plain.airr.tsv.gz");
@@ -313,31 +315,29 @@ test("--vdj streams assignment-only, IgBLAST-data, and Swig-annotation modes wit
     for(const field of ["v_call","d_call","j_call","v_sequence_start","v_sequence_end","j_sequence_start","j_sequence_end"])assert.equal(cStrictRow[field],cPermissiveRow[field]);
 
     const optimizedPath=join(temporary,"r-optimized.airr.tsv");
-    const optimized=runRawCli(root,[...common,"--assigner","aer_robust","--calling-profile","r_optimized","-out",optimizedPath]);
-    assert.equal(optimized.status,0,optimized.stderr);assert.match(optimized.stderr,/AER-R/);assert.match(optimized.stderr,/R-optimized profile/);
+    const optimized=runRawCli(root,[...common,"--calling-profile","r_optimized","-out",optimizedPath]);
+    assert.equal(optimized.status,0,optimized.stderr);assert.match(optimized.stderr,/R-optimized profile/);
     const optimizedRow=await readRow(optimizedPath);
     assert.equal(optimizedRow.v_call,v[0]);assert.equal(optimizedRow.j_call,j[0]);
 
     const sensitivePath=join(temporary,"sensitive-d.airr.tsv");
-    const sensitive=runRawCli(root,[...common,"--assigner","aer_robust","--calling-profile","sensitive_d","-out",sensitivePath]);
-    assert.equal(sensitive.status,0,sensitive.stderr);assert.match(sensitive.stderr,/AER-R/);assert.match(sensitive.stderr,/Sensitive-D profile/);
+    const sensitive=runRawCli(root,[...common,"--calling-profile","sensitive_d","-out",sensitivePath]);
+    assert.equal(sensitive.status,0,sensitive.stderr);assert.match(sensitive.stderr,/Sensitive-D profile/);
     const sensitiveRow=await readRow(sensitivePath);
     assert.equal(sensitiveRow.v_call,v[0]);assert.equal(sensitiveRow.j_call,j[0]);
 
-    const invalidProfile=runRawCli(root,[...common,"--assigner","riat_mp","--calling-profile","r_optimized","-out",join(temporary,"invalid-profile.airr.tsv")]);
-    assert.notEqual(invalidProfile.status,0);assert.match(invalidProfile.stderr,/requires --assigner aer_robust/);
+    // One search replaced the assignment strategies.
+    const removedAssigner=runRawCli(root,[...common,"--assigner","riat_mp","-out",join(temporary,"removed-assigner.airr.tsv")]);
+    assert.notEqual(removedAssigner.status,0);assert.match(removedAssigner.stderr,/Unsupported --vdj option --assigner/);
+    const invalidProfile=runRawCli(root,[...common,"--calling-profile","igblast_balanced","-out",join(temporary,"invalid-profile.airr.tsv")]);
+    assert.notEqual(invalidProfile.status,0);assert.match(invalidProfile.stderr,/--calling-profile must be/);
 
     const igblastPath=join(temporary,"igblast-data.airr.tsv");
-    const igblast=runRawCli(root,[...common,"--assigner","aer","-custom_internal_data",internalPath,"-auxiliary_data",auxPath,"-out",igblastPath]);
-    assert.equal(igblast.status,0,igblast.stderr);assert.match(igblast.stderr,/AER/);assert.match(igblast.stderr,/IgBLAST internal data/);assert.match(igblast.stderr,/IgBLAST auxiliary data/);
+    const igblast=runRawCli(root,[...common,"-custom_internal_data",internalPath,"-auxiliary_data",auxPath,"-out",igblastPath]);
+    assert.equal(igblast.status,0,igblast.stderr);assert.match(igblast.stderr,/IgBLAST internal data/);assert.match(igblast.stderr,/IgBLAST auxiliary data/);
     const igblastRow=await readRow(igblastPath);
     assert.ok(igblastRow.cdr1);assert.ok(igblastRow.cdr3);assert.equal(igblastRow.region_definition,"IMGT");
     assert.equal(Number(igblastRow.j_sequence_end)-Number(igblastRow.fwr4_end),1);
-
-    const robustPath=join(temporary,"aer-robust.airr.tsv");
-    const robust=runRawCli(root,[...common,"--assigner","aer_robust","-out",robustPath]);
-    assert.equal(robust.status,0,robust.stderr);assert.match(robust.stderr,/AER-R \(experimental\)/);
-    const robustRow=await readRow(robustPath);assert.equal(robustRow.v_call,v[0]);assert.equal(robustRow.j_call,j[0]);
 
     const swigPath=join(temporary,"swig.airr.tsv");
     const swig=runRawCli(root,[...common,"--swigannots","-organism","human","-ig_seqtype","Ig","-out",swigPath]);
@@ -357,7 +357,7 @@ test("--vdj streams assignment-only, IgBLAST-data, and Swig-annotation modes wit
   }finally{await rm(temporary,{recursive:true,force:true});}
 });
 
-test("--vdj preserves the R-optimized versus Sensitive-D joint threshold under explicit tuning",async()=>{
+test("--vdj applies the Sensitive-D prior on top of explicit IgBLAST-style D tuning",async()=>{
   const root=resolve(import.meta.dirname,"..");
   const temporary=await mkdtemp(join(root,"tmp-cli-sensitive-d-"));
   try{
@@ -378,7 +378,7 @@ test("--vdj preserves the R-optimized versus Sensitive-D joint threshold under e
     const common=[
       "--vdj","-query",join(root,"tests/fixtures/sensitive-d-joint-threshold-regression.fasta"),
       "-germline_db_V",referencePaths.V,"-germline_db_D",referencePaths.D,
-      "-germline_db_J",referencePaths.J,"--assigner","aer_robust",
+      "-germline_db_J",referencePaths.J,
       "--workers","1","--batch-records","1","-outfmt","19","-min_D_match","4",
     ];
     const annotate=async(profile)=>{
@@ -391,9 +391,9 @@ test("--vdj preserves the R-optimized versus Sensitive-D joint threshold under e
     };
     const optimized=await annotate("r_optimized");
     const sensitive=await annotate("sensitive_d");
-    assert.equal(optimized.d_call,"");
-    assert.equal(sensitive.d_call,"IGHD1-7*01");
-    assert.equal(sensitive.d_score,"12");
+    // A D twice as likely a priori shifts the presence posterior, not the call.
+    for(const row of [optimized,sensitive]){assert.equal(row.d_call,"IGHD1-7*01");assert.equal(row.d_score,"12");}
+    assert.ok(Number(sensitive.d_presence_posterior)>Number(optimized.d_presence_posterior));
   }finally{await rm(temporary,{recursive:true,force:true});}
 });
 

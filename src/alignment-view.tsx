@@ -136,7 +136,7 @@ export function AlignmentViewer({ row, mode, onMode }: {
       </div>
       <div className={`annotation-status ${hasRegions ? "valid" : "incomplete"}`}><span>{hasRegions ? "Validated region map" : "Region map unavailable"}</span><p>{hasRegions ? `${row.region_definition} boundaries · V: ${row.v_annotation_source || "unspecified"} · J: ${row.j_annotation_source || "unspecified"}${row.sequence_frame ? ` · query frame +${row.sequence_frame}` : ""}` : "No V-region delineation passed validation for the selected allele. A closest-relative transfer is accepted only when the sequence spans the mapped IMGT intervals."}</p></div>
       {mode === "aa" && <p className="alignment-explainer">All translated layers use the single rearrangement frame anchored by the mapped V cysteine and J F/W-G motif. Frames are not optimized independently per segment.</p>}
-      {row.d2_call && <p className="alignment-explainer">The composite layer is the unchanged standard SwiftIG single-D result. The D1 and D2 cards and feature track are the opt-in double-D screening model; the main AIRR export is not rewritten.</p>}
+      {row.d2_call && <p className="alignment-explainer">The composite layer is the unchanged standard single-D call. The D1 and D2 cards and feature track are the opt-in double-D screening model; the main AIRR export is not rewritten.</p>}
       <FeatureTracks row={row} mode={mode} />
       <RegionSequences row={row} mode={mode} />
       <CompositeAlignment row={row} mode={mode} />

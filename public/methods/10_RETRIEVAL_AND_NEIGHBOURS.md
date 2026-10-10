@@ -4,7 +4,7 @@
 
 The query box accepts one or more raw sequences or FASTA records. Targets are CDR3 nucleotide, CDR3 amino acid, or V–J-trimmed nucleotide sequence. Manual locus/V/J constraints are checked with the selected call resolution/ambiguity policy.
 
-For complete nucleotide rearrangements, `infer constraints` runs the same SwiftIG references, V strategy, calling profile, identity floor, and strand setting as the main analysis independently for each query. The inferred V/J calls constrain that seed only; non-empty manual overrides replace the corresponding inferred field. This is a fresh query annotation, not an inference from the repertoire allele-pooling model.
+For complete nucleotide rearrangements, `infer constraints` runs the Swig aligner with the same references, calling profile, identity floor, and strand setting as the main analysis, independently for each query. The inferred V/J calls constrain that seed only; non-empty manual overrides replace the corresponding inferred field. This is a fresh query annotation, not an inference from the repertoire allele-pooling model.
 
 ## Similarity modes
 

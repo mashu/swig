@@ -695,7 +695,7 @@ function assertChainLocus(
 
 /**
  * Perform the FASTA preparation done by IgBLAST's `edit_imgt_file.pl` where it
- * is relevant to SwiftIG: canonicalize the germline identifier and remove IMGT
+ * is relevant to the aligner: canonicalize the germline identifier and remove IMGT
  * alignment gaps before indexing. Existing SWIGMETA is deliberately removed.
  */
 export function prepareIgblastStyleGermlineFasta(

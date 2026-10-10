@@ -16,4 +16,4 @@
 - All 43 previous J misses remain recovered, with 100% specificity among their 42 no-D truths. On the 93 prior D misses, truth-in-set improves `18.28% → 22.58%` and Brier loss improves `0.800 → 0.678`. The strong perfect-D and distributed-D regression fixtures remain called.
 - Four alternating same-process one-worker validation runs per profile show no slowdown: median 7.133 s legacy versus 6.369 s R-optimized. Run-to-run noise is large, so the apparent speedup is not treated as a performance claim.
 
-See [`BENCHMARK_R_OPTIMIZED_0.38.0.md`](BENCHMARK_R_OPTIMIZED_0.38.0.md) for the scoring rule, frozen settings, split/exclusion details, tradeoffs, regression cohorts, and reproduction command.
+See [`BENCHMARK_R_OPTIMIZED_0.38.0.md`](https://github.com/mashu/swig/blob/a08a2c3fb2d42dba9dd1ac97e6fda783089b5b3f/BENCHMARK_R_OPTIMIZED_0.38.0.md) for the scoring rule, frozen settings, split/exclusion details, tradeoffs, regression cohorts, and reproduction command.

@@ -763,7 +763,7 @@ export class AirrResultStore {
       this.outputByteCount += headerBytes.byteLength;
       if (this.directOutput) await this.directOutput.writable.write(headerBytes);
     } else if (this.headerLine !== normalizedHeader) {
-      throw new Error("SwiftIG returned inconsistent AIRR columns between batches.");
+      throw new Error("The aligner returned inconsistent AIRR columns between batches.");
     }
 
     const bodyBytes = encoder.encode(bodyText);
@@ -777,7 +777,7 @@ export class AirrResultStore {
         this.doubleDHeaderLine = incomingHeader;
         this.doubleDHeaders = incomingHeader.split("\t");
       } else if (incomingHeader !== this.doubleDHeaderLine) {
-        throw new Error("SwiftIG returned inconsistent double-D evidence columns between batches.");
+        throw new Error("The aligner returned inconsistent double-D evidence columns between batches.");
       }
       const doubleDText = typeof doubleD.body === "string" ? doubleD.body : decoder.decode(doubleD.body);
       for (const rawLine of doubleDText.split("\n")) {
@@ -787,7 +787,7 @@ export class AirrResultStore {
         const row = Object.fromEntries(this.doubleDHeaders.map((name, index) => [name, values[index] ?? ""]));
         const relative = Number(row.swig_batch_record_index);
         if (!Number.isInteger(relative) || relative < 0 || relative >= lines.length || doubleDByLine.has(relative)) {
-          throw new Error("SwiftIG returned an invalid double-D batch record index.");
+          throw new Error("The aligner returned an invalid double-D batch record index.");
         }
         delete row.swig_batch_record_index;
         doubleDByLine.set(relative, row);

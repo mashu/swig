@@ -56,7 +56,8 @@ import {
 } from "./lineage-neighbours";
 import { LineageTreeViewer } from "./lineage-tree-viewer";
 import { inferAlignedReadingFrame, translateAlignedNucleotides, type AlignmentFrameOffset } from "./lineage-phylogeny";
-import { withAnalysisWebLock, type AssignerStrategy, type CallingProfile } from "./swiftig-runtime";
+import type { CallingProfile } from "./aligner-engine";
+import { withAnalysisWebLock } from "./aligner-runtime";
 import {
   canonicalizeTree,
   collapseShortInternalBranches,
@@ -113,7 +114,6 @@ interface Props {
   inputName: string;
   workers: number;
   callingProfile: CallingProfile;
-  assignerStrategy: AssignerStrategy;
   minimumIdentity: number;
   strand: 0 | 1 | 2;
   datasets?: DatasetManifestEntry[];
@@ -442,7 +442,7 @@ function isAbortError(error: unknown): boolean {
   return typeof error === "object" && error !== null && "name" in error && (error as { name?: unknown }).name === "AbortError";
 }
 
-export function PostAnalysisWorkbench({ store, references, scope, loci, resultFacets, inputName, workers, callingProfile, assignerStrategy, minimumIdentity, strand, datasets = [], sampleColors = {}, defaultCollapseScope = "sample", defaultLineageScope = "sample", doubleDCount = 0, autoPipeline, sidebarTools, onInspect, onSessionChange, sessionHandleRef, initialSession, directLineage = false }: Props) {
+export function PostAnalysisWorkbench({ store, references, scope, loci, resultFacets, inputName, workers, callingProfile, minimumIdentity, strand, datasets = [], sampleColors = {}, defaultCollapseScope = "sample", defaultLineageScope = "sample", doubleDCount = 0, autoPipeline, sidebarTools, onInspect, onSessionChange, sessionHandleRef, initialSession, directLineage = false }: Props) {
   const runtime = useMemo(() => new PostAnalysisRuntime(store, workers), [store, workers]);
   const alleleRuntime = useMemo(() => new AlleleRefinementRuntime(), [store]);
   const unifiedGermlineRuntime = useMemo(() => new UnifiedGermlineRuntime(), [store]);
@@ -2450,16 +2450,16 @@ export function PostAnalysisWorkbench({ store, references, scope, loci, resultFa
     }
     if(queryResultMode==="lineages"&&!lineages){setError("Lineage result mode requires lineage assignments on the current working set. Assign lineages first, then run this search.");return;}
     const metric = queryTarget === "trimmed" ? "sketch" : queryMetric;
-    const response = await operation(queryConstraintMode === "infer" ? "Assigning query V/J calls with SwiftIG, then searching" : "Searching the assigned repertoire", async (signal) => {
+    const response = await operation(queryConstraintMode === "infer" ? "Assigning query V/J calls with the Swig aligner, then searching" : "Searching the assigned repertoire", async (signal) => {
       let searchQueries = queries;
       let queryConstraints: QueryConstraint[] | undefined;
       let inferredAssignments: InferredQueryAssignment[] = [];
       if (queryConstraintMode === "infer") {
-        const inferred = await inferQueryAssignments(queries, queryTarget, references, callingProfile, assignerStrategy, minimumIdentity, strand, workers, signal);
+        const inferred = await inferQueryAssignments(queries, queryTarget, references, callingProfile, minimumIdentity, strand, workers, signal);
         inferredAssignments = inferred;
         const usable = inferred.filter((assignment) => assignment.searchSequence && (queryV || assignment.vCall) && (queryJ || assignment.jCall));
         if (!usable.length) {
-          throw new Error("SwiftIG could not infer both V and J for any query. Use complete rearranged nucleotide sequences, lower the main identity floor in a new run, or provide manual V/J overrides.");
+          throw new Error("The aligner could not infer both V and J for any query. Use complete rearranged nucleotide sequences, lower the main identity floor in a new run, or provide manual V/J overrides.");
         }
         searchQueries = usable.map((assignment) => assignment.searchSequence);
         queryConstraints = usable.map((assignment) => ({
@@ -2514,10 +2514,10 @@ export function PostAnalysisWorkbench({ store, references, scope, loci, resultFa
       setError("Paste at least one complete rearranged nucleotide sequence or FASTA record.");
       return;
     }
-    setBusy("Assigning seed V/J calls with the main SwiftIG configuration");
+    setBusy("Assigning seed V/J calls with the main aligner configuration");
     setError("");
     try {
-      setQueryInference(await runInActiveLock((signal) => inferQueryAssignments(queries, queryTarget, references, callingProfile, assignerStrategy, minimumIdentity, strand, workers, signal)));
+      setQueryInference(await runInActiveLock((signal) => inferQueryAssignments(queries, queryTarget, references, callingProfile, minimumIdentity, strand, workers, signal)));
     } catch (operationError) {
       if (!isAbortError(operationError)) setError(operationError instanceof Error ? operationError.message : String(operationError));
     } finally {
@@ -2949,16 +2949,16 @@ export function PostAnalysisWorkbench({ store, references, scope, loci, resultFa
             <label><span>Return mode</span><select value={queryResultMode} onChange={(event)=>{setQueryResultMode(event.target.value as "sequences"|"lineages");setQueryLineageHits([]);setExpanded(null);}}><option value="sequences">Matching sequences</option><option value="lineages" disabled={!lineages}>Best-matching lineages</option></select><small>{lineages?"Lineages rank by their best member hit.":"Assign lineages to enable lineage mode."}</small></label>
             <label><span>Metric</span><select disabled={queryTarget === "trimmed"} value={queryTarget === "trimmed" ? "sketch" : queryMetric} onChange={(event) => setQueryMetric(event.target.value as QueryMetric)}><option value="exact">Exact</option><option value="substring">Substring</option><option value="hamming">Hamming</option><option value="edit">Banded edit distance</option><option value="sketch">MinHash k-mer estimate</option></select></label>
             <label><span>Identity / similarity</span><CommitNumberInput min="0" max="1" step="0.01" value={queryIdentity} onCommit={setQueryIdentity} /></label>
-            <label><span>V/J constraint source</span><select value={queryConstraintMode} onChange={(event) => { setQueryConstraintMode(event.target.value as "manual" | "infer"); setQueryInference([]); }}><option value="manual">Manual / unconstrained</option><option value="infer">Infer per query with SwiftIG</option></select></label>
+            <label><span>V/J constraint source</span><select value={queryConstraintMode} onChange={(event) => { setQueryConstraintMode(event.target.value as "manual" | "infer"); setQueryInference([]); }}><option value="manual">Manual / unconstrained</option><option value="infer">Infer per query with the aligner</option></select></label>
             <label><span>{queryConstraintMode === "infer" ? "Locus override" : "Locus constraint"}</span><select value={queryLocus} onChange={(event) => setQueryLocus(event.target.value)}><option value="">{queryConstraintMode === "infer" ? "Use each inferred locus" : "Any locus"}</option>{loci.map((item) => <option value={item.value} key={item.value}>{item.value}</option>)}</select></label>
             <label><span>{queryConstraintMode === "infer" ? "V override" : "V constraint"}</span><CommitTextInput value={queryV} onCommit={setQueryV} placeholder={queryConstraintMode === "infer" ? "otherwise inferred per seed" : "optional IGHV…"} /></label>
             <label><span>{queryConstraintMode === "infer" ? "J override" : "J constraint"}</span><CommitTextInput value={queryJ} onCommit={setQueryJ} placeholder={queryConstraintMode === "infer" ? "otherwise inferred per seed" : "optional IGHJ…"} /></label>
             <label><span>Maximum initial hits</span><CommitNumberInput min="1" max="10000" value={queryLimit} onCommit={setQueryLimit} /></label>
           </div>
-          {queryInference.length > 0 && <div className="query-inference"><header><strong>SwiftIG seed assignments</strong><span>{queryInference.filter((item) => item.assigned).length} / {queryInference.length} with both V and J</span></header>{queryInference.slice(0, 20).map((assignment) => <div className={assignment.assigned ? "assigned" : "unassigned"} key={assignment.queryIndex}><b>Seed {assignment.queryIndex + 1}</b><span>{assignment.locus || "locus —"}</span><code>{assignment.vCall || "V —"}</code><code>{assignment.jCall || "J —"}</code><small>{assignment.searchSequence ? `${assignment.searchSequence.length} ${queryTarget === "cdr3_aa" ? "aa" : "nt"} search target` : "no target derived"}</small></div>)}</div>}
+          {queryInference.length > 0 && <div className="query-inference"><header><strong>Aligner seed assignments</strong><span>{queryInference.filter((item) => item.assigned).length} / {queryInference.length} with both V and J</span></header>{queryInference.slice(0, 20).map((assignment) => <div className={assignment.assigned ? "assigned" : "unassigned"} key={assignment.queryIndex}><b>Seed {assignment.queryIndex + 1}</b><span>{assignment.locus || "locus —"}</span><code>{assignment.vCall || "V —"}</code><code>{assignment.jCall || "J —"}</code><small>{assignment.searchSequence ? `${assignment.searchSequence.length} ${queryTarget === "cdr3_aa" ? "aa" : "nt"} search target` : "no target derived"}</small></div>)}</div>}
           <div className="current-step-input"><span>Search universe inherited from applied filters</span><strong>{workingCount.toLocaleString()} active records</strong><small>Initial search and every single-linkage expansion both use this same working set.</small></div>
           <div className="result-actions">{queryConstraintMode === "infer" && <button type="button" disabled={Boolean(busy)} onClick={() => void previewQueryInference()}>Preview inferred V/J</button>}<button className="post-primary dark" type="button" disabled={Boolean(busy)} onClick={() => void runQuery()}>{queryConstraintMode === "infer" ? `Assign seeds + rank ${queryResultMode}` : `Search + rank ${queryResultMode}`}</button><button type="button" disabled={Boolean(busy) || !queryHits.length} onClick={() => void expandMatches()}>Single-linkage expand sequence set</button></div>
-          <p className="scientific-note"><span>i</span>{queryConstraintMode === "infer" ? `Input is interpreted as rearranged nucleotide sequence. SwiftIG uses this run’s composed references, ${assignerStrategy === "riat_mp" ? "RIAT-MP" : assignerStrategy === "aer" ? "AER" : assignerStrategy === "aer_robust" ? "AER-R" : "standard SwiftIG"} assignment, ${callingProfile === "igblast_compatible" ? "IgBLAST-agreement" : callingProfile === "igblast_balanced" ? "IgBLAST-balanced" : callingProfile === "r_optimized" ? "R-optimized" : callingProfile === "sensitive_d" ? "Sensitive-D" : "truth-optimized"} calling profile, ${Math.round(minimumIdentity * 100)}% identity floor, and ${strand === 0 ? "both strands" : strand === 1 ? "plus strand" : "minus strand"}; ambiguous V/J calls remain ambiguity-aware and are applied per seed. Non-empty override fields replace the inferred value.` : queryTarget === "trimmed" ? "VDJ searches lazily build a packed index of eight independent 7-mer MinHash values per record. Scores are approximate and intended for candidate retrieval." : "Hamming search requires equal length. Edit distance is banded by the selected identity. Expansion always uses equal-length CDR3 nucleotide Hamming edges."}</p>
+          <p className="scientific-note"><span>i</span>{queryConstraintMode === "infer" ? `Input is interpreted as rearranged nucleotide sequence. The Swig aligner uses this run’s composed references, ${callingProfile === "igblast_compatible" ? "IgBLAST-agreement" : callingProfile === "r_optimized" ? "R-optimized" : callingProfile === "sensitive_d" ? "Sensitive-D" : "truth-optimized"} calling profile, ${Math.round(minimumIdentity * 100)}% identity floor, and ${strand === 0 ? "both strands" : strand === 1 ? "plus strand" : "minus strand"}; ambiguous V/J calls remain ambiguity-aware and are applied per seed. Non-empty override fields replace the inferred value.` : queryTarget === "trimmed" ? "VDJ searches lazily build a packed index of eight independent 7-mer MinHash values per record. Scores are approximate and intended for candidate retrieval." : "Hamming search requires equal length. Edit distance is banded by the selected identity. Expansion always uses equal-length CDR3 nucleotide Hamming edges."}</p>
         </div>
         <div className="query-results"><header><div><span className="section-kicker">Matched set</span><h4>{queryResultMode==="lineages"?`${queryLineageHits.length.toLocaleString()} matching lineages`:expanded ? `${expanded.ordinals.length.toLocaleString()} expanded records` : `${queryHits.length.toLocaleString()} initial hits`}</h4><p>{queryResultMode==="lineages"?"Each lineage score is its best match to any member sequence.":expanded ? `${expanded.comparisons.toLocaleString()} exact edge checks${expanded.capped ? " · result cap reached" : " · fixed point reached"}` : "Ranked by similarity, then distance."}</p></div></header><div className="query-result-list">{queryResultMode==="lineages"?queryLineageHits.slice(0,100).map((hit)=><button type="button" key={hit.lineageId} onClick={()=>void openQueryLineage(hit)}><span><strong>Lineage {hit.lineageId}</strong><small>{hit.matchedSequences.toLocaleString()} matched member{hit.matchedSequences===1?"":"s"} · {hit.matchedQueries.toLocaleString()} query seed{hit.matchedQueries===1?"":"s"}</small></span><code>best AIRR row #{(hit.bestOrdinal+1).toLocaleString()}</code><b>{(hit.bestScore*100).toFixed(1)}% · open →</b></button>):displayedQueryRows.slice(0, 100).map((record) => { const hit = queryHits.find((value) => value.ordinal === record.ordinal); return <button type="button" key={record.ordinal} onClick={() => onInspect(record.ordinal)}><span><strong>{record.sequenceId}</strong><small>{record.locus} · {record.vCall || "V—"} · {record.jCall || "J—"}</small></span><code>{record.cdr3 || record.cdr3Aa || "—"}</code><b>{hit ? `${(hit.score * 100).toFixed(1)}%` : "expanded"}</b></button>; })}{(queryResultMode==="lineages"?!queryLineageHits.length:!displayedQueryRows.length) && <div className="method-placeholder small"><span>⌕</span><h4>No query results</h4><p>Provide a sequence and search the assigned repertoire.</p></div>}</div></div>
       </div>

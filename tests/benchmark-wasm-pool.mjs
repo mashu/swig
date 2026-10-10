@@ -10,8 +10,7 @@ const TOTAL = Number(process.env.SWIG_BENCH_TOTAL || 50_000);
 const BATCH_SIZE = Number(process.env.SWIG_BENCH_BATCH || 1000);
 const requestedWorkers = Number(process.env.SWIG_BENCH_WORKERS || 0);
 const WORKERS = requestedWorkers || Math.max(1, Math.min(8, os.availableParallelism() - 1));
-const STRATEGY = process.env.SWIG_BENCH_STRATEGY || "standard";
-const PROFILE = process.env.SWIG_BENCH_PROFILE || "truth_optimized";
+const PROFILE = process.env.SWIG_BENCH_PROFILE || "r_optimized";
 const encoder = new TextEncoder();
 
 const pack = JSON.parse(zlib.gunzipSync(
@@ -40,11 +39,8 @@ class Client {
     this.index = index;
     this.worker = new Worker(new URL("./benchmark-wasm-worker.mjs", import.meta.url), {
       workerData: {
-        strategy: STRATEGY,
         profile: PROFILE,
         wasmPath: process.env.SWIG_BENCH_WASM || "",
-        reference: process.env.SWIG_BENCH_REFERENCE === "1",
-        referenceOutput: process.env.SWIG_BENCH_REFERENCE_OUTPUT === "1",
       },
     });
     this.pending = new Map();
@@ -92,10 +88,22 @@ let outputBytes = 0;
 const outputHash = crypto.createHash("sha256");
 const baselineRss = process.resourceUsage().maxRSS * 1024;
 
+// Every read differs (3% substitutions, seeded by its index), so neither
+// worker's repeated-sequence cache can answer it.
+function variant(index) {
+  let state = (index * 2654435761 + 1) >>> 0;
+  const random = () => (state = (Math.imul(state, 1664525) + 1013904223) >>> 0) / 2 ** 32;
+  const bases = [...template];
+  for (let position = 0; position < bases.length; position += 1) {
+    if (random() < 0.03) bases[position] = "ACGT"[Math.floor(random() * 4)];
+  }
+  return bases.join("");
+}
+
 function makeBatch(start, count) {
   let text = "";
   for (let offset = 0; offset < count; offset += 1) {
-    text += `>stress_${start + offset}\n${template}\n`;
+    text += `>stress_${start + offset}\n${variant(start + offset)}\n`;
   }
   return encoder.encode(text);
 }
@@ -122,7 +130,6 @@ assert.equal(completed, TOTAL);
 const summary = {
   records: completed,
   workers: WORKERS,
-  strategy: STRATEGY,
   profile: PROFILE,
   germlineAllelesPerWorker: genes[0],
   batchSize: BATCH_SIZE,

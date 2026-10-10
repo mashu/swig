@@ -8,11 +8,11 @@ The UI reports the exact number of active V/D/J/C records before a run. Per-cell
 
 ## Parsing and validation
 
-Reference FASTA is parsed into named records, normalized to uppercase nucleotide sequences, and checked for empty/duplicate-invalid content. Segment preparation computes the metadata and indexes needed by SwiftIG in a worker. Online choices fetch only the chosen public FASTA; query data are not uploaded.
+Reference FASTA is parsed into named records, normalized to uppercase nucleotide sequences, and checked for empty/duplicate-invalid content. Segment preparation computes the `SWIGMETA` coordinate metadata in a worker; each aligner worker then merges sequence-identical records, completes the germline annotation and builds its own seed indexes when it loads the prepared FASTA (see [V(D)J assignment](03_VDJ_ASSIGNMENT.md)). Online choices fetch only the chosen public FASTA; query data are not uploaded.
 
 The standalone CLI uses the same parsing, normalization, validation, taxonomic template tiers, nucleotide coordinate projection, and conserved-anchor checks for local FASTA supplied through `references.files`. This metadata preparation is enabled by default with `references.prepareMetadata: true`; setting it to `false` deliberately passes the local FASTA through without metadata transfer. The bundled fixed reference pack supplies the coordinate donors, so CLI preparation has no network dependency. Exact FASTA embedded in `references.inline` by Swig Web is already prepared and is retained byte-for-byte rather than compared again.
 
-Exact sequence-identical records may remain distinct labels for assignment output. The later repertoire allele model collapses sequence-identical labels into one unresolved inference node because no nucleotide evidence can distinguish them; this does not alter the initial database.
+Exact sequence-identical records remain distinct labels for assignment output: the aligner aligns the sequence once and reports every name in the call. The later repertoire allele model collapses sequence-identical labels into one unresolved inference node because no nucleotide evidence can distinguish them; this does not alter the initial database.
 
 Reference preparation is transactional at the UI level. A whole-database choice is displayed only after all required cells have downloaded, parsed, and prepared successfully. Cancelling terminates preparation/fetches and retains the previously committed matrix. Per-cell preparation follows the same rule.
 
@@ -20,7 +20,7 @@ The assignment controls offer unobtrusive **All / V / D / J / C** FASTA download
 
 ## Coordinate preparation
 
-SwiftIG computes local affine alignments against the selected references and reports AIRR coordinates, alignments, CIGAR strings, identities, and region annotations. Swig uses IMGT-style region fields when they can be mapped from the reference annotations; it does not claim to run IMGT/V-QUEST. See the IMGT unique numbering overview: [Lefranc et al., 2003](https://www.imgt.org/textes/PDF/DCI/27_55-77_2003.pdf).
+The Swig aligner computes local affine alignments against the selected references and reports AIRR coordinates, alignments, CIGAR strings, identities, and region annotations. Region coordinates come from each record's `SWIGMETA` where present; otherwise the aligner annotates the germline itself from the IMGT gap columns of a gapped V set, conserved Cys23/Trp41/Cys104 and J Trp/Phe118 motifs, a database consensus, or transfer from the most similar annotated allele. `v_annotation_source` and `j_annotation_source` record which source applied. Swig uses IMGT-style region fields when they can be mapped this way; it does not claim to run IMGT/V-QUEST. See the IMGT unique numbering overview: [Lefranc et al., 2003](https://www.imgt.org/textes/PDF/DCI/27_55-77_2003.pdf).
 
 ## Literature relationship
 
