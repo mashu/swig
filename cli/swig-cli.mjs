@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { _ as annotateDoubleDBatch, a as deduplicate, c as parseFasta$2, d as runDenoisePartitionJob, f as runExactDedupJob, g as annotateAirrBatch, h as DEFAULT_PIPELINE_PLAN, i as createExactDedupPlan, l as prepareReferenceMsa, n as assignLineages, o as finishExactDedupPlan, p as sequenceFingerprint, s as normalizeNt, t as DenoiseAccumulator, v as datasetScopeValue, y as stableDatasetSeed } from "./chunks/post-analysis-core-CuBDaqFF.mjs";
+import { _ as annotateDoubleDBatch, a as deduplicate, c as parseFasta$2, d as runDenoisePartitionJob, f as runExactDedupJob, g as annotateAirrBatch, h as DEFAULT_PIPELINE_PLAN, i as createExactDedupPlan, l as prepareReferenceMsa, n as assignLineages, o as finishExactDedupPlan, p as sequenceFingerprint, s as normalizeNt, t as DenoiseAccumulator, v as datasetScopeValue, y as stableDatasetSeed } from "./chunks/post-analysis-core-DJA1I-YZ.mjs";
 import { n as CALLING_PROFILES, r as isCallingProfile } from "./chunks/aligner-engine-DxPuuP9Z.mjs";
 import { createReadStream, createWriteStream, readFileSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -9361,7 +9361,7 @@ function adaptiveNeighbourOdds(readShm, options) {
 	return Math.min(cap, baseline + somaticOdds);
 }
 /**
-* Converts a literal SwiftIG call into a sparse, database-aware evidence row.
+* Converts a literal aligner call into a sparse, database-aware evidence row.
 * Co-optimal calls start at exactly equal weight. Unreported nucleotide
 * neighbours receive geometric leakage; this is an explicit evidence kernel,
 * not a claim that the affine alignment score is a calibrated read likelihood.
@@ -12079,7 +12079,7 @@ function assertChainLocus(name, locus, chain, chainLoci, source) {
 }
 /**
 * Perform the FASTA preparation done by IgBLAST's `edit_imgt_file.pl` where it
-* is relevant to SwiftIG: canonicalize the germline identifier and remove IMGT
+* is relevant to the aligner: canonicalize the germline identifier and remove IMGT
 * alignment gaps before indexing. Existing SWIGMETA is deliberately removed.
 */
 function prepareIgblastStyleGermlineFasta(text, segment, allowedLoci = LOCI) {

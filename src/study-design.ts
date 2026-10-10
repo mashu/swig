@@ -225,7 +225,7 @@ function replaceOrAppend(values: string[], positions: Map<string, number>, field
   else values[position] = value;
 }
 
-/** Adds study metadata to a SwiftIG AIRR batch without materializing the input file. */
+/** Adds study metadata to an aligner AIRR batch without materializing the input file. */
 export function annotateAirrBatch(
   headerLine: string,
   body: string | Uint8Array,

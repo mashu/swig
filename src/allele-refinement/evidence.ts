@@ -64,7 +64,7 @@ export function adaptiveNeighbourOdds(
 }
 
 /**
- * Converts a literal SwiftIG call into a sparse, database-aware evidence row.
+ * Converts a literal aligner call into a sparse, database-aware evidence row.
  * Co-optimal calls start at exactly equal weight. Unreported nucleotide
  * neighbours receive geometric leakage; this is an explicit evidence kernel,
  * not a claim that the affine alignment score is a calibrated read likelihood.

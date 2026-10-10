@@ -90,7 +90,7 @@ function replaceOrAppend(values, positions, field, value) {
 	if (position === void 0) values.push(value);
 	else values[position] = value;
 }
-/** Adds study metadata to a SwiftIG AIRR batch without materializing the input file. */
+/** Adds study metadata to an aligner AIRR batch without materializing the input file. */
 function annotateAirrBatch(headerLine, body, dataset) {
 	const headers = headerLine.replace(/\r$/, "").split("	");
 	const positions = new Map(headers.map((field, index) => [field, index]));

@@ -12,7 +12,7 @@
 
 On the first 1,000 constant-negative records of each supplied simulation, false C calls changed from 29 to 0 (IgM-like) and 40 to 0 (IgG-like). The final archive's adaptive short-prefix implementation also produced zero false C calls among 5,000 records of either dataset. Those runs used 24.712 and 31.282 CPU-seconds, respectively. C-enabled CPU time improved 6.60-fold and 4.77-fold on the original 1,000-record comparisons because upstream V(D)J sequence is no longer included in C alignment.
 
-Without a C database, complete 20,000-record IgM-like and IgG-like fair V/D/J accuracies remain unchanged; final-archive CPU changed by -0.72% and +0.18% versus the paired 0.38.3 runs. See [`BENCHMARK_CONSTANT_CALLING_0.38.4.md`](BENCHMARK_CONSTANT_CALLING_0.38.4.md) for the protocol, accuracy table, false-positive controls, and timings.
+Without a C database, complete 20,000-record IgM-like and IgG-like fair V/D/J accuracies remain unchanged; final-archive CPU changed by -0.72% and +0.18% versus the paired 0.38.3 runs. See [`BENCHMARK_CONSTANT_CALLING_0.38.4.md`](https://github.com/mashu/swig/blob/a08a2c3fb2d42dba9dd1ac97e6fda783089b5b3f/BENCHMARK_CONSTANT_CALLING_0.38.4.md) for the protocol, accuracy table, false-positive controls, and timings.
 
 ## AIRR TSV and gzip output
 

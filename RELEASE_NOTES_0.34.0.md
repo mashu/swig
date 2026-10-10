@@ -9,7 +9,7 @@
 
 ## Calibration and performance
 
-- Added reproducible fixed-seed null simulation and fitting tools plus held-out calibration checks in `BENCHMARK_AIRR_SUPPORT_0.34.0.md`.
+- Added reproducible fixed-seed null simulation and fitting tools plus held-out calibration checks in [`BENCHMARK_AIRR_SUPPORT_0.34.0.md`](https://github.com/mashu/swig/blob/a08a2c3fb2d42dba9dd1ac97e6fda783089b5b3f/BENCHMARK_AIRR_SUPPORT_0.34.0.md).
 - Database totals are cached once per worker. Runtime performs no extra alignment, candidate search, or reference scan.
 - Repeated 50,000-read, four-worker human-IGH benchmarks measured a 0.21% mean runtime difference, within run noise. Four new columns increased the benchmark AIRR output by 1.27%.
 

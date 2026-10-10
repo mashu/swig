@@ -34,7 +34,7 @@ D/J settings.
 
 ## Verification
 
-See [`BENCHMARK_ASSIGNERS_0.20.0.md`](BENCHMARK_ASSIGNERS_0.20.0.md) for the
+See [`BENCHMARK_ASSIGNERS_0.20.0.md`](https://github.com/mashu/swig/blob/a08a2c3fb2d42dba9dd1ac97e6fda783089b5b3f/BENCHMARK_ASSIGNERS_0.20.0.md) for the
 algorithm definitions, deterministic benchmark sample, first-pick and
 ambiguity-aware V/D/J results, IgBLAST agreement, throughput, structured-J
 experiment, input hashes, and limitations.

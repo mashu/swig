@@ -19,4 +19,4 @@
 - Browser and CLI version strings are 0.38.2. Both surfaces show `Sensitive-D`, enforce its AER-R requirement, retain it in saved/exported configuration, and reuse it for post-analysis query inference.
 - Profile identifier 3 is added to the WASM ABI; identifiers 0–2 and all default behavior remain unchanged.
 - The default remains RIAT-MP with truth-optimized calling. Ordinary AER, standard SwiftIG, legacy AER-R profiles, and R-optimized selection remain opt-in/unchanged except for the shared AER-R endpoint correction.
-- Full one-worker timing showed a 1–8% CPU-time increase versus v0.37.6 AER-R (4–13% versus v0.37.6 plain AER), depending on dataset/profile. See [`BENCHMARK_SENSITIVE_D_0.38.2.md`](BENCHMARK_SENSITIVE_D_0.38.2.md) for accuracy, trimming, fixture, and timing details.
+- Full one-worker timing showed a 1–8% CPU-time increase versus v0.37.6 AER-R (4–13% versus v0.37.6 plain AER), depending on dataset/profile. See [`BENCHMARK_SENSITIVE_D_0.38.2.md`](https://github.com/mashu/swig/blob/a08a2c3fb2d42dba9dd1ac97e6fda783089b5b3f/BENCHMARK_SENSITIVE_D_0.38.2.md) for accuracy, trimming, fixture, and timing details.

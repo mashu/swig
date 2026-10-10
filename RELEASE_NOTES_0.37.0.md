@@ -11,4 +11,4 @@
 
 The original scalar/hash/ostream implementations remain available as reference paths. A permanent end-to-end WASM test requires byte-identical reference and optimized AIRR for both engines.
 
-On the documented one-worker 10,000-read release-WASM control, AER throughput increased 2.20x and RIAT-MP throughput increased 1.77x; peak RSS also fell by roughly 13–14%. See [`BENCHMARK_SWIFTIG_KERNELS_0.37.0.md`](BENCHMARK_SWIFTIG_KERNELS_0.37.0.md) for the call-level profiles, protocol, timings, exact output hashes, and limitations.
+On the documented one-worker 10,000-read release-WASM control, AER throughput increased 2.20x and RIAT-MP throughput increased 1.77x; peak RSS also fell by roughly 13–14%. See [`BENCHMARK_SWIFTIG_KERNELS_0.37.0.md`](https://github.com/mashu/swig/blob/a08a2c3fb2d42dba9dd1ac97e6fda783089b5b3f/BENCHMARK_SWIFTIG_KERNELS_0.37.0.md) for the call-level profiles, protocol, timings, exact output hashes, and limitations.
