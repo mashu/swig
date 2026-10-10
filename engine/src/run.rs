@@ -1,14 +1,18 @@
 //! An assignment run as the command line and the WebAssembly module perform
-//! it: options by name, the assigner they build, and reads streamed to AIRR
-//! TSV.
+//! it: options by name, the assigner they build, and reads to AIRR rows.
 //!
 //! [`RunOptions`] holds the user-facing switches. [`RunOptions::set`] reads
-//! them by the names the command line spells (`profile`, `tandem-d`, …), so
+//! them by the names the command line spells (`profile`, `strand`, …), so
 //! every front end shares one vocabulary, one validation and one mapping to
 //! [`EngineConfig`]. [`Run`] builds the assigner from the options and a
-//! [`PreparedDatabase`] and writes AIRR rows from any [`BufRead`] to any
-//! [`Write`]; [`Run::write_rows`] takes parsed records, for front ends that
-//! schedule batches themselves.
+//! [`PreparedDatabase`]; [`Run::assign`] turns a batch of reads into AIRR
+//! rows (and double-D sidecar rows, [`crate::double_d`]), and
+//! [`Run::write_airr`] streams any [`BufRead`] to any [`Write`].
+//!
+//! Identical sequences are assigned once: within a batch, and across
+//! batches through a bounded cache of rows ([`CACHE`]). A read's row
+//! depends on its sequence alone, besides its identifier and qualities, so
+//! this changes no output.
 //!
 //! ```ignore
 //! use swig::prelude::*;
@@ -16,20 +20,22 @@
 //! let mut options = RunOptions::default();
 //! options.set("profile", Some("r"))?;
 //! let database = PreparedDatabase::from_fasta(texts, options.annotate())?;
-//! let run = Run::new(&options, database)?;
-//! let tally = run.write_airr(reads_fastq.as_bytes(), &mut std::io::stdout().lock())?;
+//! let mut run = Run::new(&options, database)?;
+//! let tally = run.write_airr(reads_fastq.as_bytes(), &mut std::io::stdout().lock(), None)?;
 //! ```
 
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io::{self, BufRead, Write};
 
-use crate::adjudicate::{CallModel, DAlleleDecoding, ResidualAdjudicator, VdjGrammar};
+use crate::adjudicate::{CallModel, DAlleleDecoding, ResidualAdjudicator};
 use crate::admission::DefaultAdmission;
 use crate::align::{Backend, InterSequenceGotoh};
 use crate::alphabet::encode;
 use crate::annotate::{AnnotateOptions, ChainType};
 use crate::batch::assign_map;
 use crate::config::{BuildError, DPrior, DefaultAssigner, DefaultVRetriever, EngineConfig};
+use crate::double_d::{self, DoubleDMode, DoubleDOptions};
 use crate::germline::SegmentKind;
 use crate::orient::OrientationPolicy;
 use crate::pipeline::{AlleleCatalog, Assigner, VdjAssigner};
@@ -38,12 +44,17 @@ use crate::profiles::CallingProfile;
 use crate::reads::{ReadError, ReadReader, ReadRecord};
 use crate::report::{AirrRecord, SupportModels};
 use crate::retrieve::{ExhaustiveRetriever, LmerMaskRetriever};
+use crate::scoring::{AffineScoring, Score};
+use crate::segment::HitAcceptance;
 use crate::stats::KarlinAltschul;
 use crate::window::{ExpandedResidual, WithAnchorWindow};
 
 /// Reads assigned per batch by [`Run::write_airr`] (bounds memory on large
 /// inputs).
 pub const BATCH: usize = 16_384;
+
+/// Rows [`Run`] keeps for sequences it may see again.
+pub const CACHE: usize = 4096;
 
 /// An option that is unknown, lacks its value, or cannot take the one given.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,16 +68,35 @@ impl fmt::Display for OptionError {
 
 impl std::error::Error for OptionError {}
 
+/// The strands reads are assigned on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Strand {
+    /// The read or its reverse complement, whichever germline k-mers support.
+    #[default]
+    Both,
+    /// The read as given.
+    Forward,
+    /// The reverse complement only.
+    Reverse,
+}
+
+impl Strand {
+    fn policy(self) -> OrientationPolicy {
+        match self {
+            Self::Both => OrientationPolicy::default(),
+            Self::Forward => OrientationPolicy::FORWARD_ONLY,
+            Self::Reverse => OrientationPolicy::REVERSE_ONLY,
+        }
+    }
+}
+
 /// The switches of an assignment run.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunOptions {
     pub profile: CallingProfile,
-    /// Chain type of the V database; `None` votes it from the database.
+    /// Chain type of the V database; `None` votes it per locus.
     pub chain: Option<ChainType>,
-    /// Allow VDDJ paths.
-    pub tandem_d: bool,
-    /// Do not try the reverse complement.
-    pub forward_only: bool,
+    pub strand: Strand,
     /// Add the conserved-anchor D window.
     pub anchor_window: bool,
     /// Report posterior probabilities (the residual adjudicator has none).
@@ -81,6 +111,20 @@ pub struct RunOptions {
     pub d_presence_rate: Option<f64>,
     /// Call C at an anchored E-value at most this (needs a C database).
     pub c_evalue: Option<f64>,
+    /// Report C only where the germline from its first base reaches this
+    /// identity (`c_prefix_identity`).
+    pub c_prefix_identity: Option<f64>,
+    /// Drop V, D and J hits below this identity.
+    pub min_identity: Option<f64>,
+    /// Shortest exact run of an admissible D; `None` keeps the profile's.
+    pub min_d_match: Option<u32>,
+    /// D and J mismatch scores; `None` keeps the profile's.
+    pub d_mismatch: Option<Score>,
+    pub j_mismatch: Option<Score>,
+    /// Fewest aligned J columns (matches and mismatches) of a J hit.
+    pub min_j_length: Option<u32>,
+    /// Swig's double-D screen ([`crate::double_d`]).
+    pub double_d: DoubleDOptions,
     /// Alignment kernel; `None` picks the fastest this CPU runs.
     pub simd: Option<Backend>,
     /// Worker threads; 0 uses every core.
@@ -92,8 +136,7 @@ impl Default for RunOptions {
         Self {
             profile: CallingProfile::ROptimized,
             chain: None,
-            tandem_d: false,
-            forward_only: false,
+            strand: Strand::Both,
             anchor_window: true,
             posterior: true,
             residual: false,
@@ -101,6 +144,13 @@ impl Default for RunOptions {
             d_allele: None,
             d_presence_rate: None,
             c_evalue: None,
+            c_prefix_identity: None,
+            min_identity: None,
+            min_d_match: None,
+            d_mismatch: None,
+            j_mismatch: None,
+            min_j_length: None,
+            double_d: DoubleDOptions::default(),
             simd: None,
             threads: 0,
         }
@@ -117,19 +167,45 @@ fn parsed<T>(
     parse(value).ok_or_else(|| OptionError(format!("--{name} expects {expects}, got '{value}'")))
 }
 
+/// A fraction in (0, 1].
+fn fraction(value: &str) -> Option<f64> {
+    value.parse().ok().filter(|f: &f64| *f > 0.0 && *f <= 1.0)
+}
+
+/// `scoring` with mismatch score `mismatch`.
+fn with_mismatch(scoring: AffineScoring, mismatch: Score) -> AffineScoring {
+    AffineScoring::new(
+        scoring.matched,
+        mismatch,
+        scoring.gaps.open,
+        scoring.gaps.extend,
+    )
+}
+
 impl RunOptions {
     /// Every option [`Self::set`] reads, and whether it takes a value.
-    pub const NAMES: [(&'static str, bool); 13] = [
+    pub const NAMES: [(&'static str, bool); 24] = [
         ("profile", true),
         ("chain", true),
+        ("strand", true),
         ("threads", true),
         ("simd", true),
         ("calls", true),
         ("d-allele", true),
         ("d-presence-rate", true),
         ("c-evalue", true),
-        ("tandem-d", false),
-        ("forward-only", false),
+        ("c-prefix-identity", true),
+        ("min-identity", true),
+        ("min-d-match", true),
+        ("d-mismatch", true),
+        ("j-mismatch", true),
+        ("min-j-length", true),
+        ("double-d", true),
+        ("double-d-min-span", true),
+        ("double-d-seed-length", true),
+        ("double-d-pseudo-trim", true),
+        ("double-d-pseudo-mismatches", true),
+        ("double-d-min-gain", true),
         ("no-anchor-window", false),
         ("no-posterior", false),
         ("residual", false),
@@ -159,6 +235,9 @@ impl RunOptions {
             }
             (false, None) => "",
         };
+        let count = |v: &str| v.parse::<u32>().ok();
+        let positive = |v: &str| v.parse::<u32>().ok().filter(|&n| n > 0);
+        let penalty = |v: &str| v.parse::<Score>().ok().filter(|s| *s < 0);
         match name {
             "profile" => {
                 self.profile = parsed(
@@ -171,7 +250,15 @@ impl RunOptions {
             "chain" => {
                 self.chain = Some(parsed(name, value, "heavy or light", ChainType::from_name)?)
             }
-            "threads" => self.threads = parsed(name, value, "a number", |v| v.parse().ok())?,
+            "strand" => {
+                self.strand = parsed(name, value, "both, forward or reverse", |v| match v {
+                    "both" => Some(Strand::Both),
+                    "forward" => Some(Strand::Forward),
+                    "reverse" => Some(Strand::Reverse),
+                    _ => None,
+                })?;
+            }
+            "threads" => self.threads = parsed(name, value, "a number", count)? as usize,
             "simd" => {
                 let names: Vec<&str> = Backend::ALL.iter().map(|b| b.name()).collect();
                 self.simd = Some(parsed(name, value, &names.join(", "), Backend::from_name)?);
@@ -198,8 +285,44 @@ impl RunOptions {
                 let evalue = |v: &str| v.parse().ok().filter(|e: &f64| *e > 0.0);
                 self.c_evalue = Some(parsed(name, value, "a positive number", evalue)?);
             }
-            "tandem-d" => self.tandem_d = true,
-            "forward-only" => self.forward_only = true,
+            "c-prefix-identity" => {
+                self.c_prefix_identity =
+                    Some(parsed(name, value, "a fraction in (0, 1]", fraction)?);
+            }
+            "min-identity" => {
+                let floor = |v: &str| v.parse().ok().filter(|f: &f64| (0.0..=1.0).contains(f));
+                self.min_identity = Some(parsed(name, value, "a fraction in [0, 1]", floor)?);
+            }
+            "min-d-match" => {
+                self.min_d_match = Some(parsed(name, value, "a positive number", positive)?);
+            }
+            "d-mismatch" => {
+                self.d_mismatch = Some(parsed(name, value, "a negative score", penalty)?);
+            }
+            "j-mismatch" => {
+                self.j_mismatch = Some(parsed(name, value, "a negative score", penalty)?);
+            }
+            "min-j-length" => self.min_j_length = Some(parsed(name, value, "a number", count)?),
+            "double-d" => {
+                self.double_d.mode =
+                    parsed(name, value, "off, all or long-span", DoubleDMode::from_name)?;
+            }
+            "double-d-min-span" => {
+                self.double_d.min_vj_span = parsed(name, value, "a number", count)?;
+            }
+            "double-d-seed-length" => {
+                self.double_d.seed_length = parsed(name, value, "a positive number", positive)?;
+            }
+            "double-d-pseudo-trim" => {
+                self.double_d.pseudo_trim = parsed(name, value, "a number", count)?;
+            }
+            "double-d-pseudo-mismatches" => {
+                self.double_d.pseudo_mismatches = parsed(name, value, "a number", count)?;
+            }
+            "double-d-min-gain" => {
+                let gain = |v: &str| v.parse::<Score>().ok();
+                self.double_d.min_score_gain = parsed(name, value, "a score", gain)?;
+            }
             "no-anchor-window" => self.anchor_window = false,
             "no-posterior" => self.posterior = false,
             "residual" => self.residual = true,
@@ -216,12 +339,8 @@ impl RunOptions {
     /// The engine configuration: the profile's, with these options applied.
     pub fn config(&self) -> EngineConfig {
         let mut config = self.profile.config();
-        if self.tandem_d {
-            config.grammar = VdjGrammar::TANDEM_D;
-        }
-        if self.forward_only {
-            config.options.orientation = OrientationPolicy::FORWARD_ONLY;
-        }
+        config.options.orientation = self.strand.policy();
+        config.options.min_identity = self.min_identity.unwrap_or(0.0);
         config.anchor_window = self.anchor_window;
         config.simd = self.simd;
         // The residual adjudicator computes no posteriors.
@@ -237,6 +356,22 @@ impl RunOptions {
         }
         if let Some(evalue) = self.c_evalue {
             config.c.evalue = evalue;
+        }
+        if let Some(run) = self.min_d_match {
+            config.d.min_exact_run = run;
+            config.min_retained[SegmentKind::D.index()] = run;
+        }
+        if let Some(mismatch) = self.d_mismatch {
+            config.d.scoring = with_mismatch(config.d.scoring, mismatch);
+        }
+        if let Some(mismatch) = self.j_mismatch {
+            config.j.scoring = with_mismatch(config.j.scoring, mismatch);
+        }
+        if let Some(columns) = self.min_j_length {
+            config.j.accept = HitAcceptance {
+                min_subst: columns,
+                ..config.j.accept
+            };
         }
         config
     }
@@ -287,18 +422,30 @@ impl From<BuildError> for RunError {
     }
 }
 
-/// Reads assigned, and how many of them have a V(D)J path.
+/// Reads assigned, how many of them have a V(D)J path, and how many
+/// double-D rows the screen wrote.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Tally {
     pub reads: usize,
     pub called: usize,
+    pub double_d: usize,
 }
 
 impl std::ops::AddAssign for Tally {
     fn add_assign(&mut self, other: Self) {
         self.reads += other.reads;
         self.called += other.called;
+        self.double_d += other.double_d;
     }
+}
+
+/// The rows of one batch: AIRR and double-D sidecar lines, each ending in
+/// a line break, without headers.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Rows {
+    pub airr: String,
+    pub double_d: String,
+    pub tally: Tally,
 }
 
 /// The default assigner with the residual adjudicator swapped in.
@@ -318,28 +465,99 @@ enum Engine {
     Residual(ResidualAssigner),
 }
 
+/// What a sequence's rows are, besides the identifier and qualities.
+#[derive(Clone, Debug)]
+struct Assigned {
+    /// The AIRR row from the tab before `sequence_aa`.
+    airr: String,
+    /// The sidecar row from the tab before `locus`.
+    double_d: Option<String>,
+    called: bool,
+}
+
+/// Rows of recently assigned sequences, oldest dropped first.
+#[derive(Debug, Default)]
+struct Cache {
+    rows: HashMap<Vec<u8>, Assigned>,
+    order: VecDeque<Vec<u8>>,
+}
+
+impl Cache {
+    fn insert(&mut self, sequence: Vec<u8>, assigned: Assigned) {
+        if self.order.len() == CACHE
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.rows.remove(&oldest);
+        }
+        self.order.push_back(sequence.clone());
+        self.rows.insert(sequence, assigned);
+    }
+}
+
+/// Free text as one TSV field: tabs and line breaks become spaces.
+fn field(text: &str) -> String {
+    text.replace(['\t', '\r', '\n'], " ")
+}
+
+/// `row` from the tab after its first `fields` fields.
+fn tail(row: &str, fields: usize) -> &str {
+    row.match_indices('\t')
+        .nth(fields - 1)
+        .map_or("", |(at, _)| &row[at..])
+}
+
+/// The [`Assigned`] rows of each of `sequences`, formatted on the worker
+/// threads.
+fn assigned<T: VdjAssigner + AlleleCatalog + Sync>(
+    assigner: &T,
+    support: &SupportModels,
+    sequences: &[&[u8]],
+    threads: usize,
+    c_prefix_identity: Option<f64>,
+    double_d: &DoubleDOptions,
+) -> Vec<Assigned> {
+    let encoded: Vec<Vec<u8>> = sequences.iter().map(|s| encode(s)).collect();
+    assign_map(assigner, &encoded, threads, |i, call| {
+        let sequence = String::from_utf8_lossy(sequences[i]);
+        let mut record = AirrRecord::from_call("", &sequence, &call, assigner, support);
+        if let Some(gate) = c_prefix_identity
+            && record
+                .c
+                .as_ref()
+                .is_some_and(|c| c.prefix_identity.is_none_or(|p| p + 1e-9 < gate))
+        {
+            record.c = None;
+        }
+        let screened = double_d::screen(
+            0,
+            "",
+            record.locus,
+            [record.v.as_ref(), record.d.as_ref(), record.j.as_ref()],
+            &call,
+            assigner,
+            support,
+            double_d,
+        );
+        Assigned {
+            // `sequence_id`, `sequence` and `quality` are the read's own.
+            airr: tail(&record.to_tsv(), 3).to_string(),
+            // The index and `sequence_id` too.
+            double_d: screened.map(|row| tail(&row, 2).to_string()),
+            called: call.path.is_some(),
+        }
+    })
+}
+
 /// An assigner built from [`RunOptions`] and a database, writing AIRR rows.
 pub struct Run {
     engine: Engine,
     support: SupportModels,
     threads: usize,
-}
-
-/// AIRR rows of `records`, each with whether its read has a path, formatted
-/// on the worker threads.
-fn rows<T: VdjAssigner + AlleleCatalog + Sync>(
-    assigner: &T,
-    support: &SupportModels,
-    records: &[ReadRecord],
-    threads: usize,
-) -> Vec<(String, bool)> {
-    let encoded: Vec<Vec<u8>> = records.iter().map(|r| encode(&r.sequence)).collect();
-    assign_map(assigner, &encoded, threads, |i, call| {
-        let record = &records[i];
-        let sequence = String::from_utf8_lossy(&record.sequence);
-        let row = AirrRecord::from_call(record.id(), &sequence, &call, assigner, support);
-        (row.to_tsv(), call.path.is_some())
-    })
+    c_prefix_identity: Option<f64>,
+    double_d: DoubleDOptions,
+    cache: Cache,
+    /// Reads seen so far: a read without an identifier is `sequence_N`.
+    ordinal: usize,
 }
 
 impl Run {
@@ -348,6 +566,13 @@ impl Run {
         if options.c_evalue.is_some() && database.c.is_none() {
             return Err(OptionError("--c-evalue needs a C database (--c)".into()).into());
         }
+        let screening = options.double_d.mode != DoubleDMode::Off;
+        if screening && options.residual {
+            return Err(OptionError(
+                "the double-D screen needs the placement DAG, not --residual".into(),
+            )
+            .into());
+        }
         let config = options.config();
         let support =
             [&config.v.scoring, &config.d.scoring, &config.j.scoring].map(KarlinAltschul::ungapped);
@@ -355,6 +580,9 @@ impl Run {
             DefaultAssigner::from_config(&config, database.v, database.d, database.j)?;
         if let Some(c) = database.c {
             assigner = assigner.with_constant(c, &config.c)?;
+        }
+        if screening {
+            assigner = assigner.with_tandem_screen();
         }
         let engine = if options.residual {
             Engine::Residual(assigner.with_adjudicator(ResidualAdjudicator {
@@ -368,6 +596,10 @@ impl Run {
             engine,
             support,
             threads: options.threads,
+            c_prefix_identity: options.c_prefix_identity,
+            double_d: options.double_d,
+            cache: Cache::default(),
+            ordinal: 0,
         })
     }
 
@@ -379,42 +611,94 @@ impl Run {
         }
     }
 
-    /// Whether rows carry the `c_` columns (a C database was given).
-    pub fn has_constant(&self) -> bool {
-        match &self.engine {
-            Engine::Dag(assigner) => assigner.segment(SegmentKind::C).is_some(),
-            Engine::Residual(assigner) => assigner.segment(SegmentKind::C).is_some(),
-        }
-    }
-
-    /// The AIRR TSV header of this run's rows, without a line break.
+    /// The AIRR TSV header, without a line break.
     pub fn airr_header(&self) -> String {
-        AirrRecord::tsv_header_with(self.has_constant())
+        AirrRecord::tsv_header()
     }
 
-    /// Assign `records` and write one AIRR TSV line per record, in order.
-    pub fn write_rows<W: Write>(&self, records: &[ReadRecord], out: &mut W) -> io::Result<Tally> {
-        let rows = match &self.engine {
-            Engine::Dag(assigner) => rows(assigner, &self.support, records, self.threads),
-            Engine::Residual(assigner) => rows(assigner, &self.support, records, self.threads),
-        };
-        let mut tally = Tally::default();
-        for (row, called) in rows {
-            writeln!(out, "{row}")?;
-            tally.reads += 1;
-            tally.called += usize::from(called);
+    /// The double-D sidecar's header, without a line break.
+    pub fn double_d_header(&self) -> String {
+        double_d::header()
+    }
+
+    /// The AIRR and double-D rows of `records`, in order: a sidecar row
+    /// starts with its read's index in `records`.
+    pub fn assign(&mut self, records: &[ReadRecord]) -> Rows {
+        // The sequences to assign: each once, and none the cache holds.
+        let mut fresh: Vec<&[u8]> = Vec::new();
+        let mut queued: HashMap<&[u8], ()> = HashMap::new();
+        for record in records {
+            let sequence = record.sequence.as_slice();
+            if !self.cache.rows.contains_key(sequence) && queued.insert(sequence, ()).is_none() {
+                fresh.push(sequence);
+            }
         }
-        Ok(tally)
+        let found = match &self.engine {
+            Engine::Dag(a) => assigned(
+                a,
+                &self.support,
+                &fresh,
+                self.threads,
+                self.c_prefix_identity,
+                &self.double_d,
+            ),
+            Engine::Residual(a) => assigned(
+                a,
+                &self.support,
+                &fresh,
+                self.threads,
+                self.c_prefix_identity,
+                &self.double_d,
+            ),
+        };
+        let batch: HashMap<&[u8], Assigned> = fresh.into_iter().zip(found).collect();
+        let mut rows = Rows::default();
+        for (index, record) in records.iter().enumerate() {
+            self.ordinal += 1;
+            let sequence = record.sequence.as_slice();
+            let assigned = batch
+                .get(sequence)
+                .or_else(|| self.cache.rows.get(sequence))
+                .expect("every sequence is assigned or cached");
+            let id = if record.id.is_empty() {
+                format!("sequence_{}", self.ordinal)
+            } else {
+                field(&record.id)
+            };
+            rows.airr += &id;
+            rows.airr.push('\t');
+            rows.airr += &AirrRecord::normalized(&String::from_utf8_lossy(sequence));
+            rows.airr.push('\t');
+            rows.airr += &field(&record.quality);
+            rows.airr += &assigned.airr;
+            rows.airr.push('\n');
+            if let Some(rest) = &assigned.double_d {
+                rows.double_d += &format!("{index}\t{id}{rest}\n");
+                rows.tally.double_d += 1;
+            }
+            rows.tally.reads += 1;
+            rows.tally.called += usize::from(assigned.called);
+        }
+        for (sequence, assigned) in batch {
+            self.cache.insert(sequence.to_vec(), assigned);
+        }
+        rows
     }
 
-    /// Write the header line, then a line per read of the FASTA or FASTQ
-    /// `reads`, [`BATCH`] reads at a time.
+    /// Write the header line, then a line per read of the FASTA, FASTQ or
+    /// AIRR `reads`, [`BATCH`] reads at a time; with `double_d`, the
+    /// screen's sidecar there (header first, `swig_batch_record_index` the
+    /// read's 0-based index in the whole input).
     pub fn write_airr<R: BufRead, W: Write>(
-        &self,
+        &mut self,
         reads: R,
         out: &mut W,
+        mut double_d: Option<&mut dyn Write>,
     ) -> Result<Tally, RunError> {
         writeln!(out, "{}", self.airr_header()).map_err(RunError::Output)?;
+        if let Some(sidecar) = double_d.as_mut() {
+            writeln!(sidecar, "{}", self.double_d_header()).map_err(RunError::Output)?;
+        }
         let mut reader = ReadReader::new(reads);
         let mut batch = Vec::with_capacity(BATCH);
         let mut tally = Tally::default();
@@ -427,7 +711,19 @@ impl Run {
             {
                 return Ok(tally);
             }
-            tally += self.write_rows(&batch, out).map_err(RunError::Output)?;
+            let rows = self.assign(&batch);
+            out.write_all(rows.airr.as_bytes())
+                .map_err(RunError::Output)?;
+            if let Some(sidecar) = double_d.as_mut() {
+                // Batch indices become indices in the whole input.
+                for line in rows.double_d.lines() {
+                    let (index, rest) = line.split_once('\t').expect("an indexed row");
+                    let index: usize = index.parse().expect("a batch index");
+                    writeln!(sidecar, "{}\t{rest}", tally.reads + index)
+                        .map_err(RunError::Output)?;
+                }
+            }
+            tally += rows.tally;
         }
     }
 }
@@ -444,14 +740,25 @@ mod tests {
         for (name, value) in [
             ("profile", Some("igblast")),
             ("chain", Some("light")),
+            ("strand", Some("reverse")),
             ("threads", Some("3")),
             ("simd", Some("scalar")),
             ("calls", Some("fixed")),
             ("d-allele", Some("max-marginal")),
             ("d-presence-rate", Some("0.9")),
             ("c-evalue", Some("0.01")),
-            ("tandem-d", None),
-            ("forward-only", None),
+            ("c-prefix-identity", Some("0.97")),
+            ("min-identity", Some("0.7")),
+            ("min-d-match", Some("5")),
+            ("d-mismatch", Some("-4")),
+            ("j-mismatch", Some("-4")),
+            ("min-j-length", Some("12")),
+            ("double-d", Some("long-span")),
+            ("double-d-min-span", Some("30")),
+            ("double-d-seed-length", Some("9")),
+            ("double-d-pseudo-trim", Some("4")),
+            ("double-d-pseudo-mismatches", Some("2")),
+            ("double-d-min-gain", Some("6")),
             ("no-anchor-window", None),
             ("no-posterior", None),
             ("residual", None),
@@ -461,8 +768,7 @@ mod tests {
         let expected = RunOptions {
             profile: CallingProfile::IgBlastAgreement,
             chain: Some(ChainType::Light),
-            tandem_d: true,
-            forward_only: true,
+            strand: Strand::Reverse,
             anchor_window: false,
             posterior: false,
             residual: true,
@@ -470,24 +776,46 @@ mod tests {
             d_allele: Some(DAlleleDecoding::MaxMarginal),
             d_presence_rate: Some(0.9),
             c_evalue: Some(0.01),
+            c_prefix_identity: Some(0.97),
+            min_identity: Some(0.7),
+            min_d_match: Some(5),
+            d_mismatch: Some(-4),
+            j_mismatch: Some(-4),
+            min_j_length: Some(12),
+            double_d: DoubleDOptions {
+                mode: DoubleDMode::LongSpan,
+                min_vj_span: 30,
+                seed_length: 9,
+                pseudo_trim: 4,
+                pseudo_mismatches: 2,
+                min_score_gain: 6,
+            },
             simd: Some(Backend::Scalar),
             threads: 3,
         };
         assert_eq!(options, expected);
         let config = options.config();
-        assert_eq!(config.grammar, VdjGrammar::TANDEM_D);
+        assert_eq!(config.options.orientation, OrientationPolicy::REVERSE_ONLY);
+        assert_eq!(config.options.min_identity, 0.7);
         assert_eq!(config.objective.d_prior, DPrior::search(0.9));
         assert!(!config.posterior && !config.anchor_window);
         assert_eq!(config.c.evalue, 0.01);
+        assert_eq!(config.d.min_exact_run, 5);
+        assert_eq!(config.d.scoring, AffineScoring::new(2, -4, -11, -1));
+        assert_eq!(config.j.accept.min_subst, 12);
         assert_eq!(
             RunOptions::default().config(),
             CallingProfile::ROptimized.config()
         );
         for (name, value) in [
             ("profile", Some("best")),
+            ("strand", Some("plus")),
             ("threads", Some("many")),
             ("d-presence-rate", Some("1")),
             ("c-evalue", Some("0")),
+            ("c-prefix-identity", Some("1.5")),
+            ("d-mismatch", Some("3")),
+            ("double-d", Some("some")),
             ("simd", Some("mmx")),
             ("profile", None),
             ("residual", Some("yes")),
@@ -497,25 +825,36 @@ mod tests {
         }
     }
 
-    /// The streamed TSV is the header and one row per read, the rows equal
-    /// to [`AirrRecord::from_call`] on the assigner the options build.
-    #[test]
-    fn a_run_writes_one_airr_row_per_read() {
+    fn texts_and_reads(count: usize) -> ([String; 4], String) {
+        texts_and_simulated(count, SimParams::mid())
+    }
+
+    fn texts_and_simulated(count: usize, params: SimParams) -> ([String; 4], String) {
         let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 5);
         let fasta = |set: &crate::germline::GermlineSet| {
             let mut text = Vec::new();
             set.write_fasta(&mut text, |_| None).unwrap();
             String::from_utf8(text).unwrap()
         };
-        let (v, d, j, c) = (fasta(&db.v), fasta(&db.d), fasta(&db.j), fasta(&db.c));
-        let sim = Simulator::new(&db.v, Some(&db.d), &db.j, SimParams::mid()).unwrap();
+        let sim = Simulator::new(&db.v, Some(&db.d), &db.j, params).unwrap();
         let reads: String = sim
-            .reads(40, 3)
+            .reads(count, 3)
             .unwrap()
             .iter()
             .enumerate()
             .map(|(i, read)| format!(">r{i}\n{}\n", String::from_utf8_lossy(&read.sequence)))
             .collect();
+        (
+            [fasta(&db.v), fasta(&db.d), fasta(&db.j), fasta(&db.c)],
+            reads,
+        )
+    }
+
+    /// The streamed TSV is the header and one row per read, the rows equal
+    /// to [`AirrRecord::from_call`] on the assigner the options build.
+    #[test]
+    fn a_run_writes_one_airr_row_per_read() {
+        let ([v, d, j, c], reads) = texts_and_reads(40);
         let texts = GermlineTexts {
             v: &v,
             d: Some(&d),
@@ -525,15 +864,16 @@ mod tests {
         let mut options = RunOptions::default();
         options.set("threads", Some("2")).unwrap();
         let database = PreparedDatabase::from_fasta(texts, options.annotate()).unwrap();
-        let run = Run::new(&options, database).unwrap();
+        let mut run = Run::new(&options, database).unwrap();
         let mut out = Vec::new();
-        let tally = run.write_airr(reads.as_bytes(), &mut out).unwrap();
+        let tally = run.write_airr(reads.as_bytes(), &mut out, None).unwrap();
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(tally.reads, 40);
         assert!(tally.called >= 38, "{tally:?}");
         assert_eq!(lines.len(), 41);
-        assert_eq!(lines[0], AirrRecord::tsv_header_with(true));
+        assert_eq!(lines[0], AirrRecord::tsv_header());
+        assert_eq!(lines[0].split('\t').nth(12), Some("j_call"));
         let columns = lines[0].split('\t').count();
         assert!(lines.iter().all(|l| l.split('\t').count() == columns));
         assert!(lines[1].starts_with("r0\t"));
@@ -552,6 +892,90 @@ mod tests {
             [&config.v.scoring, &config.d.scoring, &config.j.scoring].map(KarlinAltschul::ungapped);
         let record = AirrRecord::from_call("r0", &sequence, &call, &assigner, &support);
         assert_eq!(lines[1], record.to_tsv());
+    }
+
+    /// Repeated sequences, within a batch and across batches, get the rows
+    /// a fresh run gives them, under their own identifiers and qualities.
+    #[test]
+    fn repeated_sequences_reuse_their_rows() {
+        let ([v, d, j, _], reads) = texts_and_reads(12);
+        let texts = GermlineTexts {
+            v: &v,
+            d: Some(&d),
+            j: &j,
+            c: None,
+        };
+        let options = RunOptions::default();
+        let records: Vec<ReadRecord> = ReadReader::new(reads.as_bytes())
+            .map(Result::unwrap)
+            .collect();
+        let mut repeated = records.clone();
+        for (k, record) in records.iter().enumerate().take(6) {
+            repeated.push(ReadRecord {
+                id: format!("copy{k}"),
+                quality: "I".repeat(record.sequence.len()),
+                ..record.clone()
+            });
+        }
+        let database = || PreparedDatabase::from_fasta(texts, options.annotate()).unwrap();
+        let mut run = Run::new(&options, database()).unwrap();
+        let first = run.assign(&repeated[..12]);
+        let second = run.assign(&repeated[12..]);
+        let mut fresh = Run::new(&options, database()).unwrap();
+        let alone = fresh.assign(&repeated);
+        assert_eq!(first.airr.clone() + &second.airr, alone.airr);
+        let lines: Vec<&str> = alone.airr.lines().collect();
+        let fields: Vec<&str> = lines[12].split('\t').collect();
+        assert_eq!(fields[0], "copy0");
+        assert_eq!(fields[2].len(), records[0].sequence.len());
+        let original: Vec<&str> = lines[0].split('\t').collect();
+        assert_eq!(fields[3..], original[3..]);
+    }
+
+    /// The double-D screen leaves every AIRR row as it is and writes
+    /// sidecar rows for tandem-D reads.
+    #[test]
+    fn the_double_d_screen_adds_a_sidecar_only() {
+        let params = SimParams {
+            include_dd: 0.5,
+            ..SimParams::preset("easy").unwrap()
+        };
+        let ([v, d, j, _], reads) = texts_and_simulated(120, params);
+        let texts = GermlineTexts {
+            v: &v,
+            d: Some(&d),
+            j: &j,
+            c: None,
+        };
+        let records: Vec<ReadRecord> = ReadReader::new(reads.as_bytes())
+            .map(Result::unwrap)
+            .collect();
+        let database = || PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+        let plain = Run::new(&RunOptions::default(), database())
+            .unwrap()
+            .assign(&records);
+        let mut options = RunOptions::default();
+        options.set("double-d", Some("all")).unwrap();
+        options.set("double-d-seed-length", Some("6")).unwrap();
+        let screened = Run::new(&options, database()).unwrap().assign(&records);
+        assert_eq!(plain.airr, screened.airr);
+        assert!(plain.double_d.is_empty());
+        let rows: Vec<&str> = screened.double_d.lines().collect();
+        assert_eq!(rows.len(), screened.tally.double_d);
+        assert!(rows.len() >= 10, "{} double-D rows", rows.len());
+        let columns = double_d::COLUMNS;
+        for row in rows {
+            let fields: Vec<&str> = row.split('\t').collect();
+            assert_eq!(fields.len(), columns.len());
+            let index: usize = fields[0].parse().unwrap();
+            assert_eq!(fields[1], records[index].id);
+            let at = |name: &str| fields[columns.iter().position(|c| *c == name).unwrap()];
+            assert!(!at("d_call").is_empty() && !at("d2_call").is_empty());
+            let d_end: u32 = at("d_sequence_end").parse().unwrap();
+            let d2_start: u32 = at("d2_sequence_start").parse().unwrap();
+            assert!(d_end < d2_start);
+            assert!(at("swig_double_d_score_gain").parse::<i32>().unwrap() >= 8);
+        }
     }
 
     #[test]

@@ -675,9 +675,34 @@ impl Assigner {
             ),
             adjudicator,
             locus_adjudicators,
+            tandem: None,
             c: None,
             options: config.options,
         })
+    }
+
+    /// Add Swig's double-D screen: every read whose call places V and J is
+    /// read again under the tandem-D grammar (VDDJ as a topology of its
+    /// own, a second D paying `tandem_d_penalty` on top of its prior) over
+    /// the same placements ([`crate::double_d`]). Without a D database
+    /// there is nothing to screen.
+    pub fn with_tandem_screen(mut self) -> Self {
+        if self.d.is_some() {
+            let tandem = |dag: &PlacementDag| PlacementDag {
+                grammar: VdjGrammar {
+                    max_d: 2,
+                    ..dag.grammar
+                },
+                ..*dag
+            };
+            let by_locus = self
+                .locus_adjudicators
+                .iter()
+                .map(|(locus, dag)| (*locus, tandem(dag)))
+                .collect();
+            self.tandem = Some((tandem(&self.adjudicator), by_locus));
+        }
+        self
     }
 }
 

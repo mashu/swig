@@ -13,10 +13,17 @@
 //! V alignment, FR4 never ends after the J alignment, and the junction
 //! (Cys104 … Trp/Phe118, inclusive) is reported only when it lies inside the
 //! read. Coordinates are 0-based half-open on the oriented query.
+//!
+//! The reading frame is the junction's (Cys104's codon); without a junction
+//! it is the called V's, from its anchor or given coding frame
+//! (`frame=`/`SWIGMETA=`). A segment has a frameshift when its called
+//! alignment's net indel length is not a multiple of 3, and a productive
+//! rearrangement is in frame, free of stop codons and of frameshifts.
 
 use std::ops::Range;
 
 use crate::adjudicate::CalledSegment;
+use crate::align::Op;
 use crate::germline::{Allele, SegmentKind};
 use crate::pipeline::{AlleleCatalog, Call};
 use crate::placement::Placement;
@@ -35,6 +42,17 @@ pub struct ReadRegions {
     pub vj_in_frame: Option<bool>,
     pub stop_codon: Option<bool>,
     pub productive: Option<bool>,
+    /// The reading frame: offset (0–2) on the oriented query of the first
+    /// base of a codon.
+    pub frame: Option<u32>,
+    pub v_frameshift: Option<bool>,
+    pub j_frameshift: Option<bool>,
+    /// The called D's reading frame relative to its own coding frame, 0–2
+    /// (AIRR `d_frame` − 1), when both are known.
+    pub d_frame: Option<u32>,
+    /// The V starts within 3 bases of its germline start and the J ends
+    /// within 3 of its germline end.
+    pub complete_vdj: Option<bool>,
 }
 
 struct Projected<'a> {
@@ -46,6 +64,29 @@ struct Projected<'a> {
 impl Projected<'_> {
     fn at(&self, germline: Option<u32>) -> Option<i64> {
         germline.map(|r| self.placement.clip.project_reference(r))
+    }
+
+    /// Whether the called alignment's net indel length is not a multiple of 3.
+    fn frameshift(&self) -> bool {
+        let net: i64 = self
+            .placement
+            .clip
+            .columns(&self.called.span)
+            .map(|(op, _, _)| match op {
+                Op::Match => 0,
+                Op::Ins => 1,
+                Op::Del => -1,
+            })
+            .sum();
+        net.rem_euclid(3) != 0
+    }
+
+    /// The query offset (0–2) of codon starts by this germline's coding
+    /// frame, `germline_frame`, at the called alignment's first column.
+    fn query_frame(&self, germline_frame: u32) -> u32 {
+        let span = &self.called.span;
+        let reference_phase = (span.r_lo + 3 - germline_frame) % 3;
+        (span.q_lo + 3 - reference_phase) % 3
     }
 }
 
@@ -141,10 +182,34 @@ impl ReadRegions {
                 .any(|p| codon(q[p as usize], q[p as usize + 1], q[p as usize + 2]) == STOP);
             out.stop_codon = Some(stop);
         }
-        out.productive = out
-            .vj_in_frame
-            .zip(out.stop_codon)
-            .map(|(in_frame, stop)| in_frame && !stop);
+        out.v_frameshift = v.as_ref().map(Projected::frameshift);
+        out.j_frameshift = j.as_ref().map(Projected::frameshift);
+        out.productive = match (out.vj_in_frame, out.stop_codon) {
+            (Some(in_frame), Some(stop)) => Some(
+                in_frame
+                    && !stop
+                    && out.v_frameshift != Some(true)
+                    && out.j_frameshift != Some(true),
+            ),
+            _ => None,
+        };
+        out.frame = match (cys104, &v) {
+            (Some(c), _) if c >= 0 && out.junction.is_some() => Some((c % 3) as u32),
+            (_, Some(v)) => {
+                let germline = v.allele.anchor.map(|a| a % 3);
+                Some(v.query_frame(germline.or(v.allele.frame.map(u32::from)).unwrap_or(0)))
+            }
+            _ => None,
+        };
+        if let (Some(frame), Some(d)) = (out.frame, called(call, catalog, SegmentKind::D))
+            && let Some(own) = d.allele.frame
+        {
+            out.d_frame = Some((frame + 3 - d.query_frame(u32::from(own))) % 3);
+        }
+        if let (Some(v), Some(j)) = (&v, &j) {
+            let j_len = j.allele.codes.len() as u32;
+            out.complete_vdj = Some(v.called.span.r_lo <= 2 && j.called.span.r_hi + 3 >= j_len);
+        }
         out
     }
 }

@@ -87,7 +87,7 @@ impl Assignment {
             segments: [
                 segment(&record.v),
                 segment(&record.d),
-                segment(&record.d2),
+                None,
                 segment(&record.j),
                 segment(&record.c),
             ],

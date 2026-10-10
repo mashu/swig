@@ -53,6 +53,7 @@ pub mod batch;
 pub mod clip;
 pub mod config;
 pub mod constant;
+pub mod double_d;
 pub mod evidence;
 pub mod family_bound;
 pub mod fasta;
@@ -107,7 +108,7 @@ pub mod prelude {
     pub use crate::reads::{ReadFormat, ReadReader, ReadRecord};
     pub use crate::report::{AirrRecord, SupportModels};
     pub use crate::retrieve::{Candidate, ExhaustiveRetriever, Retriever};
-    pub use crate::run::{Run, RunError, RunOptions, Tally};
+    pub use crate::run::{Rows, Run, RunError, RunOptions, Strand, Tally};
     pub use crate::scoring::{AffineScoring, HotspotScoring};
     pub use crate::stats::KarlinAltschul;
     pub use crate::window::{

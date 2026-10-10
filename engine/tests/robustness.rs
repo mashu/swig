@@ -28,9 +28,28 @@ fn random(rng: &mut Rng, len: usize) -> Vec<u8> {
 /// field per column, coordinates inside the read, and spans consistent with
 /// their alignment strings.
 fn check_record(record: &AirrRecord, query_len: usize) {
-    let columns = AirrRecord::tsv_header_with(true).split('\t').count();
+    let columns = AirrRecord::tsv_header().split('\t').count();
     assert_eq!(record.to_tsv().split('\t').count(), columns);
-    for segment in [&record.v, &record.d, &record.d2, &record.j, &record.c]
+    assert_eq!(
+        record.sequence_alignment.len(),
+        record.germline_alignment.len()
+    );
+    for range in [
+        &record.regions.fwr1,
+        &record.regions.cdr1,
+        &record.regions.fwr2,
+        &record.regions.cdr2,
+        &record.regions.fwr3,
+        &record.regions.cdr3,
+        &record.regions.fwr4,
+        &record.regions.junction,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        assert!(range.start < range.end && range.end as usize <= query_len);
+    }
+    for segment in [&record.v, &record.d, &record.j, &record.c]
         .into_iter()
         .flatten()
     {

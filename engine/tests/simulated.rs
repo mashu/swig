@@ -333,7 +333,7 @@ fn airr_tsv_rows_score_like_the_records_they_were_written_from() {
         let mut direct = Assignment::from_record(&record);
         assert_eq!(
             record.d_presence_posterior.is_some(),
-            record.path_score.is_some(),
+            call.path.is_some(),
             "posteriors by default"
         );
         // Posteriors are written with six decimals (more near 0 and 1).

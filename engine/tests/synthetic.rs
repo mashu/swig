@@ -203,7 +203,6 @@ fn calls_vdj_alleles_on_clean_rearrangements() {
         if first_label(&rec.d).as_deref() == Some(sim.d[0].as_str()) {
             d_correct += 1;
         }
-        assert!(rec.d2.is_none(), "default grammar allows one D");
     }
     assert!(
         d_correct * 100 >= trials * 95,
@@ -306,13 +305,24 @@ fn tandem_d_is_a_first_class_path() {
         let first = 5 + rng.below(3);
         let second = (first - 5 + 1 + rng.below(2)) % 3 + 5;
         let sim = simulate(&db, &mut rng, &[first, second], 0.0);
-        let rec = record(&tandem, &sim.query);
-        let calls = (first_label(&rec.d), first_label(&rec.d2));
-        if calls == (Some(sim.d[0].clone()), Some(sim.d[1].clone())) {
+        let d_labels = |assigner: &DefaultAssigner| {
+            let call = assigner.assign(&encode(sim.query.as_bytes()), &mut assigner.workspace());
+            let set = assigner.segment(SegmentKind::D).unwrap().set();
+            call.path
+                .iter()
+                .flat_map(|p| &p.segments)
+                .map(|s| &call.placements[s.placement])
+                .filter(|p| p.kind == SegmentKind::D)
+                .map(|p| set.allele(p.primary_allele()).name.clone())
+                .collect::<Vec<_>>()
+        };
+        if d_labels(&tandem) == sim.d[..2] {
             both_correct += 1;
         }
-        assert!(record(&single, &sim.query).d2.is_none());
-        assert!(rec.np3.is_some(), "VDDJ reports three N/P regions");
+        assert!(
+            d_labels(&single).len() <= 1,
+            "the default grammar allows one D"
+        );
     }
     assert!(
         both_correct * 100 >= trials * 90,
@@ -492,35 +502,16 @@ fn the_constant_region_is_called_from_the_j_exit() {
     assert!(false_calls <= 1, "{false_calls} false C calls");
 }
 
-/// Rows gain the twelve `c_` columns after `productive` only with a C stage;
-/// the columns before them are unchanged.
+/// The `c_` columns are empty without a C stage; with one, every other
+/// column is unchanged.
 #[test]
-fn c_columns_follow_the_vdj_columns_only_with_a_c_stage() {
+fn c_columns_are_filled_only_with_a_c_stage() {
     let db = Db::new();
     let config = EngineConfig::default();
     let (plain, constant) = (db.assigner(&config), with_c(&db, &config));
     let header = AirrRecord::tsv_header();
-    let with_header = AirrRecord::tsv_header_with(true);
-    assert_eq!(with_header.strip_prefix(&header).unwrap(), {
-        let c: Vec<String> = [
-            "call",
-            "score",
-            "identity",
-            "support",
-            "posterior",
-            "cigar",
-            "sequence_start",
-            "sequence_end",
-            "germline_start",
-            "germline_end",
-            "sequence_alignment",
-            "germline_alignment",
-        ]
-        .iter()
-        .map(|f| format!("\tc_{f}"))
-        .collect();
-        c.concat()
-    });
+    let constant_column: Vec<bool> = header.split('\t').map(|c| c.starts_with("c_")).collect();
+    assert_eq!(constant_column.iter().filter(|&&c| c).count(), 14);
     let mut rng = Rng::new(41);
     let (mut ws_plain, mut ws_c) = (plain.workspace(), constant.workspace());
     for k in 0..60 {
@@ -537,9 +528,14 @@ fn c_columns_follow_the_vdj_columns_only_with_a_c_stage() {
         let (without, with) = (row(&plain, &mut ws_plain), row(&constant, &mut ws_c));
         assert!(without.c.is_none());
         let (a, b) = (without.to_tsv(), with.to_tsv());
-        let tail = b.strip_prefix(&a).unwrap();
-        assert_eq!(tail.matches('\t').count(), 12);
-        assert_eq!(b.split('\t').count(), with_header.split('\t').count());
+        for ((x, y), &is_c) in a.split('\t').zip(b.split('\t')).zip(&constant_column) {
+            if is_c {
+                assert!(x.is_empty());
+            } else {
+                assert_eq!(x, y);
+            }
+        }
+        assert_eq!(b.split('\t').count(), constant_column.len());
         match &with.c {
             Some(report) if len > 0 => {
                 assert!(report.call.split(',').any(|n| n == name));
@@ -548,6 +544,7 @@ fn c_columns_follow_the_vdj_columns_only_with_a_c_stage() {
                 assert_eq!(report.germline_start, 1);
                 assert!(report.sequence_end as usize >= j_end as usize + len);
                 assert!(report.support.unwrap() <= 1e-3);
+                assert!(report.prefix_identity.is_some_and(|p| p > 0.9));
             }
             None => assert_eq!(len, 0),
             Some(report) => panic!("a C call without C: {report:?}"),

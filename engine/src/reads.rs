@@ -1,10 +1,14 @@
-//! Streaming FASTA / FASTQ reader for query reads.
+//! Streaming FASTA / FASTQ / AIRR-table reader for query reads.
 //!
 //! The format is detected from the first non-blank character (`>` FASTA,
-//! `@` FASTQ); reads are delivered in batches so arbitrarily large files run
-//! in bounded memory. FASTQ records may span several sequence and quality
-//! lines (quality lines may start with `@` or `+`; records are delimited by
-//! counting quality characters). Qualities are validated and discarded.
+//! `@` FASTQ, anything else an AIRR Rearrangement table); reads are
+//! delivered in batches so arbitrarily large files run in bounded memory.
+//! FASTQ records may span several sequence and quality lines (quality lines
+//! may start with `@` or `+`; records are delimited by counting quality
+//! characters); qualities are validated and kept for the AIRR `quality`
+//! column. An AIRR table is tab-separated, or comma-separated when its
+//! header line holds no tab, and is read from its `sequence`, `sequence_id`
+//! and `quality` columns: Swig re-annotates AIRR input from its sequences.
 //! Gzip input is recognised by its magic bytes and rejected with a hint to
 //! decompress on the fly (the crate has no dependencies).
 
@@ -15,20 +19,33 @@ use std::io::{self, BufRead};
 pub enum ReadFormat {
     Fasta,
     Fastq,
+    /// An AIRR Rearrangement table (TSV, or CSV without quoting).
+    Airr,
 }
 
-/// One read: header line (without `>`/`@`) and raw sequence symbols.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One read: its identifier, raw sequence symbols and FASTQ qualities.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReadRecord {
-    pub header: String,
+    /// The first whitespace-delimited token of a FASTA/FASTQ header, or an
+    /// AIRR row's `sequence_id`; may be empty.
+    pub id: String,
     pub sequence: Vec<u8>,
+    /// FASTQ qualities or an AIRR row's `quality`; empty for FASTA.
+    pub quality: String,
 }
 
-impl ReadRecord {
-    /// First whitespace-delimited token of the header.
-    pub fn id(&self) -> &str {
-        self.header.split_whitespace().next().unwrap_or("")
-    }
+/// The identifier of a FASTA/FASTQ header line (without `>`/`@`).
+fn header_id(header: &str) -> String {
+    header.split_whitespace().next().unwrap_or("").to_string()
+}
+
+/// Where an AIRR table keeps what a read needs.
+#[derive(Clone, Copy, Debug)]
+struct AirrColumns {
+    delimiter: char,
+    sequence: usize,
+    id: Option<usize>,
+    quality: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -59,6 +76,10 @@ pub enum ReadError {
         sequence: usize,
         quality: usize,
     },
+    /// A table (neither FASTA nor FASTQ) without a `sequence` column.
+    NoSequenceColumn {
+        line: usize,
+    },
 }
 
 impl fmt::Display for ReadError {
@@ -72,9 +93,13 @@ impl fmt::Display for ReadError {
             Self::UnknownFormat { line, found } => {
                 write!(
                     f,
-                    "line {line}: expected FASTA ('>') or FASTQ ('@'), found {found:?}"
+                    "line {line}: expected FASTA ('>'), FASTQ ('@') or an AIRR table, found {found:?}"
                 )
             }
+            Self::NoSequenceColumn { line } => write!(
+                f,
+                "line {line}: expected FASTA ('>'), FASTQ ('@') or an AIRR table with a 'sequence' column"
+            ),
             Self::SequenceBeforeHeader { line } => {
                 write!(f, "sequence data before the first header (line {line})")
             }
@@ -122,6 +147,8 @@ pub struct ReadReader<R> {
     buffer: String,
     /// FASTA header already read while finishing the previous record.
     pending_header: Option<String>,
+    /// The columns of an AIRR table.
+    airr: Option<AirrColumns>,
 }
 
 impl<R: BufRead> ReadReader<R> {
@@ -133,6 +160,7 @@ impl<R: BufRead> ReadReader<R> {
             line: 0,
             buffer: String::new(),
             pending_header: None,
+            airr: None,
         }
     }
 
@@ -176,6 +204,7 @@ impl<R: BufRead> ReadReader<R> {
             None => Ok(None),
             Some(ReadFormat::Fasta) => self.next_fasta(),
             Some(ReadFormat::Fastq) => self.next_fastq(),
+            Some(ReadFormat::Airr) => self.next_airr(),
         }
     }
 
@@ -204,12 +233,56 @@ impl<R: BufRead> ReadReader<R> {
             return match symbol {
                 b'>' => Ok(Some(ReadFormat::Fasta)),
                 b'@' => Ok(Some(ReadFormat::Fastq)),
+                other if other.is_ascii_graphic() => {
+                    self.airr = Some(self.airr_header()?);
+                    Ok(Some(ReadFormat::Airr))
+                }
                 other => Err(ReadError::UnknownFormat {
                     line: self.line + 1,
                     found: char::from(other),
                 }),
             };
         }
+    }
+
+    /// Read an AIRR table's header line and find its columns.
+    fn airr_header(&mut self) -> Result<AirrColumns, ReadError> {
+        self.next_line()?;
+        let delimiter = if self.buffer.contains('\t') {
+            '\t'
+        } else {
+            ','
+        };
+        let names: Vec<&str> = self.buffer.split(delimiter).map(str::trim).collect();
+        let column = |name: &str| names.iter().position(|&n| n == name);
+        Ok(AirrColumns {
+            delimiter,
+            sequence: column("sequence").ok_or(ReadError::NoSequenceColumn { line: self.line })?,
+            id: column("sequence_id"),
+            quality: column("quality"),
+        })
+    }
+
+    /// The next AIRR row with a sequence; rows without one are skipped.
+    fn next_airr(&mut self) -> Result<Option<ReadRecord>, ReadError> {
+        let columns = self.airr.expect("the header was read on detection");
+        while self.next_line()? {
+            let values: Vec<&str> = self.buffer.split(columns.delimiter).collect();
+            let value = |at: Option<usize>| at.and_then(|i| values.get(i)).map_or("", |v| v.trim());
+            let sequence = value(Some(columns.sequence));
+            if sequence.is_empty() {
+                continue;
+            }
+            return Ok(Some(ReadRecord {
+                id: value(columns.id).to_string(),
+                sequence: sequence
+                    .bytes()
+                    .filter(|b| b.is_ascii_alphabetic())
+                    .collect(),
+                quality: value(columns.quality).to_string(),
+            }));
+        }
+        Ok(None)
     }
 
     /// Read one line into `self.buffer` without its line terminator.
@@ -247,7 +320,11 @@ impl<R: BufRead> ReadReader<R> {
             }
             sequence.extend(self.buffer.bytes().filter(|b| b.is_ascii_alphabetic()));
         }
-        Ok(Some(ReadRecord { header, sequence }))
+        Ok(Some(ReadRecord {
+            id: header_id(&header),
+            sequence,
+            quality: String::new(),
+        }))
     }
 
     fn next_fastq(&mut self) -> Result<Option<ReadRecord>, ReadError> {
@@ -281,21 +358,25 @@ impl<R: BufRead> ReadReader<R> {
             }
             sequence.extend(line.bytes());
         }
-        let mut quality = 0;
-        while quality < sequence.len() {
+        let mut quality = String::new();
+        while quality.len() < sequence.len() {
             if !self.next_line()? {
                 break;
             }
-            quality += self.buffer.trim().len();
+            quality.push_str(self.buffer.trim());
         }
-        if quality != sequence.len() {
+        if quality.len() != sequence.len() {
             return Err(ReadError::QualityLength {
                 header,
                 sequence: sequence.len(),
-                quality,
+                quality: quality.len(),
             });
         }
-        Ok(Some(ReadRecord { header, sequence }))
+        Ok(Some(ReadRecord {
+            id: header_id(&header),
+            sequence,
+            quality,
+        }))
     }
 }
 
@@ -315,10 +396,18 @@ mod tests {
         ReadReader::new(text).collect()
     }
 
-    fn record(header: &str, sequence: &str) -> ReadRecord {
+    fn record(id: &str, sequence: &str) -> ReadRecord {
         ReadRecord {
-            header: header.into(),
+            id: id.into(),
             sequence: sequence.as_bytes().to_vec(),
+            quality: String::new(),
+        }
+    }
+
+    fn fastq(id: &str, sequence: &str, quality: &str) -> ReadRecord {
+        ReadRecord {
+            quality: quality.into(),
+            ..record(id, sequence)
         }
     }
 
@@ -327,9 +416,8 @@ mod tests {
         let records = read_all(b"\n>r1 desc\nACGT\nac-gt\n>r2\r\nTTTT\r\n").unwrap();
         assert_eq!(
             records,
-            vec![record("r1 desc", "ACGTacgt"), record("r2", "TTTT")]
+            vec![record("r1", "ACGTacgt"), record("r2", "TTTT")]
         );
-        assert_eq!(records[0].id(), "r1");
     }
 
     #[test]
@@ -339,9 +427,9 @@ mod tests {
         assert_eq!(
             records,
             vec![
-                record("r1", "ACGT"),
-                record("r2 x", "ACGT"),
-                record("r3", "")
+                fastq("r1", "ACGT", "IIII"),
+                fastq("r2", "ACGT", "@+II"),
+                fastq("r3", "", "")
             ]
         );
     }
@@ -371,14 +459,15 @@ mod tests {
         ));
         assert_eq!(
             read_all(b"@r\nAC.T-\n+\nIIIII\n").unwrap(),
-            [record("r", "AC.T-")]
+            [fastq("r", "AC.T-", "IIIII")]
         );
         assert!(matches!(
             read_all(b"ACGT\n"),
-            Err(ReadError::UnknownFormat {
-                line: 1,
-                found: 'A'
-            })
+            Err(ReadError::NoSequenceColumn { line: 1 })
+        ));
+        assert!(matches!(
+            read_all(b"\x01ACGT\n"),
+            Err(ReadError::UnknownFormat { line: 1, .. })
         ));
         assert!(matches!(
             read_all(&[0x1f, 0x8b, 8, 0]),
@@ -397,8 +486,25 @@ mod tests {
         assert_eq!(reader.read_batch(2, &mut out).unwrap(), 1);
         assert_eq!(reader.read_batch(2, &mut out).unwrap(), 0);
         assert_eq!(
-            out.iter().map(|r| r.id()).collect::<Vec<_>>(),
+            out.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
             ["a", "b", "c"]
         );
+    }
+
+    #[test]
+    fn reads_airr_tables_by_column_name() {
+        let tsv = b"sequence_id\tv_call\tsequence\tquality\nq1\tIGHV1\tACGT\tIIII\n\nq2\t\t\t\nq3\t\tAC-gt\t\r\n";
+        let records = read_all(tsv).unwrap();
+        assert_eq!(
+            records,
+            vec![fastq("q1", "ACGT", "IIII"), record("q3", "ACgt")]
+        );
+        let csv = b"sequence,sequence_id\nTTTT,c1\nGG,\n";
+        assert_eq!(
+            read_all(csv).unwrap(),
+            vec![record("c1", "TTTT"), record("", "GG")]
+        );
+        let mut reader = ReadReader::new(&csv[..]);
+        assert_eq!(reader.format().unwrap(), Some(ReadFormat::Airr));
     }
 }

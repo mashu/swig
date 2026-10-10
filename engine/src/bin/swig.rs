@@ -17,43 +17,53 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use swig::double_d::DoubleDMode;
 use swig::prelude::*;
 use swig::prepare::DatabaseError;
 use swig::sim::{Assignment, C_STREAM, Evaluation, Paired, Rng, SimParams, Simulator, Truth};
 
 const USAGE: &str = "\
-usage: swig --v V.fasta --j J.fasta [--d D.fasta] [--c C.fasta] [options] <reads.fasta|reads.fastq|->
+usage: swig --v V.fasta --j J.fasta [--d D.fasta] [--c C.fasta] [options] <reads|->
        swig prepare --v V.fasta --j J.fasta [--d D.fasta] [--c C.fasta] [--chain heavy|light] --out DIR
        swig simulate --v V.fasta --j J.fasta [--d D.fasta] [--c C.fasta] --out PREFIX
-                  [--preset easy|mid|hard] [--reads N] [--seed S] [--rc P] [--shm RATE]
+                  [--preset easy|mid|hard] [--reads N] [--seed S] [--rc P] [--shm RATE] [--dd P]
        swig evaluate --truth PREFIX.truth.tsv <calls.tsv> [other.tsv]
+
+Assigns V(D)J (and C) germline alleles to reads and writes Swig's AIRR
+Rearrangement TSV on stdout. Reads may be FASTA, FASTQ or an AIRR table
+with a 'sequence' column (detected from the first character; TSV, or CSV
+without quoting); '-' reads stdin, so compressed input can be streamed:
+zcat reads.fastq.gz | swig ... -
 
 simulate writes PREFIX.fasta and PREFIX.truth.tsv: reads from the IgSim model
 (presets as in IgSim.jl; --rc reverse-complements that fraction, default 0.5;
---shm fixes the SHM rate of every read) with their true alleles, the
-germline-equivalent alleles, segment intervals and junctions. evaluate scores
-an AIRR Rearrangement TSV from any tool against that truth (germline-
-equivalence-aware allele, gene, boundary, D-presence and junction accuracy).
-Given a second calls file, evaluate also compares the two read by read:
-accuracy difference with its 95 % confidence interval and an exact McNemar
-test on the reads only one of them gets right (D also by remnant length),
-and the D allele and D-presence Brier scores with a paired t.
+--shm fixes the SHM rate of every read; --dd sets the tandem-DD fraction)
+with their true alleles, the germline-equivalent alleles, segment intervals
+and junctions. evaluate scores an AIRR Rearrangement TSV from any tool
+against that truth (germline-equivalence-aware allele, gene, boundary,
+D-presence and junction accuracy). Given a second calls file, evaluate also
+compares the two read by read: accuracy difference with its 95 % confidence
+interval and an exact McNemar test on the reads only one of them gets right
+(D also by remnant length), and the D allele and D-presence Brier scores
+with a paired t.
 
-Reads may be FASTA or FASTQ (detected from the first character); '-' reads
-stdin, so compressed input can be streamed: zcat reads.fastq.gz | swig ... -
-
-Germline databases are FASTA. Headers may carry 0-based positions:
+Germline databases are FASTA and may hold several loci (IGH, IGK and IGL;
+or the TR loci): each allele's locus is read from its name, and every
+rearrangement, D and C call stays within one locus. Headers may carry
+0-based positions:
   anchor=POS            first base of the V Cys104 / J Trp-Phe118 codon (fixes the frame)
   fr1= cdr1= fr2= cdr2= fr3=   V region starts (IMGT definitions)
-Missing values are detected on every start (motifs, database consensus,
-transfer from the closest sibling allele; milliseconds). Identical sequences
-are merged and reported under all their names. `prepare` writes the result as
-annotated FASTA plus annotation.tsv for review; header values always win.
+  frame=F               offset of the first complete codon (D: d_frame)
+  SWIGMETA=...          Swig's prepared coordinates (filling what the keys leave open)
+Missing values are detected on every start, per locus (motifs, database
+consensus, transfer from the closest sibling allele; milliseconds).
+Identical sequences are merged and reported under all their names.
+`prepare` writes the result as annotated FASTA plus annotation.tsv for
+review; header values always win.
 
 --c adds constant-region (isotype) calls: C base 0 is anchored within 3 bases
-of the called J's end and aligned to the read's end, and the c_ columns follow
-productive. Give one locus' C regions (coding CH1 onward, e.g. human IGHC):
-the gate counts every C gene in the file. prepare warns about C records that
+of the called J's end, in the J's locus, and aligned to the read's end. The
+gate counts the C genes of that locus. prepare warns about C records that
 cannot be anchored (5'-truncated, genomic) and J records whose 3' end strays.
 simulate --c reads 80 % of reads through the J-C splice into a C allele and
 adds c_call, c_equivalent, c_start and c_end to the truth; evaluate then
@@ -61,11 +71,11 @@ scores C by its length against anchored equivalence.
 
 options:
   --profile NAME       r (default) | truth | igblast | sensitive-d
-                       r is Swig's r_optimized; also accepts r_optimized, truth_optimized, sensitive_d
+                       (also r_optimized, truth_optimized, igblast_compatible, sensitive_d)
   --threads N          worker threads (default: all cores)
-  --chain TYPE         heavy | light (default: voted from the database)
-  --tandem-d           allow VDDJ paths (second D as a first-class node)
-  --forward-only       do not try the reverse complement
+  --chain TYPE         heavy | light (default: voted per locus from the database)
+  --strand S           both (default) | forward | reverse
+  --min-identity F     drop V, D and J hits below identity F (0-1; default none)
   --no-anchor-window   do not add the conserved-anchor D window
   --no-posterior       skip posterior probabilities (*_posterior columns; ~30 % faster)
   --calls MODEL        the model the call maximises: per-read (each read's own, the
@@ -76,8 +86,20 @@ options:
   --d-presence-rate R  D prior from the D search's own chance-hit count (alleles x
                        offsets x positions) at D-presence rate R, 0 < R < 1, instead
                        of genes x positions at even odds (docs/ALGORITHM.md 2.3)
+  --min-d-match N      shortest exact run of an admissible D (default: the profile's)
+  --d-mismatch S       D mismatch score, negative (default: the profile's)
+  --j-mismatch S       J mismatch score, negative (default: the profile's)
+  --min-j-length N     fewest aligned J columns of a J hit (default none)
   --c-evalue E         call C when its anchored E-value, C genes x 7 start
                        diagonals x e^(-lambda S), is at most E (default 1e-3)
+  --c-prefix-identity F  report C only where the germline from its first base
+                       reaches identity F (c_prefix_identity; default off)
+  --double-d MODE      off (default) | all | long-span: Swig's double-D screen, a
+                       tandem-D reading of every V...J call, written to --double-d-out
+  --double-d-out FILE  the screen's sidecar TSV
+  --double-d-min-span N, --double-d-seed-length N, --double-d-pseudo-trim N,
+  --double-d-pseudo-mismatches N, --double-d-min-gain S
+                       the screen's evidence rules (defaults 40, 11, 5, 3, 8)
   --simd NAME          alignment kernel: avx512 | avx2 | neon | portable | scalar
                        (default: the fastest this CPU supports, avx512 excepted)
   --residual           ordinary commit-V/J-then-D adjudication instead of the DAG
@@ -108,13 +130,13 @@ impl Mode {
     fn takes_value(self, name: &str) -> Option<bool> {
         let germline = matches!(name, "v" | "d" | "j" | "c");
         let own = match self {
-            Mode::Assign => germline,
+            Mode::Assign => germline || name == "double-d-out",
             Mode::Prepare => germline || matches!(name, "out" | "chain"),
             Mode::Simulate => {
                 germline
                     || matches!(
                         name,
-                        "out" | "chain" | "preset" | "reads" | "seed" | "rc" | "shm"
+                        "out" | "chain" | "preset" | "reads" | "seed" | "rc" | "shm" | "dd"
                     )
             }
             Mode::Evaluate => name == "truth",
@@ -166,6 +188,9 @@ struct Args {
     seed: Option<String>,
     rc: Option<String>,
     shm: Option<String>,
+    dd: Option<String>,
+    /// Assignment: the double-D sidecar.
+    double_d_out: Option<String>,
 }
 
 /// What the command line asks for.
@@ -238,6 +263,8 @@ fn parse_args() -> Result<Command, String> {
             "seed" => &mut args.seed,
             "rc" => &mut args.rc,
             "shm" => &mut args.shm,
+            "dd" => &mut args.dd,
+            "double-d-out" => &mut args.double_d_out,
             _ => {
                 args.run
                     .set(name, value.as_deref())
@@ -303,17 +330,34 @@ fn run_assign(args: &Args) -> Result<(), Box<dyn Error>> {
     let reads = args
         .input
         .as_deref()
-        .ok_or("a reads file (FASTA, FASTQ or '-') is required")?;
+        .ok_or("a reads file (FASTA, FASTQ, AIRR TSV or '-') is required")?;
+    let screening = args.run.double_d.mode != DoubleDMode::Off;
+    if screening != args.double_d_out.is_some() {
+        return Err("--double-d and --double-d-out go together".into());
+    }
     let database = load_database(&args.files, &args.run)?;
-    let run = Run::new(&args.run, database)?;
+    let mut run = Run::new(&args.run, database)?;
+    let mut sidecar = args
+        .double_d_out
+        .as_deref()
+        .map(|path| {
+            File::create(path)
+                .map(BufWriter::new)
+                .map_err(|e| format!("{path}: {e}"))
+        })
+        .transpose()?;
     let started = Instant::now();
     let mut out = BufWriter::new(io::stdout().lock());
+    let double_d = sidecar.as_mut().map(|s| s as &mut dyn Write);
     let (source, written) = match reads {
-        "-" => ("stdin", run.write_airr(io::stdin().lock(), &mut out)),
+        "-" => (
+            "stdin",
+            run.write_airr(io::stdin().lock(), &mut out, double_d),
+        ),
         path => {
             let file = File::open(path).map_err(|e| format!("{path}: {e}"))?;
             let input = BufReader::with_capacity(1 << 20, file);
-            (path, run.write_airr(input, &mut out))
+            (path, run.write_airr(input, &mut out, double_d))
         }
     };
     let tally = written.map_err(|e| match e {
@@ -321,9 +365,16 @@ fn run_assign(args: &Args) -> Result<(), Box<dyn Error>> {
         e => e.to_string(),
     })?;
     out.flush()?;
+    if let Some(sidecar) = sidecar.as_mut() {
+        sidecar.flush()?;
+    }
     let seconds = started.elapsed().as_secs_f64();
+    let screened = match screening {
+        true => format!(", {} double-D", tally.double_d),
+        false => String::new(),
+    };
     eprintln!(
-        "swig: {} reads ({} with a V(D)J path) in {seconds:.1} s ({:.0} reads/s)",
+        "swig: {} reads ({} with a V(D)J path{screened}) in {seconds:.1} s ({:.0} reads/s)",
         tally.reads,
         tally.called,
         tally.reads as f64 / seconds.max(1e-9)
@@ -353,6 +404,9 @@ fn run_simulate(args: &Args) -> Result<(), Box<dyn Error>> {
         .with_reverse_complement(number(&args.rc, "--rc", 0.5)?);
     if args.shm.is_some() {
         params = params.with_shm(number(&args.shm, "--shm", 0.0)?);
+    }
+    if args.dd.is_some() {
+        params.include_dd = number(&args.dd, "--dd", 0.0)?;
     }
     let count: usize = number(&args.count, "--reads", 10_000)?;
     let seed: u64 = number(&args.seed, "--seed", 1)?;

@@ -43,25 +43,51 @@ impl Orientation {
     }
 }
 
+/// The strands a read is assigned on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OrientationPolicy {
-    /// Consider the reverse complement at all.
+    /// Consider the read as given.
+    pub try_forward: bool,
+    /// Consider the reverse complement.
     pub try_reverse: bool,
 }
 
 impl Default for OrientationPolicy {
     fn default() -> Self {
-        Self { try_reverse: true }
+        Self {
+            try_forward: true,
+            try_reverse: true,
+        }
     }
 }
 
 impl OrientationPolicy {
     /// Forward only (pre-oriented input).
-    pub const FORWARD_ONLY: Self = Self { try_reverse: false };
+    pub const FORWARD_ONLY: Self = Self {
+        try_forward: true,
+        try_reverse: false,
+    };
+    /// Reverse complement only (input read from the other strand).
+    pub const REVERSE_ONLY: Self = Self {
+        try_forward: false,
+        try_reverse: true,
+    };
+
+    /// The one strand allowed, if only one is.
+    pub fn only(&self) -> Option<Orientation> {
+        match (self.try_forward, self.try_reverse) {
+            (true, false) => Some(Orientation::Forward),
+            (false, true) => Some(Orientation::Reverse),
+            _ => None,
+        }
+    }
 
     /// Strictly stronger reverse evidence flips the strand; ties stay forward.
     pub fn choose(&self, forward: u32, reverse: u32) -> Orientation {
-        if self.try_reverse && reverse > forward {
+        if let Some(only) = self.only() {
+            return only;
+        }
+        if reverse > forward {
             Orientation::Reverse
         } else {
             Orientation::Forward

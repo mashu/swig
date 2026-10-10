@@ -231,7 +231,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let record = AirrRecord::from_call("r", "", call, &assigner, &[None, None, None]);
             v += usize::from(record.v.is_some());
             j += usize::from(record.j.is_some());
-            path += usize::from(record.path_score.is_some());
+            path += usize::from(call.path.is_some());
         }
         println!(
             "random reads {n}: with a path {:.2}%  V called {:.2}%  J called {:.2}%",
