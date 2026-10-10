@@ -161,7 +161,7 @@ pub(crate) fn probability(p: f64) -> String {
     }
 }
 
-fn push_run(cigar: &mut String, symbol: char, length: u32) {
+pub(crate) fn push_run(cigar: &mut String, symbol: char, length: u32) {
     if length > 0 {
         let _ = write!(cigar, "{length}{symbol}");
     }

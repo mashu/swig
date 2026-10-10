@@ -19,8 +19,8 @@ doc = false
 lto = "thin"
 codegen-units = 1
 
-# The WebAssembly modules (`wasm/build.sh`): whole-program LTO and no symbol
-# names, for a smaller download.
+# Swig's WebAssembly module (`scripts/build-swig-wasm.sh`): whole-program LTO
+# and no symbol names, for a smaller download.
 [profile.wasm]
 inherits = "release"
 lto = "fat"

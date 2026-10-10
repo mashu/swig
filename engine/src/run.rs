@@ -35,7 +35,7 @@ use crate::alphabet::encode;
 use crate::annotate::{AnnotateOptions, ChainType};
 use crate::batch::assign_map;
 use crate::config::{BuildError, DPrior, DefaultAssigner, DefaultVRetriever, EngineConfig};
-use crate::double_d::{self, DoubleDMode, DoubleDOptions};
+use crate::double_d::{self, DoubleDMode, DoubleDOptions, DoubleDScreen};
 use crate::germline::SegmentKind;
 use crate::orient::OrientationPolicy;
 use crate::pipeline::{AlleleCatalog, Assigner, VdjAssigner};
@@ -167,9 +167,9 @@ fn parsed<T>(
     parse(value).ok_or_else(|| OptionError(format!("--{name} expects {expects}, got '{value}'")))
 }
 
-/// A fraction in (0, 1].
+/// A fraction in [0, 1].
 fn fraction(value: &str) -> Option<f64> {
-    value.parse().ok().filter(|f: &f64| *f > 0.0 && *f <= 1.0)
+    value.parse().ok().filter(|f: &f64| (0.0..=1.0).contains(f))
 }
 
 /// `scoring` with mismatch score `mismatch`.
@@ -286,12 +286,12 @@ impl RunOptions {
                 self.c_evalue = Some(parsed(name, value, "a positive number", evalue)?);
             }
             "c-prefix-identity" => {
-                self.c_prefix_identity =
-                    Some(parsed(name, value, "a fraction in (0, 1]", fraction)?);
+                // 0 turns the gate off.
+                let gate = parsed(name, value, "a fraction in [0, 1]", fraction)?;
+                self.c_prefix_identity = (gate > 0.0).then_some(gate);
             }
             "min-identity" => {
-                let floor = |v: &str| v.parse().ok().filter(|f: &f64| (0.0..=1.0).contains(f));
-                self.min_identity = Some(parsed(name, value, "a fraction in [0, 1]", floor)?);
+                self.min_identity = Some(parsed(name, value, "a fraction in [0, 1]", fraction)?);
             }
             "min-d-match" => {
                 self.min_d_match = Some(parsed(name, value, "a positive number", positive)?);
@@ -311,7 +311,12 @@ impl RunOptions {
                 self.double_d.min_vj_span = parsed(name, value, "a number", count)?;
             }
             "double-d-seed-length" => {
-                self.double_d.seed_length = parsed(name, value, "a positive number", positive)?;
+                let seed = |v: &str| {
+                    v.parse()
+                        .ok()
+                        .filter(|l| double_d::SEED_LENGTHS.contains(l))
+                };
+                self.double_d.seed_length = parsed(name, value, "a number from 6 to 24", seed)?;
             }
             "double-d-pseudo-trim" => {
                 self.double_d.pseudo_trim = parsed(name, value, "a number", count)?;
@@ -514,7 +519,7 @@ fn assigned<T: VdjAssigner + AlleleCatalog + Sync>(
     sequences: &[&[u8]],
     threads: usize,
     c_prefix_identity: Option<f64>,
-    double_d: &DoubleDOptions,
+    screen: Option<&DoubleDScreen>,
 ) -> Vec<Assigned> {
     let encoded: Vec<Vec<u8>> = sequences.iter().map(|s| encode(s)).collect();
     assign_map(assigner, &encoded, threads, |i, call| {
@@ -528,21 +533,20 @@ fn assigned<T: VdjAssigner + AlleleCatalog + Sync>(
         {
             record.c = None;
         }
-        let screened = double_d::screen(
-            0,
-            "",
-            record.locus,
-            [record.v.as_ref(), record.d.as_ref(), record.j.as_ref()],
-            &call,
-            assigner,
-            support,
-            double_d,
-        );
+        let double_d = screen
+            .zip(assigner.segment(SegmentKind::D))
+            .and_then(|(screen, d)| {
+                screen.screen(
+                    d.set(),
+                    &call.query,
+                    record.locus,
+                    [record.v.as_ref(), record.d.as_ref(), record.j.as_ref()],
+                )
+            });
         Assigned {
             // `sequence_id`, `sequence` and `quality` are the read's own.
             airr: tail(&record.to_tsv(), 3).to_string(),
-            // The index and `sequence_id` too.
-            double_d: screened.map(|row| tail(&row, 2).to_string()),
+            double_d,
             called: call.path.is_some(),
         }
     })
@@ -554,7 +558,8 @@ pub struct Run {
     support: SupportModels,
     threads: usize,
     c_prefix_identity: Option<f64>,
-    double_d: DoubleDOptions,
+    /// The double-D screen, when it is on and there is a D database.
+    screen: Option<DoubleDScreen>,
     cache: Cache,
     /// Reads seen so far: a read without an identifier is `sequence_N`.
     ordinal: usize,
@@ -566,13 +571,6 @@ impl Run {
         if options.c_evalue.is_some() && database.c.is_none() {
             return Err(OptionError("--c-evalue needs a C database (--c)".into()).into());
         }
-        let screening = options.double_d.mode != DoubleDMode::Off;
-        if screening && options.residual {
-            return Err(OptionError(
-                "the double-D screen needs the placement DAG, not --residual".into(),
-            )
-            .into());
-        }
         let config = options.config();
         let support =
             [&config.v.scoring, &config.d.scoring, &config.j.scoring].map(KarlinAltschul::ungapped);
@@ -581,9 +579,10 @@ impl Run {
         if let Some(c) = database.c {
             assigner = assigner.with_constant(c, &config.c)?;
         }
-        if screening {
-            assigner = assigner.with_tandem_screen();
-        }
+        let screen = assigner
+            .segment(SegmentKind::D)
+            .filter(|_| options.double_d.mode != DoubleDMode::Off)
+            .map(|d| DoubleDScreen::new(d.set(), options.double_d));
         let engine = if options.residual {
             Engine::Residual(assigner.with_adjudicator(ResidualAdjudicator {
                 min_retained: config.min_retained,
@@ -597,7 +596,7 @@ impl Run {
             support,
             threads: options.threads,
             c_prefix_identity: options.c_prefix_identity,
-            double_d: options.double_d,
+            screen,
             cache: Cache::default(),
             ordinal: 0,
         })
@@ -640,7 +639,7 @@ impl Run {
                 &fresh,
                 self.threads,
                 self.c_prefix_identity,
-                &self.double_d,
+                self.screen.as_ref(),
             ),
             Engine::Residual(a) => assigned(
                 a,
@@ -648,7 +647,7 @@ impl Run {
                 &fresh,
                 self.threads,
                 self.c_prefix_identity,
-                &self.double_d,
+                self.screen.as_ref(),
             ),
         };
         let batch: HashMap<&[u8], Assigned> = fresh.into_iter().zip(found).collect();
@@ -673,7 +672,7 @@ impl Run {
             rows.airr += &assigned.airr;
             rows.airr.push('\n');
             if let Some(rest) = &assigned.double_d {
-                rows.double_d += &format!("{index}\t{id}{rest}\n");
+                rows.double_d += &format!("{index}\t{id}\t{rest}\n");
                 rows.tally.double_d += 1;
             }
             rows.tally.reads += 1;

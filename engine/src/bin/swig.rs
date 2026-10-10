@@ -93,9 +93,10 @@ options:
   --c-evalue E         call C when its anchored E-value, C genes x 7 start
                        diagonals x e^(-lambda S), is at most E (default 1e-3)
   --c-prefix-identity F  report C only where the germline from its first base
-                       reaches identity F (c_prefix_identity; default off)
+                       reaches identity F (c_prefix_identity; default 0, off)
   --double-d MODE      off (default) | all | long-span: Swig's double-D screen, a
-                       tandem-D reading of every V...J call, written to --double-d-out
+                       seeded search for two D between every call's V and J,
+                       written to --double-d-out
   --double-d-out FILE  the screen's sidecar TSV
   --double-d-min-span N, --double-d-seed-length N, --double-d-pseudo-trim N,
   --double-d-pseudo-mismatches N, --double-d-min-gain S
