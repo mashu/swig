@@ -7,7 +7,8 @@
 // index.html is opened from disk, as a file: page with no server, and from a
 // static HTTP server. Its calls.tsv, and assignInWorkers' TSV, must equal the
 // native command line's; opened from disk, it may request nothing but itself
-// and the blobs it makes. Each browser named (default chromium) must be
+// and the blobs it makes (Chromium reports every load; Playwright's Firefox
+// reports only HTTP ones). Each browser named (default chromium) must be
 // installed.
 
 import assert from 'node:assert/strict';

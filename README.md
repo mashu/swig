@@ -227,8 +227,9 @@ const file = new Blob(parts);                 // the AIRR TSV at any size: heade
   and both modules inlined (`web/standalone.js`, 2.5 MB): it compiles the
   embedded bytes and starts its workers from a blob, so it fetches nothing
   and runs opened from disk or from any static host. The browser test
-  opens it from disk and checks that it requests nothing but itself and
-  its blobs. CI uploads it with the API and both modules as the
+  opens it from disk in Chromium, Firefox and WebKit, and checks in
+  Chromium, which reports every load, that it requests nothing but itself
+  and its blobs. CI uploads it with the API and both modules as the
   `vdj-assign-web` artifact, which `.github/workflows/pages.yml` publishes
   to GitHub Pages after CI passes on `main`; each release ships it as
   `vdj-assign-<version>.html` and, with the API, as

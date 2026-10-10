@@ -20,8 +20,8 @@ pushed tag or a hand run of the Release workflow on `main` does the same.
 - `assignInWorkers` takes a `createWorker` option; its default, a module
   worker on `worker.js`, is unchanged.
 - The browser test opens the page from disk and from a server in Chromium,
-  Firefox and WebKit, and checks that the page opened from disk requests
-  nothing but itself and its blobs.
+  Firefox and WebKit, and checks in Chromium, which reports every load,
+  that the page opened from disk requests nothing but itself and its blobs.
 
 ### Releases
 

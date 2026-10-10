@@ -38,9 +38,10 @@ script() {
             file=${line#'//@ '}
             key=baseline
             [ "$file" = vdj_assign_simd.wasm ] && key=simd
-            printf "  %s: '" "$key"
-            base64 < "web/$file" | tr -d '\n'
-            printf "',\n"
+            # Not in a pipeline, so a failing or missing base64 stops the build.
+            encoded=$(base64 < "web/$file") || fail "base64 failed on web/$file"
+            [ -n "$encoded" ] || fail "web/$file is empty"
+            printf "  %s: '%s',\n" "$key" "$(printf '%s' "$encoded" | tr -d '\n')"
             ;;
         '//@ vdj-assign.js')
             sed -e 's/^export //' -e 's/import\.meta\.url/self.location.href/g' web/vdj-assign.js
@@ -62,6 +63,8 @@ marker='<script type="module" src="app.js"></script>'
 [ "$(grep -cxF "$marker" web/page.html)" = 1 ] ||
     fail "web/page.html must hold the line '$marker' once"
 bundle=web/index.html.tmp
+# A failed build leaves no partial files behind (and web/index.html as it was).
+trap 'rm -f "$bundle" "$bundle.js"' EXIT
 script > "$bundle.js"
 # The script is inline: nothing in it may end or escape the script element,
 # and no module syntax may remain.
