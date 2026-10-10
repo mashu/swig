@@ -1,4 +1,4 @@
-# vdj_assign
+# swig
 
 Seeded, banded, affine V(D)J germline assignment with placement-DAG
 adjudication. It started as a Rust implementation of the SwiftIG / Swig 0.38.x
@@ -24,7 +24,7 @@ platform's `exp` differs in the last bit (see *In the browser* below).
 
 ## Install
 
-Each [release](https://github.com/mashu/vdj_assign/releases) ships the
+Each [release](https://github.com/mashu/swig/releases) ships the
 command line for Linux (x86-64, AArch64), macOS (Intel, Apple silicon) and
 Windows (x86-64), and the browser build; see [CHANGELOG.md](CHANGELOG.md)
 for the files. Every archive was unpacked and tested on its own platform
@@ -32,23 +32,23 @@ before the release was published.
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS  # macOS: shasum -a 256 --check --ignore-missing SHA256SUMS
-tar xzf vdj-assign-0.1.1-x86_64-unknown-linux-gnu.tar.gz
-vdj-assign-0.1.1-x86_64-unknown-linux-gnu/vdj-assign --version
+tar xzf swig-0.1.1-x86_64-unknown-linux-gnu.tar.gz
+swig-0.1.1-x86_64-unknown-linux-gnu/swig --version
 ```
 
 The binaries are not signed. On macOS, clear the quarantine flag before the
-first run: `xattr -dr com.apple.quarantine vdj-assign-0.1.1-aarch64-apple-darwin`
-(`vdj-assign-0.1.1-x86_64-apple-darwin` on Intel). On Windows, unzip
-`vdj-assign-0.1.1-x86_64-pc-windows-msvc.zip` and run `vdj-assign.exe`.
+first run: `xattr -dr com.apple.quarantine swig-0.1.1-aarch64-apple-darwin`
+(`swig-0.1.1-x86_64-apple-darwin` on Intel). On Windows, unzip
+`swig-0.1.1-x86_64-pc-windows-msvc.zip` and run `swig.exe`.
 
 To try it without installing anything, open the web demo:
-https://mashu.github.io/vdj_assign/ (deployed from `main` whenever CI
+https://mashu.github.io/swig/ (deployed from `main` whenever CI
 passes). The browser build needs no installation and no server: open
-`vdj-assign-0.1.1.html` in a browser (double-click it, or drag it into a
+`swig-0.1.1.html` in a browser (double-click it, or drag it into a
 window). It is one self-contained page, both WebAssembly modules included,
 that computes in the browser and uploads nothing; *Use demo data* fills in a
 synthetic database and reads. Put the same file on any static host (GitHub
-Pages, an intranet folder) to share it. `vdj-assign-web-0.1.1.zip` holds it
+Pages, an intranet folder) to share it. `swig-web-0.1.1.zip` holds it
 as `index.html` next to the JavaScript API, which Node.js 18 or later
 imports as an ES module (see *In the browser* below).
 
@@ -59,26 +59,26 @@ cargo build --release                          # always run the release build
 cargo test --release                           # unit, annotation, robustness, synthetic and simulated-accuracy tests
 cargo test --release -- --ignored              # + accuracy at scale: 20,000 reads per preset
 
-target/release/vdj-assign --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta \
+target/release/swig --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta \
     [--profile r|truth|igblast|sensitive-d] [--threads N] [--tandem-d] \
     [--chain heavy|light] [--forward-only] [--no-anchor-window] [--no-posterior] [--residual] \
     [--calls per-read|fixed] [--d-allele map|max-marginal] [--d-presence-rate R] \
     [--simd avx512|avx2|neon|portable|scalar] [--c IGHC.fasta [--c-evalue E]] \
     reads.fastq > calls.tsv
 
-zcat reads.fastq.gz | target/release/vdj-assign --v V.fasta --d D.fasta --j J.fasta - > calls.tsv
+zcat reads.fastq.gz | target/release/swig --v V.fasta --d D.fasta --j J.fasta - > calls.tsv
 
 # optional: write the annotated database for review or curation
-target/release/vdj-assign prepare --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta [--c IGHC.fasta] \
+target/release/swig prepare --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta [--c IGHC.fasta] \
     --out prepared/
 
 # simulate reads with known truth (IgSim model), then score any tool's AIRR TSV against it
-target/release/vdj-assign simulate --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta [--c IGHC.fasta] \
+target/release/swig simulate --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta [--c IGHC.fasta] \
     --preset hard --reads 10000 --seed 1 --out sim          # sim.fasta + sim.truth.tsv
-target/release/vdj-assign --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta sim.fasta > calls.tsv
-target/release/vdj-assign evaluate --truth sim.truth.tsv calls.tsv   # works for IgBLAST etc. too
+target/release/swig --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta sim.fasta > calls.tsv
+target/release/swig evaluate --truth sim.truth.tsv calls.tsv   # works for IgBLAST etc. too
 # two callers (or settings) on the same reads: paired differences, 95 % CIs, exact McNemar tests
-target/release/vdj-assign evaluate --truth sim.truth.tsv calls.tsv other.tsv
+target/release/swig evaluate --truth sim.truth.tsv calls.tsv other.tsv
 
 # accuracy and throughput on simulated reads (synthetic database unless --v/--d/--j are given)
 cargo run --release --example benchmark -- [--v V.fasta --d D.fasta --j J.fasta] \
@@ -138,7 +138,7 @@ the *first* name is any of them, so read the isotype from the genes listed.
 As a library:
 
 ```rust
-use vdj_assign::prelude::*;
+use swig::prelude::*;
 
 let database = prepare(v_set, Some(d_set), j_set, AnnotateOptions::default())?; // dedup + anchors
 let config = CallingProfile::ROptimized.config();
@@ -149,7 +149,7 @@ let calls = assign_all(&assigner, &queries, 0);            // parallel, input or
 ```
 
 or a whole run as the command line performs it, from FASTA text to AIRR TSV
-(`vdj_assign::run`; options by their command-line names):
+(`swig::run`; options by their command-line names):
 
 ```rust
 let mut options = RunOptions::default();
@@ -167,19 +167,19 @@ The page reads the files and runs the module locally; nothing is uploaded.
 
 ```sh
 rustup target add wasm32-unknown-unknown
-wasm/build.sh                                 # web/vdj_assign_simd.wasm, web/vdj_assign.wasm, web/index.html
+wasm/build.sh                                 # web/swig_simd.wasm, web/swig.wasm, web/index.html
 # then open web/index.html in a browser: no server needed
-node web/test.mjs target/release/vdj-assign   # the modules against the command line
-node web/browser-test.mjs target/release/vdj-assign chromium,firefox,webkit
+node web/test.mjs target/release/swig   # the modules against the command line
+node web/browser-test.mjs target/release/swig chromium,firefox,webkit
                                               # the page from disk and from a server, and workers (needs playwright)
 ```
 
 ```js
-import { load, assignInWorkers } from './vdj-assign.js';
+import { load, assignInWorkers } from './swig.js';
 
 const vdj = await load();                     // browser or worker: fetches the SIMD build where the engine has SIMD
 // Node.js cannot fetch file: URLs; give it the bytes:
-// const vdj = await load({ bytes: fs.readFileSync('web/vdj_assign_simd.wasm') });
+// const vdj = await load({ bytes: fs.readFileSync('web/swig_simd.wasm') });
 const run = vdj.createRun({ v, d, j, c, options: { profile: 'r', 'tandem-d': true } });
 const tsv = run.assign(fastqText);            // AIRR TSV, header included, as one string;
                                               // run.parts(reads) for any size (new Blob(parts))
@@ -203,8 +203,8 @@ const file = new Blob(parts);                 // the AIRR TSV at any size: heade
   against the platform's) of a rounding tie: 2 of 260,000 rows in a test,
   with every call identical.
 - **Two modules.** WebAssembly has no run-time feature detection, so
-  `vdj_assign_simd.wasm` uses the `simd128` kernel (every current browser,
-  Node.js) and `vdj_assign.wasm` the scalar kernel; `load()` validates a
+  `swig_simd.wasm` uses the `simd128` kernel (every current browser,
+  Node.js) and `swig.wasm` the scalar kernel; `load()` validates a
   SIMD probe and fetches the right one. 0.9 MB each, 0.3 MB gzipped, no
   imports.
 - **Speed.** With SIMD under V8, 1,100–1,450 reads/s per worker on
@@ -214,7 +214,7 @@ const file = new Blob(parts);                 // the AIRR TSV at any size: heade
   copy of the reads.
 - **Zero dependencies there too.** The module exposes a small C ABI over
   linear memory (`wasm/src/lib.rs`), so it builds with `cargo` and the
-  `wasm32-unknown-unknown` target alone; `web/vdj-assign.js` wraps it, and
+  `wasm32-unknown-unknown` target alone; `web/swig.js` wraps it, and
   runs in browsers, Web Workers and Node.js 18 or later.
 - **The page.** Germline FASTA files (or demo data: a synthetic database
   and simulated reads), reads as FASTA or FASTQ (gzip decompressed by the
@@ -223,17 +223,17 @@ const file = new Blob(parts);                 // the AIRR TSV at any size: heade
 - **One file, no server.** A browser will not let a page opened from disk
   (`file:`) load a module script, fetch a `.wasm` file or start a worker
   from a file. So `wasm/build.sh` writes `web/index.html` from the page's
-  source (`web/page.html`, `web/app.js`) with `vdj-assign.js`, `worker.js`
+  source (`web/page.html`, `web/app.js`) with `swig.js`, `worker.js`
   and both modules inlined (`web/standalone.js`, 2.5 MB): it compiles the
   embedded bytes and starts its workers from a blob, so it fetches nothing
   and runs opened from disk or from any static host. The browser test
   opens it from disk in Chromium, Firefox and WebKit, and checks in
   Chromium, which reports every load, that it requests nothing but itself
   and its blobs. CI uploads it with the API and both modules as the
-  `vdj-assign-web` artifact, which `.github/workflows/pages.yml` publishes
+  `swig-web` artifact, which `.github/workflows/pages.yml` publishes
   to GitHub Pages after CI passes on `main`; each release ships it as
-  `vdj-assign-<version>.html` and, with the API, as
-  `vdj-assign-web-<version>.zip`.
+  `swig-<version>.html` and, with the API, as
+  `swig-web-<version>.zip`.
 
 ## Germline annotation and regions
 
@@ -391,7 +391,7 @@ Synthetic genes are built from heavy and light framework templates:
 
 ### `prepare`
 
-`vdj-assign prepare` writes `V.fasta`, `D.fasta` and `J.fasta` with every
+`swig prepare` writes `V.fasta`, `D.fasta` and `J.fasta` with every
 anchor and region start in the headers (plus `annotation=SOURCE`), `C.fasta`
 with `--c`, and `annotation.tsv` with one row per allele:
 
@@ -760,7 +760,7 @@ Results come back in input order, and reporting is formatted on the workers
 
 ## Simulation and evaluation
 
-`vdj_assign::sim` is a dependency-free port of
+`swig::sim` is a dependency-free port of
 [IgSim.jl](https://github.com/mashu/IgSim.jl). It has the same generative
 model and the `easy`/`mid`/`hard` presets:
 - uniform allele sampling, exonuclease trims, N additions, random flanks;
@@ -784,7 +784,7 @@ It extends IgSim in four ways:
 
 `sim::Truth` holds one read's ground truth and reads and writes it as TSV.
 `sim::Assignment` is a call, built from an `AirrRecord` or from any tool's
-AIRR Rearrangement TSV row. `vdj-assign simulate` and `vdj-assign evaluate`
+AIRR Rearrangement TSV row. `swig simulate` and `swig evaluate`
 expose both, so other callers can be scored on identical reads.
 `sim::Evaluation` scores calls against the truth:
 - an allele call is *equivalent* when the primary allele contains the
@@ -840,15 +840,15 @@ identical sequences, ORFs and pseudogenes included; 95 % intervals ≤ ±0.5 pp)
 
 **Against IgBLAST 1.22** (Bioconda build, defaults, `-organism human` with
 the same germline as BLAST databases; the same simulated reads, all forward
-strand, 5000 per preset, scored by `vdj-assign evaluate`):
+strand, 5000 per preset, scored by `swig evaluate`):
 
 | Preset | Tool | V | V gene | D | J | Junction | D-free reads given a D | Throughput, 4 threads |
 |---|---|---|---|---|---|---|---|---|
-| easy | vdj_assign | **99.88** | **100.00** | **99.29** | 99.84 | **100.00** | 0 % | **5200 reads/s** |
+| easy | swig | **99.88** | **100.00** | **99.29** | 99.84 | **100.00** | 0 % | **5200 reads/s** |
 | easy | IgBLAST | 99.12 | 99.78 | 98.86 | **99.86** | 99.77 | 0 % | 67 reads/s |
-| mid | vdj_assign | **97.88** | **99.72** | 93.35 | **98.74** | **99.97** | **23 %** | **5100 reads/s** |
+| mid | swig | **97.88** | **99.72** | 93.35 | **98.74** | **99.97** | **23 %** | **5100 reads/s** |
 | mid | IgBLAST | 97.18 | 99.62 | **93.73** | 98.60 | 99.72 | 43 % | 66 reads/s |
-| hard | vdj_assign | **89.44** | 98.84 | **83.00** | **92.80** | **99.69** | **16 %** | **5200 reads/s** |
+| hard | swig | **89.44** | 98.84 | **83.00** | **92.80** | **99.69** | **16 %** | **5200 reads/s** |
 | hard | IgBLAST | 89.16 | **98.90** | 81.75 | 91.84 | 98.07 | 30 % | 71 reads/s |
 
 IgBLAST's higher mid-preset D accuracy comes with twice the D calls on D-free
@@ -857,7 +857,7 @@ measured with the previous V retrieval defaults (the current ones use 4 % more
 instructions).
 IgBLAST takes J anchors from its auxiliary file, which lacks three of this
 database's J alleles; the comparison adds them (frame and CDR3 end from
-`vdj-assign prepare`, which agrees with the file on all 13 shared alleles).
+`swig prepare`, which agrees with the file on all 13 shared alleles).
 Without them IgBLAST reports no junction for 18 % of reads.
 
 `examples/diagnose` separates errors by aligning every allele unbanded under

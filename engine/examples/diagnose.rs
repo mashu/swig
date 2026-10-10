@@ -16,12 +16,12 @@ mod common;
 use std::error::Error;
 
 use common::Args;
-use vdj_assign::align::{Aligner, InterSequenceWorkspace};
-use vdj_assign::flank::{OuterExtend, extend_outer};
-use vdj_assign::prelude::*;
-use vdj_assign::scoring::GapCosts;
-use vdj_assign::scoring::SubstitutionProfile;
-use vdj_assign::sim::{Region, SimParams, Simulator};
+use swig::align::{Aligner, InterSequenceWorkspace};
+use swig::flank::{OuterExtend, extend_outer};
+use swig::prelude::*;
+use swig::scoring::GapCosts;
+use swig::scoring::SubstitutionProfile;
+use swig::sim::{Region, SimParams, Simulator};
 
 /// Exhaustive ranking of every allele: (score, allele), best first.
 fn exhaustive(

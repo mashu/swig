@@ -1,4 +1,4 @@
-# Critical assessment of vdj_assign
+# Critical assessment of swig
 
 This assessment covers what the code did at commit `a0ddd70`, what was
 principled and what was patchwork, how each finding was measured, what
@@ -611,15 +611,15 @@ errors that remain are wrong alleles (§5.9).
 
 **Against IgBLAST 1.22.** Same reads (5000 per preset, forward strand), same
 germline as BLAST databases, `-organism human -ig_seqtype Ig -outfmt 19`,
-scored by `vdj-assign evaluate`:
+scored by `swig evaluate`:
 
 | Preset | Tool | V | V gene | D | J | Junction | D called on D-free reads | Reads/s, 4 threads (previous V retrieval) |
 |---|---|---|---|---|---|---|---|---|
-| easy | vdj_assign | 99.88 | 100.00 | 99.29 | 99.84 | 100.00 | 0 % | 5200 |
+| easy | swig | 99.88 | 100.00 | 99.29 | 99.84 | 100.00 | 0 % | 5200 |
 | easy | IgBLAST | 99.12 | 99.78 | 98.86 | 99.86 | 99.77 | 0 % | 67 |
-| mid | vdj_assign | 97.88 | 99.72 | 93.35 | 98.74 | 99.97 | 23 % | 5100 |
+| mid | swig | 97.88 | 99.72 | 93.35 | 98.74 | 99.97 | 23 % | 5100 |
 | mid | IgBLAST | 97.18 | 99.62 | 93.73 | 98.60 | 99.72 | 43 % | 66 |
-| hard | vdj_assign | 89.44 | 98.84 | 83.00 | 92.80 | 99.69 | 16 % | 5200 |
+| hard | swig | 89.44 | 98.84 | 83.00 | 92.80 | 99.69 | 16 % | 5200 |
 | hard | IgBLAST | 89.16 | 98.90 | 81.75 | 91.84 | 98.07 | 30 % | 71 |
 
 IgBLAST's higher mid D accuracy comes with twice the D calls on D-free
@@ -627,7 +627,7 @@ junctions, and its V gene is 0.06 pp better on the hard preset. Two setup
 issues had to be fixed for a fair junction comparison. IgBLAST takes J
 anchors from its auxiliary file, which lacks three of this database's J
 alleles, so it reported no junction for 18 % of reads; the entries were
-added, with frames and CDR3 ends from `vdj-assign prepare`, which agrees
+added, with frames and CDR3 ends from `swig prepare`, which agrees
 with the file on all 13 shared alleles. The remaining disagreements exposed
 item 16 on our side.
 
@@ -643,7 +643,7 @@ the comparisons are statistically meaningful.
   a 95 % interval of ±0.7 pp, so most sub-point differences in §§3–8 were
   within noise. Every comparison below is **paired** (both configurations
   on the same reads) and tested with an exact McNemar test on the reads only
-  one of them gets right (`vdj-assign evaluate --truth T a.tsv b.tsv`,
+  one of them gets right (`swig evaluate --truth T a.tsv b.tsv`,
   `sim::Paired`).
 - **Real germline**: the IMGT human IGH reference shipped in the `airrship`
   PyPI package (424 V including ORFs and pseudogenes, 44 D, 13 J; 415 / 37 /

@@ -67,7 +67,7 @@ impl fmt::Display for ReadError {
             Self::Io(e) => write!(f, "{e}"),
             Self::Gzip => write!(
                 f,
-                "input is gzip-compressed; decompress on the fly, e.g. `zcat reads.fastq.gz | vdj-assign ... -`"
+                "input is gzip-compressed; decompress on the fly, e.g. `zcat reads.fastq.gz | swig ... -`"
             ),
             Self::UnknownFormat { line, found } => {
                 write!(

@@ -4,7 +4,7 @@
 //! alleles with their germline-equivalent alternatives, the labelled read
 //! intervals, the junction, and the D remnant length. It is built from a
 //! [`SimulatedRead`] and written to and read from a TSV, so reads simulated
-//! once can score any tool's AIRR output (`vdj-assign simulate` / `evaluate`).
+//! once can score any tool's AIRR output (`swig simulate` / `evaluate`).
 //!
 //! Coordinates are 0-based half-open on the read *in germline sense*, which
 //! is the oriented query of a caller that orients the read correctly.

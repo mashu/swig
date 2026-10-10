@@ -1,14 +1,14 @@
 //! Accuracy regression tests on simulated repertoires.
 //!
-//! Reads come from the IgSim model ([`vdj_assign::sim`]) on a synthetic
+//! Reads come from the IgSim model ([`swig::sim`]) on a synthetic
 //! IGH-like germline database with a family → gene → allele hierarchy, half
 //! of them reverse-complemented. Seeds are fixed, so every run sees the same
 //! reads; the floors sit a little below the measured accuracy, so a change
 //! that loses accuracy fails here. Accuracy is germline-equivalence aware
-//! (see `vdj_assign::sim::evaluate`).
+//! (see `swig::sim::evaluate`).
 
-use vdj_assign::prelude::*;
-use vdj_assign::sim::{
+use swig::prelude::*;
+use swig::sim::{
     Assignment, Evaluation, Rng, SimParams, Simulator, SyntheticDatabase, SyntheticSpec, Truth,
 };
 
@@ -231,8 +231,8 @@ fn constant_regions_are_called_from_the_splice() {
 /// identical, down to every placement and posterior.
 #[test]
 fn family_bounds_agree_with_full_scoring_under_config_variants() {
-    use vdj_assign::retrieve::UngappedParams;
-    use vdj_assign::segment::HitAcceptance;
+    use swig::retrieve::UngappedParams;
+    use swig::segment::HitAcceptance;
 
     let setup = Setup::new();
     let sim = Simulator::new(

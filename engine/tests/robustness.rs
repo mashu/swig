@@ -1,8 +1,8 @@
 //! Degenerate and adversarial reads: the pipeline must neither panic nor
 //! produce malformed output, and must call nothing it cannot support.
 
-use vdj_assign::prelude::*;
-use vdj_assign::sim::{C_STREAM, Rng, SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
+use swig::prelude::*;
+use swig::sim::{C_STREAM, Rng, SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
 
 fn database() -> SyntheticDatabase {
     SyntheticDatabase::generate(&SyntheticSpec::default(), 11)
@@ -61,10 +61,10 @@ fn check_record(record: &AirrRecord, query_len: usize) {
 
 fn degenerate_reads(db: &SyntheticDatabase) -> Vec<(String, Vec<u8>)> {
     let mut rng = Rng::new(17);
-    let v = vdj_assign::alphabet::decode(&db.v.allele(0).codes).into_bytes();
-    let j = vdj_assign::alphabet::decode(&db.j.allele(0).codes).into_bytes();
-    let c = vdj_assign::alphabet::decode(&db.c.allele(0).codes).into_bytes();
-    let reverse = |s: &[u8]| vdj_assign::sim::reverse_complement(s);
+    let v = swig::alphabet::decode(&db.v.allele(0).codes).into_bytes();
+    let j = swig::alphabet::decode(&db.j.allele(0).codes).into_bytes();
+    let c = swig::alphabet::decode(&db.c.allele(0).codes).into_bytes();
+    let reverse = |s: &[u8]| swig::sim::reverse_complement(s);
     let vj = [v.clone(), j.clone()].concat();
     let vjc = [vj.clone(), c.clone()].concat();
     let mut reads = vec![
@@ -191,11 +191,11 @@ fn degenerate_reads_are_handled_by_every_configuration() {
 fn a_lone_j_is_called_on_either_strand() {
     let db = database();
     let assigner = assigner(&db, &EngineConfig::default());
-    let j = vdj_assign::alphabet::decode(&db.j.allele(0).codes).into_bytes();
+    let j = swig::alphabet::decode(&db.j.allele(0).codes).into_bytes();
     let mut ws = assigner.workspace();
     for (sequence, reverse) in [
         (j.clone(), false),
-        (vdj_assign::sim::reverse_complement(&j), true),
+        (swig::sim::reverse_complement(&j), true),
     ] {
         let call = assigner.assign(&encode(&sequence), &mut ws);
         assert_eq!(call.orientation.is_reverse(), reverse);
@@ -225,9 +225,9 @@ fn fixed_tails_after_a_j_are_not_called_c() {
     let db = database();
     let assigner = constant_assigner(&db, &EngineConfig::default());
     let mut ws = assigner.workspace();
-    let v = vdj_assign::alphabet::decode(&db.v.allele(0).codes);
+    let v = swig::alphabet::decode(&db.v.allele(0).codes);
     for j in db.j.alleles() {
-        let j_bases = vdj_assign::alphabet::decode(&j.codes);
+        let j_bases = swig::alphabet::decode(&j.codes);
         for tail in tails {
             let read = format!("{v}GGTAC{j_bases}{}", String::from_utf8_lossy(tail));
             let call = assigner.assign(&encode(read.as_bytes()), &mut ws);

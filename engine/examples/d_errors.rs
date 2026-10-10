@@ -27,10 +27,10 @@ use std::error::Error;
 use std::ops::Range;
 
 use common::Args;
-use vdj_assign::placement::Placement;
-use vdj_assign::prelude::*;
-use vdj_assign::sim::{SimParams, Simulator, Slot, Truth};
-use vdj_assign::window::DWindowPolicy;
+use swig::placement::Placement;
+use swig::prelude::*;
+use swig::sim::{SimParams, Simulator, Slot, Truth};
+use swig::window::DWindowPolicy;
 
 fn overlaps(a: &Range<usize>, b: &Range<usize>) -> bool {
     a.start < b.end && b.start < a.end
@@ -90,7 +90,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let tally = &mut tallies[usize::from(true_d.span.len() < 8)];
         tally.reads += 1;
         let record = AirrRecord::from_call("x", "", &call, &assigner, &[None, None, None]);
-        let span = |r: &Option<vdj_assign::report::SegmentReport>| {
+        let span = |r: &Option<swig::report::SegmentReport>| {
             r.as_ref()
                 .map(|s| s.sequence_start as usize - 1..s.sequence_end as usize)
         };

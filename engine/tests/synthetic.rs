@@ -7,13 +7,13 @@
 
 use std::collections::{HashMap, HashSet};
 
-use vdj_assign::adjudicate::{
+use swig::adjudicate::{
     Adjudicator, DagScratch, EvidenceModel, PathScore, ReadModel, Topology, Units, Within,
     divergence,
 };
-use vdj_assign::placement::Placement;
-use vdj_assign::prelude::*;
-use vdj_assign::sim::Rng;
+use swig::placement::Placement;
+use swig::prelude::*;
+use swig::sim::Rng;
 
 /// Random ASCII bases as a string.
 fn bases(rng: &mut Rng, len: usize) -> String {
@@ -149,7 +149,7 @@ fn with_c(db: &Db, config: &EngineConfig) -> DefaultAssigner {
         .unwrap()
 }
 
-fn first_label(report: &Option<vdj_assign::report::SegmentReport>) -> Option<String> {
+fn first_label(report: &Option<swig::report::SegmentReport>) -> Option<String> {
     report
         .as_ref()
         .map(|r| r.call.split(',').next().unwrap().to_string())
@@ -782,7 +782,7 @@ fn dag_and_brute(
 /// without a per-base N/P cost.
 #[test]
 fn dag_equals_brute_force_on_hypermutated_igsim_reads() {
-    use vdj_assign::sim::{SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
+    use swig::sim::{SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
     let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 11);
     let config = EngineConfig::default();
     let assigner =
@@ -835,7 +835,7 @@ fn dag_equals_brute_force_on_hypermutated_igsim_reads() {
 /// the fixed-scale call's.
 #[test]
 fn per_read_dag_equals_exhaustive_enumeration() {
-    use vdj_assign::sim::{SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
+    use swig::sim::{SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
     let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 11);
     let config = EngineConfig::default();
     let assigner =
@@ -920,7 +920,7 @@ fn per_read_dag_equals_exhaustive_enumeration() {
 /// [`Within`]; with every placement kept it is the unconditioned call.
 #[test]
 fn conditioned_dag_equals_exhaustive_enumeration() {
-    use vdj_assign::sim::{SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
+    use swig::sim::{SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
     let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 11);
     let config = EngineConfig::default();
     let assigner =
@@ -981,7 +981,7 @@ fn conditioned_dag_equals_exhaustive_enumeration() {
 /// read, and changes a D only to an allele of larger posterior mass.
 #[test]
 fn max_marginal_d_keeps_the_topology_and_raises_the_d_mass() {
-    use vdj_assign::sim::{SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
+    use swig::sim::{SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
     let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 11);
     let assigner = |d_allele| {
         let config = EngineConfig {

@@ -1,6 +1,6 @@
-# The vdj_assign algorithm
+# The swig algorithm
 
-This document is a methods-section description of what vdj_assign computes
+This document is a methods-section description of what swig computes
 (the model) and how it finds it (the search). It gives the guarantee of each
 search step: *exact*, *lossless* (provably drops nothing the model could
 choose), *bounded* (drops only what lies outside a stated geometric bound), or
@@ -732,7 +732,7 @@ V/D/J databases from the same FASTA), scored by the same evaluator after
 mapping IgBLAST's names back. IgBLAST takes J frames and CDR3 ends from its
 auxiliary file, which must list every J allele of the database: three were
 missing (IGHJ4\*02_g23-, IGHJ5\*02_c33t, IGHJ5\*04) and were added from
-`vdj-assign prepare`'s anchors (CDR3 end = anchor − 1, frame = anchor mod 3;
+`swig prepare`'s anchors (CDR3 end = anchor − 1, frame = anchor mod 3;
 these agree with the file on all 13 shared alleles). Without them IgBLAST
 reports no junction for 18 % of reads.
 

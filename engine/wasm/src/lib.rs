@@ -1,6 +1,6 @@
-//! The WebAssembly module of vdj_assign: a C ABI over linear memory for
+//! The WebAssembly module of swig: a C ABI over linear memory for
 //! JavaScript hosts (browsers, Web Workers, Node.js), with no bindings
-//! generator. `web/vdj-assign.js` wraps it in a JavaScript API.
+//! generator. `web/swig.js` wraps it in a JavaScript API.
 //!
 //! The module runs the library's [`Run`] exactly as the command line does:
 //! the same options by the same names, the same database preparation and
@@ -28,10 +28,10 @@ use std::fmt::Write as _;
 use std::io::Cursor;
 use std::rc::Rc;
 
-use vdj_assign::align::Backend;
-use vdj_assign::config::CSegmentConfig;
-use vdj_assign::prelude::*;
-use vdj_assign::sim::{SimParams, Simulator, SyntheticDatabase, SyntheticSpec, Truth};
+use swig::align::Backend;
+use swig::config::CSegmentConfig;
+use swig::prelude::*;
+use swig::sim::{SimParams, Simulator, SyntheticDatabase, SyntheticSpec, Truth};
 
 thread_local! {
     static OUTPUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -284,7 +284,7 @@ pub unsafe extern "C" fn vdj_builder_set(
 }
 
 /// Prepare the builder's database and leave its files as a JSON object
-/// (file name → text) in the output buffer, as `vdj-assign prepare`
+/// (file name → text) in the output buffer, as `swig prepare`
 /// writes them.
 ///
 /// # Safety
@@ -348,7 +348,7 @@ pub unsafe extern "C" fn vdj_run_free(run: *mut Rc<Run>) {
 pub struct Session {
     run: Rc<Run>,
     reader: ReadReader<Cursor<Vec<u8>>>,
-    records: Vec<vdj_assign::reads::ReadRecord>,
+    records: Vec<swig::reads::ReadRecord>,
     len: usize,
     next_block: usize,
     worker: usize,

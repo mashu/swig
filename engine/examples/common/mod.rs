@@ -4,10 +4,10 @@
 use std::error::Error;
 use std::str::FromStr;
 
-use vdj_assign::annotate::AnnotateOptions;
-use vdj_assign::prelude::*;
-use vdj_assign::prepare::{PreparedDatabase, prepare};
-use vdj_assign::sim::{SyntheticDatabase, SyntheticSpec};
+use swig::annotate::AnnotateOptions;
+use swig::prelude::*;
+use swig::prepare::{PreparedDatabase, prepare};
+use swig::sim::{SyntheticDatabase, SyntheticSpec};
 
 /// `--name value` options and `--flag`s, in any order.
 pub struct Args(Vec<String>);

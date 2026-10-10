@@ -3,12 +3,12 @@
 version = 4
 
 [[package]]
-name = "vdj_assign"
-version = "0.1.1"
+name = "swig"
+version = "0.39.0"
 
 [[package]]
-name = "vdj_assign_wasm"
-version = "0.1.1"
+name = "swig_wasm"
+version = "0.39.0"
 dependencies = [
- "vdj_assign",
+ "swig",
 ]

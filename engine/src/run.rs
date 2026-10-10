@@ -11,7 +11,7 @@
 //! schedule batches themselves.
 //!
 //! ```ignore
-//! use vdj_assign::prelude::*;
+//! use swig::prelude::*;
 //! let texts = GermlineTexts { v: &v_fasta, d: Some(&d_fasta), j: &j_fasta, c: None };
 //! let mut options = RunOptions::default();
 //! options.set("profile", Some("r"))?;

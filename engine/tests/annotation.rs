@@ -7,11 +7,11 @@
 //! W occur), random mutation of non-conserved framework residues, random
 //! synonymous codons, and optional 5′ truncation that shifts the frame.
 
-use vdj_assign::annotate::{AlleleAnnotation, AnchorSource, AnnotateOptions, ChainType, annotate};
-use vdj_assign::germline::Allele;
-use vdj_assign::prelude::*;
-use vdj_assign::sim::Rng;
-use vdj_assign::translate::{codon, translate};
+use swig::annotate::{AlleleAnnotation, AnchorSource, AnnotateOptions, ChainType, annotate};
+use swig::germline::Allele;
+use swig::prelude::*;
+use swig::sim::Rng;
+use swig::translate::{codon, translate};
 
 const RESIDUES: &[u8] = b"ACDEFGHIKLMNPQRSTVWY";
 
@@ -382,8 +382,8 @@ fn ambiguous_cys23_of_a_truncated_allele_is_resolved_from_its_sibling() {
 
 #[test]
 fn read_regions_match_the_simulated_rearrangement() {
-    use vdj_assign::prepare::prepare;
-    use vdj_assign::read_regions::ReadRegions;
+    use swig::prepare::prepare;
+    use swig::read_regions::ReadRegions;
     let mut rng = Rng::new(7);
     let mut v = GermlineSet::new(SegmentKind::V);
     let mut v_truth = Vec::new();

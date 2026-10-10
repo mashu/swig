@@ -12,7 +12,7 @@
 //!   constant-region accuracy of any tool's AIRR calls against the truth.
 //!
 //! ```ignore
-//! use vdj_assign::sim::{SimParams, Simulator, Evaluation};
+//! use swig::sim::{SimParams, Simulator, Evaluation};
 //! let sim = Simulator::new(&v, Some(&d), &j, SimParams::hard().with_reverse_complement(0.5))?;
 //! let reads = sim.reads(10_000, 1)?;
 //! let mut evaluation = Evaluation::default();

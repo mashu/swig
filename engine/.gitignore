@@ -1,5 +1,1 @@
 /target
-/web/*.wasm
-/web/index.html
-/web/index.html.tmp*
-/node_modules

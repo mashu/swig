@@ -303,7 +303,7 @@ Each fix has its own commit and a regression test that fails without it.
 | Thread-optional batches | `batch.rs` | The caller works; helpers are spawned only where possible. |
 | Shared run | `run.rs`, `prepare.rs` | `RunOptions`, `PreparedDatabase::{from_fasta, warnings, files}`, `Run`. Used by the binary and the module alike. |
 | Module | `wasm/` | Zero-dependency `cdylib` with a C ABI over linear memory; `wasm/build.sh` builds both modules (0.9 MB each, 0.3 MB gzipped, no imports). |
-| JavaScript API | `web/vdj-assign.js`, `web/worker.js` | `load`, `createRun().assign`, `prepare`, `demo`, `assignInWorkers`. Works in browsers, Web Workers and Node.js 18+. |
+| JavaScript API | `web/swig.js`, `web/worker.js` | `load`, `createRun().assign`, `prepare`, `demo`, `assignInWorkers`. Works in browsers, Web Workers and Node.js 18+. |
 | Page | `web/page.html`, `web/app.js` (built with `web/standalone.js` into the self-contained `web/index.html`) | Files or demo data in, AIRR TSV, prepared database and a preview out. Nothing is uploaded. |
 | Checks | `web/test.mjs`, CI `wasm` job | Both modules agree, sessions reassemble, errors surface, and the module output equals the native command line. 45,000 rows across presets and options are identical, and so is headless Chromium with four workers. |
 

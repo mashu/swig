@@ -8,7 +8,7 @@
 //! ```
 //!
 //! Without germline files a synthetic IGH-like database is generated
-//! ([`vdj_assign::sim::SyntheticDatabase`]). Reads are reverse-complemented
+//! ([`swig::sim::SyntheticDatabase`]). Reads are reverse-complemented
 //! with probability `--rc` (default 0.5). Throughput is measured on the
 //! given number of threads (default 1).
 
@@ -18,8 +18,8 @@ use std::error::Error;
 use std::time::Instant;
 
 use common::Args;
-use vdj_assign::prelude::*;
-use vdj_assign::sim::{Assignment, Evaluation, SimParams, Simulator, Truth};
+use swig::prelude::*;
+use swig::sim::{Assignment, Evaluation, SimParams, Simulator, Truth};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::from_env();
@@ -42,17 +42,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut config = profile.config();
     if let Some(name) = value("--simd") {
         config.simd =
-            Some(vdj_assign::align::Backend::from_name(&name).ok_or("unknown --simd backend")?);
+            Some(swig::align::Backend::from_name(&name).ok_or("unknown --simd backend")?);
     }
     if args.flag("--tandem-d") {
         config.grammar = VdjGrammar::TANDEM_D;
     }
     if let Some(penalty) = value("--p-d") {
-        config.objective.d_prior = vdj_assign::config::DPrior::Fixed(penalty.parse()?);
+        config.objective.d_prior = swig::config::DPrior::Fixed(penalty.parse()?);
     }
     if let Some(e) = value("--anchor-evalue") {
         let e: f64 = e.parse()?;
-        let gates = (e > 0.0).then_some(vdj_assign::segment::EvalueGates {
+        let gates = (e > 0.0).then_some(swig::segment::EvalueGates {
             anchor: e,
             ..Default::default()
         });
@@ -83,7 +83,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     if let Some(sampling) = value("--sampling") {
         // all | closed:W | open:W | min:W
-        use vdj_assign::seed::SeedSampling;
+        use swig::seed::SeedSampling;
         let (kind, w) = match sampling.split_once(':') {
             Some((kind, w)) => (kind, w.parse::<u8>()?),
             None if sampling == "all" => ("all", 0),
@@ -131,14 +131,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     if let Some(v) = list("--seeds") {
-        config.v.primary = vdj_assign::seed::SeedShape::contiguous(v[0].parse()?);
+        config.v.primary = swig::seed::SeedShape::contiguous(v[0].parse()?);
         let fallback: usize = v[1].parse()?;
         config.v.fallback =
-            (fallback > 0).then(|| vdj_assign::seed::SeedShape::contiguous(fallback));
+            (fallback > 0).then(|| swig::seed::SeedShape::contiguous(fallback));
     }
     // Primary V seed as a 0/1 pattern, e.g. a spaced seed `11101101111`.
     if let Some(pattern) = value("--v-shape") {
-        config.v.primary = vdj_assign::seed::SeedShape::from_pattern(&pattern)?;
+        config.v.primary = swig::seed::SeedShape::from_pattern(&pattern)?;
     }
     if let Some(v) = list("--budget") {
         if v.len() != 3 {
@@ -219,7 +219,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Negative control: random reads with the simulated length distribution.
     if let Some(n) = value("--random") {
         let n: usize = n.parse()?;
-        let mut rng = vdj_assign::sim::Rng::new(seed ^ 0xA5A5);
+        let mut rng = swig::sim::Rng::new(seed ^ 0xA5A5);
         let random: Vec<Vec<u8>> = simulated
             .iter()
             .cycle()

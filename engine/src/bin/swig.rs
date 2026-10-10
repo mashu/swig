@@ -1,12 +1,12 @@
-//! `vdj-assign` — assign V(D)J germline alleles to FASTA or FASTQ reads,
-//! AIRR TSV on stdout; `vdj-assign prepare` writes an annotated database;
+//! `swig` — assign V(D)J germline alleles to FASTA or FASTQ reads,
+//! AIRR TSV on stdout; `swig prepare` writes an annotated database;
 //! `simulate` and `evaluate` score any tool on identical simulated reads.
 //!
 //! ```text
-//! vdj-assign --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta [options] reads.fastq > calls.tsv
-//! vdj-assign prepare --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta --out prepared/
-//! vdj-assign simulate --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta --preset hard --out sim
-//! vdj-assign evaluate --truth sim.truth.tsv calls.tsv
+//! swig --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta [options] reads.fastq > calls.tsv
+//! swig prepare --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta --out prepared/
+//! swig simulate --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta --preset hard --out sim
+//! swig evaluate --truth sim.truth.tsv calls.tsv
 //! ```
 
 use std::collections::{HashMap, HashSet};
@@ -17,16 +17,16 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use vdj_assign::prelude::*;
-use vdj_assign::prepare::DatabaseError;
-use vdj_assign::sim::{Assignment, C_STREAM, Evaluation, Paired, Rng, SimParams, Simulator, Truth};
+use swig::prelude::*;
+use swig::prepare::DatabaseError;
+use swig::sim::{Assignment, C_STREAM, Evaluation, Paired, Rng, SimParams, Simulator, Truth};
 
 const USAGE: &str = "\
-usage: vdj-assign --v V.fasta --j J.fasta [--d D.fasta] [--c C.fasta] [options] <reads.fasta|reads.fastq|->
-       vdj-assign prepare --v V.fasta --j J.fasta [--d D.fasta] [--c C.fasta] [--chain heavy|light] --out DIR
-       vdj-assign simulate --v V.fasta --j J.fasta [--d D.fasta] [--c C.fasta] --out PREFIX
+usage: swig --v V.fasta --j J.fasta [--d D.fasta] [--c C.fasta] [options] <reads.fasta|reads.fastq|->
+       swig prepare --v V.fasta --j J.fasta [--d D.fasta] [--c C.fasta] [--chain heavy|light] --out DIR
+       swig simulate --v V.fasta --j J.fasta [--d D.fasta] [--c C.fasta] --out PREFIX
                   [--preset easy|mid|hard] [--reads N] [--seed S] [--rc P] [--shm RATE]
-       vdj-assign evaluate --truth PREFIX.truth.tsv <calls.tsv> [other.tsv]
+       swig evaluate --truth PREFIX.truth.tsv <calls.tsv> [other.tsv]
 
 simulate writes PREFIX.fasta and PREFIX.truth.tsv: reads from the IgSim model
 (presets as in IgSim.jl; --rc reverse-complements that fraction, default 0.5;
@@ -40,7 +40,7 @@ test on the reads only one of them gets right (D also by remnant length),
 and the D allele and D-presence Brier scores with a paired t.
 
 Reads may be FASTA or FASTQ (detected from the first character); '-' reads
-stdin, so compressed input can be streamed: zcat reads.fastq.gz | vdj-assign ... -
+stdin, so compressed input can be streamed: zcat reads.fastq.gz | swig ... -
 
 Germline databases are FASTA. Headers may carry 0-based positions:
   anchor=POS            first base of the V Cys104 / J Trp-Phe118 codon (fixes the frame)
@@ -275,12 +275,12 @@ fn load_database(files: &Files, options: &RunOptions) -> Result<PreparedDatabase
         }
     })?;
     eprintln!(
-        "vdj-assign: database prepared in {:.1} ms: {}",
+        "swig: database prepared in {:.1} ms: {}",
         started.elapsed().as_secs_f64() * 1e3,
         database.summary()
     );
     for warning in database.warnings(CSegmentConfig::default().spread) {
-        eprintln!("vdj-assign: warning: {warning}");
+        eprintln!("swig: warning: {warning}");
     }
     Ok(database)
 }
@@ -290,14 +290,14 @@ fn run_prepare(args: &Args) -> Result<(), Box<dyn Error>> {
     let database = load_database(&args.files, &args.run)?;
     database.write(Path::new(out))?;
     let names: Vec<&str> = database.files().iter().map(|&(name, _)| name).collect();
-    eprintln!("vdj-assign: wrote {} into {out}", names.join(", "));
+    eprintln!("swig: wrote {} into {out}", names.join(", "));
     Ok(())
 }
 
 fn run_assign(args: &Args) -> Result<(), Box<dyn Error>> {
     if cfg!(debug_assertions) {
         eprintln!(
-            "vdj-assign: warning: debug build, typically 10-50x slower; build with `cargo build --release`"
+            "swig: warning: debug build, typically 10-50x slower; build with `cargo build --release`"
         );
     }
     let reads = args
@@ -323,7 +323,7 @@ fn run_assign(args: &Args) -> Result<(), Box<dyn Error>> {
     out.flush()?;
     let seconds = started.elapsed().as_secs_f64();
     eprintln!(
-        "vdj-assign: {} reads ({} with a V(D)J path) in {seconds:.1} s ({:.0} reads/s)",
+        "swig: {} reads ({} with a V(D)J path) in {seconds:.1} s ({:.0} reads/s)",
         tally.reads,
         tally.called,
         tally.reads as f64 / seconds.max(1e-9)
@@ -375,7 +375,7 @@ fn run_simulate(args: &Args) -> Result<(), Box<dyn Error>> {
     reads.flush()?;
     truth.flush()?;
     eprintln!(
-        "vdj-assign: wrote {count} reads to {out}.fasta and their truth to {out}.truth.tsv (preset {preset}, seed {seed})"
+        "swig: wrote {count} reads to {out}.fasta and their truth to {out}.truth.tsv (preset {preset}, seed {seed})"
     );
     Ok(())
 }
@@ -437,7 +437,7 @@ fn run_evaluate(args: &Args) -> Result<(), Box<dyn Error>> {
     {
         if let (Some(path), 1..) = (path, missing) {
             eprintln!(
-                "vdj-assign: {missing} simulated reads have no row in {path}; counted as unassigned"
+                "swig: {missing} simulated reads have no row in {path}; counted as unassigned"
             );
         }
     }
@@ -455,7 +455,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Command::Version) => {
-            println!("vdj-assign {}", env!("CARGO_PKG_VERSION"));
+            println!("swig {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
         Ok(Command::Run(args)) => {
@@ -468,13 +468,13 @@ fn main() -> ExitCode {
             match result {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
-                    eprintln!("vdj-assign: {e}");
+                    eprintln!("swig: {e}");
                     ExitCode::FAILURE
                 }
             }
         }
         Err(e) => {
-            eprintln!("vdj-assign: {e}\n\n{USAGE}");
+            eprintln!("swig: {e}\n\n{USAGE}");
             ExitCode::from(2)
         }
     }

@@ -1,4 +1,4 @@
-//! # vdj_assign
+//! # swig
 //!
 //! Seeded, banded, affine V(D)J germline assignment with placement-DAG
 //! adjudication — a Rust implementation of the SwiftIG method note, organised
@@ -32,7 +32,7 @@
 //! and annotates their anchors and regions, which the assigner reads.
 //!
 //! ```ignore
-//! use vdj_assign::prelude::*;
+//! use swig::prelude::*;
 //! let database = prepare(v, Some(d), j, AnnotateOptions::default())?;
 //! let config = CallingProfile::ROptimized.config();
 //! let assigner = DefaultAssigner::from_config(&config, database.v, database.d, database.j)?;
