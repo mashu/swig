@@ -68,13 +68,43 @@ jobs:
         run: |
           rustup update stable --no-self-update
           rustup default stable
+      # Linux links glibc statically: a dynamic build from these runners needs glibc 2.34,
+      # while swig-cli itself runs from glibc 2.17 (RHEL 8, Ubuntu 20.04, Debian 11 and most
+      # HPC hosts in between). --target keeps the flag off build scripts. Windows links the
+      # C runtime statically through .cargo/config.toml.
       - name: Build the native swig aligner
-        run: cargo build --release --locked --manifest-path engine/Cargo.toml --bin swig
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            triple=$(rustc -vV | sed -n 's/^host: //p')
+            RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --locked --manifest-path engine/Cargo.toml --bin swig --target "$triple"
+            built="engine/target/$triple/release/${{ matrix.binary }}"
+            dynamic=$(readelf -d "$built")
+            if grep -q '(NEEDED)' <<< "$dynamic"; then
+              echo "$dynamic"
+              echo "::error::$built links shared libraries"
+              exit 1
+            fi
+          else
+            cargo build --release --locked --manifest-path engine/Cargo.toml --bin swig
+            built="engine/target/release/${{ matrix.binary }}"
+            if [ "$RUNNER_OS" = Windows ]; then
+              rustup component add llvm-tools
+              objdump="$(cygpath -u "$(rustc --print sysroot)")/lib/rustlib/x86_64-pc-windows-msvc/bin/llvm-objdump.exe"
+              imports=$("$objdump" -p "$built" | grep 'DLL Name')
+              echo "$imports"
+              if grep -qi 'vcruntime' <<< "$imports"; then
+                echo "::error::$built needs the Visual C++ Redistributable"
+                exit 1
+              fi
+            fi
+          fi
+          echo "BUILT_ALIGNER=$built" >> "$GITHUB_ENV"
       - name: Name the release asset
         shell: bash
         run: |
           mkdir -p release
-          cp "engine/target/release/${{ matrix.binary }}" "release/${{ matrix.artifact }}"
+          cp "$BUILT_ALIGNER" "release/${{ matrix.artifact }}"
           "release/${{ matrix.artifact }}" --version
       - uses: actions/upload-artifact@v4
         with:
@@ -162,9 +192,46 @@ jobs:
           path: release/${{ matrix.artifact }}
           if-no-files-found: error
 
+  # The Windows executable is cross-compiled on Linux: run its native route (the embedded
+  # swig.exe extracted under LOCALAPPDATA and piped as a child process) on Windows itself.
+  windows-smoke:
+    name: Windows x86-64 executable
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v4
+        with:
+          name: swig-cli-windows-x64.exe
+          path: release
+      - name: Native-route smoke tests
+        env:
+          SWIG_CLI_EXECUTABLE: ${{ github.workspace }}\release\swig-cli-windows-x64.exe
+        run: node --test --test-name-pattern="native|both aligners" tests/cli-smoke.test.mjs
+      - name: Two first runs share the default cache
+        shell: bash
+        run: |
+          exe=release/swig-cli-windows-x64.exe
+          refs=public/references/kimdb-1.1/Macaca_mulatta/IGH
+          args=(--vdj -query tests/fixtures/kimdb-perfect-d-regression.fasta -germline_db_V "$refs/V.fasta" -germline_db_D "$refs/D.fasta" -germline_db_J "$refs/J.fasta" -outfmt 19)
+          "$exe" "${args[@]}" -out first.tsv 2> first.err & one=$!
+          "$exe" "${args[@]}" -out second.tsv 2> second.err & two=$!
+          wait "$one"; wait "$two"
+          "$exe" "${args[@]}" --aligner wasm -out wasm.tsv 2> wasm.err
+          cat first.err second.err wasm.err
+          grep -q 'native aligner;' first.err
+          grep -q 'native aligner;' second.err
+          cmp first.tsv second.tsv
+          cmp first.tsv wasm.tsv
+          ls -l "$(cygpath "$LOCALAPPDATA")"/swig-cli/*/swig.exe
+
   publish:
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build, aligner]
+    needs: [build, aligner, windows-smoke]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

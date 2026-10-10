@@ -8,11 +8,12 @@
 // back to the queued batches by counting line breaks. It assigns ENGINE_BATCH
 // records at a time and writes a batch's rows only once it has read that many
 // (or the input ended), so the caller keeps more than ENGINE_BATCH records in
-// flight (`window`) and calls finishInput() after its last batch.
+// flight past the batch it awaits (`window`), and calls finishInput() after its
+// last batch, before it awaits the batches still queued.
 
 import { spawn, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { alignerOptions } from "../src/aligner-engine.ts";
@@ -27,19 +28,33 @@ function executableName() {
   return process.platform === "win32" ? "swig.exe" : "swig";
 }
 
-/** Where an embedded binary is extracted to, most preferred first. */
+/**
+ * Where an embedded binary is extracted to, most preferred first. The last
+ * resort is the shared temporary directory, so on POSIX it gets a directory of
+ * its own per user (`private`: checked before anything in it is run).
+ */
 function cacheRoots() {
   const roots = [];
-  if (process.env.SWIG_CLI_CACHE_DIR) roots.push(process.env.SWIG_CLI_CACHE_DIR);
+  if (process.env.SWIG_CLI_CACHE_DIR) roots.push({ path: process.env.SWIG_CLI_CACHE_DIR, private: false });
   if (process.platform === "win32") {
-    if (process.env.LOCALAPPDATA) roots.push(process.env.LOCALAPPDATA);
+    if (process.env.LOCALAPPDATA) roots.push({ path: process.env.LOCALAPPDATA, private: false });
   } else if (process.platform === "darwin") {
-    roots.push(join(homedir(), "Library", "Caches"));
+    roots.push({ path: join(homedir(), "Library", "Caches"), private: false });
   } else {
-    roots.push(process.env.XDG_CACHE_HOME || join(homedir(), ".cache"));
+    roots.push({ path: process.env.XDG_CACHE_HOME || join(homedir(), ".cache"), private: false });
   }
-  roots.push(tmpdir());
+  if (typeof process.getuid === "function") roots.push({ path: join(tmpdir(), `swig-cli-${process.getuid()}`), private: true });
+  else roots.push({ path: tmpdir(), private: false });
   return roots;
+}
+
+/** Create `path` for this user only, and refuse it if another user could change what is in it. */
+function privateDirectory(path) {
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+  const status = lstatSync(path);
+  if (!status.isDirectory() || status.uid !== process.getuid() || (status.mode & 0o077) !== 0) {
+    throw new Error(`${path} is not a directory private to this user`);
+  }
 }
 
 function sha256(bytes) {
@@ -56,12 +71,13 @@ function extract(sourcePath, version) {
   const digest = sha256(bytes);
   const failures = [];
   for (const root of cacheRoots()) {
-    const directory = join(root, "swig-cli", `${version}-${digest.slice(0, 16)}`);
+    const directory = join(root.path, "swig-cli", `${version}-${digest.slice(0, 16)}`);
     const target = join(directory, executableName());
     try {
+      if (root.private) privateDirectory(root.path);
       if (existsSync(target) && sha256(readFileSync(target)) === digest) return target;
       mkdirSync(directory, { recursive: true });
-      const temporary = `${target}.${process.pid}.tmp`;
+      const temporary = `${target}.${randomUUID()}.tmp`;
       writeFileSync(temporary, bytes, { mode: 0o755 });
       chmodSync(temporary, 0o755);
       try {
@@ -83,7 +99,11 @@ function extract(sourcePath, version) {
 function probe(binary, version) {
   const result = spawnSync(binary, ["--version"], { encoding: "utf8", timeout: 15_000, windowsHide: true });
   if (result.error) return `${binary}: ${result.error.message}`;
-  if (result.status !== 0) return `${binary} --version exited with status ${result.status}`;
+  if (result.status !== 0) {
+    // The loader's reason, e.g. a missing shared library.
+    const detail = (result.stderr ?? "").trim().split(/\r?\n/).at(-1);
+    return `${binary} --version exited with ${result.status === null ? `signal ${result.signal}` : `status ${result.status}`}${detail ? `: ${detail}` : ""}`;
+  }
   const reported = result.stdout.trim();
   return reported === `swig ${version}` ? null : `${binary} reports '${reported}', not 'swig ${version}'`;
 }
@@ -120,6 +140,13 @@ export function resolveNativeAligner(assets, version, notes = []) {
   return null;
 }
 
+/** A refused batch: the caller may never await it (ready() throws first), so it is marked handled. */
+function refuse(error) {
+  const refused = Promise.reject(error);
+  refused.catch(() => {});
+  return refused;
+}
+
 export class NativePool {
   /**
    * @param binary the native `swig` executable
@@ -140,9 +167,16 @@ export class NativePool {
     this.carry = null;
     this.ended = false;
     this.drain = null;
+    this.records = 0;
+    this.rows = 0;
   }
 
-  /** Batches the caller may queue before it awaits the oldest one. */
+  /**
+   * Batches the caller may hold before it awaits the oldest one. The caller
+   * awaits the oldest only when a further batch is ready to queue, so every
+   * batch held is full and (window - 1) × batchRecords > ENGINE_BATCH records
+   * follow the oldest: enough to close the engine batch that holds its rows.
+   */
   get window() {
     return Math.floor(ENGINE_BATCH / Math.max(1, this.batchRecords)) + 2;
   }
@@ -188,7 +222,11 @@ export class NativePool {
         readyReject(error);
         this.fail(error);
       } else if (this.jobs.length) {
-        this.fail(new Error(`The native aligner exited with ${this.jobs.length} batch(es) unanswered.`));
+        this.fail(
+          new Error(
+            `The native aligner exited with ${this.jobs.length} batch(es) unanswered (${this.rows.toLocaleString()} rows for ${this.records.toLocaleString()} records).`,
+          ),
+        );
       }
       readyResolve();
     });
@@ -198,7 +236,11 @@ export class NativePool {
   exitMessage(code, signal) {
     if (code === 0) return null;
     const lines = this.stderr.split(/\r?\n/).filter((line) => line && !/^swig: (database prepared|warning:)/.test(line));
-    const detail = lines.at(-1)?.replace(/^swig: /, "") ?? "";
+    // An argument error is followed by the usage text, and a panic by a note:
+    // report the engine's own "swig: " line, or the panic message.
+    const error = lines.findLast((line) => line.startsWith("swig: "));
+    const panic = lines.findIndex((line) => / panicked at /.test(line));
+    const detail = error ? error.slice("swig: ".length) : panic >= 0 ? lines.slice(panic, panic + 2).join(" ") : (lines.at(-1) ?? "");
     return `The native Swig aligner ${signal ? `was stopped by ${signal}` : `exited with status ${code}`}${detail ? `: ${detail}` : "."}`;
   }
 
@@ -234,6 +276,7 @@ export class NativePool {
         const newline = buffer.indexOf(10, position);
         if (newline < 0) break;
         job.remaining -= 1;
+        this.rows += 1;
         position = newline + 1;
         end = position;
       }
@@ -258,15 +301,16 @@ export class NativePool {
    * come back as a Buffer.
    */
   run({ text, count, bytes = false }) {
-    if (this.failed) return Promise.reject(this.failed);
-    if (this.ended) return Promise.reject(new Error("The native aligner's input is closed."));
+    if (this.failed) return refuse(this.failed);
+    if (this.ended) return refuse(new Error("The native aligner's input is closed."));
     if (!text.startsWith(">") && !text.startsWith("@")) {
       const newline = text.indexOf("\n");
       const header = text.slice(0, newline);
       if (this.airrHeader === null) this.airrHeader = header;
-      else if (header !== this.airrHeader) return Promise.reject(new Error("The AIRR input changed its columns between batches."));
+      else if (header !== this.airrHeader) return refuse(new Error("The AIRR input changed its columns between batches."));
       else text = text.slice(newline + 1);
     }
+    this.records += count;
     const promise = new Promise((resolve, reject) => {
       this.jobs.push({ count, remaining: count, parts: [], resolve, reject, bytes });
       if (!this.child.stdin.write(text)) {

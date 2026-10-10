@@ -353,7 +353,8 @@ export async function* airrRecords(source: AsyncIterable<string>): AsyncGenerato
     }
     if (!line.trim()) continue;
     const values = line.split(delimiter);
-    if (values[sequenceColumn]) yield { header, row: line };
+    // A blank sequence is no record, as for the aligner, which counts on one row per record.
+    if (values[sequenceColumn]?.trim()) yield { header, row: line };
   }
 }
 

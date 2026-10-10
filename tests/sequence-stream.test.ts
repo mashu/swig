@@ -225,6 +225,14 @@ test("AIRR input retains its header in every compute batch", async () => {
   assert.ok(!result.batches.some((batch) => batch.text.includes("\nc\t")));
 });
 
+test("AIRR rows whose sequence is only whitespace are no records, as for the aligner", async () => {
+  // The aligner writes one row per record; a row it skips must not be counted in a batch.
+  const source = "sequence_id\tsequence\na\tACGT\nblank\t   \nb\tTGCA\n";
+  const result = await collect(source, 3, 2);
+  assert.deepEqual(result.batches.map((batch) => batch.count), [2]);
+  assert.ok(!result.batches.some((batch) => batch.text.includes("blank")));
+});
+
 test("seeded reservoir subsampling is exact, reproducible, and input-order stable", async () => {
   const source = Array.from({ length: 100 }, (_, index) => `>read_${index}\nACGT${index % 10}\n`).join("");
   const first = await sampledIds(source, 10, 73);

@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 import { _ as annotateDoubleDBatch, a as deduplicate, c as parseFasta$2, d as runDenoisePartitionJob, f as runExactDedupJob, g as annotateAirrBatch, h as DEFAULT_PIPELINE_PLAN, i as createExactDedupPlan, l as prepareReferenceMsa, n as assignLineages, o as finishExactDedupPlan, p as sequenceFingerprint, s as normalizeNt, t as DenoiseAccumulator, v as datasetScopeValue, y as stableDatasetSeed } from "./chunks/post-analysis-core-DJA1I-YZ.mjs";
 import { i as isCallingProfile, n as CALLING_PROFILES, r as alignerOptions } from "./chunks/aligner-engine-DEa3stHz.mjs";
-import { chmodSync, createReadStream, createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, createReadStream, createWriteStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createGunzip, createGzip, gunzipSync, gzipSync } from "node:zlib";
 import { createInterface } from "node:readline";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import { once } from "node:events";
@@ -11198,7 +11198,7 @@ async function* airrRecords(source) {
 			continue;
 		}
 		if (!line.trim()) continue;
-		if (line.split(delimiter)[sequenceColumn]) yield {
+		if (line.split(delimiter)[sequenceColumn]?.trim()) yield {
 			header,
 			row: line
 		};
@@ -12857,16 +12857,48 @@ const ALIGNER_MODES = [
 function executableName() {
 	return process.platform === "win32" ? "swig.exe" : "swig";
 }
-/** Where an embedded binary is extracted to, most preferred first. */
+/**
+* Where an embedded binary is extracted to, most preferred first. The last
+* resort is the shared temporary directory, so on POSIX it gets a directory of
+* its own per user (`private`: checked before anything in it is run).
+*/
 function cacheRoots() {
 	const roots = [];
-	if (process.env.SWIG_CLI_CACHE_DIR) roots.push(process.env.SWIG_CLI_CACHE_DIR);
+	if (process.env.SWIG_CLI_CACHE_DIR) roots.push({
+		path: process.env.SWIG_CLI_CACHE_DIR,
+		private: false
+	});
 	if (process.platform === "win32") {
-		if (process.env.LOCALAPPDATA) roots.push(process.env.LOCALAPPDATA);
-	} else if (process.platform === "darwin") roots.push(join(homedir(), "Library", "Caches"));
-	else roots.push(process.env.XDG_CACHE_HOME || join(homedir(), ".cache"));
-	roots.push(tmpdir());
+		if (process.env.LOCALAPPDATA) roots.push({
+			path: process.env.LOCALAPPDATA,
+			private: false
+		});
+	} else if (process.platform === "darwin") roots.push({
+		path: join(homedir(), "Library", "Caches"),
+		private: false
+	});
+	else roots.push({
+		path: process.env.XDG_CACHE_HOME || join(homedir(), ".cache"),
+		private: false
+	});
+	if (typeof process.getuid === "function") roots.push({
+		path: join(tmpdir(), `swig-cli-${process.getuid()}`),
+		private: true
+	});
+	else roots.push({
+		path: tmpdir(),
+		private: false
+	});
 	return roots;
+}
+/** Create `path` for this user only, and refuse it if another user could change what is in it. */
+function privateDirectory(path) {
+	mkdirSync(path, {
+		recursive: true,
+		mode: 448
+	});
+	const status = lstatSync(path);
+	if (!status.isDirectory() || status.uid !== process.getuid() || (status.mode & 63) !== 0) throw new Error(`${path} is not a directory private to this user`);
 }
 function sha256$1(bytes) {
 	return createHash("sha256").update(bytes).digest("hex");
@@ -12881,12 +12913,13 @@ function extract(sourcePath, version) {
 	const digest = sha256$1(bytes);
 	const failures = [];
 	for (const root of cacheRoots()) {
-		const directory = join(root, "swig-cli", `${version}-${digest.slice(0, 16)}`);
+		const directory = join(root.path, "swig-cli", `${version}-${digest.slice(0, 16)}`);
 		const target = join(directory, executableName());
 		try {
+			if (root.private) privateDirectory(root.path);
 			if (existsSync(target) && sha256$1(readFileSync(target)) === digest) return target;
 			mkdirSync(directory, { recursive: true });
-			const temporary = `${target}.${process.pid}.tmp`;
+			const temporary = `${target}.${randomUUID()}.tmp`;
 			writeFileSync(temporary, bytes, { mode: 493 });
 			chmodSync(temporary, 493);
 			try {
@@ -12910,7 +12943,10 @@ function probe(binary, version) {
 		windowsHide: true
 	});
 	if (result.error) return `${binary}: ${result.error.message}`;
-	if (result.status !== 0) return `${binary} --version exited with status ${result.status}`;
+	if (result.status !== 0) {
+		const detail = (result.stderr ?? "").trim().split(/\r?\n/).at(-1);
+		return `${binary} --version exited with ${result.status === null ? `signal ${result.signal}` : `status ${result.status}`}${detail ? `: ${detail}` : ""}`;
+	}
 	const reported = result.stdout.trim();
 	return reported === `swig ${version}` ? null : `${binary} reports '${reported}', not 'swig ${version}'`;
 }
@@ -12944,6 +12980,12 @@ function resolveNativeAligner(assets, version, notes = []) {
 	}
 	return null;
 }
+/** A refused batch: the caller may never await it (ready() throws first), so it is marked handled. */
+function refuse(error) {
+	const refused = Promise.reject(error);
+	refused.catch(() => {});
+	return refused;
+}
 var NativePool = class {
 	/**
 	* @param binary the native `swig` executable
@@ -12964,8 +13006,15 @@ var NativePool = class {
 		this.carry = null;
 		this.ended = false;
 		this.drain = null;
+		this.records = 0;
+		this.rows = 0;
 	}
-	/** Batches the caller may queue before it awaits the oldest one. */
+	/**
+	* Batches the caller may hold before it awaits the oldest one. The caller
+	* awaits the oldest only when a further batch is ready to queue, so every
+	* batch held is full and (window - 1) × batchRecords > ENGINE_BATCH records
+	* follow the oldest: enough to close the engine batch that holds its rows.
+	*/
 	get window() {
 		return Math.floor(ENGINE_BATCH / Math.max(1, this.batchRecords)) + 2;
 	}
@@ -13024,14 +13073,17 @@ var NativePool = class {
 				const error = new Error(message);
 				readyReject(error);
 				this.fail(error);
-			} else if (this.jobs.length) this.fail(/* @__PURE__ */ new Error(`The native aligner exited with ${this.jobs.length} batch(es) unanswered.`));
+			} else if (this.jobs.length) this.fail(/* @__PURE__ */ new Error(`The native aligner exited with ${this.jobs.length} batch(es) unanswered (${this.rows.toLocaleString()} rows for ${this.records.toLocaleString()} records).`));
 			readyResolve();
 		});
 		await ready;
 	}
 	exitMessage(code, signal) {
 		if (code === 0) return null;
-		const detail = this.stderr.split(/\r?\n/).filter((line) => line && !/^swig: (database prepared|warning:)/.test(line)).at(-1)?.replace(/^swig: /, "") ?? "";
+		const lines = this.stderr.split(/\r?\n/).filter((line) => line && !/^swig: (database prepared|warning:)/.test(line));
+		const error = lines.findLast((line) => line.startsWith("swig: "));
+		const panic = lines.findIndex((line) => / panicked at /.test(line));
+		const detail = error ? error.slice(6) : panic >= 0 ? lines.slice(panic, panic + 2).join(" ") : lines.at(-1) ?? "";
 		return `The native Swig aligner ${signal ? `was stopped by ${signal}` : `exited with status ${code}`}${detail ? `: ${detail}` : "."}`;
 	}
 	fail(error) {
@@ -13065,6 +13117,7 @@ var NativePool = class {
 				const newline = buffer.indexOf(10, position);
 				if (newline < 0) break;
 				job.remaining -= 1;
+				this.rows += 1;
 				position = newline + 1;
 				end = position;
 			}
@@ -13091,15 +13144,16 @@ var NativePool = class {
 	* come back as a Buffer.
 	*/
 	run({ text, count, bytes = false }) {
-		if (this.failed) return Promise.reject(this.failed);
-		if (this.ended) return Promise.reject(/* @__PURE__ */ new Error("The native aligner's input is closed."));
+		if (this.failed) return refuse(this.failed);
+		if (this.ended) return refuse(/* @__PURE__ */ new Error("The native aligner's input is closed."));
 		if (!text.startsWith(">") && !text.startsWith("@")) {
 			const newline = text.indexOf("\n");
 			const header = text.slice(0, newline);
 			if (this.airrHeader === null) this.airrHeader = header;
-			else if (header !== this.airrHeader) return Promise.reject(/* @__PURE__ */ new Error("The AIRR input changed its columns between batches."));
+			else if (header !== this.airrHeader) return refuse(/* @__PURE__ */ new Error("The AIRR input changed its columns between batches."));
 			else text = text.slice(newline + 1);
 		}
+		this.records += count;
 		const promise = new Promise((resolve, reject) => {
 			this.jobs.push({
 				count,
@@ -13363,8 +13417,10 @@ async function* sequenceBatches(input, batchRecords, preprocessing, airrMode, da
 	const filter = preprocessing.fastqFilter;
 	validateFastqQualityFilter(filter);
 	state.fastqFilter = emptyFastqQualityFilterStats(filter.enabled, filter.enabled && format === "fastq");
+	const unnamed = () => `sequence_${state.inputRecords}`;
 	const parsed = async function* () {
 		if (format === "airr") {
+			let identifiers = null;
 			for await (const record of airrRecords(lines)) {
 				state.inputRecords += 1;
 				state.eligibleRecords += 1;
@@ -13373,8 +13429,31 @@ async function* sequenceBatches(input, batchRecords, preprocessing, airrMode, da
 					state.fastqFilter.recordsPassedThrough += 1;
 				}
 				const delimiter = record.header.includes("	") ? "	" : ",";
-				const header = delimiter === "	" ? record.header : record.header.split(delimiter).join("	");
-				const row = delimiter === "	" ? record.row : record.row.split(delimiter).join("	");
+				let header = delimiter === "	" ? record.header : record.header.split(delimiter).join("	");
+				let row = delimiter === "	" ? record.row : record.row.split(delimiter).join("	");
+				if (airrMode !== "preserve") {
+					if (identifiers?.source !== header) {
+						const columns = header.split("	");
+						const column = columns.indexOf("sequence_id");
+						identifiers = {
+							source: header,
+							columns: columns.length,
+							column,
+							header: column < 0 ? `${header}\tsequence_id` : header
+						};
+					}
+					const values = row.split("	");
+					if (identifiers.column < 0) {
+						while (values.length < identifiers.columns) values.push("");
+						values.push(unnamed());
+						row = values.join("	");
+					} else if (!(values[identifiers.column] ?? "").trim()) {
+						while (values.length <= identifiers.column) values.push("");
+						values[identifiers.column] = unnamed();
+						row = values.join("	");
+					}
+					header = identifiers.header;
+				}
 				yield {
 					ordinal: state.inputRecords - 1,
 					text: `${row}\n`,
@@ -13384,13 +13463,15 @@ async function* sequenceBatches(input, batchRecords, preprocessing, airrMode, da
 			return;
 		}
 		if (format === "fasta") {
-			for await (const text of fastaRecords(lines)) {
+			for await (const record of fastaRecords(lines)) {
 				state.inputRecords += 1;
 				state.eligibleRecords += 1;
 				if (filter.enabled) {
 					state.fastqFilter.recordsRetained += 1;
 					state.fastqFilter.recordsPassedThrough += 1;
 				}
+				const newline = record.indexOf("\n");
+				const text = record.slice(1, newline).trim() ? record : `>${unnamed()}${record.slice(newline)}`;
 				yield {
 					ordinal: state.inputRecords - 1,
 					text
@@ -13400,6 +13481,7 @@ async function* sequenceBatches(input, batchRecords, preprocessing, airrMode, da
 		}
 		for await (const record of fastqRecords(lines)) {
 			state.inputRecords += 1;
+			if (!record.header.slice(1).trim()) record.header = `@${unnamed()}`;
 			const text = filter.enabled ? filterFastqRecord(record, filter, state.fastqFilter) : canonicalFastq(record);
 			if (text !== null) {
 				state.eligibleRecords += 1;
@@ -13536,8 +13618,7 @@ var WasmPool = class {
 		else this.available.push(worker);
 	}
 	run(message) {
-		if (this.failed) return Promise.reject(this.failed);
-		return new Promise((resolvePromise, reject) => {
+		const promise = this.failed ? Promise.reject(this.failed) : new Promise((resolvePromise, reject) => {
 			const job = {
 				message,
 				resolve: resolvePromise,
@@ -13547,6 +13628,8 @@ var WasmPool = class {
 			if (worker) this.dispatch(worker, job);
 			else this.queued.push(job);
 		});
+		promise.catch(() => {});
+		return promise;
 	}
 	async close() {
 		const error = /* @__PURE__ */ new Error("The aligner's worker pool closed before queued work completed.");
@@ -14419,11 +14502,15 @@ function createCliWriteStream(path) {
 }
 function createVdjOutput(path) {
 	const file = createCliWriteStream(path);
+	const discard = (stream) => {
+		stream.on("error", () => {});
+		stream.destroy();
+	};
 	if (!/\.gz$/i.test(path)) return {
 		stream: file,
 		opened: once(file, "open"),
 		finish: () => finishWritable(file),
-		destroy: () => file.destroy()
+		destroy: () => discard(file)
 	};
 	const gzip = createGzip();
 	const completed = pipeline(gzip, file);
@@ -14435,8 +14522,8 @@ function createVdjOutput(path) {
 			await completed;
 		},
 		destroy: () => {
-			gzip.destroy();
-			file.destroy();
+			discard(gzip);
+			discard(file);
 			completed.catch(() => {});
 		}
 	};
@@ -14686,6 +14773,7 @@ async function runPipeline(config, base, assets) {
 			};
 			try {
 				for await (const batch of sequenceBatches(input, annotationBatchRecords, config.preprocessing, config.annotation.airrMode, datasetIndex, preprocessingState)) {
+					if (pending.length >= window) await consume(pending.shift());
 					const promise = batch.format === "airr" && config.annotation.airrMode === "preserve" ? Promise.resolve({
 						direct: true,
 						header: batch.header,
@@ -14698,7 +14786,6 @@ async function runPipeline(config, base, assets) {
 						count: batch.count
 					});
 					if (datasetPool instanceof NativePool) await datasetPool.ready();
-					if (pending.length >= window) await consume(pending.shift());
 				}
 				if (datasetPool instanceof NativePool) datasetPool.finishInput();
 				while (pending.length) await consume(pending.shift());
@@ -14919,10 +15006,11 @@ function vdjTuning(options) {
 	});
 	return tuning;
 }
-/** "auto", "native" or "wasm"; SWIG_CLI_ALIGNER sets the default. */
-function alignerMode(value) {
-	const mode = String(value ?? process.env.SWIG_CLI_ALIGNER ?? "auto").toLowerCase();
-	if (!ALIGNER_MODES.includes(mode)) throw new Error(`--aligner must be ${ALIGNER_MODES.join(", ")}.`);
+/** "auto", "native" or "wasm"; a non-empty SWIG_CLI_ALIGNER sets the default. `source` names `value` in errors. */
+function alignerMode(value, source = "--aligner") {
+	const fromEnvironment = value == null && Boolean(process.env.SWIG_CLI_ALIGNER);
+	const mode = String(value ?? (process.env.SWIG_CLI_ALIGNER || "auto")).toLowerCase();
+	if (!ALIGNER_MODES.includes(mode)) throw new Error(`${fromEnvironment ? "SWIG_CLI_ALIGNER" : source} must be ${ALIGNER_MODES.join(", ")}.`);
 	return mode;
 }
 /**
@@ -14998,7 +15086,12 @@ async function runVdj(rawArgs, assets) {
 		if (!nativeBinary || mode === "native" || /database/i.test(error.message)) throw error;
 		process.stderr.write(`The native aligner did not start (${error.message}); using WebAssembly.\n`);
 		pool = new WasmPool(workers, init);
-		await pool.start();
+		try {
+			await pool.start();
+		} catch (fallbackError) {
+			await pool.close().catch(() => {});
+			throw fallbackError;
+		}
 	}
 	const native = pool instanceof NativePool;
 	const window = native ? pool.window : Math.max(2, workers * 2);
@@ -15044,12 +15137,12 @@ async function runVdj(rawArgs, assets) {
 			format: "fasta"
 		};
 		for await (const batch of sequenceBatches(input, batchRecords, preprocessing, "reannotate", 0, state)) {
+			if (pending.length >= window) await consume(pending.shift());
 			pending.push({ promise: pool.run({
 				...workerAnnotation(batch.text, batch.count),
 				bytes
 			}) });
 			if (native) await pool.ready();
-			if (pending.length >= window) await consume(pending.shift());
 		}
 		if (native) pool.finishInput();
 		while (pending.length) await consume(pending.shift());
@@ -15153,7 +15246,7 @@ async function runCli(assets = defaultCliAssets()) {
 		};
 	}
 	const config = normalizeCliConfig(raw);
-	config.annotation.aligner = alignerMode(raw.annotation?.aligner);
+	config.annotation.aligner = alignerMode(raw.annotation?.aligner, commandAligner !== void 0 ? "--aligner" : "annotation.aligner");
 	if (!isCallingProfile(config.annotation.callingProfile)) throw new Error(`annotation.callingProfile must be ${CALLING_PROFILES.join(", ")}.`);
 	if (config.annotation.workers === 0) config.annotation.workers = Math.max(1, Math.min(8, availableParallelism()));
 	config.inputs = config.inputs.map((input) => ({

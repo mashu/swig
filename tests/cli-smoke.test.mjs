@@ -26,14 +26,17 @@ function runRawCli(root,args,env=process.env,input){
 /**
  * The environment under which the CLI finds a native aligner: a standalone
  * executable carries its own; the repository bundle uses the engine's release
- * build when there is one. Null when neither exists.
+ * build when there is one (CI builds it first with `npm run test:engine`).
+ * Null when neither exists, outside CI.
  */
 function nativeAlignerEnvironment(root,cache){
   const env={...process.env,SWIG_CLI_CACHE_DIR:cache};
   delete env.SWIG_CLI_ALIGNER;delete env.SWIG_CLI_ALIGNER_PATH;
   if(process.env.SWIG_CLI_EXECUTABLE)return env;
   const binary=join(root,"engine/target/release",process.platform==="win32"?"swig.exe":"swig");
-  return existsSync(binary)?{...env,SWIG_CLI_ALIGNER_PATH:binary}:null;
+  if(existsSync(binary))return {...env,SWIG_CLI_ALIGNER_PATH:binary};
+  if(process.env.CI)throw new Error(`CI tests the native aligner, but ${binary} does not exist: run npm run test:engine first.`);
+  return null;
 }
 
 test("the CLI pipeline runs annotation through lazy lineage-study export",async()=>{
@@ -540,7 +543,8 @@ test("--vdj runs the native aligner by default and writes the same AIRR as WebAs
     const {reads,references}=syntheticRearrangements(pack,17_500);
     const paths={query:join(temporary,"reads.fasta"),V:join(temporary,"V.fasta"),D:join(temporary,"D.fasta"),J:join(temporary,"J.fasta")};
     await writeFile(paths.query,reads);for(const segment of ["V","D","J"])await writeFile(paths[segment],references[segment]);
-    const common=["--vdj","-germline_db_V",paths.V,"-germline_db_D",paths.D,"-germline_db_J",paths.J,"-outfmt","19","--batch-records","700"];
+    const germlines=["--vdj","-germline_db_V",paths.V,"-germline_db_D",paths.D,"-germline_db_J",paths.J,"-outfmt","19"];
+    const common=[...germlines,"--batch-records","700"];
     const nativePath=join(temporary,"native.tsv"),wasmPath=join(temporary,"wasm.tsv"),streamedPath=join(temporary,"streamed.tsv.gz");
     const native=runRawCli(root,[...common,"-query",paths.query,"-out",nativePath],env);
     assert.equal(native.status,0,native.stderr);
@@ -555,6 +559,39 @@ test("--vdj runs the native aligner by default and writes the same AIRR as WebAs
     const streamed=runRawCli(root,[...common,"--aligner","native","--workers","2","-query","-","-out",streamedPath],env,reads);
     assert.equal(streamed.status,0,streamed.stderr);
     assert.deepEqual(gunzipSync(await readFile(streamedPath)),nativeTable);
+    // 17,500 = 17,000 + 500: the engine writes the first batch's last 616 rows only at the end of
+    // its input, so the short last batch must reach it before the first batch is awaited.
+    const tailPath=join(temporary,"tail.tsv");
+    const tail=runRawCli(root,[...germlines,"--batch-records","17000","--workers","2","-query",paths.query,"-out",tailPath],env);
+    assert.equal(tail.status,0,tail.stderr);assert.match(tail.stderr,/native aligner; assignments-only; 2 threads; 17,000 records\/batch;/);
+    assert.deepEqual(await readFile(tailPath),nativeTable);
+  }finally{await rm(temporary,{recursive:true,force:true});}
+});
+
+test("native and WebAssembly routes name unnamed reads by input position",async(t)=>{
+  const root=resolve(import.meta.dirname,"..");
+  const temporary=await mkdtemp(join(root,"tmp-cli-native-unnamed-"));
+  try{
+    const env=nativeAlignerEnvironment(root,join(temporary,"cache"));
+    if(!env){t.skip("no native aligner: build engine/ with cargo build --release");return;}
+    const pack=JSON.parse(gunzipSync(await readFile(join(root,"public/references/imgt-202632-7-swig-0.7.json.gz"))).toString("utf8"));
+    const {reads,references}=syntheticRearrangements(pack,1_200);
+    // Every third read has no identifier; each WebAssembly worker would otherwise number its own.
+    let index=0;
+    const unnamed=reads.replace(/^>read_\d+$/gm,(header)=>(index++%3===0?">":header));
+    const paths={query:join(temporary,"reads.fasta"),V:join(temporary,"V.fasta"),D:join(temporary,"D.fasta"),J:join(temporary,"J.fasta")};
+    await writeFile(paths.query,unnamed);for(const segment of ["V","D","J"])await writeFile(paths[segment],references[segment]);
+    const run=(aligner)=>{
+      const out=join(temporary,`${aligner}.tsv`);
+      const result=runRawCli(root,["--vdj","--aligner",aligner,"--workers","2","--batch-records","100","-query",paths.query,"-germline_db_V",paths.V,"-germline_db_D",paths.D,"-germline_db_J",paths.J,"-outfmt","19","-out",out],env);
+      assert.equal(result.status,0,result.stderr);
+      return readFile(out,"utf8");
+    };
+    const native=await run("native"),wasm=await run("wasm");
+    assert.equal(native,wasm);
+    const ids=native.trimEnd().split("\n").slice(1).map((row)=>row.split("\t")[0]);
+    assert.equal(ids.length,1_200);assert.equal(new Set(ids).size,1_200);
+    assert.deepEqual([ids[0],ids[1],ids[3],ids[1_197]],["sequence_1","read_1","sequence_4","sequence_1198"]);
   }finally{await rm(temporary,{recursive:true,force:true});}
 });
 
@@ -567,19 +604,24 @@ test("the pipeline annotates FASTA, FASTQ and AIRR datasets identically on both 
     const fasta=await readFile(join(root,"tests/fixtures/cli-smoke.fasta"),"utf8");
     const records=fasta.trim().split(/(?=>)/).map((record)=>{const [header,...lines]=record.split(/\r?\n/);return {id:header.slice(1).trim().split(/\s+/)[0],sequence:lines.join("").trim()};});
     const fastaPath=join(temporary,"reads.fasta"),fastqPath=join(temporary,"reads.fastq"),airrPath=join(temporary,"reads.airr.tsv");
-    await writeFile(fastaPath,fasta);
+    // An unnamed record in FASTA and AIRR, and an AIRR row whose sequence is blank (no record).
+    await writeFile(fastaPath,`${fasta.trimEnd()}\n>\n${records[0].sequence}\n`);
     await writeFile(fastqPath,records.map((r)=>`@${r.id}\n${r.sequence}\n+\n${"I".repeat(r.sequence.length)}\n`).join(""));
-    await writeFile(airrPath,`sequence_id\tsequence\n${records.map((r)=>`${r.id}\t${r.sequence}`).join("\n")}\n`);
+    await writeFile(airrPath,`sequence_id\tsequence\n${records.map((r)=>`${r.id}\t${r.sequence}`).join("\n")}\nblank\t  \n\t${records[1].sequence}\n`);
     const annotate=async(aligner,doubleD="off")=>{
       const output=join(temporary,`${aligner}-${doubleD}`),configPath=join(temporary,`${aligner}-${doubleD}.json`);
-      await writeFile(configPath,JSON.stringify({inputs:[{path:fastaPath,sampleId:"a",subjectId:"d"},{path:fastqPath,sampleId:"b",subjectId:"d"},{path:airrPath,format:"airr",sampleId:"c",subjectId:"d"}],annotation:{workers:2,airrMode:"reannotate",aligner,doubleD:{mode:doubleD}},pipeline:{collapse:{enabled:false},lineage:{enabled:false},shm:{enabled:false}},output:{directory:output,prefix:"run",writeLineageStudy:false}}));
+      await writeFile(configPath,JSON.stringify({inputs:[{path:fastaPath,sampleId:"a",subjectId:"d"},{path:fastqPath,sampleId:"b",subjectId:"d"},{path:airrPath,format:"airr",sampleId:"c",subjectId:"d"}],annotation:{workers:2,batchRecords:1,airrMode:"reannotate",aligner,doubleD:{mode:doubleD}},pipeline:{collapse:{enabled:false},lineage:{enabled:false},shm:{enabled:false}},output:{directory:output,prefix:"run",writeLineageStudy:false}}));
       const result=runCli(root,configPath,[],env);
       return {result,table:result.status===0?await readFile(join(output,"run.annotated.airr.tsv")):null};
     };
     const native=await annotate("native"),wasm=await annotate("wasm");
-    assert.equal(native.result.status,0,native.result.stderr);assert.match(native.result.stderr,/Using the native aligner \(2 threads/);
-    assert.equal(wasm.result.status,0,wasm.result.stderr);assert.match(wasm.result.stderr,/Starting the WebAssembly aligner pool \(2 workers/);
+    // One record per batch: AIRR repeats its header in every batch, which the native child reads once.
+    assert.equal(native.result.status,0,native.result.stderr);assert.match(native.result.stderr,/Using the native aligner \(2 threads; 1 records\/batch\)/);
+    assert.equal(wasm.result.status,0,wasm.result.stderr);assert.match(wasm.result.stderr,/Starting the WebAssembly aligner pool \(2 workers; 1 records\/batch\)/);
     assert.deepEqual(native.table,wasm.table);
+    const ids=native.table.toString("utf8").trimEnd().split("\n").slice(1).map((row)=>row.split("\t")[0]);
+    assert.equal(ids.length,records.length*3+2);
+    assert.equal(ids.filter((id)=>id.endsWith(`::sequence_${records.length+1}`)).length,2);
     // The double-D sidecar runs only on WebAssembly: auto switches, native refuses.
     const screened=await annotate("auto","all");
     assert.equal(screened.result.status,0,screened.result.stderr);assert.match(screened.result.stderr,/Using the WebAssembly aligner: the double-D screen runs only on it/);
@@ -611,5 +653,25 @@ test("an unusable native aligner falls back to WebAssembly unless --aligner nati
     }
     const invalid=runRawCli(root,args("gpu"),env);
     assert.notEqual(invalid.status,0);assert.match(invalid.stderr,/--aligner must be auto, native, wasm/);
+    // A binary that passes the version check but cannot start (an illegal instruction, say).
+    const version=JSON.parse(await readFile(join(root,"package.json"),"utf8")).version;
+    const crashing=join(temporary,"crashing-swig");
+    await writeFile(crashing,`#!/bin/sh\nif [ "$1" = "--version" ]; then echo 'swig ${version}'; exit 0; fi\necho 'Illegal instruction' >&2\nexit 132\n`);await chmod(crashing,0o755);
+    const crashEnv={...env,SWIG_CLI_ALIGNER_PATH:crashing};
+    const fellBack=runRawCli(root,args("auto"),crashEnv);
+    assert.equal(fellBack.status,0,fellBack.stderr);
+    assert.match(fellBack.stderr,/The native aligner did not start \(The native Swig aligner exited with status 132: Illegal instruction\); using WebAssembly\./);
+    assert.match(fellBack.stderr,/WebAssembly aligner;/);
+    const crashed=runRawCli(root,args("native"),crashEnv);
+    assert.notEqual(crashed.status,0);assert.match(crashed.stderr,/swig-cli: The native Swig aligner exited with status 132: Illegal instruction/);
+    // SWIG_CLI_ALIGNER: empty means unset; a bad value is named as such.
+    const unset=runRawCli(root,args("auto").filter((value,index,all)=>value!=="--aligner"&&all[index-1]!=="--aligner"),{...env,SWIG_CLI_ALIGNER:""});
+    assert.equal(unset.status,0,unset.stderr);
+    const badEnvironment=runRawCli(root,args("auto").filter((value,index,all)=>value!=="--aligner"&&all[index-1]!=="--aligner"),{...env,SWIG_CLI_ALIGNER:"gpu"});
+    assert.notEqual(badEnvironment.status,0);assert.match(badEnvironment.stderr,/SWIG_CLI_ALIGNER must be auto, native, wasm/);
+    const configPath=join(temporary,"gpu.json");
+    await writeFile(configPath,JSON.stringify({inputs:[{path:fasta,sampleId:"a",subjectId:"d"}],annotation:{workers:1,aligner:"gpu"},output:{directory:join(temporary,"gpu")}}));
+    const badConfig=runCli(root,configPath,[],env);
+    assert.notEqual(badConfig.status,0);assert.match(badConfig.stderr,/annotation\.aligner must be auto, native, wasm/);
   }finally{await rm(temporary,{recursive:true,force:true});}
 });

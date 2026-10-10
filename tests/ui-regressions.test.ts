@@ -328,6 +328,11 @@ test("post-analysis skipping, richer lineage rows, CLI export, and lazy lineage 
   assert.match(release,/wasm32-unknown-unknown/);
   for(const target of ["bun-linux-x64-baseline","bun-linux-arm64","bun-darwin-x64","bun-darwin-arm64","bun-windows-x64-baseline"]){assert.match(release,new RegExp(target));}
   assert.match(release,/Smoke-test the actual executable/);
+  // Linux aligners link glibc statically (swig-cli runs from glibc 2.17); Windows runs its executable.
+  assert.match(release,/target-feature=\+crt-static/);
+  assert.match(release,/needs: \[build, aligner, windows-smoke\]/);
+  const cargoConfig=fs.readFileSync(new URL("../.cargo/config.toml",import.meta.url),"utf8");
+  assert.match(cargoConfig,/\[target\.x86_64-pc-windows-msvc\]\nrustflags = \["-C", "target-feature=\+crt-static"\]/);
 });
 
 test("lineage alignment offers direct Alivibe-compatible MSA and retains manual round trip", () => {

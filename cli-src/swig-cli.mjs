@@ -274,28 +274,51 @@ async function* sequenceBatches(input,batchRecords,preprocessing,airrMode,datase
   const filter=preprocessing.fastqFilter;
   validateFastqQualityFilter(filter);
   state.fastqFilter=emptyFastqQualityFilterStats(filter.enabled,filter.enabled&&format==="fastq");
+  // A record without an identifier is named sequence_N by its position N in the input before it
+  // is batched: the aligner would number it within its own run (per WebAssembly worker), so the
+  // name would depend on the route and the worker count.
+  const unnamed=()=>`sequence_${state.inputRecords}`;
   const parsed=async function*(){
     if(format==="airr"){
+      let identifiers=null;
       for await(const record of airrRecords(lines)){
         state.inputRecords+=1;state.eligibleRecords+=1;
         if(filter.enabled){state.fastqFilter.recordsRetained+=1;state.fastqFilter.recordsPassedThrough+=1;}
         const delimiter=record.header.includes("\t")?"\t":",";
-        const header=delimiter==="\t"?record.header:record.header.split(delimiter).join("\t");
-        const row=delimiter==="\t"?record.row:record.row.split(delimiter).join("\t");
+        let header=delimiter==="\t"?record.header:record.header.split(delimiter).join("\t");
+        let row=delimiter==="\t"?record.row:record.row.split(delimiter).join("\t");
+        if(airrMode!=="preserve"){
+          if(identifiers?.source!==header){
+            const columns=header.split("\t");const column=columns.indexOf("sequence_id");
+            identifiers={source:header,columns:columns.length,column,header:column<0?`${header}\tsequence_id`:header};
+          }
+          const values=row.split("\t");
+          if(identifiers.column<0){
+            while(values.length<identifiers.columns)values.push("");
+            values.push(unnamed());row=values.join("\t");
+          }else if(!(values[identifiers.column]??"").trim()){
+            while(values.length<=identifiers.column)values.push("");
+            values[identifiers.column]=unnamed();row=values.join("\t");
+          }
+          header=identifiers.header;
+        }
         yield {ordinal:state.inputRecords-1,text:`${row}\n`,header};
       }
       return;
     }
     if(format==="fasta"){
-      for await(const text of fastaRecords(lines)){
+      for await(const record of fastaRecords(lines)){
         state.inputRecords+=1;state.eligibleRecords+=1;
         if(filter.enabled){state.fastqFilter.recordsRetained+=1;state.fastqFilter.recordsPassedThrough+=1;}
+        const newline=record.indexOf("\n");
+        const text=record.slice(1,newline).trim()?record:`>${unnamed()}${record.slice(newline)}`;
         yield {ordinal:state.inputRecords-1,text};
       }
       return;
     }
     for await(const record of fastqRecords(lines)){
       state.inputRecords+=1;
+      if(!record.header.slice(1).trim())record.header=`@${unnamed()}`;
       const text=filter.enabled?filterFastqRecord(record,filter,state.fastqFilter):canonicalFastq(record);
       if(text!==null){state.eligibleRecords+=1;yield {ordinal:state.inputRecords-1,text};}
     }
@@ -367,11 +390,14 @@ class WasmPool {
   }
   release(worker){const job=this.queued.shift();if(job)this.dispatch(worker,job);else this.available.push(worker);}
   run(message){
-    if(this.failed)return Promise.reject(this.failed);
-    return new Promise((resolvePromise,reject)=>{
+    const promise=this.failed?Promise.reject(this.failed):new Promise((resolvePromise,reject)=>{
       const job={message,resolve:resolvePromise,reject};const worker=this.available.shift();
       if(worker)this.dispatch(worker,job);else this.queued.push(job);
     });
+    // The caller awaits batches later, in order, and stops at the first failure: the batches
+    // queued behind it (rejected when the pool closes) must not be reported as unhandled.
+    promise.catch(()=>{});
+    return promise;
   }
   async close(){
     const error=new Error("The aligner's worker pool closed before queued work completed.");
@@ -866,14 +892,16 @@ function createCliWriteStream(path){return createWriteStream(path,{highWaterMark
 
 function createVdjOutput(path){
   const file=createCliWriteStream(path);
-  if(!/\.gz$/i.test(path))return {stream:file,opened:once(file,"open"),finish:()=>finishWritable(file),destroy:()=>file.destroy()};
+  // A failed run abandons its output: late write errors must not be reported over the real one.
+  const discard=(stream)=>{stream.on("error",()=>{});stream.destroy();};
+  if(!/\.gz$/i.test(path))return {stream:file,opened:once(file,"open"),finish:()=>finishWritable(file),destroy:()=>discard(file)};
   const gzip=createGzip();
   const completed=pipeline(gzip,file);
   return {
     stream:gzip,
     opened:once(file,"open"),
     finish:async()=>{gzip.end();await completed;},
-    destroy:()=>{gzip.destroy();file.destroy();void completed.catch(()=>{});},
+    destroy:()=>{discard(gzip);discard(file);void completed.catch(()=>{});},
   };
 }
 
@@ -1001,12 +1029,14 @@ async function runPipeline(config,base,assets){
       };
       try{
         for await(const batch of sequenceBatches(input,annotationBatchRecords,config.preprocessing,config.annotation.airrMode,datasetIndex,preprocessingState)){
+          // Await the oldest batch only once another is ready to queue: then every batch held is
+          // full, which the native window counts on (a short last batch waits for finishInput).
+          if(pending.length>=window)await consume(pending.shift());
           const promise=batch.format==="airr"&&config.annotation.airrMode==="preserve"
             ? Promise.resolve({direct:true,header:batch.header,body:batch.body,doubleDHeader:"",doubleDBody:""})
             : datasetPool.run(workerAnnotation(batch.text,batch.count));
           pending.push({promise,count:batch.count});
           if(datasetPool instanceof NativePool)await datasetPool.ready();
-          if(pending.length>=window)await consume(pending.shift());
         }
         if(datasetPool instanceof NativePool)datasetPool.finishInput();
         while(pending.length)await consume(pending.shift());
@@ -1126,10 +1156,11 @@ function vdjTuning(options){
   return tuning;
 }
 
-/** "auto", "native" or "wasm"; SWIG_CLI_ALIGNER sets the default. */
-function alignerMode(value){
-  const mode=String(value??process.env.SWIG_CLI_ALIGNER??"auto").toLowerCase();
-  if(!ALIGNER_MODES.includes(mode))throw new Error(`--aligner must be ${ALIGNER_MODES.join(", ")}.`);
+/** "auto", "native" or "wasm"; a non-empty SWIG_CLI_ALIGNER sets the default. `source` names `value` in errors. */
+function alignerMode(value,source="--aligner"){
+  const fromEnvironment=value==null&&Boolean(process.env.SWIG_CLI_ALIGNER);
+  const mode=String(value??(process.env.SWIG_CLI_ALIGNER||"auto")).toLowerCase();
+  if(!ALIGNER_MODES.includes(mode))throw new Error(`${fromEnvironment?"SWIG_CLI_ALIGNER":source} must be ${ALIGNER_MODES.join(", ")}.`);
   return mode;
 }
 
@@ -1193,7 +1224,9 @@ async function runVdj(rawArgs,assets){
     // Germline errors would stop WebAssembly too; anything else falls back to it.
     if(!nativeBinary||mode==="native"||/database/i.test(error.message))throw error;
     process.stderr.write(`The native aligner did not start (${error.message}); using WebAssembly.\n`);
-    pool=new WasmPool(workers,init);await pool.start();
+    pool=new WasmPool(workers,init);
+    try{await pool.start();}
+    catch(fallbackError){await pool.close().catch(()=>{});throw fallbackError;}
   }
   const native=pool instanceof NativePool;
   const window=native?pool.window:Math.max(2,workers*2);
@@ -1218,9 +1251,11 @@ async function runVdj(rawArgs,assets){
     const preprocessing={fastqFilter:{...DEFAULT_CLI_CONFIG.preprocessing.fastqFilter,trim3Prime:{...DEFAULT_CLI_CONFIG.preprocessing.fastqFilter.trim3Prime}},subsample:{...DEFAULT_CLI_CONFIG.preprocessing.subsample,enabled:false}};
     const input={path:queryPath,format:"fasta"};
     for await(const batch of sequenceBatches(input,batchRecords,preprocessing,"reannotate",0,state)){
+      // Await the oldest batch only once another is ready to queue: then every batch held is
+      // full, which the native window counts on (a short last batch waits for finishInput).
+      if(pending.length>=window)await consume(pending.shift());
       pending.push({promise:pool.run({...workerAnnotation(batch.text,batch.count),bytes})});
       if(native)await pool.ready();
-      if(pending.length>=window)await consume(pending.shift());
     }
     if(native)pool.finishInput();
     while(pending.length)await consume(pending.shift());
@@ -1266,7 +1301,7 @@ export async function runCli(assets=defaultCliAssets()){
   if(commandCompression!==undefined){if(!["none","gzip"].includes(commandCompression))throw new Error("--airr-compression must be none or gzip.");raw.output={...(raw.output??{}),airrCompression:commandCompression};}
   const config=normalizeCliConfig(raw);
   // An explicit --aligner or annotation.aligner wins over SWIG_CLI_ALIGNER.
-  config.annotation.aligner=alignerMode(raw.annotation?.aligner);
+  config.annotation.aligner=alignerMode(raw.annotation?.aligner,commandAligner!==undefined?"--aligner":"annotation.aligner");
   if(!isCallingProfile(config.annotation.callingProfile)){
     throw new Error(`annotation.callingProfile must be ${CALLING_PROFILES.join(", ")}.`);
   }

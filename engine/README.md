@@ -14,7 +14,7 @@ instead of tuned patches. Every component is a replaceable, statically
 dispatched trait, and every search shortcut is either lossless or measured
 on simulated repertoires.
 
-The crate and binary are `swig` 0.39.0. The workspace member `wasm/` (crate
+The crate and binary are `swig` 0.39.1. The workspace member `wasm/` (crate
 `swig_wasm`) is the WebAssembly module. There are no dependencies; Rust ≥
 1.89, edition 2024. The alignment kernel runs on AVX-512BW, AVX2, NEON,
 WebAssembly SIMD or portable lanes, chosen at run time (on WebAssembly, at
@@ -379,7 +379,11 @@ the message in the error buffer. Results stay readable until the next call.
   flushes the rows of every `BATCH` (16,384 records) as soon as they are
   assigned, so the CLI keeps more than that many records in flight. The
   WebAssembly module stays the fallback and the route for the double-D
-  sidecar; the rows are byte-identical.
+  sidecar; the rows are the same, up to the last-digit posterior exception
+  above. The Linux release binaries link glibc statically
+  (`-C target-feature=+crt-static`) and the Windows one its C runtime
+  (`.cargo/config.toml`), so neither needs a newer system library than
+  swig-cli itself.
 - **Threads.** `wasm32-unknown-unknown` has none: `assign_map` runs every
   chunk on the calling thread, and Swig parallelises by running one
   instance per worker. In the standalone project's measurements, one
