@@ -59,6 +59,8 @@ pub mod fasta;
 pub mod flank;
 pub mod germline;
 pub mod index;
+pub mod locus;
+pub mod metadata;
 pub mod orient;
 pub mod pipeline;
 pub mod placement;

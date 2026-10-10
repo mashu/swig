@@ -63,7 +63,8 @@ pub use transfer::{
 pub use v_motif::{VHit, VSearch, find_v};
 
 use crate::align::GotohWorkspace;
-use crate::germline::{GermlineSet, RegionSlot, RegionStarts};
+use crate::germline::{Allele, GermlineSet, RegionSlot, RegionStarts};
+use crate::locus::{Loci, Locus};
 use crate::translate::{codon, translate};
 use given::Given;
 
@@ -199,6 +200,10 @@ pub struct DatabaseAnnotation {
     /// Most V allele names are TR or IGL ones: loci whose FR3 length IMGT
     /// varies by gene family, so one chain default is wrong for some.
     pub fr3_varies: bool,
+    /// For a database of several loci, each locus annotated on its own
+    /// ([`annotate_by_locus`]); `None` for alleles of unknown locus. `v` and
+    /// `j` above then hold every allele's annotation.
+    pub parts: Vec<(Option<Locus>, DatabaseAnnotation)>,
 }
 
 fn mode(values: impl Iterator<Item = u32>) -> Option<u32> {
@@ -666,6 +671,66 @@ fn annotate_j(
         *anchor = anchor.or(found);
     }
     (result, tail, vote)
+}
+
+/// The locus an allele is annotated with: its first, `None` if unknown.
+fn annotation_locus(allele: &Allele) -> Option<Locus> {
+    (allele.loci != Loci::ANY)
+        .then(|| allele.loci.first())
+        .flatten()
+}
+
+/// [`annotate`] each locus of the database on its own: V and J alleles of
+/// one locus share a chain type, an FR3 length model and Cys23 priors,
+/// which differ between loci (heavy and light chains, TR loci). A
+/// database of one locus is annotated as a whole.
+pub fn annotate_by_locus(
+    v: &mut GermlineSet,
+    mut j: Option<&mut GermlineSet>,
+    options: AnnotateOptions,
+) -> DatabaseAnnotation {
+    let mut loci: Vec<Option<Locus>> = v
+        .alleles()
+        .iter()
+        .chain(j.iter().flat_map(|j| j.alleles()))
+        .map(annotation_locus)
+        .collect();
+    loci.sort_unstable();
+    loci.dedup();
+    if loci.len() <= 1 {
+        return annotate(v, j, options);
+    }
+    let mut merged = DatabaseAnnotation {
+        v: vec![AlleleAnnotation::new(AnchorSource::Missing, Vec::new()); v.len()],
+        j: vec![
+            AlleleAnnotation::new(AnchorSource::Missing, Vec::new());
+            j.as_ref().map_or(0, |j| j.len())
+        ],
+        ..DatabaseAnnotation::default()
+    };
+    for locus in loci {
+        let of_locus = |a: &Allele| annotation_locus(a) == locus;
+        let (mut v_part, v_ids) = v.subset(of_locus);
+        let mut j_part = j.as_deref().map(|j| j.subset(of_locus));
+        let part = annotate(&mut v_part, j_part.as_mut().map(|(set, _)| set), options);
+        for (copy, &id) in v_part.alleles().iter().zip(&v_ids) {
+            let (anchor, regions, _) = v.annotation_mut(id);
+            (*anchor, *regions) = (copy.anchor, copy.regions);
+        }
+        for (annotation, &id) in part.v.iter().zip(&v_ids) {
+            merged.v[id as usize] = annotation.clone();
+        }
+        if let (Some(j), Some((j_part, j_ids))) = (j.as_deref_mut(), &j_part) {
+            for (copy, &id) in j_part.alleles().iter().zip(j_ids) {
+                *j.annotation_mut(id).0 = copy.anchor;
+            }
+            for (annotation, &id) in part.j.iter().zip(j_ids) {
+                merged.j[id as usize] = annotation.clone();
+            }
+        }
+        merged.parts.push((locus, part));
+    }
+    merged
 }
 
 /// Annotate `v` (anchors and region starts) and `j` (anchors) in place.
@@ -1148,6 +1213,7 @@ pub fn annotate(
         imgt_gaps,
         fr3_model,
         fr3_varies,
+        parts: Vec::new(),
     }
 }
 
@@ -1171,8 +1237,19 @@ impl DatabaseAnnotation {
             .join(", ")
     }
 
-    /// One line per segment for logs.
+    /// One line per segment for logs; per locus for a database of several.
     pub fn summary(&self) -> String {
+        if !self.parts.is_empty() {
+            let parts: Vec<String> = self
+                .parts
+                .iter()
+                .map(|(locus, part)| {
+                    let name = locus.map_or("unknown locus", Locus::name);
+                    format!("{name}: {}", part.summary())
+                })
+                .collect();
+            return parts.join(" | ");
+        }
         let chain = self.chain.map_or("unknown", ChainType::name);
         let mut text = format!("chain {chain}; V anchors: {}", Self::counts(&self.v));
         if !self.j.is_empty() {
@@ -1199,6 +1276,9 @@ impl DatabaseAnnotation {
     /// default places some FR3 starts wrong, and every such start is
     /// marked uncertain.
     pub fn fr3_warning(&self) -> bool {
+        if !self.parts.is_empty() {
+            return self.parts.iter().any(|(_, part)| part.fr3_warning());
+        }
         self.fr3_model.is_none() && self.fr3_varies && self.chain.is_some()
     }
 

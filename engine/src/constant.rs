@@ -73,6 +73,7 @@ use crate::band::Band;
 use crate::clip::ClipIndex;
 use crate::config::CSegmentConfig;
 use crate::germline::{GermlineSet, SegmentKind};
+use crate::locus::{Loci, Locus};
 use crate::pipeline::Call;
 use crate::placement::{Placement, merge_identical};
 use crate::report::co_optimal;
@@ -149,6 +150,9 @@ pub struct ConstantStage {
     /// `s`: C's base 0 lies within `s` bases of the J exit.
     pub spread: u32,
     pub significance: AnchoredSignificance,
+    /// For a C database of several loci, the gate of each: `N_C` counts the
+    /// C genes of the read's locus only ([`crate::locus`]).
+    pub locus_significance: Vec<(Locus, AnchoredSignificance)>,
 }
 
 impl ConstantStage {
@@ -170,13 +174,48 @@ impl ConstantStage {
             ..config.keep
         };
         let retriever = ReachClasses::new(&set, config.spread);
+        let loci: Vec<Locus> = Locus::ALL
+            .into_iter()
+            .filter(|&l| set.alleles().iter().any(|a| a.loci == Loci::of(l)))
+            .collect();
+        let locus_significance = if loci.len() > 1 {
+            loci.into_iter()
+                .filter_map(|locus| {
+                    let (part, _) = set.subset(|a| a.loci.contains(locus));
+                    let gate =
+                        AnchoredSignificance::new(&part, &scoring, config.spread, config.evalue)?;
+                    Some((locus, gate))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         Some(Self {
             anchored: SegmentStage::new(Arc::new(anchored), retriever, keep),
             plain: Arc::new(PreparedSegment::new(set, &scoring, scoring.gaps)),
             model,
             spread: config.spread,
             significance,
+            locus_significance,
         })
+    }
+
+    /// The gate of a read whose J belongs to `loci`.
+    fn significance(&self, loci: Loci) -> &AnchoredSignificance {
+        loci.single()
+            .and_then(|l| self.locus_significance.iter().find(|(at, _)| *at == l))
+            .map_or(&self.significance, |(_, gate)| gate)
+    }
+
+    /// Whether some allele of the reach class of `representative` belongs
+    /// to `loci`.
+    fn class_pairs(&self, representative: u32, reach: usize, loci: Loci) -> bool {
+        let set = self.plain.set();
+        self.anchored
+            .retriever
+            .members(representative, reach)
+            .iter()
+            .any(|&a| set.allele(a).loci.pairs_with(loci))
     }
 
     /// The splice window of a call whose path ends with a J, if C can follow.
@@ -188,13 +227,16 @@ impl ConstantStage {
         SpliceWindow::new(last.span.q_hi, call.query.len(), self.spread)
     }
 
-    /// Place and call C for a chunk of finished calls: one score batch and
-    /// traceback waves for the whole chunk, then per read the C placements
-    /// ([`Call::constant`]) and the call ([`Call::c`]).
+    /// Place and call C for a chunk of finished calls, the J of call `i`
+    /// belonging to `loci[i]`: one score batch and traceback waves for the
+    /// whole chunk, then per read the C placements ([`Call::constant`]) of
+    /// the J's locus and the call ([`Call::c`]).
+    #[allow(clippy::too_many_arguments)]
     pub fn assign<A: Aligner>(
         &self,
         aligner: &A,
         calls: &mut [Call],
+        loci: &[Loci],
         scratch: &mut CScratch,
         retrieval: &mut RetrievalScratch,
         dp: &mut A::Workspace,
@@ -213,10 +255,17 @@ impl ConstantStage {
         }
         let placed = &mut placed[..calls.len()];
         placed.iter_mut().for_each(Vec::clear);
-        for ((window, found), call) in windows.iter().zip(candidates.iter_mut()).zip(&*calls) {
+        for (((window, found), call), &loci) in windows
+            .iter()
+            .zip(candidates.iter_mut())
+            .zip(&*calls)
+            .zip(loci)
+        {
             if let Some(w) = window {
                 self.anchored
                     .retrieve(&call.query, w.window.clone(), retrieval, found);
+                let reach = self.anchored.retriever.reach(w.window.len());
+                found.retain(|c| self.class_pairs(c.allele, reach, loci));
             }
         }
         let requests: Vec<SegmentRequest<'_>> = windows
@@ -235,9 +284,14 @@ impl ConstantStage {
         self.anchored
             .place_many(aligner, &requests, dp, batch, placed);
         drop(requests);
-        for ((call, window), anchored) in calls.iter_mut().zip(windows.iter()).zip(placed.iter()) {
+        for (((call, window), anchored), &loci) in calls
+            .iter_mut()
+            .zip(windows.iter())
+            .zip(placed.iter())
+            .zip(loci)
+        {
             if let Some(w) = window {
-                self.settle(call, w, anchored);
+                self.settle(call, w, anchored, loci);
             }
         }
     }
@@ -245,7 +299,7 @@ impl ConstantStage {
     /// The read's C placements from its anchored ones: anchor stripped,
     /// clipped to `[x, n)`, class members joined, ranked by (score, longest
     /// exact run, matches, allele id) and merged; then the call.
-    fn settle(&self, call: &mut Call, w: &SpliceWindow, anchored: &[Placement]) {
+    fn settle(&self, call: &mut Call, w: &SpliceWindow, anchored: &[Placement], loci: Loci) {
         let n = call.query.len() as u32;
         let reach = self.anchored.retriever.reach(w.window.len());
         for p in anchored {
@@ -265,14 +319,21 @@ impl ConstantStage {
                 &call.query,
                 &self.plain,
             );
+            let set = self.plain.set();
             placement.alleles = p
                 .alleles
                 .iter()
                 .flat_map(|&a| self.anchored.retriever.members(a, reach))
                 .copied()
+                .filter(|&a| set.allele(a).loci.pairs_with(loci))
                 .collect();
             placement.alleles.sort_unstable();
             placement.alleles.dedup();
+            // Members of a reach class align identically, so the first of
+            // the locus reports for the class.
+            if placement.alleles.is_empty() {
+                continue;
+            }
             call.constant.push(placement);
         }
         call.constant.sort_by_key(|p| {
@@ -284,13 +345,14 @@ impl ConstantStage {
             )
         });
         merge_identical(&mut call.constant, 0);
-        call.c = self.decide(call, w.x);
+        call.c = self.decide(call, w.x, self.significance(loci));
     }
 
-    /// The call from the ranked C placements: the best, if significant.
-    fn decide(&self, call: &Call, x: u32) -> Option<ConstantCall> {
+    /// The call from the ranked C placements: the best, if significant
+    /// under `gate`.
+    fn decide(&self, call: &Call, x: u32, gate: &AnchoredSignificance) -> Option<ConstantCall> {
         let best = call.constant.first()?;
-        if best.score() < self.significance.min_score() {
+        if best.score() < gate.min_score() {
             return None;
         }
         let n = call.query.len() as u32;
@@ -322,7 +384,7 @@ impl ConstantStage {
             let substitution = matched * e.matches as Score + mismatch * e.mismatches as Score;
             scale.lambda * f64::from(substitution)
                 + scale.mu * f64::from(e.matches + e.mismatches)
-                + self.significance.lambda * f64::from(q.score() - substitution)
+                + gate.lambda * f64::from(q.score() - substitution)
         };
         let top = call
             .constant
@@ -334,7 +396,7 @@ impl ConstantStage {
         let counted: f64 = co.counted.iter().map(|&i| weight(&call.constant[i])).sum();
         Some(ConstantCall {
             segment,
-            evalue: self.significance.evalue(best.score()),
+            evalue: gate.evalue(best.score()),
             posterior: (counted / total).min(1.0),
         })
     }

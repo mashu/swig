@@ -13,7 +13,7 @@ use std::fmt;
 use std::io;
 use std::path::Path;
 
-use crate::annotate::{AlleleAnnotation, AnnotateOptions, DatabaseAnnotation, annotate};
+use crate::annotate::{AlleleAnnotation, AnnotateOptions, DatabaseAnnotation, annotate_by_locus};
 use crate::germline::{GermlineError, GermlineSet, MergedDuplicate, SegmentKind};
 use crate::retrieve::GeneFrames;
 use crate::seed::SeedShape;
@@ -191,7 +191,17 @@ pub fn prepare(
     {
         deduplicate(set, &mut merged)?;
     }
-    let annotation = annotate(&mut v, Some(&mut j), options);
+    let annotation = annotate_by_locus(&mut v, Some(&mut j), options);
+    // An allele without a given provenance (`SWIGMETA=`) reports the
+    // annotation's source.
+    for (set, annotations) in [(&mut v, &annotation.v), (&mut j, &annotation.j)] {
+        for (id, annotation) in (0..).zip(annotations) {
+            let source = set.annotation_mut(id).2;
+            if source.is_none() {
+                *source = Some(annotation.source.label());
+            }
+        }
+    }
     Ok(PreparedDatabase {
         v,
         d,

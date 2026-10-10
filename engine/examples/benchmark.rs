@@ -41,8 +41,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     let mut config = profile.config();
     if let Some(name) = value("--simd") {
-        config.simd =
-            Some(swig::align::Backend::from_name(&name).ok_or("unknown --simd backend")?);
+        config.simd = Some(swig::align::Backend::from_name(&name).ok_or("unknown --simd backend")?);
     }
     if args.flag("--tandem-d") {
         config.grammar = VdjGrammar::TANDEM_D;
@@ -133,8 +132,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Some(v) = list("--seeds") {
         config.v.primary = swig::seed::SeedShape::contiguous(v[0].parse()?);
         let fallback: usize = v[1].parse()?;
-        config.v.fallback =
-            (fallback > 0).then(|| swig::seed::SeedShape::contiguous(fallback));
+        config.v.fallback = (fallback > 0).then(|| swig::seed::SeedShape::contiguous(fallback));
     }
     // Primary V seed as a 0/1 pattern, e.g. a spaced seed `11101101111`.
     if let Some(pattern) = value("--v-shape") {

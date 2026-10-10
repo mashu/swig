@@ -39,6 +39,7 @@ use crate::alphabet::reverse_complement_into;
 use crate::config::DefaultVRetriever;
 use crate::constant::{CScratch, ConstantCall, ConstantStage};
 use crate::germline::SegmentKind;
+use crate::locus::{Loci, Locus};
 use crate::orient::{Orientation, OrientationPolicy, StrandIndex};
 use crate::placement::Placement;
 use crate::retrieve::{
@@ -127,6 +128,10 @@ pub struct Assigner<
     pub d_window: W,
     pub d_admission: Adm,
     pub adjudicator: Adj,
+    /// Adjudicators for reads of one locus, where it differs from
+    /// `adjudicator`: a D database of several loci prices a D by its own
+    /// locus' D genes ([`crate::config::DPrior`]).
+    pub locus_adjudicators: Vec<(Locus, Adj)>,
     /// Constant-region assignment after adjudication; `None` without a C
     /// database ([`Assigner::with_constant`]).
     pub c: Option<ConstantStage>,
@@ -195,35 +200,80 @@ macro_rules! replace {
 /// monomorphises again around it.
 impl<A, RV, RJ, RD, W, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj> {
     pub fn with_aligner<A2>(self, aligner: A2) -> Assigner<A2, RV, RJ, RD, W, Adm, Adj> {
-        replace!(self { v, j, d, strand, j_window, d_window, d_admission, adjudicator, c, options } aligner: aligner)
+        replace!(self { v, j, d, strand, j_window, d_window, d_admission, adjudicator, locus_adjudicators, c, options } aligner: aligner)
     }
 
     pub fn with_d_window<W2>(self, d_window: W2) -> Assigner<A, RV, RJ, RD, W2, Adm, Adj> {
-        replace!(self { v, j, d, strand, j_window, aligner, d_admission, adjudicator, c, options } d_window: d_window)
+        replace!(self { v, j, d, strand, j_window, aligner, d_admission, adjudicator, locus_adjudicators, c, options } d_window: d_window)
     }
 
     pub fn with_d_admission<Adm2>(
         self,
         d_admission: Adm2,
     ) -> Assigner<A, RV, RJ, RD, W, Adm2, Adj> {
-        replace!(self { v, j, d, strand, j_window, aligner, d_window, adjudicator, c, options } d_admission: d_admission)
+        replace!(self { v, j, d, strand, j_window, aligner, d_window, adjudicator, locus_adjudicators, c, options } d_admission: d_admission)
     }
 
-    /// Swap the adjudicator. The D stage keeps the D placements the original
-    /// one needed: built with posteriors, it keeps those below the DAG's D
-    /// floor, so pair an adjudicator without its own D significance floor
-    /// (such as [`crate::adjudicate::ResidualAdjudicator`]) with
-    /// `posterior: false`.
+    /// Swap the adjudicator, for reads of every locus. The D stage keeps
+    /// the D placements the original one needed: built with posteriors, it
+    /// keeps those below the DAG's D floor, so pair an adjudicator without
+    /// its own D significance floor (such as
+    /// [`crate::adjudicate::ResidualAdjudicator`]) with `posterior: false`.
     pub fn with_adjudicator<Adj2>(
         self,
         adjudicator: Adj2,
     ) -> Assigner<A, RV, RJ, RD, W, Adm, Adj2> {
-        replace!(self { v, j, d, strand, j_window, aligner, d_window, d_admission, c, options } adjudicator: adjudicator)
+        let assigner = self;
+        Assigner {
+            adjudicator,
+            locus_adjudicators: Vec::new(),
+            v: assigner.v,
+            j: assigner.j,
+            d: assigner.d,
+            strand: assigner.strand,
+            j_window: assigner.j_window,
+            aligner: assigner.aligner,
+            d_window: assigner.d_window,
+            d_admission: assigner.d_admission,
+            c: assigner.c,
+            options: assigner.options,
+        }
     }
 
     pub fn with_options(mut self, options: AssignerOptions) -> Self {
         self.options = options;
         self
+    }
+}
+
+impl<A, RV, RJ, RD, W, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj> {
+    /// The loci of a placement: those of its alleles together.
+    fn placement_loci(&self, placement: &Placement) -> Loci {
+        let Some(segment) = self.segment(placement.kind) else {
+            return Loci::ANY;
+        };
+        let set = segment.set();
+        placement
+            .alleles
+            .iter()
+            .fold(Loci::NONE, |loci, &a| loci.union(set.allele(a).loci))
+    }
+
+    /// The loci of `placements` together; [`Loci::ANY`] when there are none.
+    fn placed_loci(&self, placements: &[Placement]) -> Loci {
+        if placements.is_empty() {
+            return Loci::ANY;
+        }
+        placements
+            .iter()
+            .fold(Loci::NONE, |loci, p| loci.union(self.placement_loci(p)))
+    }
+
+    /// The adjudicator for reads of `locus` (`None`: unknown or several).
+    fn adjudicator_for(&self, locus: Option<Locus>) -> &Adj {
+        locus
+            .and_then(|l| self.locus_adjudicators.iter().find(|(at, _)| *at == l))
+            .map_or(&self.adjudicator, |(_, adjudicator)| adjudicator)
     }
 }
 
@@ -338,6 +388,7 @@ where
         dp: &mut A::Workspace,
         batch: &mut BatchScratch,
     ) {
+        let set = self.j.segment.set();
         for (state, placed) in reads.iter_mut().zip(placements.iter()) {
             state.j_window = self.j_window.window(state.query.len(), placed);
             self.j.retrieve(
@@ -346,6 +397,11 @@ where
                 retrieval,
                 &mut state.j,
             );
+            // A J joins a V of its own locus.
+            let loci = self.placed_loci(placed);
+            state
+                .j
+                .retain(|c| set.allele(c.allele).loci.pairs_with(loci));
         }
         let requests = read_requests(reads, |r| r.j_window.clone(), |r| &r.j);
         self.j
@@ -386,8 +442,12 @@ where
         if candidates.len() < windows.len() {
             candidates.resize_with(windows.len(), Vec::new);
         }
+        let set = d.segment.set();
         for ((k, window), found) in windows.iter().zip(candidates.iter_mut()) {
             d.retrieve(&reads[*k].query, window.clone(), retrieval, found);
+            // A D joins the V and J of its own locus.
+            let loci = self.placed_loci(&placements[*k]);
+            found.retain(|c| set.allele(c.allele).loci.pairs_with(loci));
         }
         let requests: Vec<SegmentRequest<'_>> = windows
             .iter()
@@ -415,10 +475,8 @@ where
         self.v.significance.is_some() || self.j.significance.is_some()
     }
 
-    /// Stage 5, per read: adjudication into calls. A path
-    /// without an anchor ([`Placement::anchor`]) is not a call. A path the
-    /// adjudicator decodes from the posterior replaces the call when it
-    /// keeps an anchor.
+    /// Stage 5, per read: adjudication into calls (see
+    /// [`Self::adjudicate_loci`] for reads whose placements span loci).
     fn stage_adjudicate(
         &self,
         reads: &[ReadState],
@@ -428,22 +486,7 @@ where
     ) {
         out.reserve(reads.len());
         for (state, placed) in reads.iter().zip(placements.iter_mut()) {
-            let anchored = |path: &CallPath| {
-                !self.requires_anchor() || path.segments.iter().any(|s| placed[s.placement].anchor)
-            };
-            let mut path = self
-                .adjudicator
-                .adjudicate(state.query.len(), placed, adjudication)
-                .filter(anchored);
-            let marginals = path
-                .as_ref()
-                .and_then(|path| self.adjudicator.marginals(placed, path, adjudication));
-            if let (Some(called), Some(m)) = (&path, &marginals)
-                && let Some(decoded) = self.adjudicator.decode(placed, called, m, adjudication)
-                && anchored(&decoded)
-            {
-                path = Some(decoded);
-            }
+            let (path, marginals) = self.adjudicate_loci(state.query.len(), placed, adjudication);
             out.push(Call {
                 orientation: state.orientation.expect("stage 1 orients every read"),
                 query: state.query.clone(),
@@ -454,6 +497,120 @@ where
                 c: None,
             });
         }
+    }
+
+    /// One read's path and marginals, each path within one locus. When
+    /// every placement shares a locus, the read is adjudicated once (by
+    /// that locus' adjudicator). Otherwise each locus is adjudicated over
+    /// the placements that belong to it, and the call is the path of the
+    /// locus with the largest likelihood `Z` (or, without posteriors, the
+    /// best path): the posterior is the mixture over loci, weighted by `Z`,
+    /// as each locus' paths are hypotheses of one model.
+    fn adjudicate_loci(
+        &self,
+        query_len: usize,
+        placed: &[Placement],
+        scratch: &mut Adj::Scratch,
+    ) -> (Option<CallPath>, Option<Marginals>) {
+        let loci: Vec<Loci> = placed.iter().map(|p| self.placement_loci(p)).collect();
+        let shared = loci.iter().fold(Loci::ANY, |all, &l| all.intersection(l));
+        if !shared.is_empty() {
+            let adjudicator = self.adjudicator_for(shared.single());
+            return self.adjudicate_read(adjudicator, query_len, placed, scratch);
+        }
+        let all = loci.iter().fold(Loci::NONE, |all, &l| all.union(l));
+        // Per locus: the placement ids, the path and the marginals.
+        let mut found: Vec<(Vec<usize>, CallPath, Option<Marginals>)> = Vec::new();
+        for locus in all.iter() {
+            let ids: Vec<usize> = (0..placed.len())
+                .filter(|&i| loci[i].contains(locus))
+                .collect();
+            if ids.iter().all(|&i| placed[i].kind == SegmentKind::D) {
+                continue;
+            }
+            let subset: Vec<Placement> = ids.iter().map(|&i| placed[i].clone()).collect();
+            let adjudicator = self.adjudicator_for(Some(locus));
+            if let (Some(path), marginals) =
+                self.adjudicate_read(adjudicator, query_len, &subset, scratch)
+            {
+                found.push((ids, path, marginals));
+            }
+        }
+        let posterior = found.iter().all(|(_, _, m)| m.is_some());
+        let best = if posterior {
+            found.iter().enumerate().max_by(|(_, a), (_, b)| {
+                let z = |m: &Option<Marginals>| m.as_ref().map_or(0.0, |m| m.log_partition);
+                z(&a.2).total_cmp(&z(&b.2))
+            })
+        } else {
+            found
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, (_, path, _))| path.score)
+        };
+        let Some((best, _)) = best else {
+            return (None, None);
+        };
+        let marginals = posterior.then(|| {
+            let log_z: Vec<f64> = found
+                .iter()
+                .map(|(_, _, m)| m.as_ref().expect("posterior").log_partition)
+                .collect();
+            let top = log_z.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let total = log_z.iter().map(|z| (z - top).exp()).sum::<f64>();
+            let mut mixed = Marginals {
+                placement: vec![0.0; placed.len()],
+                d_count: Vec::new(),
+                log_partition: top + total.ln(),
+            };
+            for ((ids, _, m), z) in found.iter().zip(&log_z) {
+                let m = m.as_ref().expect("posterior");
+                let weight = (z - top).exp() / total;
+                for (&id, p) in ids.iter().zip(&m.placement) {
+                    mixed.placement[id] += weight * p;
+                }
+                if mixed.d_count.len() < m.d_count.len() {
+                    mixed.d_count.resize(m.d_count.len(), 0.0);
+                }
+                for (sum, p) in mixed.d_count.iter_mut().zip(&m.d_count) {
+                    *sum += weight * p;
+                }
+            }
+            mixed
+        });
+        let (ids, mut path, _) = found.swap_remove(best);
+        for segment in &mut path.segments {
+            segment.placement = ids[segment.placement];
+        }
+        (Some(path), marginals)
+    }
+
+    /// A path without an anchor ([`Placement::anchor`]) is not a call. A
+    /// path the adjudicator decodes from the posterior replaces the call
+    /// when it keeps an anchor.
+    fn adjudicate_read(
+        &self,
+        adjudicator: &Adj,
+        query_len: usize,
+        placed: &[Placement],
+        scratch: &mut Adj::Scratch,
+    ) -> (Option<CallPath>, Option<Marginals>) {
+        let anchored = |path: &CallPath| {
+            !self.requires_anchor() || path.segments.iter().any(|s| placed[s.placement].anchor)
+        };
+        let mut path = adjudicator
+            .adjudicate(query_len, placed, scratch)
+            .filter(anchored);
+        let marginals = path
+            .as_ref()
+            .and_then(|path| adjudicator.marginals(placed, path, scratch));
+        if let (Some(called), Some(m)) = (&path, &marginals)
+            && let Some(decoded) = adjudicator.decode(placed, called, m, scratch)
+            && anchored(&decoded)
+        {
+            path = Some(decoded);
+        }
+        (path, marginals)
     }
 }
 
@@ -516,7 +673,25 @@ where
         let first = out.len();
         self.stage_adjudicate(reads, placements, adjudication, out);
         if let Some(stage) = &self.c {
-            stage.assign(&self.aligner, &mut out[first..], c, retrieval, dp, batch);
+            // C follows the J of its own locus.
+            let loci: Vec<Loci> = out[first..]
+                .iter()
+                .map(|call| {
+                    let last = call.path.as_ref().and_then(|p| p.segments.last());
+                    last.map_or(Loci::ANY, |s| {
+                        self.placement_loci(&call.placements[s.placement])
+                    })
+                })
+                .collect();
+            stage.assign(
+                &self.aligner,
+                &mut out[first..],
+                &loci,
+                c,
+                retrieval,
+                dp,
+                batch,
+            );
         }
     }
 }

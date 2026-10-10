@@ -19,6 +19,7 @@ use crate::family_bound::FamilyBoundTable;
 use crate::flank::OuterExtend;
 use crate::germline::{GermlineSet, SegmentKind};
 use crate::index::IndexError;
+use crate::locus::{Loci, Locus};
 use crate::orient::StrandIndex;
 use crate::pipeline::{Assigner, AssignerOptions};
 use crate::retrieve::{
@@ -613,6 +614,42 @@ impl Assigner {
             d_allele: config.d_allele,
             ..PlacementDag::new(grammar, objective, config.min_retained)
         };
+        // A D database of several loci: a read of one locus prices a D by
+        // that locus' D genes.
+        let d_loci: Vec<Locus> = d.as_ref().map_or(Vec::new(), |d| {
+            Locus::ALL
+                .into_iter()
+                .filter(|&l| d.alleles().iter().any(|a| a.loci == Loci::of(l)))
+                .collect()
+        });
+        let locus_adjudicators: Vec<(Locus, PlacementDag)> = match &d {
+            Some(d) if d_loci.len() > 1 => d_loci
+                .iter()
+                .map(|&locus| {
+                    let (part, _) = d.subset(|a| a.loci.contains(locus));
+                    let model = config.objective.resolve(Some(&part), &config.d);
+                    (
+                        locus,
+                        PlacementDag {
+                            model,
+                            ..adjudicator
+                        },
+                    )
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        // The D floor must not prune a D any locus would call.
+        let floor = locus_adjudicators
+            .iter()
+            .map(|(_, a)| a.model)
+            .fold(objective, |low, m| {
+                if m.d_presence < low.d_presence {
+                    m
+                } else {
+                    low
+                }
+            });
         Ok(Assigner {
             v: v_stage(v, &config.v)?,
             j: j_stage(j, &config.j),
@@ -620,7 +657,7 @@ impl Assigner {
             // win a per-read call.
             d: d.map(|set| {
                 let keep = adjudicator.posterior || !adjudicator.calls_on_fixed_scale();
-                d_stage(set, &config.d, &objective, keep)
+                d_stage(set, &config.d, &floor, keep)
             }),
             strand,
             j_window: config.j.window,
@@ -637,6 +674,7 @@ impl Assigner {
                 config.d.distributed,
             ),
             adjudicator,
+            locus_adjudicators,
             c: None,
             options: config.options,
         })

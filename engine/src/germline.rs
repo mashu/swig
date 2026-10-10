@@ -6,6 +6,8 @@ use std::io::{self, Write};
 
 use crate::alphabet;
 use crate::fasta::{FastaError, parse_fasta};
+use crate::locus::Loci;
+use crate::metadata::SwigMeta;
 use crate::translate::codon;
 
 /// Gene segment type. The derive order (V < D < J < C) is genomic order.
@@ -306,6 +308,15 @@ pub struct Allele {
     /// annotation decides whether the database's gaps follow IMGT and
     /// merges them under the header keys.
     pub imgt: Option<Box<ImgtNumbering>>,
+    /// The loci the allele belongs to ([`crate::locus`]).
+    pub loci: Loci,
+    /// Offset (0–2) of the first complete codon, when given (`frame=` or
+    /// `SWIGMETA=`); a V or J anchor fixes the frame too.
+    pub frame: Option<u8>,
+    /// Where the anchor and region starts come from: the `SWIGMETA=`
+    /// provenance, else the database annotation's source
+    /// ([`crate::prepare`]).
+    pub source: Option<String>,
 }
 
 impl Allele {
@@ -328,6 +339,9 @@ impl Allele {
             self.regions = copy.regions;
         }
         self.imgt = self.imgt.take().or(copy.imgt);
+        self.loci = self.loci.union(copy.loci);
+        self.frame = self.frame.or(copy.frame);
+        self.source = self.source.take().or(copy.source);
     }
 }
 
@@ -406,6 +420,42 @@ fn parse_position(name: &str, key: &str, value: &str) -> Result<u32, GermlineErr
         })
 }
 
+/// The anchor and region starts of a record whose keys gave `anchor` and
+/// `regions`, with `meta` filling the open ones: V regions and anchor, J
+/// anchor. Coordinates that do not fit the `len`-nt sequence, or that
+/// contradict the keys, are left unused.
+fn meta_fill(
+    kind: SegmentKind,
+    meta: &SwigMeta,
+    anchor: Option<u32>,
+    regions: RegionStarts,
+    len: usize,
+) -> (Option<u32>, RegionStarts) {
+    let fits = |a: u32| u64::from(a) + 3 <= len as u64;
+    let meta_anchor = match kind {
+        SegmentKind::V => meta.v_anchor(),
+        SegmentKind::J => meta.j_anchor(),
+        SegmentKind::D | SegmentKind::C => None,
+    };
+    let given = anchor;
+    let anchor = given.or(meta_anchor.filter(|&a| fits(a)));
+    if kind != SegmentKind::V {
+        return (anchor, regions);
+    }
+    let mut values = regions.values();
+    for (slot, start) in values.iter_mut().zip(meta.region_starts()) {
+        *slot = slot.or(start);
+    }
+    let filled = RegionStarts::from_values(values);
+    if filled.check(anchor, len).is_ok() {
+        (anchor, filled)
+    } else if regions.check(anchor, len).is_ok() {
+        (anchor, regions)
+    } else {
+        (given, regions)
+    }
+}
+
 impl GermlineSet {
     pub fn new(kind: SegmentKind) -> Self {
         Self {
@@ -481,13 +531,19 @@ impl GermlineSet {
             regions: RegionStarts::default(),
             aliases: Vec::new(),
             imgt: None,
+            loci: Loci::infer(name, name),
+            frame: None,
+            source: None,
         });
         Ok(id)
     }
 
-    /// Load from FASTA. Header: `>NAME [anchor=POS] [fr1= cdr1= fr2= cdr2= fr3=] [aliases=A,B]`
-    /// (0-based positions; unknown keys are ignored). A gapped V record
-    /// keeps its IMGT numbering in [`Allele::imgt`].
+    /// Load from FASTA. Header: `>NAME [anchor=POS] [fr1= cdr1= fr2= cdr2= fr3=]
+    /// [frame=F] [aliases=A,B] [SWIGMETA=…]` (0-based positions; unknown keys
+    /// are ignored). Swig's `SWIGMETA=` field ([`crate::metadata`]) fills
+    /// what the keys leave open. A gapped V record keeps its IMGT numbering
+    /// in [`Allele::imgt`]; the loci come from the label, else the header
+    /// ([`Loci::infer`]).
     pub fn from_fasta(kind: SegmentKind, text: &str) -> Result<Self, GermlineError> {
         let mut set = Self::new(kind);
         for record in parse_fasta(text)? {
@@ -498,21 +554,53 @@ impl GermlineSet {
                     .map(|v| parse_position(name, key, v))
                     .transpose()
             };
+            let meta = record
+                .attribute("SWIGMETA")
+                .map(|value| {
+                    SwigMeta::parse(value).ok_or_else(|| GermlineError::BadAttribute {
+                        name: name.to_string(),
+                        key: "SWIGMETA".to_string(),
+                        value: value.to_string(),
+                    })
+                })
+                .transpose()?;
             let anchor = position("anchor")?;
             let mut values = [None; 5];
             for (slot, key) in values.iter_mut().zip(RegionStarts::KEYS) {
                 *slot = position(key)?;
             }
             let regions = RegionStarts::from_values(values);
+            let len = record.sequence.len();
             regions
-                .check(anchor, record.sequence.len())
+                .check(anchor, len)
                 .map_err(|reason| GermlineError::BadRegions {
                     name: name.to_string(),
                     reason,
                 })?;
+            // SWIGMETA fills what the keys leave open, as long as the
+            // result stays consistent; otherwise its coordinates are unused.
+            let (anchor, regions) = match &meta {
+                Some(meta) => meta_fill(kind, meta, anchor, regions, len),
+                None => (anchor, regions),
+            };
+            let frame = match record.attribute("frame") {
+                Some(value) => {
+                    Some(value.parse::<u8>().ok().filter(|f| *f < 3).ok_or_else(|| {
+                        GermlineError::BadAttribute {
+                            name: name.to_string(),
+                            key: "frame".to_string(),
+                            value: value.to_string(),
+                        }
+                    })?)
+                }
+                None => meta.and_then(|m| m.frame),
+            };
             let id = set.push(name, &record.sequence, anchor)?;
             let allele = &mut set.alleles[id as usize];
             allele.regions = regions;
+            allele.frame = frame;
+            allele.source = meta.and_then(|m| m.source).map(str::to_string);
+            allele.loci = Loci::infer(name, &record.header);
             if kind == SegmentKind::V {
                 allele.imgt = ImgtNumbering::read(&record.gaps, &allele.codes).map(Box::new);
             }
@@ -540,7 +628,9 @@ impl GermlineSet {
                 .collect();
             set.push_codes(&allele.name, codes, None)
                 .expect("a copied allele is valid");
-            set.alleles.last_mut().expect("just pushed").aliases = allele.aliases.clone();
+            let copy = set.alleles.last_mut().expect("just pushed");
+            copy.aliases = allele.aliases.clone();
+            copy.loci = allele.loci;
         }
         set
     }
@@ -594,6 +684,9 @@ impl GermlineSet {
             target.regions = allele.regions;
             target.aliases = allele.aliases;
             target.imgt = allele.imgt;
+            target.loci = allele.loci;
+            target.frame = allele.frame;
+            target.source = allele.source;
         }
         *self = rebuilt;
         Ok(merged)
@@ -610,6 +703,9 @@ impl GermlineSet {
             write!(out, ">{}", allele.name)?;
             if let Some(anchor) = allele.anchor {
                 write!(out, " anchor={anchor}")?;
+            }
+            if let Some(frame) = allele.frame {
+                write!(out, " frame={frame}")?;
             }
             for (key, value) in RegionStarts::KEYS.iter().zip(allele.regions.values()) {
                 if let Some(value) = value {
@@ -634,6 +730,16 @@ impl GermlineSet {
         self.alleles
             .iter_mut()
             .map(|a| (a.codes.as_slice(), &mut a.anchor, &mut a.regions))
+    }
+
+    /// The anchor, region starts and source of allele `id`, for annotation
+    /// (sequence and name stay fixed).
+    pub fn annotation_mut(
+        &mut self,
+        id: AlleleId,
+    ) -> (&mut Option<u32>, &mut RegionStarts, &mut Option<String>) {
+        let allele = &mut self.alleles[id as usize];
+        (&mut allele.anchor, &mut allele.regions, &mut allele.source)
     }
 
     pub fn kind(&self) -> SegmentKind {
@@ -668,6 +774,34 @@ impl GermlineSet {
 
     pub fn gene_name(&self, gene: GeneId) -> &str {
         &self.genes[gene as usize]
+    }
+
+    /// The loci of every allele together.
+    pub fn loci(&self) -> Loci {
+        self.alleles
+            .iter()
+            .fold(Loci::NONE, |loci, a| loci.union(a.loci))
+    }
+
+    /// The alleles for which `keep` holds, in order, as a set of their own,
+    /// with their ids in this set.
+    pub fn subset(&self, keep: impl Fn(&Allele) -> bool) -> (Self, Vec<AlleleId>) {
+        let mut set = Self::new(self.kind);
+        let mut ids = Vec::new();
+        for (id, allele) in (0..).zip(&self.alleles) {
+            if keep(allele) {
+                let new = set
+                    .push_codes(&allele.name, allele.codes.clone(), allele.anchor)
+                    .expect("a copied allele is valid");
+                let gene = set.alleles[new as usize].gene;
+                set.alleles[new as usize] = Allele {
+                    gene,
+                    ..allele.clone()
+                };
+                ids.push(id);
+            }
+        }
+        (set, ids)
     }
 }
 
