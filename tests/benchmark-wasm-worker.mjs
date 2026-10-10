@@ -1,71 +1,31 @@
 import fs from "node:fs";
 import { parentPort, workerData } from "node:worker_threads";
 
-import { WASI } from "@bjorn3/browser_wasi_shim";
+import { AlignerEngine } from "../src/aligner-engine.ts";
 
-const encoder = new TextEncoder();
-const decoder = new TextDecoder();
-let runtime;
-
-function put(bytes) {
-  const pointer = runtime.swig_alloc(bytes.byteLength);
-  if (!pointer && bytes.byteLength) throw new Error("WASM allocation failed");
-  new Uint8Array(runtime.memory.buffer, pointer, bytes.byteLength).set(bytes);
-  return [pointer, bytes.byteLength];
-}
-
-function errorText() {
-  return decoder.decode(new Uint8Array(
-    runtime.memory.buffer,
-    runtime.swig_error_ptr(),
-    runtime.swig_error_len(),
-  ));
-}
+let engine;
 
 async function initialize(references) {
   const wasmBytes = fs.readFileSync(
-    workerData?.wasmPath || new URL("../public/swiftig.wasm", import.meta.url),
+    workerData?.wasmPath || new URL("../public/swig.wasm", import.meta.url),
   );
-  const wasi = new WASI([], [], []);
   const module = await WebAssembly.compile(wasmBytes);
-  const instance = await WebAssembly.instantiate(module, { wasi_snapshot_preview1: wasi.wasiImport });
-  wasi.initialize(instance);
-  runtime = instance.exports;
-  const strategy = workerData?.strategy === "riat_mp" ? 1 :
-    workerData?.strategy === "aer" ? 2 : workerData?.strategy === "aer_robust" ? 3 : 0;
-  if (runtime.swig_set_assigner_strategy(strategy) !== 0) {
-    throw new Error("SwiftIG rejected the benchmark assignment strategy");
-  }
-  const profile = workerData?.profile === "r_optimized" ? 2 :
-    workerData?.profile === "sensitive_d" ? 3 :
-    workerData?.profile === "igblast_compatible" ? 1 : 0;
-  if (runtime.swig_set_calling_profile(profile) !== 0) {
-    throw new Error("SwiftIG rejected the benchmark calling profile");
-  }
-  if (workerData?.reference && runtime.swig_set_optimized_kernels) {
-    runtime.swig_set_optimized_kernels(0);
-  }
-  if (workerData?.referenceOutput && runtime.swig_set_optimized_output) {
-    runtime.swig_set_optimized_output(0);
-  }
-  const allocations = [references.V, references.D, references.J, references.C].map((value) => put(encoder.encode(value)));
-  const genes = runtime.swig_init_database(...allocations.flat());
-  allocations.forEach(([pointer]) => runtime.swig_free(pointer));
-  if (genes < 0) throw new Error(errorText());
-  return genes;
+  const settings = {
+    callingProfile: workerData?.profile || "r_optimized",
+    minimumIdentity: 0.6,
+    strand: 0,
+  };
+  const created = await AlignerEngine.create(module, settings, references);
+  engine = created.engine;
+  return created.records;
 }
 
 function annotate(message) {
-  const [pointer, length] = put(new Uint8Array(message.query));
-  const count = runtime.swig_annotate(pointer, length, 1, 600, 0);
-  runtime.swig_free(pointer);
-  if (count < 0) throw new Error(errorText());
-  const output = new Uint8Array(
-    runtime.memory.buffer,
-    runtime.swig_result_ptr(),
-    runtime.swig_result_len(),
-  ).slice();
-  parentPort.postMessage({ type: "batch", id: message.id, count, output: output.buffer }, [output.buffer]);
+  const batch = engine.annotate(new Uint8Array(message.query), message.count, false);
+  const output = new Uint8Array(batch.header.length + 1 + batch.body.byteLength);
+  output.set(new TextEncoder().encode(`${batch.header}\n`));
+  output.set(batch.body, batch.header.length + 1);
+  parentPort.postMessage({ type: "batch", id: message.id, count: batch.count, output: output.buffer }, [output.buffer]);
 }
 
 parentPort.on("message", (message) => {

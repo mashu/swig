@@ -4,7 +4,7 @@ import type { DenoiseOptions } from "./post-analysis-core.ts";
 import type { CompiledReferences, ScopeKey } from "./reference-pack.ts";
 import { DEFAULT_REPERTOIRE_SELECTION, type RepertoireSelectionOptions } from "./repertoire-selection.ts";
 import { DEFAULT_PIPELINE_PLAN, type DatasetManifestEntry, type PipelinePlan, type StudyDesign } from "./study-design.ts";
-import type { AssignerStrategy, CallingProfile, DoubleDScreenOptions } from "./swiftig-runtime.ts";
+import type { CallingProfile, DoubleDScreenOptions } from "./aligner-engine.ts";
 import { DEFAULT_FASTQ_QUALITY_FILTER, type FastqQualityFilterOptions } from "./sequence-stream.ts";
 import type { PostAnalysisSessionSnapshot } from "./session-state.ts";
 
@@ -45,12 +45,11 @@ export interface CliAnnotationConfig {
   workers: number;
   batchRecords: number;
   callingProfile: CallingProfile;
-  assignerStrategy: AssignerStrategy;
   minimumIdentity: number;
   /** Optional extra gate over the complete query-covered C-reference prefix. */
   minimumConstantPrefixIdentity: number | null;
   strand: 0 | 1 | 2;
-  /** Re-run SwiftIG on AIRR `sequence`, or trust the existing AIRR calls. */
+  /** Re-run the aligner on AIRR `sequence`, or trust the existing AIRR calls. */
   airrMode: "reannotate" | "preserve";
   doubleD: DoubleDScreenOptions;
 }
@@ -157,7 +156,6 @@ export const DEFAULT_CLI_CONFIG: SwigCliConfig = {
     workers: 0,
     batchRecords: 0,
     callingProfile: "r_optimized",
-    assignerStrategy: "aer_robust",
     minimumIdentity: 0.6,
     minimumConstantPrefixIdentity: null,
     strand: 0,
@@ -211,8 +209,9 @@ export function normalizeCliConfig(value: PartialSwigCliConfig): SwigCliConfig {
     const sampleId=safeIdentifier(input.sampleId??datasetId,`sample-${index+1}`);
     return {...input,format:input.format??"auto",datasetId,sampleId,subjectId:safeIdentifier(input.subjectId??sampleId,`subject-${index+1}`),cohort:input.cohort??"",timepoint:input.timepoint??"",compartment:input.compartment??""};
   });
-  const annotation={...DEFAULT_CLI_CONFIG.annotation,...value.annotation,doubleD:{...DEFAULT_CLI_CONFIG.annotation.doubleD,...value.annotation?.doubleD}};
-  if (value.annotation?.callingProfile === undefined && annotation.assignerStrategy !== "aer_robust") annotation.callingProfile = "truth_optimized";
+  // Swig 0.38 configs also name a SwiftIG assigner strategy; the Rust aligner has one search.
+  const {assignerStrategy:_strategy,...given}=(value.annotation??{}) as Partial<CliAnnotationConfig>&{assignerStrategy?:unknown};
+  const annotation={...DEFAULT_CLI_CONFIG.annotation,...given,doubleD:{...DEFAULT_CLI_CONFIG.annotation.doubleD,...given.doubleD}};
   annotation.workers=Math.max(0,Math.floor(finite(annotation.workers,0)));
   annotation.batchRecords=Math.max(0,Math.floor(finite(annotation.batchRecords,0)));
   annotation.minimumIdentity=Math.max(0,Math.min(1,finite(annotation.minimumIdentity,0.6)));
@@ -257,7 +256,6 @@ export interface BrowserCliExport {
   scope: ScopeKey;
   workers: number;
   callingProfile: CallingProfile;
-  assignerStrategy: AssignerStrategy;
   minimumIdentity: number;
   minimumConstantPrefixIdentity?: number | null;
   strand: 0|1|2;
@@ -343,7 +341,7 @@ export function cliConfigFromBrowser(run: BrowserCliExport): SwigCliConfig {
     inputs:run.datasets.map((dataset)=>{const source=(dataset as DatasetManifestEntry & {source?:unknown}).source;return {path:dataset.inputPath??dataset.inputName,inputName:dataset.inputName,inline:typeof source==="string"?source:undefined,format:dataset.inputFormat??"auto",gzipRange:dataset.gzipRange?{...dataset.gzipRange}:undefined,datasetId:dataset.datasetId,sampleId:dataset.sampleId,subjectId:dataset.subjectId,cohort:dataset.cohort,timepoint:dataset.timepoint,compartment:dataset.compartment??""};}),
     references:{species:run.species,scope:run.scope,inline:{V:run.references.V,D:run.references.D,J:run.references.J,C:run.references.C}},
     preprocessing:{fastqFilter:run.fastqFilter,subsample:run.subsample},
-    annotation:{workers:run.workers,callingProfile:run.callingProfile,assignerStrategy:run.assignerStrategy,minimumIdentity:run.minimumIdentity,minimumConstantPrefixIdentity:run.minimumConstantPrefixIdentity??null,strand:run.strand,airrMode:"reannotate",doubleD:run.doubleD},
+    annotation:{workers:run.workers,callingProfile:run.callingProfile,minimumIdentity:run.minimumIdentity,minimumConstantPrefixIdentity:run.minimumConstantPrefixIdentity??null,strand:run.strand,airrMode:"reannotate",doubleD:run.doubleD},
     pipeline:{
       collapse:{...run.pipeline.collapse,denoise:run.collapseOptions},
       chimera:{...run.pipeline.chimera,...run.chimeraOptions},

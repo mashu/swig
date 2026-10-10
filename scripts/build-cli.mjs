@@ -14,6 +14,6 @@ await build({
 });
 const assets=new URL("../cli/assets/",import.meta.url);
 await mkdir(assets,{recursive:true});
-await copyFile(new URL("../public/swiftig.wasm",import.meta.url),new URL("swiftig.wasm",assets));
+await copyFile(new URL("../public/swig.wasm",import.meta.url),new URL("swig.wasm",assets));
 await copyFile(new URL("../public/references/imgt-202632-7-swig-0.7.json.gz",import.meta.url),new URL("imgt-reference-pack.json.gz",assets));
 await chmod(new URL("../cli/swig-cli.mjs",import.meta.url),0o755);

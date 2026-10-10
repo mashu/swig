@@ -11,7 +11,7 @@ import {
   type SequenceSource,
   sequenceSourceSize,
 } from "./sequence-stream";
-import type { AssignerStrategy, CallingProfile, DoubleDScreenOptions } from "./swiftig-runtime";
+import type { AlignerSettings, GermlineTexts } from "./aligner-engine";
 import {
   ASSIGNMENT_TELEMETRY_INTERVAL_MS,
   initializingAssignmentTelemetry,
@@ -25,17 +25,12 @@ interface StartRequest {
   id: number;
   query: SequenceSource;
   format: SequenceFormat;
-  references: { V: string; D: string; J: string; C: string };
-  callingProfile: CallingProfile;
-  assignerStrategy: AssignerStrategy;
-  minimumIdentity: number;
-  minimumConstantPrefixIdentity: number | null;
-  strand: 0 | 1 | 2;
+  references: GermlineTexts;
+  settings: AlignerSettings;
   workers: number;
   countHint: number | null;
   subsample?: { size: number; seed: number };
   fastqFilter?: FastqQualityFilterOptions;
-  doubleD?: DoubleDScreenOptions;
 }
 
 interface AckRequest {
@@ -86,12 +81,12 @@ function waitForAcknowledgement(id: number, batch: number): Promise<void> {
 }
 
 async function compileCore(): Promise<WebAssembly.Module> {
-  const url = `${import.meta.env.BASE_URL}swiftig.wasm`;
+  const url = `${import.meta.env.BASE_URL}swig.wasm`;
   try {
     return await WebAssembly.compileStreaming(fetch(url));
   } catch {
     const response = await fetch(url);
-    if (!response.ok) throw new Error("The SwiftIG WebAssembly core could not be loaded.");
+    if (!response.ok) throw new Error("The Swig aligner's WebAssembly module could not be loaded.");
     return WebAssembly.compile(await response.arrayBuffer());
   }
 }
@@ -115,12 +110,10 @@ function batchSize(countHint: number | null): number {
 async function initializeSlot(
   index: number,
   module: WebAssembly.Module,
-  references: StartRequest["references"],
-  callingProfile: CallingProfile,
-  assignerStrategy: AssignerStrategy,
-  minimumConstantPrefixIdentity: number | null,
+  references: GermlineTexts,
+  settings: AlignerSettings,
 ): Promise<ComputeSlot> {
-  const worker = new Worker(new URL("./swiftig-compute-worker.ts", import.meta.url), { type: "module" });
+  const worker = new Worker(new URL("./aligner-compute-worker.ts", import.meta.url), { type: "module" });
   const slot: ComputeSlot = { index, worker, busy: false };
   return new Promise((resolve, reject) => {
     const fail = (error: Error) => {
@@ -129,14 +122,14 @@ async function initializeSlot(
     };
     worker.onerror = (event) => fail(new Error(event.message || `Compute worker ${index + 1} stopped unexpectedly.`));
     worker.onmessage = (event) => {
-      const message = event.data as { type: "ready" | "error"; genes?: number; message?: string };
+      const message = event.data as { type: "ready" | "error"; records?: number; message?: string };
       if (message.type === "error") {
         fail(new Error(message.message || `Compute worker ${index + 1} could not initialize.`));
         return;
       }
       resolve(slot);
     };
-    worker.postMessage({ type: "initialize", worker: index, module, references, callingProfile, assignerStrategy, minimumConstantPrefixIdentity });
+    worker.postMessage({ type: "initialize", worker: index, module, references, settings });
   });
 }
 
@@ -172,10 +165,7 @@ function annotate(slot: ComputeSlot, batch: SequenceBatch, request: StartRequest
       batch: batch.index,
       query: query.buffer,
       count: batch.count,
-      format: batch.format,
-      minimumIdentity: request.minimumIdentity,
-      strand: request.strand,
-      doubleD: request.doubleD,
+      doubleD: Boolean(request.settings.doubleD && request.settings.doubleD.mode !== "off"),
     }, [query.buffer]);
   });
 }
@@ -189,7 +179,7 @@ async function handleRequest(request: StartRequest) {
     postInitializationTelemetry(request.id, workerCount, 0);
     const module = await compileCore();
     postProgress(request.id, `Indexing germlines in ${workerCount} worker${workerCount === 1 ? "" : "s"}`, 0.08);
-    // Each compute worker receives its own SwiftIG instance and germline index.
+    // Each compute worker receives its own aligner instance and germline index.
     // The initializations are launched together, which is the expected brief
     // all-core burst at the start of every browser dataset.
     let activeInitializers = workerCount;
@@ -198,10 +188,7 @@ async function handleRequest(request: StartRequest) {
       { length: workerCount },
       async (_, index) => {
         try {
-          return await initializeSlot(
-            index, module, request.references, request.callingProfile, request.assignerStrategy,
-            request.minimumConstantPrefixIdentity,
-          );
+          return await initializeSlot(index, module, request.references, request.settings);
         } finally {
           activeInitializers -= 1;
           postInitializationTelemetry(request.id, workerCount, activeInitializers);

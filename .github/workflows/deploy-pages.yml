@@ -42,12 +42,21 @@ jobs:
             --output "$RUNNER_TEMP/wasi-sdk.tar.gz"
           tar -xzf "$RUNNER_TEMP/wasi-sdk.tar.gz" -C "$RUNNER_TEMP"
 
-      - name: Build SIMD/LTO WebAssembly core
+      - name: Set up Rust for the aligner
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add wasm32-unknown-unknown
+
+      - name: Test the aligner engine
+        run: npm run test:engine
+
+      - name: Build SIMD/LTO WebAssembly cores
         run: npm run build:wasm
         env:
           WASI_SDK: ${{ runner.temp }}/wasi-sdk-25.0-x86_64-linux
 
-      - name: Test streaming pipeline and WebAssembly core
+      - name: Test streaming pipeline and WebAssembly cores
         run: npm test
 
       - name: Build static site

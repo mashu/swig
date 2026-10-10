@@ -32,12 +32,11 @@ test("small CLI configs receive analysis defaults and explicit donor grouping",(
   assert.equal(config.pipeline.lineage.scope,"subject");
   assert.equal(config.pipeline.shm.enabled,true);
   assert.equal(config.annotation.workers,0,"zero means choose the host default at CLI startup");
-  assert.equal(config.annotation.assignerStrategy,"aer_robust");
+  assert.equal(config.annotation.callingProfile,"r_optimized");
   assert.equal(config.annotation.minimumConstantPrefixIdentity,null);
   assert.equal(config.output.airrCompression,"none");
   assert.equal(normalizeCliConfig({annotation:{minimumConstantPrefixIdentity:.98},output:{airrCompression:"gzip"}}).annotation.minimumConstantPrefixIdentity,.98);
   assert.equal(normalizeCliConfig({output:{airrCompression:"gzip"}}).output.airrCompression,"gzip");
-  assert.equal(normalizeCliConfig({annotation:{assignerStrategy:"aer_robust"}}).annotation.assignerStrategy,"aer_robust");
   assert.equal(normalizeCliConfig({annotation:{callingProfile:"r_optimized"}}).annotation.callingProfile,"r_optimized");
   assert.equal(normalizeCliConfig({annotation:{callingProfile:"sensitive_d"}}).annotation.callingProfile,"sensitive_d");
   assert.equal(config.references.prepareMetadata,true);
@@ -57,7 +56,6 @@ test("browser CLI export preserves exact references, methods, and sample-to-dono
     scope:"IGH",
     workers:3,
     callingProfile:"truth_optimized",
-    assignerStrategy:"aer",
     minimumIdentity:0.7,
     minimumConstantPrefixIdentity:0.98,
     strand:0,
@@ -95,7 +93,7 @@ test("completed interactive settings map back to executable CLI fields without l
   // The browser may have started in interactive mode; only stages with a
   // committed result should become enabled in its Results-page export.
   const state=cliStateFromPostAnalysis({...DEFAULT_PIPELINE_PLAN,enabled:false},post);
-  const config=cliConfigFromBrowser({studyName:"interactive",studyDesign:"custom",datasets:[{datasetId:"d",inputName:"reads.airr.tsv",sampleId:"s",subjectId:"p",cohort:"",timepoint:""}],references,species:"Homo sapiens",scope:"IGH",workers:2,callingProfile:"truth_optimized",assignerStrategy:"aer",minimumIdentity:0.6,strand:0,doubleD:{mode:"off",minimumVjSpan:40,seedLength:11,pseudoTrim:5,maximumPseudoMismatches:3,minimumScoreGain:8},...state});
+  const config=cliConfigFromBrowser({studyName:"interactive",studyDesign:"custom",datasets:[{datasetId:"d",inputName:"reads.airr.tsv",sampleId:"s",subjectId:"p",cohort:"",timepoint:""}],references,species:"Homo sapiens",scope:"IGH",workers:2,callingProfile:"truth_optimized",minimumIdentity:0.6,strand:0,doubleD:{mode:"off",minimumVjSpan:40,seedLength:11,pseudoTrim:5,maximumPseudoMismatches:3,minimumScoreGain:8},...state});
   assert.equal(config.pipeline.collapse.mode,"indel");
   assert.equal(config.pipeline.collapse.scope,"cohort");
   assert.equal(config.pipeline.collapse.denoise.maximumEditDistance,4);
@@ -113,28 +111,25 @@ test("completed interactive settings map back to executable CLI fields without l
 
 test("pre-run export embeds a pasted dataset instead of emitting an unusable text-file path",()=>{
   const pasted={datasetId:"paste",inputName:"pasted-sequences.txt",inputPath:"pasted-sequences.txt",inputFormat:"fasta",sampleId:"sample",subjectId:"donor",cohort:"",timepoint:"",source:">read\nACGT\n"} as DatasetManifestEntry & {source:string};
-  const config=cliConfigFromBrowser({studyName:"paste",studyDesign:"independent",datasets:[pasted],references,species:"Homo sapiens",scope:"IGH",workers:1,callingProfile:"truth_optimized",assignerStrategy:"aer",minimumIdentity:0.6,strand:0,doubleD:{mode:"off",minimumVjSpan:40,seedLength:11,pseudoTrim:5,maximumPseudoMismatches:3,minimumScoreGain:8},pipeline:{...DEFAULT_PIPELINE_PLAN,enabled:true}});
+  const config=cliConfigFromBrowser({studyName:"paste",studyDesign:"independent",datasets:[pasted],references,species:"Homo sapiens",scope:"IGH",workers:1,callingProfile:"truth_optimized",minimumIdentity:0.6,strand:0,doubleD:{mode:"off",minimumVjSpan:40,seedLength:11,pseudoTrim:5,maximumPseudoMismatches:3,minimumScoreGain:8},pipeline:{...DEFAULT_PIPELINE_PLAN,enabled:true}});
   assert.equal(config.inputs[0].format,"fasta");
   assert.equal(config.inputs[0].inline,">read\nACGT\n");
 });
 
-test("browser CLI export preserves the AER-R-only R-optimized profile",()=>{
-  const config=cliConfigFromBrowser({studyName:"r profile",studyDesign:"independent",datasets:[],references,species:"Macaca mulatta",scope:"IGH",workers:2,callingProfile:"r_optimized",assignerStrategy:"aer_robust",minimumIdentity:0.6,strand:1,doubleD:{mode:"off",minimumVjSpan:40,seedLength:11,pseudoTrim:5,maximumPseudoMismatches:3,minimumScoreGain:8},pipeline:{...DEFAULT_PIPELINE_PLAN,enabled:false}});
-  assert.equal(config.annotation.callingProfile,"r_optimized");
-  assert.equal(config.annotation.assignerStrategy,"aer_robust");
-});
+for(const callingProfile of ["r_optimized","sensitive_d","truth_optimized","igblast_compatible"] as const){
+  test(`browser CLI export preserves the ${callingProfile} calling profile`,()=>{
+    const config=cliConfigFromBrowser({studyName:"profile",studyDesign:"independent",datasets:[],references,species:"Macaca mulatta",scope:"IGH",workers:2,callingProfile,minimumIdentity:0.6,strand:1,doubleD:{mode:"off",minimumVjSpan:40,seedLength:11,pseudoTrim:5,maximumPseudoMismatches:3,minimumScoreGain:8},pipeline:{...DEFAULT_PIPELINE_PLAN,enabled:false}});
+    assert.equal(config.annotation.callingProfile,callingProfile);
+    assert.equal("assignerStrategy" in config.annotation,false);
+  });
+}
 
-test("browser CLI export preserves the AER-R-only Sensitive-D profile",()=>{
-  const config=cliConfigFromBrowser({studyName:"sensitive D",studyDesign:"independent",datasets:[],references,species:"Macaca mulatta",scope:"IGH",workers:2,callingProfile:"sensitive_d",assignerStrategy:"aer_robust",minimumIdentity:0.6,strand:1,doubleD:{mode:"off",minimumVjSpan:40,seedLength:11,pseudoTrim:5,maximumPseudoMismatches:3,minimumScoreGain:8},pipeline:{...DEFAULT_PIPELINE_PLAN,enabled:false}});
-  assert.equal(config.annotation.callingProfile,"sensitive_d");
-  assert.equal(config.annotation.assignerStrategy,"aer_robust");
-});
-
-test("assignment defaults choose AER-R/R-optimized while explicit legacy strategies remain usable",()=>{
+test("assignment defaults to R-optimized; a saved assignment strategy is dropped, its profile kept",()=>{
   const defaults=normalizeCliConfig({});
-  assert.equal(defaults.annotation.assignerStrategy,"aer_robust");
   assert.equal(defaults.annotation.callingProfile,"r_optimized");
-  const explicit=normalizeCliConfig({annotation:{assignerStrategy:"riat_mp"}});
-  assert.equal(explicit.annotation.assignerStrategy,"riat_mp");
-  assert.equal(explicit.annotation.callingProfile,"truth_optimized");
+  assert.equal("assignerStrategy" in defaults.annotation,false);
+  const saved=normalizeCliConfig({annotation:{assignerStrategy:"riat_mp",callingProfile:"truth_optimized"}});
+  assert.equal("assignerStrategy" in saved.annotation,false);
+  assert.equal(saved.annotation.callingProfile,"truth_optimized");
+  assert.equal(normalizeCliConfig({annotation:{assignerStrategy:"riat_mp"}}).annotation.callingProfile,"r_optimized");
 });

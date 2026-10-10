@@ -1,3 +1,4 @@
+import type { AlignerSettings } from "./aligner-engine";
 import type { CompiledReferences } from "./reference-pack";
 import type { FastqQualityFilterOptions, FastqQualityFilterStats, SequenceSource } from "./sequence-stream";
 import type { AssignmentTelemetry } from "./assignment-telemetry";
@@ -13,34 +14,17 @@ export interface ResultBatch {
   doubleDCount?: number;
 }
 
-export type DoubleDScreenMode = "off" | "all" | "long_span";
-
-export type CallingProfile = "truth_optimized" | "igblast_compatible" | "igblast_balanced" | "r_optimized" | "sensitive_d";
-export type AssignerStrategy = "standard" | "riat_mp" | "aer" | "aer_robust";
-
-export interface DoubleDScreenOptions {
-  mode: DoubleDScreenMode;
-  minimumVjSpan: number;
-  seedLength: number;
-  pseudoTrim: number;
-  maximumPseudoMismatches: number;
-  minimumScoreGain: number;
-}
+export type { CallingProfile, DoubleDScreenMode, DoubleDScreenOptions } from "./aligner-engine";
 
 export interface RunOptions {
   query: SequenceSource;
   format: 1 | 2 | 3;
   references: CompiledReferences;
-  callingProfile: CallingProfile;
-  assignerStrategy: AssignerStrategy;
-  minimumIdentity: number;
-  minimumConstantPrefixIdentity?: number | null;
-  strand: 0 | 1 | 2;
+  settings: AlignerSettings;
   workers: number;
   countHint?: number | null;
   subsample?: { size: number; seed: number };
   fastqFilter?: FastqQualityFilterOptions;
-  doubleD?: DoubleDScreenOptions;
   onProgress?: (stage: string, value: number) => void;
   onTelemetry?: (telemetry: AssignmentTelemetry) => void;
   onBatch?: (batch: ResultBatch) => void | Promise<void>;
@@ -87,9 +71,9 @@ export async function withAnalysisWebLock<T>(
   });
 }
 
-export function runSwiftIg(options: RunOptions): Promise<RunResult> {
+export function runAligner(options: RunOptions): Promise<RunResult> {
   const id = ++requestId;
-  const worker = new Worker(new URL("./swiftig-worker.ts", import.meta.url), { type: "module" });
+  const worker = new Worker(new URL("./aligner-worker.ts", import.meta.url), { type: "module" });
   return new Promise((resolve, reject) => {
     let finished = false;
     const fail = (error: Error) => {
@@ -152,7 +136,7 @@ export function runSwiftIg(options: RunOptions): Promise<RunResult> {
         return;
       }
       if (message.type === "error") {
-        fail(new Error(message.message ?? "SwiftIG failed."));
+        fail(new Error(message.message ?? "The Swig aligner failed."));
         return;
       }
       finished = true;
@@ -176,7 +160,7 @@ export function runSwiftIg(options: RunOptions): Promise<RunResult> {
         },
       });
     };
-    worker.onerror = (event) => fail(new Error(event.message || "The SwiftIG worker stopped unexpectedly."));
+    worker.onerror = (event) => fail(new Error(event.message || "The aligner worker stopped unexpectedly."));
     worker.postMessage({
       type: "start",
       id,
@@ -188,16 +172,11 @@ export function runSwiftIg(options: RunOptions): Promise<RunResult> {
         J: options.references.J,
         C: options.references.C,
       },
-      callingProfile: options.callingProfile,
-      assignerStrategy: options.assignerStrategy,
-      minimumIdentity: options.minimumIdentity,
-      minimumConstantPrefixIdentity: options.minimumConstantPrefixIdentity ?? null,
-      strand: options.strand,
+      settings: options.settings,
       workers: options.workers,
       countHint: options.countHint ?? null,
       subsample: options.subsample,
       fastqFilter: options.fastqFilter,
-      doubleD: options.doubleD,
     });
   });
 }

@@ -1,7 +1,8 @@
 import type { QueryTarget } from "./post-analysis-core";
 import type { CompiledReferences } from "./reference-pack";
 import { AirrResultStore } from "./result-store";
-import { runSwiftIg, type AssignerStrategy, type CallingProfile } from "./swiftig-runtime";
+import type { CallingProfile } from "./aligner-engine";
+import { runAligner } from "./aligner-runtime";
 
 export interface InferredQueryAssignment {
   queryIndex: number;
@@ -31,7 +32,6 @@ export async function inferQueryAssignments(
   target: QueryTarget,
   references: CompiledReferences,
   callingProfile: CallingProfile,
-  assignerStrategy: AssignerStrategy,
   minimumIdentity: number,
   strand: 0 | 1 | 2,
   workers: number,
@@ -39,14 +39,11 @@ export async function inferQueryAssignments(
 ): Promise<InferredQueryAssignment[]> {
   const store = new AirrResultStore();
   try {
-    await runSwiftIg({
+    await runAligner({
       query: fastaForQueries(queries),
       format: 1,
       references,
-      callingProfile,
-      assignerStrategy,
-      minimumIdentity,
-      strand,
+      settings: { callingProfile, minimumIdentity, strand },
       workers: Math.max(1, Math.min(workers, queries.length, 8)),
       countHint: queries.length,
       signal,
