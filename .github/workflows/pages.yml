@@ -1,0 +1,52 @@
+name: Pages
+
+# The web demo. When CI passes on a push to main, the web build it tested
+# (its vdj-assign-web artifact: the page as index.html, the JavaScript API
+# and both modules) is published to GitHub Pages. Pages must be enabled
+# with GitHub Actions as its source (Settings > Pages > Build and
+# deployment). To publish again, re-run this workflow's run.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+# The newest build wins; a deployment in progress is not cut short.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # A push to main in this repository, never a pull request's run.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: vdj-assign-web
+          path: site
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - name: The page is the site's index
+        run: |
+          test -s site/index.html
+          ls -l site
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@v4

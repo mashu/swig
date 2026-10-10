@@ -32,21 +32,23 @@ before the release was published.
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS  # macOS: shasum -a 256 --check --ignore-missing SHA256SUMS
-tar xzf vdj-assign-0.1.0-x86_64-unknown-linux-gnu.tar.gz
-vdj-assign-0.1.0-x86_64-unknown-linux-gnu/vdj-assign --version
+tar xzf vdj-assign-0.1.1-x86_64-unknown-linux-gnu.tar.gz
+vdj-assign-0.1.1-x86_64-unknown-linux-gnu/vdj-assign --version
 ```
 
 The binaries are not signed. On macOS, clear the quarantine flag before the
-first run: `xattr -dr com.apple.quarantine vdj-assign-0.1.0-aarch64-apple-darwin`
-(`vdj-assign-0.1.0-x86_64-apple-darwin` on Intel). On Windows, unzip
-`vdj-assign-0.1.0-x86_64-pc-windows-msvc.zip` and run `vdj-assign.exe`.
+first run: `xattr -dr com.apple.quarantine vdj-assign-0.1.1-aarch64-apple-darwin`
+(`vdj-assign-0.1.1-x86_64-apple-darwin` on Intel). On Windows, unzip
+`vdj-assign-0.1.1-x86_64-pc-windows-msvc.zip` and run `vdj-assign.exe`.
 
-The browser build needs no installation and no server: open
-`vdj-assign-0.1.0.html` in a browser (double-click it, or drag it into a
+To try it without installing anything, open the web demo:
+https://mashu.github.io/vdj_assign/ (deployed from `main` whenever CI
+passes). The browser build needs no installation and no server: open
+`vdj-assign-0.1.1.html` in a browser (double-click it, or drag it into a
 window). It is one self-contained page, both WebAssembly modules included,
 that computes in the browser and uploads nothing; *Use demo data* fills in a
 synthetic database and reads. Put the same file on any static host (GitHub
-Pages, an intranet folder) to share it. `vdj-assign-web-0.1.0.zip` holds it
+Pages, an intranet folder) to share it. `vdj-assign-web-0.1.1.zip` holds it
 as `index.html` next to the JavaScript API, which Node.js 18 or later
 imports as an ES module (see *In the browser* below).
 
@@ -227,7 +229,8 @@ const file = new Blob(parts);                 // the AIRR TSV at any size: heade
   and runs opened from disk or from any static host. The browser test
   opens it from disk and checks that it requests nothing but itself and
   its blobs. CI uploads it with the API and both modules as the
-  `vdj-assign-web` artifact; each release ships it as
+  `vdj-assign-web` artifact, which `.github/workflows/pages.yml` publishes
+  to GitHub Pages after CI passes on `main`; each release ships it as
   `vdj-assign-<version>.html` and, with the API, as
   `vdj-assign-web-<version>.zip`.
 

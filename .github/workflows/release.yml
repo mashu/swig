@@ -1,14 +1,19 @@
 name: Release
 
-# A tag vX.Y.Z runs the whole CI, builds the command line for Linux, macOS
-# and Windows and the browser bundle, unpacks and tests every archive on its
-# own platform, and publishes them as the GitHub release vX.Y.Z with the
-# CHANGELOG.md section as its notes. Running the workflow by hand on main
-# (Actions > Release > Run workflow) does the same for the crate version and
-# creates its tag at that commit. A pull request that changes this file or
-# the changelog builds and tests the archives without publishing.
+# A release runs the whole CI, builds the command line for Linux, macOS and
+# Windows and the browser page, unpacks and tests every archive on its own
+# platform, and publishes them as the GitHub release vX.Y.Z with the
+# CHANGELOG.md section as its notes. It starts when
+# - a push to main carries a crate version that has no tag yet (merging a
+#   version bump releases it; the tag is created at that commit; a push whose
+#   version is already tagged does nothing),
+# - a tag vX.Y.Z is pushed, or
+# - the workflow is run by hand on main (Actions > Release > Run workflow).
+# A pull request that changes this file or the changelog builds and tests
+# the archives without publishing.
 on:
   push:
+    branches: [main]
     tags: ['v*']
   workflow_dispatch:
   pull_request:
@@ -19,6 +24,11 @@ on:
 permissions:
   contents: read
 
+# One release at a time, so a second push to main sees the first one's tag.
+concurrency:
+  group: release-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -27,6 +37,9 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      # Build and test the archives; publish them as the release.
+      build: ${{ steps.version.outputs.build }}
+      publish: ${{ steps.version.outputs.publish }}
     steps:
       - uses: actions/checkout@v5
       - id: version
@@ -45,30 +58,45 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME does not match the crate version $version"
             exit 1
           fi
-          # By hand: from main only, and an existing tag must name this commit.
-          if [ "$EVENT" = workflow_dispatch ]; then
+          build=true
+          publish=true
+          if [ "$EVENT" = pull_request ]; then publish=false; fi
+          # A push to main or a run by hand releases this commit: the tag is
+          # created here. A push to main whose version is tagged already is
+          # not a release; by hand, an existing tag must name this commit.
+          if [ "$EVENT" = workflow_dispatch ] || { [ "$EVENT" = push ] && [ "$GITHUB_REF_TYPE" = branch ]; }; then
             if [ "$GITHUB_REF" != refs/heads/main ]; then
-              echo "::error::run the release by hand on main, not $GITHUB_REF"
+              echo "::error::release from main, not $GITHUB_REF"
               exit 1
             fi
             tagged=$(git ls-remote --tags origin "refs/tags/v$version^{}" "refs/tags/v$version" | sort -k2 -r | head -n 1 | cut -f1)
-            if [ -n "$tagged" ] && [ "$tagged" != "$GITHUB_SHA" ]; then
+            if [ -n "$tagged" ] && [ "$EVENT" = push ]; then
+              echo "v$version is released already ($tagged): nothing to do"
+              build=false
+              publish=false
+            elif [ -n "$tagged" ] && [ "$tagged" != "$GITHUB_SHA" ]; then
               echo "::error::v$version already tags $tagged, not $GITHUB_SHA"
               exit 1
             fi
           fi
-          if ! grep -q "^## \[$version\]" CHANGELOG.md; then
+          if [ "$build" = true ] && ! grep -q "^## \[$version\]" CHANGELOG.md; then
             echo "::error::CHANGELOG.md has no [$version] section"
             exit 1
           fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$version"
+            echo "build=$build"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
 
   ci:
-    if: github.event_name != 'pull_request'
+    needs: version
+    if: needs.version.outputs.publish == 'true'
     uses: ./.github/workflows/ci.yml
 
   cli:
     needs: version
+    if: needs.version.outputs.build == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -113,6 +141,7 @@ jobs:
 
   web:
     needs: version
+    if: needs.version.outputs.build == 'true'
     runs-on: ubuntu-latest
     env:
       NAME: vdj-assign-web-${{ needs.version.outputs.version }}
@@ -218,8 +247,8 @@ jobs:
           node "dist/$WEB/test.mjs" "$exe"
 
   release:
-    if: github.event_name != 'pull_request'
     needs: [version, ci, cli, web, verify]
+    if: needs.version.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
