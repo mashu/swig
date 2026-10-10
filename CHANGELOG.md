@@ -33,9 +33,11 @@ The first release.
   `vdj_assign.wasm` (scalar), with no imports. `vdj-assign.js` fetches the
   right one in browsers and Web Workers; in Node.js 18 or later (the
   bundle's `package.json` marks it an ES module) give `load()` the bytes.
-- A page (`index.html`) that assigns reads in the browser, on Web Workers,
-  with demo data; nothing is uploaded. Its output equals the command line's
-  up to a rare last-digit difference in a posterior.
+- A page that assigns reads in the browser, on Web Workers, with demo
+  data; nothing is uploaded. It is one self-contained HTML file, both
+  modules included, that runs opened from disk (no server) or from any
+  static host. Its output equals the command line's up to a rare
+  last-digit difference in a posterior.
 
 ### Release assets
 
@@ -46,5 +48,6 @@ The first release.
 | `vdj-assign-0.1.0-x86_64-apple-darwin.tar.gz` | macOS on Intel |
 | `vdj-assign-0.1.0-aarch64-apple-darwin.tar.gz` | macOS on Apple silicon |
 | `vdj-assign-0.1.0-x86_64-pc-windows-msvc.zip` | Windows x86-64 (statically linked C runtime) |
-| `vdj-assign-web-0.1.0.zip` | The page, the JavaScript API and both WebAssembly modules |
-| `SHA256SUMS` | SHA-256 of every archive above |
+| `vdj-assign-0.1.0.html` | The browser page as one file: open it, no server needed |
+| `vdj-assign-web-0.1.0.zip` | The same page (`index.html`), the JavaScript API and both WebAssembly modules |
+| `SHA256SUMS` | SHA-256 of every file above |

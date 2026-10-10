@@ -1,3 +1,4 @@
 /target
 /web/*.wasm
+/web/index.html
 /node_modules

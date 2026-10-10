@@ -1,10 +1,14 @@
-// End-to-end tests of the page and of assignInWorkers in headless Chromium:
+// End-to-end tests of the page and of assignInWorkers in headless browsers:
 //
-//   npm install --no-save playwright && npx playwright install chromium
+//   npm install --no-save playwright && npx playwright install chromium [firefox webkit]
 //   wasm/build.sh && cargo build --release
-//   node web/browser-test.mjs target/release/vdj-assign
+//   node web/browser-test.mjs target/release/vdj-assign [chromium,firefox,webkit]
 //
-// The page's and the workers' TSV must equal the native command line's.
+// index.html is opened from disk, as a file: page with no server, and from a
+// static HTTP server. Its calls.tsv, and assignInWorkers' TSV, must equal the
+// native command line's; opened from disk, it may request nothing but itself
+// and the blobs it makes. Each browser named (default chromium) must be
+// installed.
 
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
@@ -16,11 +20,12 @@ import { extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { load } from './vdj-assign.js';
 
-const { chromium } = createRequire(import.meta.url)('playwright');
-const [cli] = process.argv.slice(2);
-assert.ok(cli, 'usage: node web/browser-test.mjs path/to/vdj-assign');
+const playwright = createRequire(import.meta.url)('playwright');
+const [cli, names = 'chromium'] = process.argv.slice(2);
+assert.ok(cli, 'usage: node web/browser-test.mjs path/to/vdj-assign [chromium,firefox,webkit]');
 
 const web = fileURLToPath(new URL('.', import.meta.url));
+const page = new URL('index.html', import.meta.url).href;
 const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.wasm': 'application/wasm' };
 const server = createServer((request, response) => {
   const path = new URL(request.url, 'http://localhost').pathname;
@@ -56,87 +61,109 @@ const native = (args) =>
   });
 const germlineArgs = ['v', 'd', 'j', 'c'].flatMap((k) => [`--${k}`, join(dir, `${k.toUpperCase()}.fasta`)]);
 
-const browser = await chromium.launch();
-try {
-  const page = await browser.newPage();
-  const problems = [];
-  page.on('pageerror', (error) => problems.push(error.message));
-  page.on('console', (message) => message.type() === 'error' && problems.push(message.text()));
-  await page.goto(`${origin}/`);
-  await page.waitForFunction(() => document.getElementById('engine').textContent !== 'loading…');
-  assert.match(await page.textContent('#engine'), /simd128/);
+/** A page that records its errors in `problems` and its requests in `requests`. */
+async function open(browser, url, problems, requests = []) {
+  const tab = await browser.newPage();
+  tab.on('pageerror', (error) => problems.push(error.message));
+  tab.on('console', (message) => message.type() === 'error' && problems.push(message.text()));
+  tab.on('request', (request) => requests.push(request.url()));
+  await tab.goto(url);
+  await tab.waitForFunction(() => document.getElementById('engine').textContent !== 'loading…');
+  assert.match(await tab.textContent('#engine'), /simd128/);
+  return tab;
+}
 
-  // assignInWorkers, with and without callbacks, equals the command line.
-  const demo = demoFiles(300);
-  const expected = native([...germlineArgs, '--tandem-d']);
-  for (const callbacks of [false, true]) {
-    const result = await page.evaluate(
-      async ({ demo, callbacks }) => {
-        const { assignInWorkers } = await import('./vdj-assign.js');
-        let infos = 0;
-        let last = 0;
-        const result = await assignInWorkers({
-          germlines: { v: demo['V.fasta'], d: demo['D.fasta'], j: demo['J.fasta'], c: demo['C.fasta'], options: { 'tandem-d': true } },
-          reads: demo['reads.fasta'],
-          workers: 3,
-          block: 32,
-          ...(callbacks && { onInfo: () => infos++, onProgress: (p) => (last = p) }),
-        });
-        return { text: result.parts.join(''), reads: result.reads, called: result.called, infos, last };
-      },
-      { demo, callbacks },
-    );
-    assert.equal(result.text, expected, `assignInWorkers (callbacks: ${callbacks}) equals the command line`);
-    assert.equal(result.reads, 300);
-    assert.ok(result.called > 290);
-    if (callbacks) assert.deepEqual([result.infos, result.last], [1, 1]);
-  }
-  const zero = await page.evaluate(async () => {
-    const { assignInWorkers } = await import('./vdj-assign.js');
-    return assignInWorkers({ germlines: {}, reads: '', workers: 0 }).catch((error) => error.name);
-  });
-  assert.equal(zero, 'RangeError');
+/** The text of the file the first download link of the page saves. */
+async function firstDownload(tab) {
+  const [download] = await Promise.all([tab.waitForEvent('download'), tab.click('#downloads a')]);
+  return readFileSync(await download.path(), 'utf8');
+}
 
-  // The page: demo data, options, workers; its calls.tsv equals the command line.
+/** The page assigns 500 demo reads (tandem D, 2 workers) as the command line does. */
+async function assignDemo(tab) {
   demoFiles(500);
-  await page.fill('#demo-reads', '500');
-  await page.click('#demo');
-  await page.fill('#workers', '2');
-  await page.check('#tandem-d');
-  await page.click('#run');
-  await page.waitForSelector('#results:not([hidden])');
-  assert.match(await page.textContent('#summary'), /^500 reads, \d+ with a V\(D\)J call/);
-  const links = await page.$$eval('#downloads a', (as) => as.map((a) => a.download));
+  await tab.fill('#demo-reads', '500');
+  await tab.click('#demo');
+  await tab.fill('#workers', '2');
+  await tab.check('#tandem-d');
+  await tab.click('#run');
+  await tab.waitForSelector('#results:not([hidden])');
+  assert.match(await tab.textContent('#summary'), /^500 reads, \d+ with a V\(D\)J call/);
+  const links = await tab.$$eval('#downloads a', (as) => as.map((a) => a.download));
   assert.deepEqual(links, ['calls.tsv', 'V.fasta', 'D.fasta', 'J.fasta', 'C.fasta', 'annotation.tsv']);
-  const calls = await page.evaluate(async () => (await fetch(document.querySelector('#downloads a').href)).text());
-  assert.equal(calls, native([...germlineArgs, '--tandem-d']), "the page's calls.tsv equals the command line");
-  assert.equal(await page.$$eval('#preview tbody tr', (rows) => rows.length), 200);
+  assert.equal(await firstDownload(tab), native([...germlineArgs, '--tandem-d']), "the page's calls.tsv equals the command line");
+  assert.equal(await tab.$$eval('#preview tbody tr', (rows) => rows.length), 200);
+}
 
-  // Chosen germline files replace the whole demo database: no demo D or C.
-  await page.setInputFiles('#v', join(dir, 'V.fasta'));
-  await page.setInputFiles('#j', join(dir, 'J.fasta'));
-  await page.uncheck('#tandem-d');
-  await page.click('#run');
-  await page.waitForSelector('#results:not([hidden])');
-  const vj = await page.$$eval('#downloads a', (as) => as.map((a) => a.download));
-  assert.deepEqual(vj, ['calls.tsv', 'V.fasta', 'J.fasta', 'annotation.tsv']);
-  const vjCalls = await page.evaluate(async () => (await fetch(document.querySelector('#downloads a').href)).text());
-  assert.equal(vjCalls, native(['--v', join(dir, 'V.fasta'), '--j', join(dir, 'J.fasta')]));
+try {
+  for (const name of names.split(',')) {
+    const browser = await playwright[name].launch();
+    try {
+      // Opened from disk: no server, and nothing requested but the page and its blobs.
+      const problems = [];
+      const requests = [];
+      const fromDisk = await open(browser, page, problems, requests);
+      await assignDemo(fromDisk);
+      const elsewhere = requests.filter((url) => url !== page && !/^(blob|data):/.test(url));
+      assert.deepEqual(elsewhere, [], `${name}: the page opened from disk requests only blobs`);
 
-  // A bad option is a notice, and the page stays usable.
-  await page.fill('#d-presence-rate', '1.5');
-  await page.click('#run');
-  await page.waitForSelector('#notices p.bad');
-  assert.match(await page.textContent('#notices p.bad'), /--d-presence-rate expects a rate in \(0, 1\)/);
-  assert.equal(await page.isDisabled('#run'), false);
-  assert.deepEqual(problems, []);
+      // From a static server: the page, and assignInWorkers through the module API.
+      const tab = await open(browser, `${origin}/`, problems);
+      await assignDemo(tab);
+      const demo = demoFiles(300);
+      const expected = native([...germlineArgs, '--tandem-d']);
+      for (const callbacks of [false, true]) {
+        const result = await tab.evaluate(
+          async ({ demo, callbacks }) => {
+            const { assignInWorkers } = await import('./vdj-assign.js');
+            let infos = 0;
+            let last = 0;
+            const result = await assignInWorkers({
+              germlines: { v: demo['V.fasta'], d: demo['D.fasta'], j: demo['J.fasta'], c: demo['C.fasta'], options: { 'tandem-d': true } },
+              reads: demo['reads.fasta'],
+              workers: 3,
+              block: 32,
+              ...(callbacks && { onInfo: () => infos++, onProgress: (p) => (last = p) }),
+            });
+            return { text: result.parts.join(''), reads: result.reads, called: result.called, infos, last };
+          },
+          { demo, callbacks },
+        );
+        assert.equal(result.text, expected, `${name}: assignInWorkers (callbacks: ${callbacks}) equals the command line`);
+        assert.equal(result.reads, 300);
+        assert.ok(result.called > 290);
+        if (callbacks) assert.deepEqual([result.infos, result.last], [1, 1]);
+      }
+      const zero = await tab.evaluate(async () => {
+        const { assignInWorkers } = await import('./vdj-assign.js');
+        return assignInWorkers({ germlines: {}, reads: '', workers: 0 }).catch((error) => error.name);
+      });
+      assert.equal(zero, 'RangeError');
 
-  // Opened as a file, the page says it needs a web server.
-  const file = await browser.newPage();
-  await file.goto(new URL('index.html', import.meta.url).href);
-  assert.equal(await file.isVisible('#protocol'), true);
+      // Chosen germline files replace the whole demo database: no demo D or C.
+      demoFiles(500);
+      await tab.setInputFiles('#v', join(dir, 'V.fasta'));
+      await tab.setInputFiles('#j', join(dir, 'J.fasta'));
+      await tab.uncheck('#tandem-d');
+      await tab.click('#run');
+      await tab.waitForSelector('#results:not([hidden])');
+      const vj = await tab.$$eval('#downloads a', (as) => as.map((a) => a.download));
+      assert.deepEqual(vj, ['calls.tsv', 'V.fasta', 'J.fasta', 'annotation.tsv']);
+      assert.equal(await firstDownload(tab), native(['--v', join(dir, 'V.fasta'), '--j', join(dir, 'J.fasta')]));
+
+      // A bad option is a notice, and the page stays usable.
+      await tab.fill('#d-presence-rate', '1.5');
+      await tab.click('#run');
+      await tab.waitForSelector('#notices p.bad');
+      assert.match(await tab.textContent('#notices p.bad'), /--d-presence-rate expects a rate in \(0, 1\)/);
+      assert.equal(await tab.isDisabled('#run'), false);
+      assert.deepEqual(problems, [], `${name}: no page errors`);
+      console.log(`${name}: the page from disk and from a server, and assignInWorkers, equal the command line`);
+    } finally {
+      await browser.close();
+    }
+  }
 } finally {
-  await browser.close();
   server.close();
 }
-console.log('browser tests passed (assignInWorkers and the page equal the native command line)');
+console.log(`browser tests passed (${names})`);

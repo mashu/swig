@@ -41,18 +41,14 @@ first run: `xattr -dr com.apple.quarantine vdj-assign-0.1.0-aarch64-apple-darwin
 (`vdj-assign-0.1.0-x86_64-apple-darwin` on Intel). On Windows, unzip
 `vdj-assign-0.1.0-x86_64-pc-windows-msvc.zip` and run `vdj-assign.exe`.
 
-To try the browser build, serve the unpacked directory over HTTP (browsers
-do not run modules or workers from `file:` pages) and open the page; *Use
-demo data* fills in a synthetic database and reads:
-
-```sh
-unzip vdj-assign-web-0.1.0.zip
-python3 -m http.server -d vdj-assign-web-0.1.0 8000   # then open http://localhost:8000
-```
-
-From Node.js 18 or later, the same directory is an ES module (its
-`package.json` says so); give `load()` the module's bytes (see *In the
-browser* below).
+The browser build needs no installation and no server: open
+`vdj-assign-0.1.0.html` in a browser (double-click it, or drag it into a
+window). It is one self-contained page, both WebAssembly modules included,
+that computes in the browser and uploads nothing; *Use demo data* fills in a
+synthetic database and reads. Put the same file on any static host (GitHub
+Pages, an intranet folder) to share it. `vdj-assign-web-0.1.0.zip` holds it
+as `index.html` next to the JavaScript API, which Node.js 18 or later
+imports as an ES module (see *In the browser* below).
 
 ## Build and run
 
@@ -169,10 +165,11 @@ The page reads the files and runs the module locally; nothing is uploaded.
 
 ```sh
 rustup target add wasm32-unknown-unknown
-wasm/build.sh                                 # web/vdj_assign_simd.wasm, web/vdj_assign.wasm
-python3 -m http.server -d web 8000            # then open http://localhost:8000
+wasm/build.sh                                 # web/vdj_assign_simd.wasm, web/vdj_assign.wasm, web/index.html
+# then open web/index.html in a browser: no server needed
 node web/test.mjs target/release/vdj-assign   # the modules against the command line
-node web/browser-test.mjs target/release/vdj-assign  # the page and workers in Chromium (needs playwright)
+node web/browser-test.mjs target/release/vdj-assign chromium,firefox,webkit
+                                              # the page from disk and from a server, and workers (needs playwright)
 ```
 
 ```js
@@ -197,7 +194,8 @@ const file = new Blob(parts);                 // the AIRR TSV at any size: heade
   AIRR rows. On 45,000 rows (three presets, three option sets) and in
   headless Chromium, its TSV equals the command line's byte for byte; CI
   checks both on every push (`web/test.mjs` in Node.js,
-  `web/browser-test.mjs` for the page and `assignInWorkers` in Chromium).
+  `web/browser-test.mjs` for the page and `assignInWorkers` in Chromium,
+  Firefox and WebKit).
   A posterior can still differ in its last printed digit where it lands
   within a last-bit difference of `exp` (WebAssembly's portable libm
   against the platform's) of a rounding tie: 2 of 260,000 rows in a test,
@@ -219,9 +217,19 @@ const file = new Blob(parts);                 // the AIRR TSV at any size: heade
 - **The page.** Germline FASTA files (or demo data: a synthetic database
   and simulated reads), reads as FASTA or FASTQ (gzip decompressed by the
   browser), every assignment option and a worker count; it gives the AIRR
-  TSV, the prepared database files and a preview. CI uploads `web/` with
-  both modules as the `vdj-assign-web` artifact, and each release ships it
-  as `vdj-assign-web-<version>.zip`, ready for static hosting.
+  TSV, the prepared database files and a preview.
+- **One file, no server.** A browser will not let a page opened from disk
+  (`file:`) load a module script, fetch a `.wasm` file or start a worker
+  from a file. So `wasm/build.sh` writes `web/index.html` from the page's
+  source (`web/page.html`, `web/app.js`) with `vdj-assign.js`, `worker.js`
+  and both modules inlined (`web/standalone.js`, 2.5 MB): it compiles the
+  embedded bytes and starts its workers from a blob, so it fetches nothing
+  and runs opened from disk or from any static host. The browser test
+  opens it from disk and checks that it requests nothing but itself and
+  its blobs. CI uploads it with the API and both modules as the
+  `vdj-assign-web` artifact; each release ships it as
+  `vdj-assign-<version>.html` and, with the API, as
+  `vdj-assign-web-<version>.zip`.
 
 ## Germline annotation and regions
 

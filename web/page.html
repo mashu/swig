@@ -1,4 +1,9 @@
 <!doctype html>
+<!-- The page's source. wasm/build.sh writes index.html from it: app.js,
+     vdj-assign.js, worker.js and both WebAssembly modules inlined in place of
+     the module script at the end, so index.html is one file that runs opened
+     from disk or from any static host, with no server. Served over HTTP next
+     to the built modules, this file also runs as it is (development). -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -59,13 +64,6 @@ footer { color: var(--muted); font-size: 0.85rem; padding-bottom: 32px; }
   <p class="lede">V(D)J germline assignment of immune receptor reads, compiled to WebAssembly.
     It computes what the <code>vdj-assign</code> command line computes, and nothing leaves your
     browser.</p>
-  <p class="notice bad" id="protocol" hidden>Open this page through a web server (for example, run
-    <code>python3 -m http.server 8000</code> in this page's folder and open http://localhost:8000), not as a
-    file: browsers load modules and workers only over HTTP.</p>
-  <script>
-    // A classic script: it runs from file:, where the module script is blocked.
-    if (location.protocol === 'file:') document.getElementById('protocol').hidden = false;
-  </script>
 </header>
 <main>
   <section>

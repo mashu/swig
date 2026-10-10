@@ -116,6 +116,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       NAME: vdj-assign-web-${{ needs.version.outputs.version }}
+      PAGE: vdj-assign-${{ needs.version.outputs.version }}.html
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -124,29 +125,35 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Build the modules
+      - name: Build the modules and the page
         run: wasm/build.sh
+      # The page as one file, and in the archive as index.html next to the
+      # JavaScript API and the modules; the page's sources are inlined in it.
       - name: Package
         run: |
           mkdir dist
+          cp web/index.html "dist/$PAGE"
           cp -R web "dist/$NAME"
-          rm "dist/$NAME/test.mjs" "dist/$NAME/browser-test.mjs"
+          (cd "dist/$NAME" && rm test.mjs browser-test.mjs page.html app.js standalone.js)
           (cd dist && zip -qr "$NAME.zip" "$NAME")
       # The archive as a user unpacks it, with the tests copied in so they
-      # load the packaged files.
-      - name: The packaged page and workers in Chromium
+      # load the packaged files; the page opened from disk in each browser.
+      - name: The packaged page and workers in Chromium, Firefox and WebKit
         run: |
           cargo build --release --locked --bin vdj-assign
           mkdir unpacked
           unzip -q "dist/$NAME.zip" -d unpacked
+          cmp "dist/$PAGE" "unpacked/$NAME/index.html"
           cp web/test.mjs web/browser-test.mjs "unpacked/$NAME/"
           npm install --no-save --no-package-lock playwright@1.56.1
-          npx playwright install --with-deps chromium
-          node "unpacked/$NAME/browser-test.mjs" target/release/vdj-assign
+          npx playwright install --with-deps chromium firefox webkit
+          node "unpacked/$NAME/browser-test.mjs" target/release/vdj-assign chromium,firefox,webkit
       - uses: actions/upload-artifact@v4
         with:
           name: web
-          path: dist/${{ env.NAME }}.zip
+          path: |
+            dist/${{ env.NAME }}.zip
+            dist/${{ env.PAGE }}
           if-no-files-found: error
 
   # Every command-line archive, unpacked on its own platform, against the
@@ -253,12 +260,10 @@ jobs:
           (`vdj-assign.exe --version` on Windows). The binaries are not signed; on macOS, clear the
           quarantine flag before the first run: `xattr -dr com.apple.quarantine vdj-assign-*-apple-darwin`.
 
-          The browser build runs from any static HTTP server (not from `file:`):
-
-          ```sh
-          unzip vdj-assign-web-*.zip
-          python3 -m http.server -d vdj-assign-web-*/ 8000   # open http://localhost:8000, then "Use demo data"
-          ```
+          The browser build needs no installation and no server: download the `.html` file
+          (or unzip the web archive and open its `index.html`) and open it in a browser, then
+          *Use demo data* and *Assign*. It is one self-contained page that computes in the
+          browser and uploads nothing; put it on any static host to share it.
 
           See the README's *Install* and *In the browser* sections for the JavaScript and Node.js API.
           EOF
