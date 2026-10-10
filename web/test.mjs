@@ -3,7 +3,7 @@
 //   wasm/build.sh && node web/test.mjs [path/to/vdj-assign]
 //
 // Given the native binary, the modules' TSV must equal its output byte for
-// byte on the same files.
+// byte on the same files. index.html must embed both modules unchanged.
 
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
@@ -103,6 +103,17 @@ assert.throws(() => simd.demo({ preset: 'impossible' }), /unknown preset/);
 const prepared = simd.prepare(germlines);
 assert.deepEqual(Object.keys(prepared), ['V.fasta', 'D.fasta', 'J.fasta', 'C.fasta', 'annotation.tsv']);
 assert.ok(prepared['annotation.tsv'].startsWith('segment\tallele\t'));
+
+// index.html, the page as one file, embeds both modules byte for byte (a
+// SIMD engine never loads the scalar one, so no browser test reaches it).
+{
+  const page = readFileSync(new URL('index.html', here), 'utf8');
+  for (const [key, file] of [['simd', 'vdj_assign_simd.wasm'], ['baseline', 'vdj_assign.wasm']]) {
+    const embedded = page.match(new RegExp(`^  ${key}: '([A-Za-z0-9+/=]*)',$`, 'm'));
+    assert.ok(embedded, `index.html embeds ${file}`);
+    assert.ok(Buffer.from(embedded[1], 'base64').equals(bytes(file)), `index.html embeds ${file} byte for byte`);
+  }
+}
 
 if (cli) {
   const dir = mkdtempSync(join(tmpdir(), 'vdj-assign-'));

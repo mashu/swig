@@ -1,14 +1,19 @@
 name: Release
 
-# A tag vX.Y.Z runs the whole CI, builds the command line for Linux, macOS
-# and Windows and the browser bundle, unpacks and tests every archive on its
-# own platform, and publishes them as the GitHub release vX.Y.Z with the
-# CHANGELOG.md section as its notes. Running the workflow by hand on main
-# (Actions > Release > Run workflow) does the same for the crate version and
-# creates its tag at that commit. A pull request that changes this file or
-# the changelog builds and tests the archives without publishing.
+# A release runs the whole CI, builds the command line for Linux, macOS and
+# Windows and the browser page, unpacks and tests every archive on its own
+# platform, and publishes them as the GitHub release vX.Y.Z with the
+# CHANGELOG.md section as its notes. It starts when
+# - a push to main carries a crate version that has no tag yet (merging a
+#   version bump releases it; the tag is created at that commit; a push whose
+#   version is already tagged does nothing),
+# - a tag vX.Y.Z is pushed, or
+# - the workflow is run by hand on main (Actions > Release > Run workflow).
+# A pull request that changes this file or the changelog builds and tests
+# the archives without publishing.
 on:
   push:
+    branches: [main]
     tags: ['v*']
   workflow_dispatch:
   pull_request:
@@ -19,6 +24,13 @@ on:
 permissions:
   contents: read
 
+# Releases from main (pushes and hand runs) run one at a time, so a second
+# push sees the first one's tag. Pull requests, tag pushes and runs on other
+# branches each queue apart, so a push to main never replaces them.
+concurrency:
+  group: release-${{ (github.event_name == 'pull_request' || github.ref_type == 'tag' || github.ref != 'refs/heads/main') && github.ref || 'publish' }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -27,12 +39,17 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      # Build and test the archives; publish them as the release.
+      build: ${{ steps.version.outputs.build }}
+      publish: ${{ steps.version.outputs.publish }}
     steps:
       - uses: actions/checkout@v5
       - id: version
         name: The tag, both crates and the changelog name one version
         env:
           EVENT: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
@@ -45,30 +62,54 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME does not match the crate version $version"
             exit 1
           fi
-          # By hand: from main only, and an existing tag must name this commit.
-          if [ "$EVENT" = workflow_dispatch ]; then
+          build=true
+          publish=true
+          if [ "$EVENT" = pull_request ]; then publish=false; fi
+          # A push to main or a run by hand releases this commit: the tag is
+          # created here. On a push to main, a version with a release is done,
+          # and one tagged on another commit without a release is its tag
+          # run's to publish; tagged here without a release (a failed run),
+          # it is published again. By hand, an existing tag must name this
+          # commit.
+          if [ "$EVENT" = workflow_dispatch ] || { [ "$EVENT" = push ] && [ "$GITHUB_REF_TYPE" = branch ]; }; then
             if [ "$GITHUB_REF" != refs/heads/main ]; then
-              echo "::error::run the release by hand on main, not $GITHUB_REF"
+              echo "::error::release from main, not $GITHUB_REF"
               exit 1
             fi
             tagged=$(git ls-remote --tags origin "refs/tags/v$version^{}" "refs/tags/v$version" | sort -k2 -r | head -n 1 | cut -f1)
-            if [ -n "$tagged" ] && [ "$tagged" != "$GITHUB_SHA" ]; then
+            if [ -n "$tagged" ] && [ "$EVENT" = push ]; then
+              if gh release view "v$version" > /dev/null 2>&1; then
+                echo "v$version is released already ($tagged): nothing to do"
+                build=false
+                publish=false
+              elif [ "$tagged" != "$GITHUB_SHA" ]; then
+                echo "::warning::v$version tags $tagged but has no release: that tag's run publishes it (re-run it if it failed)"
+                build=false
+                publish=false
+              fi
+            elif [ -n "$tagged" ] && [ "$tagged" != "$GITHUB_SHA" ]; then
               echo "::error::v$version already tags $tagged, not $GITHUB_SHA"
               exit 1
             fi
           fi
-          if ! grep -q "^## \[$version\]" CHANGELOG.md; then
+          if [ "$build" = true ] && ! grep -q "^## \[$version\]" CHANGELOG.md; then
             echo "::error::CHANGELOG.md has no [$version] section"
             exit 1
           fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$version"
+            echo "build=$build"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
 
   ci:
-    if: github.event_name != 'pull_request'
+    needs: version
+    if: needs.version.outputs.publish == 'true'
     uses: ./.github/workflows/ci.yml
 
   cli:
     needs: version
+    if: needs.version.outputs.build == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -113,9 +154,11 @@ jobs:
 
   web:
     needs: version
+    if: needs.version.outputs.build == 'true'
     runs-on: ubuntu-latest
     env:
       NAME: vdj-assign-web-${{ needs.version.outputs.version }}
+      PAGE: vdj-assign-${{ needs.version.outputs.version }}.html
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -124,29 +167,35 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Build the modules
+      - name: Build the modules and the page
         run: wasm/build.sh
+      # The page as one file, and in the archive as index.html next to the
+      # JavaScript API and the modules; the page's sources are inlined in it.
       - name: Package
         run: |
           mkdir dist
+          cp web/index.html "dist/$PAGE"
           cp -R web "dist/$NAME"
-          rm "dist/$NAME/test.mjs" "dist/$NAME/browser-test.mjs"
+          (cd "dist/$NAME" && rm test.mjs browser-test.mjs page.html app.js standalone.js)
           (cd dist && zip -qr "$NAME.zip" "$NAME")
       # The archive as a user unpacks it, with the tests copied in so they
-      # load the packaged files.
-      - name: The packaged page and workers in Chromium
+      # load the packaged files; the page opened from disk in each browser.
+      - name: The packaged page and workers in Chromium, Firefox and WebKit
         run: |
           cargo build --release --locked --bin vdj-assign
           mkdir unpacked
           unzip -q "dist/$NAME.zip" -d unpacked
+          cmp "dist/$PAGE" "unpacked/$NAME/index.html"
           cp web/test.mjs web/browser-test.mjs "unpacked/$NAME/"
           npm install --no-save --no-package-lock playwright@1.56.1
-          npx playwright install --with-deps chromium
-          node "unpacked/$NAME/browser-test.mjs" target/release/vdj-assign
+          npx playwright install --with-deps chromium firefox webkit
+          node "unpacked/$NAME/browser-test.mjs" target/release/vdj-assign chromium,firefox,webkit
       - uses: actions/upload-artifact@v4
         with:
           name: web
-          path: dist/${{ env.NAME }}.zip
+          path: |
+            dist/${{ env.NAME }}.zip
+            dist/${{ env.PAGE }}
           if-no-files-found: error
 
   # Every command-line archive, unpacked on its own platform, against the
@@ -211,8 +260,8 @@ jobs:
           node "dist/$WEB/test.mjs" "$exe"
 
   release:
-    if: github.event_name != 'pull_request'
     needs: [version, ci, cli, web, verify]
+    if: needs.version.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -253,12 +302,10 @@ jobs:
           (`vdj-assign.exe --version` on Windows). The binaries are not signed; on macOS, clear the
           quarantine flag before the first run: `xattr -dr com.apple.quarantine vdj-assign-*-apple-darwin`.
 
-          The browser build runs from any static HTTP server (not from `file:`):
-
-          ```sh
-          unzip vdj-assign-web-*.zip
-          python3 -m http.server -d vdj-assign-web-*/ 8000   # open http://localhost:8000, then "Use demo data"
-          ```
+          The browser build needs no installation and no server: download the `.html` file
+          (or unzip the web archive and open its `index.html`) and open it in a browser, then
+          *Use demo data* and *Assign*. It is one self-contained page that computes in the
+          browser and uploads nothing; put it on any static host to share it.
 
           See the README's *Install* and *In the browser* sections for the JavaScript and Node.js API.
           EOF
@@ -267,8 +314,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # --target creates the tag at this commit when the run was started
-          # by hand; a pushed tag already exists and is used as it is.
+          # Where the tag points now: the version job looked long ago, and a
+          # re-run of an old run must not publish its archives under a tag
+          # that names another commit. --target creates the tag at this
+          # commit when there is none yet.
+          tagged=$(git ls-remote --tags origin "refs/tags/$TAG^{}" "refs/tags/$TAG" | sort -k2 -r | head -n 1 | cut -f1)
+          if [ -n "$tagged" ] && [ "$tagged" != "$GITHUB_SHA" ]; then
+            echo "::error::$TAG tags $tagged, not $GITHUB_SHA: these archives are not its build"
+            exit 1
+          fi
           if gh release view "$TAG" > /dev/null 2>&1; then
             gh release upload "$TAG" dist/* --clobber
           else

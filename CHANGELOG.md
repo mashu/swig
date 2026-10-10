@@ -1,8 +1,45 @@
 # Changelog
 
 Each release's section is its GitHub release notes; the tag `vX.Y.Z` must
-match the crate version (`.github/workflows/release.yml`). Push the tag, or
-run the Release workflow by hand on `main`, which creates it.
+match the crate version (`.github/workflows/release.yml`). Merging a version
+bump and its section to `main` publishes the release and creates the tag; a
+pushed tag or a hand run of the Release workflow on `main` does the same.
+
+## [0.1.1] - 2026-10-10
+
+### The browser page needs no server
+
+- The page is one self-contained HTML file, `vdj-assign-0.1.1.html`
+  (2.5 MB): its scripts and both WebAssembly modules are inlined and its
+  workers start from blobs, so it fetches nothing and runs opened straight
+  from disk (double-click it) or from any static host. The 0.1.0 page
+  needed an HTTP server, because browsers do not let a page opened from disk
+  load module scripts, fetch `.wasm` files or start workers from files.
+- The demo is deployed to GitHub Pages from `main` whenever CI passes:
+  https://mashu.github.io/vdj_assign/
+- `assignInWorkers` takes a `createWorker` option; its default, a module
+  worker on `worker.js`, is unchanged.
+- The browser test opens the page from disk and from a server in Chromium,
+  Firefox and WebKit, and checks in Chromium, which reports every load,
+  that the page opened from disk requests nothing but itself and its blobs.
+
+### Releases
+
+- Merging a version bump and its changelog section to `main` publishes the
+  release; a pushed tag or a hand run of the Release workflow still does.
+
+### Release assets
+
+| File | Contents |
+|---|---|
+| `vdj-assign-0.1.1-x86_64-unknown-linux-gnu.tar.gz` | Linux x86-64 (glibc 2.35 or later) |
+| `vdj-assign-0.1.1-aarch64-unknown-linux-gnu.tar.gz` | Linux AArch64 (glibc 2.35 or later) |
+| `vdj-assign-0.1.1-x86_64-apple-darwin.tar.gz` | macOS on Intel |
+| `vdj-assign-0.1.1-aarch64-apple-darwin.tar.gz` | macOS on Apple silicon |
+| `vdj-assign-0.1.1-x86_64-pc-windows-msvc.zip` | Windows x86-64 (statically linked C runtime) |
+| `vdj-assign-0.1.1.html` | The browser page as one file: open it, no server needed |
+| `vdj-assign-web-0.1.1.zip` | The same page (`index.html`), the JavaScript API and both WebAssembly modules |
+| `SHA256SUMS` | SHA-256 of every file above |
 
 ## [0.1.0] - 2026-10-09
 

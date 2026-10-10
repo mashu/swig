@@ -16,6 +16,9 @@
 // In a browser, assignInWorkers() spreads one run over Web Workers.
 // In Node.js, which cannot fetch file: URLs, pass the module's bytes:
 // load({ bytes: fs.readFileSync('web/vdj_assign_simd.wasm') }).
+// index.html (wasm/build.sh) inlines this file, worker.js and both modules
+// into one page, which needs no server: it compiles the embedded bytes and
+// starts its workers from a blob (createWorker below).
 
 const SIMD_FILE = 'vdj_assign_simd.wasm';
 const BASELINE_FILE = 'vdj_assign.wasm';
@@ -343,7 +346,9 @@ function tally(rows, v, j) {
  * the run and onProgress(fraction) as blocks finish. Resolves to { parts,
  * reads, called, info }: `parts` is the AIRR TSV in input order, header
  * line first, in pieces, so `new Blob(parts)` is the file at any size
- * (`parts.join('')` is its text when a string can hold it).
+ * (`parts.join('')` is its text when a string can hold it). Each worker is
+ * createWorker(), by default a module worker on worker.js next to this file;
+ * any Worker running worker.js's code will do.
  */
 export async function assignInWorkers({
   germlines,
@@ -353,6 +358,7 @@ export async function assignInWorkers({
   module,
   onInfo,
   onProgress,
+  createWorker = () => new Worker(new URL('./worker.js', import.meta.url), { type: 'module' }),
 }) {
   integer('workers', workers, 1, 1024);
   integer('block', block, 1, U32_MAX);
@@ -371,7 +377,7 @@ export async function assignInWorkers({
         { length: workers },
         (_, worker) =>
           new Promise((resolve, reject) => {
-            const thread = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+            const thread = createWorker();
             threads.push(thread);
             thread.onmessage = ({ data }) => {
               if (data.type === 'ready') {
