@@ -24,9 +24,11 @@ on:
 permissions:
   contents: read
 
-# One release at a time, so a second push to main sees the first one's tag.
+# Releases from main (pushes and hand runs) run one at a time, so a second
+# push sees the first one's tag. Pull requests, tag pushes and runs on other
+# branches each queue apart, so a push to main never replaces them.
 concurrency:
-  group: release-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
+  group: release-${{ (github.event_name == 'pull_request' || github.ref_type == 'tag' || github.ref != 'refs/heads/main') && github.ref || 'publish' }}
   cancel-in-progress: false
 
 env:
@@ -46,6 +48,8 @@ jobs:
         name: The tag, both crates and the changelog name one version
         env:
           EVENT: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
@@ -62,8 +66,11 @@ jobs:
           publish=true
           if [ "$EVENT" = pull_request ]; then publish=false; fi
           # A push to main or a run by hand releases this commit: the tag is
-          # created here. A push to main whose version is tagged already is
-          # not a release; by hand, an existing tag must name this commit.
+          # created here. On a push to main, a version with a release is done,
+          # and one tagged on another commit without a release is its tag
+          # run's to publish; tagged here without a release (a failed run),
+          # it is published again. By hand, an existing tag must name this
+          # commit.
           if [ "$EVENT" = workflow_dispatch ] || { [ "$EVENT" = push ] && [ "$GITHUB_REF_TYPE" = branch ]; }; then
             if [ "$GITHUB_REF" != refs/heads/main ]; then
               echo "::error::release from main, not $GITHUB_REF"
@@ -71,9 +78,15 @@ jobs:
             fi
             tagged=$(git ls-remote --tags origin "refs/tags/v$version^{}" "refs/tags/v$version" | sort -k2 -r | head -n 1 | cut -f1)
             if [ -n "$tagged" ] && [ "$EVENT" = push ]; then
-              echo "v$version is released already ($tagged): nothing to do"
-              build=false
-              publish=false
+              if gh release view "v$version" > /dev/null 2>&1; then
+                echo "v$version is released already ($tagged): nothing to do"
+                build=false
+                publish=false
+              elif [ "$tagged" != "$GITHUB_SHA" ]; then
+                echo "::warning::v$version tags $tagged but has no release: that tag's run publishes it (re-run it if it failed)"
+                build=false
+                publish=false
+              fi
             elif [ -n "$tagged" ] && [ "$tagged" != "$GITHUB_SHA" ]; then
               echo "::error::v$version already tags $tagged, not $GITHUB_SHA"
               exit 1
@@ -301,8 +314,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # --target creates the tag at this commit when the run was started
-          # by hand; a pushed tag already exists and is used as it is.
+          # Where the tag points now: the version job looked long ago, and a
+          # re-run of an old run must not publish its archives under a tag
+          # that names another commit. --target creates the tag at this
+          # commit when there is none yet.
+          tagged=$(git ls-remote --tags origin "refs/tags/$TAG^{}" "refs/tags/$TAG" | sort -k2 -r | head -n 1 | cut -f1)
+          if [ -n "$tagged" ] && [ "$tagged" != "$GITHUB_SHA" ]; then
+            echo "::error::$TAG tags $tagged, not $GITHUB_SHA: these archives are not its build"
+            exit 1
+          fi
           if gh release view "$TAG" > /dev/null 2>&1; then
             gh release upload "$TAG" dist/* --clobber
           else

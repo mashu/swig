@@ -1,10 +1,11 @@
 name: Pages
 
-# The web demo. When CI passes on a push to main, the web build it tested
-# (its vdj-assign-web artifact: the page as index.html, the JavaScript API
-# and both modules) is published to GitHub Pages. Pages must be enabled
-# with GitHub Actions as its source (Settings > Pages > Build and
-# deployment). To publish again, re-run this workflow's run.
+# The web demo. When CI passes on a push to main and that commit is still
+# main's newest, the web build CI tested (its vdj-assign-web artifact: the
+# page as index.html, the JavaScript API and both modules) is published to
+# GitHub Pages. Pages must be enabled with GitHub Actions as its source
+# (Settings > Pages > Build and deployment). To publish again, re-run this
+# workflow's latest run.
 on:
   workflow_run:
     workflows: [CI]
@@ -14,18 +15,21 @@ on:
 permissions:
   contents: read
 
-# The newest build wins; a deployment in progress is not cut short.
-concurrency:
-  group: pages
-  cancel-in-progress: false
-
 jobs:
   deploy:
-    # A push to main in this repository, never a pull request's run.
+    # A push to main in this repository, never a pull request's run, and
+    # main's newest commit (github.sha), so a slower run of an older commit
+    # never replaces a newer site.
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.head_repository.full_name == github.repository
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.head_sha == github.sha
+    # One deployment at a time; one in progress is not cut short. At job
+    # level, so runs that deploy nothing never take the queue's place.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -45,8 +49,13 @@ jobs:
         run: |
           test -s site/index.html
           ls -l site
+      # Named per attempt: a re-run would otherwise find the first
+      # attempt's artifact too and refuse to deploy.
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
+          name: github-pages-${{ github.run_attempt }}
       - id: deployment
         uses: actions/deploy-pages@v4
+        with:
+          artifact_name: github-pages-${{ github.run_attempt }}
