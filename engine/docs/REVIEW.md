@@ -1,8 +1,9 @@
 # Code review: soundness, design and the WebAssembly port
 
-A review of the whole crate (≈30,600 lines at `31c0c0f`), done before
-adding the WebAssembly build. Five subsystems were reviewed line by line in
-parallel: adjudication, alignment kernels, search, data and IO, and
+A review of the whole crate (≈30,600 lines at `31c0c0f`, when it was the
+standalone vdj_assign project), done before adding the WebAssembly build.
+Five subsystems were reviewed line by line in parallel: adjudication,
+alignment kernels, search, data and IO, and
 simulation and tests. The composition layer (pipeline, configuration,
 batching and the binary) was read alongside them. Every finding below
 marked *confirmed* was reproduced, or follows directly from the code
@@ -112,7 +113,7 @@ Each fix has its own commit and a regression test that fails without it.
 | **Slow default kernel on WebAssembly without SIMD** (`Backend::detect`) | Detection fell back to portable lanes, which there run about 4× slower than the scalar kernel because nothing vectorises them. A catch-all dispatch arm would also have dropped jobs silently for a backend not built for the target. | Fall back to the scalar kernel on WebAssembly without `simd128`; other targets keep portable lanes. Name every backend in dispatch and fail loudly on one not built. Remove two dead `#[allow]`s. |
 | **Probability text depended on the platform's `exp`** (`report.rs`, `probability`) | A distance from 0 or 1 below 10⁻⁴ printed with ten decimals even when it rounds away: `1 − 10⁻¹⁶` printed as `1.0000000000` and an exact 1 as `1.000000`. Platforms whose `exp` differs in the last bit (glibc against WebAssembly's portable libm) printed different text for the same call. | Distances below 5·10⁻¹¹ print as an exact 0 or 1 does. Native and WebAssembly output are now identical on 45,000 rows. A value that lands within a last-bit difference of a rounding tie can still print differently: 2 of 260,000 rows differed in the sixth decimal of `c_posterior`. |
 | **The quick start skipped `prepare`** (`lib.rs`) | `from_config` on raw sets has no anchors and no regions: no junction, no FR/CDR, silently. | The example prepares the database. The crate map listed a nonexistent `refine` module and missed ten real ones; it is rewritten. |
-| **Application logic in the binary** (`bin/assign.rs`) | Another front end (WebAssembly) would have duplicated it. | `run.rs`: `RunOptions` reads options by their command-line names; `PreparedDatabase::from_fasta`, `warnings` and `files` handle the database; `Run` writes AIRR rows over any `BufRead`/`Write`. The binary's output is byte-identical before and after on all four subcommands and eight option sets. |
+| **Application logic in the binary** (then `bin/assign.rs`, now `src/bin/swig.rs`) | Another front end (WebAssembly) would have duplicated it. | `run.rs`: `RunOptions` reads options by their command-line names; `PreparedDatabase::from_fasta`, `warnings` and `files` handle the database; `Run` writes AIRR rows over any `BufRead`/`Write`. The binary's output is byte-identical before and after on all four subcommands and eight option sets. |
 | **`assign_map` always spawned threads** (`batch.rs`) | It panics where threads do not exist (WebAssembly), and it spawned a pointless thread for `threads = 1`. | The caller is one of the workers. A target that cannot spawn runs every chunk on the caller. |
 
 ## 3. Open findings, by priority
@@ -156,7 +157,8 @@ Each fix has its own commit and a regression test that fails without it.
      - `productive` is never exercised meaningfully;
      - `simulate::tests::constant_regions_continue_the_reading_frame…`
        passes only for its seed;
-     - the browser demo shows about 99 % unproductive reads (it says so).
+     - the standalone project's browser demo, which used it (since
+       removed), showed about 99 % unproductive reads (it said so).
    - Fix: substitute synonymous-or-sense codons, as C already does. This
      shifts every synthetic accuracy floor, so re-measure them with it.
 5. **`evaluate` scores a calls file without `rev_comp` as misoriented**
@@ -203,8 +205,9 @@ Each fix has its own commit and a regression test that fails without it.
     - traceback memory per lane group is bounded only by
       `16,000² × lanes` (latent; 4 GiB is all of wasm32);
     - required AIRR columns are missing: `sequence_alignment`,
-      `germline_alignment`, `locus`;
-    - `AirrRecord::tsv_header()` omits `c_` columns that rows can carry;
+      `germline_alignment`, `locus` (fixed in Swig 0.39.0: Swig's schema);
+    - `AirrRecord::tsv_header()` omits `c_` columns that rows can carry
+      (fixed in Swig 0.39.0: one 111-column schema for every row);
     - a UTF-8 BOM, non-UTF-8 headers and a reader used again after an
       error are mishandled;
     - `examples/benchmark --tail` scores against the untruncated truth;
@@ -220,8 +223,8 @@ Each fix has its own commit and a regression test that fails without it.
 - Node's WASI host segfaults intermittently on one test binary
   (`tests/simulated.rs`, `family_bounds_agree…`). The same binary passes
   under Wasmtime every time, and V8 itself ran 45,000 rows of the browser
-  build cleanly, so the fault is Node's WASI layer. CI therefore runs the
-  WebAssembly suite under Wasmtime.
+  build cleanly, so the fault is Node's WASI layer. The standalone
+  project's CI therefore ran the WebAssembly suite under Wasmtime.
 - `sim::random`'s doc claims "a seed fixes every simulated read on every
   platform", but `ln`, `exp` and `cos` come from each platform's libm. On
   `wasm32-wasip1`, 105 of 20,000 hard-preset truth rows differed in the
@@ -297,16 +300,21 @@ Each fix has its own commit and a regression test that fails without it.
 
 ## 5. What this branch adds for WebAssembly
 
+The standalone project shipped its own JavaScript API, Web Worker and
+browser page with the module. Since the engine moved into Swig, those are
+removed: Swig's wrapper and workers use the module instead. The table says
+where each piece lives now.
+
 | Piece | Where | Notes |
 |---|---|---|
-| `simd128` kernel backend | `align/lanes.rs`, `align/inter_seq.rs` | `Lanes<16>` over two `v128`. It is compiled only into `simd128` builds, since WebAssembly has no run-time feature detection. The whole suite passes on `wasm32-wasip1` + `simd128` under Wasmtime; the kernel tests compare `simd128`, portable and scalar. |
+| `simd128` kernel backend | `align/lanes.rs`, `align/inter_seq.rs` | `Lanes<16>` over two `v128`. It is compiled only into `simd128` builds, since WebAssembly has no run-time feature detection. The whole suite passed on `wasm32-wasip1` + `simd128` under Wasmtime; the kernel tests compare `simd128`, portable and scalar. |
 | Thread-optional batches | `batch.rs` | The caller works; helpers are spawned only where possible. |
 | Shared run | `run.rs`, `prepare.rs` | `RunOptions`, `PreparedDatabase::{from_fasta, warnings, files}`, `Run`. Used by the binary and the module alike. |
-| Module | `wasm/` | Zero-dependency `cdylib` with a C ABI over linear memory; `wasm/build.sh` builds both modules (0.9 MB each, 0.3 MB gzipped, no imports). |
-| JavaScript API | `web/swig.js`, `web/worker.js` | `load`, `createRun().assign`, `prepare`, `demo`, `assignInWorkers`. Works in browsers, Web Workers and Node.js 18+. |
-| Page | `web/page.html`, `web/app.js` (built with `web/standalone.js` into the self-contained `web/index.html`) | Files or demo data in, AIRR TSV, prepared database and a preview out. Nothing is uploaded. |
-| Checks | `web/test.mjs`, CI `wasm` job | Both modules agree, sessions reassemble, errors surface, and the module output equals the native command line. 45,000 rows across presets and options are identical, and so is headless Chromium with four workers. |
+| Module | `wasm/` (crate `swig_wasm`) | Zero-dependency `cdylib` with a C ABI over linear memory and no imports. The review built a SIMD and a scalar module (0.9 MB each, 0.3 MB gzipped); Swig builds only the SIMD one, `public/swig.wasm`, with `scripts/build-swig-wasm.sh`. |
+| JavaScript API | Swig's `src/aligner-engine.ts` | One engine per worker over the ABI, used by Swig Web's aligner workers and swig-cli's workers. It replaces the standalone project's API. |
+| Page | Swig Web | Replaces the standalone project's self-contained page (files or demo data in; AIRR TSV, prepared database and a preview out). |
+| Checks | `wasm/src/lib.rs` (`the_abi_runs_the_library_run`), Swig's `tests/swig-wasm.test.mjs` | At review time, a Node.js check and the standalone CI showed that both modules agree, sessions reassemble, errors surface, and the module output equals the native command line: 45,000 rows across presets and options were identical, and so was headless Chromium with four workers. |
 
-Throughput under V8 with SIMD is 1,100–1,450 reads/s per worker on
+Throughput under V8 with SIMD was 1,100–1,450 reads/s per worker on
 simulated reads. That is about 60 % of the native AVX2 kernel on the same
 file, single-threaded.

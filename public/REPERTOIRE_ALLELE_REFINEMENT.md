@@ -22,7 +22,7 @@ Reference records with identical nucleotide sequences are collapsed into one unr
 Let \(E_{ra}\) denote local evidence for read \(r\) and reference node \(a\).
 
 - Every literal co-optimal AIRR call starts at weight 1. A two-way explicit tie is therefore 50:50 before repertoire pooling.
-- A retained alternative with alignment score \(S_a\) receives
+- A retained alternative with alignment score \(S_a\) receives the weight below. In rows written by the Swig aligner, the retained alternatives are the entries of `*_alternatives`: alleles whose alignment, clipped to the called interval, scores within \(\max(2, \lfloor|S|/100\rfloor)\) of the call's score \(S\).
 
   \[
   \min\left(1,\exp\left[\frac{S_a-S_{\max}}{T}\right]\right),
@@ -31,7 +31,7 @@ Let \(E_{ra}\) denote local evidence for read \(r\) and reference node \(a\).
   where \(T\) is an adjustable score temperature.
 - An alternative without a numeric score receives a separate fallback weight.
 
-These values form an evidence kernel. SwiftIG alignment scores are not claimed to be fully calibrated read likelihoods.
+These values form an evidence kernel. The Swig aligner's raw alignment scores are not claimed to be calibrated read likelihoods, and the kernel does not read the aligner's per-read `*_posterior` columns.
 
 ### SHM-adaptive neighbour leakage
 

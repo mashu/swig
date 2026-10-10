@@ -1,14 +1,16 @@
 //! # swig
 //!
 //! Seeded, banded, affine V(D)J germline assignment with placement-DAG
-//! adjudication — a Rust implementation of the SwiftIG method note, organised
-//! so that every heuristic is a replaceable component.
+//! adjudication: Swig's aligner. It began as a Rust implementation of the
+//! SwiftIG method note, organised so that every heuristic is a replaceable
+//! component.
 //!
 //! ```text
 //! alphabet / fasta / germline      germline data
+//! locus / metadata                 loci of a database; SWIGMETA header values
 //! translate / annotate / prepare   codon table, anchors and region starts,
 //!                                  deduplicated and annotated databases
-//! reads                            streaming FASTA / FASTQ reads
+//! reads                            streaming FASTA / FASTQ / AIRR-table reads
 //! orient                           strand from germline k-mer support
 //! scoring                          substitution profiles and affine gaps
 //! seed → index → retrieve          candidate generation (k-mers as integers)
@@ -18,11 +20,13 @@
 //! segment / family_bound / flank   retrieve → score-only DP → keep → traceback
 //! clip / evidence / placement      O(1) clip-and-rescore, admission evidence
 //! window / admission               where D is searched, which D hits count
-//! adjudicate                       placement DAG (VJ / VDJ / VDDJ) or residual
+//! adjudicate                       placement DAG (VJ / VDJ; VDDJ as a grammar)
+//!                                  or residual
 //! constant                         C anchored at the J exit, after adjudication
 //! pipeline / config / profiles     stage-wise, chunk-batched composition and the
 //!                                  note's calling profiles
 //! report / read_regions / stats    AIRR output, FR/CDR projection, E-values
+//! double_d                         Swig's double-D screen and its sidecar
 //! batch / run                      parallel batches; a whole run from named
 //!                                  options to AIRR TSV (CLI and WebAssembly)
 //! sim                              IgSim simulator and accuracy evaluation

@@ -118,8 +118,8 @@ function vdjUsage(){
     `  -query FASTA            Query FASTA or '-' for stdin (default '-')\n`+
     `  -germline_db_D FASTA    D germline FASTA\n`+
     `  -c_region_db FASTA      Constant-region FASTA\n\n`+
-    `Annotation modes (default: the aligner's own annotation from IMGT gaps, conserved motifs and\n`+
-    `annotated relatives; v_annotation_source and j_annotation_source name each source):\n`+
+    `Annotation modes (default: the aligner's own annotation from conserved motifs and annotated\n`+
+    `relatives of the ungapped FASTA; v_annotation_source and j_annotation_source name each source):\n`+
     `  -custom_internal_data FILE  IgBLAST V .ndm.imgt data (1-based inclusive intervals)\n`+
     `  -auxiliary_data FILE        IgBLAST J .aux data (0-based frame/CDR3 stop)\n`+
     `  -d_frame_data FILE          IgBLAST D frame-one starts\n`+

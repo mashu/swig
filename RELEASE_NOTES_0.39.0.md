@@ -44,8 +44,8 @@ chimeras, lineages, SHM, germline inference, alignment and phylogeny.
   the reported names include the read's allele, up to germline equivalence.
   `d_presence_posterior` gives the probability that the read has a D at all.
 - **Annotation without metadata.** When a germline record has no `SWIGMETA`,
-  the aligner derives FWR/CDR boundaries and anchors from IMGT gaps,
-  conserved motifs and annotated relatives. As a result,
+  the aligner derives FWR/CDR boundaries and anchors from IMGT gaps (where
+  the FASTA keeps them), conserved motifs and annotated relatives. As a result,
   `swig-cli --vdj` without annotation data now fills FWR/CDR, junction and
   productivity fields. `v_annotation_source` and `j_annotation_source` name
   where each allele's coordinates came from.

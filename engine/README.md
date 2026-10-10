@@ -1,141 +1,291 @@
-# swig
+# swig: the V(D)J aligner of Swig
 
-Seeded, banded, affine V(D)J germline assignment with placement-DAG
-adjudication. It started as a Rust implementation of the SwiftIG / Swig 0.38.x
-method note; its decision rules are now derived from one log-likelihood-ratio
-objective (see [docs/ALGORITHM.md](docs/ALGORITHM.md)) instead of tuned patches.
-Every component is a replaceable, statically dispatched trait, and every
-search shortcut is either lossless or measured on simulated repertoires.
+This crate is Swig's V(D)J aligner. Swig Web runs it as WebAssembly
+(`public/swig.wasm`) in its browser workers, swig-cli runs the same module
+in its workers, and it is also available natively as the `swig` binary. It
+assigns V, D, J and, optionally, C germline alleles to reads by seeded,
+banded, affine alignment with placement-DAG adjudication, and writes Swig's
+AIRR Rearrangement TSV.
 
-Zero dependencies, Rust ≥ 1.89, edition 2024. The alignment kernel runs on
-AVX-512BW, AVX2, NEON, WebAssembly SIMD or portable lanes, chosen at run
-time; output is byte-identical across them and across x86-64 and AArch64
-Linux. The same engine also runs on macOS, on Windows and in a browser, with
-the same output up to a rare last-digit difference in a posterior where the
-platform's `exp` differs in the last bit (see *In the browser* below).
+It originated as vdj_assign, a Rust implementation of the SwiftIG / Swig
+0.38 method note. Its decision rules were then re-derived from one
+log-likelihood-ratio objective (see [docs/ALGORITHM.md](docs/ALGORITHM.md))
+instead of tuned patches. Every component is a replaceable, statically
+dispatched trait, and every search shortcut is either lossless or measured
+on simulated repertoires.
+
+The crate and binary are `swig` 0.39.0. The workspace member `wasm/` (crate
+`swig_wasm`) is the WebAssembly module. There are no dependencies; Rust ≥
+1.89, edition 2024. The alignment kernel runs on AVX-512BW, AVX2, NEON,
+WebAssembly SIMD or portable lanes, chosen at run time (on WebAssembly, at
+build time), and calls do not depend on the kernel.
 
 - [docs/ALGORITHM.md](docs/ALGORITHM.md): the model, the search and its
   guarantees, structured for a methods section.
 - [docs/ASSESSMENT.md](docs/ASSESSMENT.md): the critical assessment behind
-  the current design. It covers what was ad hoc, what replaced it, the measurements, and
-  the remaining plan.
+  the current design. It covers what was ad hoc, what replaced it, the
+  measurements, and the remaining plan.
 - [docs/REVIEW.md](docs/REVIEW.md): a code review of soundness and design,
   what it fixed, and the open findings ranked.
 
 ## Install
 
-Each [release](https://github.com/mashu/swig/releases) ships the
-command line for Linux (x86-64, AArch64), macOS (Intel, Apple silicon) and
-Windows (x86-64), and the browser build; see [CHANGELOG.md](CHANGELOG.md)
-for the files. Every archive was unpacked and tested on its own platform
-before the release was published.
+The engine has no releases of its own. Each
+[Swig release](https://github.com/mashu/swig/releases) attaches the native
+aligner as one executable per platform, built by
+[`.github/workflows/release-cli.yml`](../.github/workflows/release-cli.yml)
+(`cargo build --release --locked --bin swig`) and run with `--version` on
+its own platform:
+
+| Asset | Platform |
+|---|---|
+| `swig-aligner-linux-x64` | Linux x86-64 |
+| `swig-aligner-linux-arm64` | Linux AArch64 |
+| `swig-aligner-macos-x64` | macOS Intel |
+| `swig-aligner-macos-arm64` | macOS Apple silicon |
+| `swig-aligner-windows-x64.exe` | Windows x86-64 |
+
+The binaries are not signed. Make a downloaded file executable
+(`chmod +x swig-aligner-linux-x64`); on macOS, also clear the quarantine
+flag before the first run (`xattr -d com.apple.quarantine
+swig-aligner-macos-arm64`). The same releases attach `swig-cli-*`, Swig's
+command line, which carries the WebAssembly build of this engine and does
+not need the native binary.
+
+## Build and test
+
+From the root of the Swig repository:
 
 ```sh
-sha256sum --check --ignore-missing SHA256SUMS  # macOS: shasum -a 256 --check --ignore-missing SHA256SUMS
-tar xzf swig-0.1.1-x86_64-unknown-linux-gnu.tar.gz
-swig-0.1.1-x86_64-unknown-linux-gnu/swig --version
+npm run test:engine        # = cargo test --release --workspace --manifest-path engine/Cargo.toml
+                           #   unit, annotation, loci, robustness, synthetic, simulated-accuracy
+                           #   and WebAssembly-ABI tests (always test the release build)
+cargo test --release --workspace --manifest-path engine/Cargo.toml -- --ignored
+                           # only the ignored test: accuracy at scale, 20,000 reads per preset
+cargo build --release --manifest-path engine/Cargo.toml    # engine/target/release/swig
+
+rustup target add wasm32-unknown-unknown
+bash scripts/build-swig-wasm.sh                            # public/swig.wasm (npm run build:swig-wasm)
 ```
 
-The binaries are not signed. On macOS, clear the quarantine flag before the
-first run: `xattr -dr com.apple.quarantine swig-0.1.1-aarch64-apple-darwin`
-(`swig-0.1.1-x86_64-apple-darwin` on Intel). On Windows, unzip
-`swig-0.1.1-x86_64-pc-windows-msvc.zip` and run `swig.exe`.
+[`scripts/build-swig-wasm.sh`](../scripts/build-swig-wasm.sh) builds the
+`swig_wasm` crate for `wasm32-unknown-unknown` with `+simd128` and the
+`wasm` profile (fat LTO, stripped) into `engine/target/wasm-simd`, and
+copies the module to `public/swig.wasm` (or `$SWIG_WASM_OUTPUT`).
 
-To try it without installing anything, open the web demo:
-https://mashu.github.io/swig/ (deployed from `main` whenever CI
-passes). The browser build needs no installation and no server: open
-`swig-0.1.1.html` in a browser (double-click it, or drag it into a
-window). It is one self-contained page, both WebAssembly modules included,
-that computes in the browser and uploads nothing; *Use demo data* fills in a
-synthetic database and reads. Put the same file on any static host (GitHub
-Pages, an intranet folder) to share it. `swig-web-0.1.1.zip` holds it
-as `index.html` next to the JavaScript API, which Node.js 18 or later
-imports as an ES module (see *In the browser* below).
-
-## Build and run
+## Command line
 
 ```sh
-cargo build --release                          # always run the release build
-cargo test --release                           # unit, annotation, robustness, synthetic and simulated-accuracy tests
-cargo test --release -- --ignored              # + accuracy at scale: 20,000 reads per preset
+swig --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta reads.fastq > calls.tsv
 
-target/release/swig --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta \
-    [--profile r|truth|igblast|sensitive-d] [--threads N] [--tandem-d] \
-    [--chain heavy|light] [--forward-only] [--no-anchor-window] [--no-posterior] [--residual] \
-    [--calls per-read|fixed] [--d-allele map|max-marginal] [--d-presence-rate R] \
-    [--simd avx512|avx2|neon|portable|scalar] [--c IGHC.fasta [--c-evalue E]] \
-    reads.fastq > calls.tsv
+swig --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta --c IGHC.fasta \
+    --profile sensitive-d --strand forward --threads 8 reads.fastq > calls.tsv
 
-zcat reads.fastq.gz | target/release/swig --v V.fasta --d D.fasta --j J.fasta - > calls.tsv
+zcat reads.fastq.gz | swig --v V.fasta --d D.fasta --j J.fasta - > calls.tsv
+
+# one database of several loci: every rearrangement stays within one locus
+cat IGHV.fasta IGKV.fasta IGLV.fasta > V.fasta
+cat IGHJ.fasta IGKJ.fasta IGLJ.fasta > J.fasta
+swig --v V.fasta --d IGHD.fasta --j J.fasta reads.fasta > calls.tsv
+
+# Swig's double-D screen: AIRR rows unchanged, VDDJ evidence in a sidecar
+swig --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta \
+    --double-d all --double-d-out double_d.tsv reads.fasta > calls.tsv
 
 # optional: write the annotated database for review or curation
-target/release/swig prepare --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta [--c IGHC.fasta] \
+swig prepare --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta [--c IGHC.fasta] [--chain heavy|light] \
     --out prepared/
 
 # simulate reads with known truth (IgSim model), then score any tool's AIRR TSV against it
-target/release/swig simulate --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta [--c IGHC.fasta] \
-    --preset hard --reads 10000 --seed 1 --out sim          # sim.fasta + sim.truth.tsv
-target/release/swig --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta sim.fasta > calls.tsv
-target/release/swig evaluate --truth sim.truth.tsv calls.tsv   # works for IgBLAST etc. too
-# two callers (or settings) on the same reads: paired differences, 95 % CIs, exact McNemar tests
-target/release/swig evaluate --truth sim.truth.tsv calls.tsv other.tsv
-
-# accuracy and throughput on simulated reads (synthetic database unless --v/--d/--j are given)
-cargo run --release --example benchmark -- [--v V.fasta --d D.fasta --j J.fasta] \
-    [--preset easy|mid|hard] [--reads N] [--threads N] [--random N]
-# search errors vs model errors against an exhaustive oracle
-cargo run --release --example diagnose -- --v V.fasta --d D.fasta --j J.fasta --preset hard
-# where D errors arise: adjudication, not found, outside the D windows, eaten by J or V
-cargo run --release --example d_errors -- --v V.fasta --d D.fasta --j J.fasta --preset hard
+swig simulate --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta [--c IGHC.fasta] \
+    --preset hard --reads 10000 --seed 1 [--rc 0.5] [--shm RATE] [--dd P] --out sim
+swig --v IGHV.fasta --d IGHD.fasta --j IGHJ.fasta sim.fasta > calls.tsv
+swig evaluate --truth sim.truth.tsv calls.tsv              # works for IgBLAST etc. too
+swig evaluate --truth sim.truth.tsv calls.tsv other.tsv    # paired: 95 % CIs, exact McNemar tests
 ```
 
-Reads may be FASTA or FASTQ. The format is detected from the first
-character; multi-line FASTQ is supported and qualities are validated, then
-ignored. FASTQ sequence lines may not hold spaces, tabs or control
+`--v` and `--j` are required; `--d` and `--c` are optional. Assignment
+options (`swig --help` prints them):
+
+| Option | Meaning |
+|---|---|
+| `--profile NAME` | `r` (default), `truth`, `igblast` or `sensitive-d`; also `r_optimized`, `truth_optimized`, `igblast_compatible`, `sensitive_d` (see *Calling profiles*) |
+| `--threads N` | worker threads (default: all cores) |
+| `--chain heavy\|light` | chain type for annotation (default: voted per locus from the database) |
+| `--strand both\|forward\|reverse` | strands a read is assigned on (default `both`, chosen per read) |
+| `--min-identity F` | drop V, D and J hits below identity F (0–1; default none) |
+| `--no-anchor-window` | do not add the conserved-anchor D window |
+| `--no-posterior` | skip the V, D, J and D-presence posteriors (~30 % faster) |
+| `--calls per-read\|fixed` | the model the call maximises: each read's own (default; the model its posteriors come from) or the fixed `(2, −3)` scores |
+| `--d-allele map\|max-marginal` | report the call's D allele (default) or the one of largest posterior marginal given the call's D presence and topology (needs posteriors) |
+| `--d-presence-rate R` | D prior from the D search's own chance-hit count at D-presence rate R, 0 < R < 1 (see *The model in brief*) |
+| `--min-d-match N` | shortest exact run of an admissible D (default: the profile's) |
+| `--d-mismatch S`, `--j-mismatch S` | D or J mismatch score, negative (default: the profile's) |
+| `--min-j-length N` | fewest aligned J columns of a J hit (default none) |
+| `--c-evalue E` | call C when its anchored E-value is at most E (default 10⁻³; needs `--c`) |
+| `--c-prefix-identity F` | report C only where the germline from its first base reaches identity F (default 0, off) |
+| `--double-d off\|all\|long-span` | Swig's double-D screen (default off); needs `--double-d-out FILE` |
+| `--double-d-min-span N`, `--double-d-seed-length N`, `--double-d-pseudo-trim N`, `--double-d-pseudo-mismatches N`, `--double-d-min-gain S` | the screen's evidence rules (defaults 40, 11, 5, 3, 8) |
+| `--simd NAME` | alignment kernel: `avx512`, `avx2`, `neon`, `portable` or `scalar` (default: the fastest this CPU runs, AVX-512 excepted) |
+| `--residual` | commit V and J, then search D in the residual, instead of the DAG (no posteriors) |
+
+`simulate` presets are those of IgSim.jl: `easy`, `mid` (alias `train`) and
+`hard`. `--rc` reverse-complements that fraction of reads (default 0.5),
+`--shm` fixes every read's SHM rate, and `--dd` sets the tandem-DD
+fraction. It writes `PREFIX.fasta` and `PREFIX.truth.tsv`.
+
+**Reads** may be FASTA, FASTQ or an AIRR Rearrangement table. The format is
+detected from the first non-blank character (`>`, `@`, anything else a
+table). A table is tab-separated, or comma-separated without quoting when
+its header holds no tab, and is read from its `sequence`, `sequence_id` and
+`quality` columns: AIRR input is re-annotated from its sequences.
+Multi-line FASTQ is supported; qualities are validated and kept for the
+`quality` column. FASTQ sequence lines may not hold spaces, tabs or control
 characters (FASTA drops them, but a FASTQ quality counts each base); no-call
-symbols such as `.` read as N. Reads are streamed in batches of 16,384, so memory stays bounded on
-large files, and `-` reads stdin. Gzip input is recognised and rejected with
-a `zcat` hint, since the crate has no dependencies.
+symbols such as `.` read as N. Reads are streamed in batches of 16,384, so
+memory stays bounded on large files, and `-` reads stdin. Gzip input is
+recognised and rejected with a `zcat` hint, since the crate has no
+dependencies.
 
-The CLI rejects:
-- a repeated option, such as `--v` given twice;
-- a FASTQ file passed as a germline database.
+**Repeated sequences** are assigned once: within a batch, and across
+batches through a cache of the last 4,096 distinct sequences' rows. A row
+depends only on the read's sequence, besides its identifier and qualities,
+so the cache changes no output.
 
-A debug build prints a warning, because it is 10–50× slower.
+The command line rejects an option that takes a value given twice (a
+repeated flag changes nothing), a FASTQ file passed as a germline database,
+`--double-d` without `--double-d-out` and the reverse, and `--c-evalue`
+without `--c`. A debug build prints a warning, because it is 10–50× slower.
+The database summary, warnings and throughput go to stderr.
 
-Germline databases are FASTA; IMGT reference headers
-(`accession|allele|species|…`) are read as the allele name. No IMGT
-annotation is needed: anchors and V
-region boundaries are taken from the headers where present and detected
-otherwise, on every start, in milliseconds (see *Germline annotation* below).
-Identical sequences are merged and reported under all their names. Anchors
-also enable the anchor-bounded D window. Output is an AIRR Rearrangement TSV.
-Coordinates are 1-based closed intervals on the oriented query. CIGARs use
-`S`/`N` for unaligned query and germline bases and `=`/`X`/`I`/`D` for
-columns. `np1`–`np3` hold the junctional N/P regions, and `*_support` holds
-Karlin–Altschul E-values. `*_posterior` is the posterior probability that
-the call is germline-equivalent to the read's allele, and
-`d_presence_posterior` the probability that the read has a D at all (see
-*Posterior probabilities* below; `--no-posterior` skips them, ~30 % faster).
-Region columns follow: `fwr1`–`fwr4`, `cdr1`–`cdr3`
-(sequence, `_start`, `_end`), `cdr3_aa`, `junction`, `junction_length`,
-`junction_aa`, `vj_in_frame`, `stop_codon` and `productive`. A read without a
-significant V or J (see *Significance* below) is written with empty calls.
+**Germline databases** are FASTA and may hold several loci. IMGT reference
+headers (`accession|allele|species|…`) are read as the allele name, and
+identical sequences are merged and reported under all their names. Anchors
+and V region boundaries come from the headers where present and are
+detected otherwise, on every start (see *Germline annotation and regions*).
 
-**Constant region (isotype).** With `--c C.fasta`, twelve `c_` columns
-follow `productive` (`c_call`, `c_score`, `c_identity`, `c_support`,
-`c_posterior`, `c_cigar`, sequence and germline coordinates and alignments);
-without it the output is unchanged. C's germline base 0 is anchored within 3
-bases of the called J's end and aligned exactly from there to the read's
-end; V, D and J calls never change. `c_support` is the anchored E-value
-`N_C·7·e^(−λS)` over the file's C genes and start diagonals, and C is called
-at `c_support ≤ 10⁻³` (`--c-evalue`). Give one locus' spliced coding C
-regions, CH1 onward (IMGT or codon-aligned records such as abstar's both
-work), since every gene in the file counts. `c_call` lists every co-optimal
-allele: for a short C part shared by several genes (IGHG1/2/4 open alike)
-the *first* name is any of them, so read the isotype from the genes listed.
+## Output: Swig's AIRR schema
 
-As a library:
+Every row has the same 111 tab-separated columns (`AirrRecord::COLUMNS`),
+header first: Swig's 106 columns in the order Swig's interface has always
+read, then the engine's five posterior columns.
+
+| Columns | Content |
+|---|---|
+| 1–10 | `sequence_id`, `sequence`, `quality`, `sequence_aa`, `rev_comp`, `productive`, `vj_in_frame`, `stop_codon`, `complete_vdj`, `locus` |
+| 11–22 | `v_call`, `d_call`, `j_call`, `c_call`, `sequence_alignment`, `sequence_alignment_aa`, `germline_alignment`, `germline_alignment_aa`, `junction`, `junction_aa`, `np1`, `np2` |
+| 23–36 | `cdr1`, `cdr2`, `cdr3`, `fwr1`, `fwr2`, `fwr3`, `fwr4`, each followed by its `_aa` |
+| 37–53 | `v_`, `d_` and `j_` `score`, `identity`, `support`, `cigar`; `c_score`, `c_identity`, `c_prefix_identity`, `c_support`, `c_cigar` |
+| 54–69 | `v_`, `d_`, `j_` and `c_` `sequence_start`, `sequence_end`, `germline_start`, `germline_end` |
+| 70–83 | `cdr1`, `cdr2`, `cdr3`, `fwr1`–`fwr4` `_start` and `_end` |
+| 84–91 | `v_`, `d_`, `j_`, `c_sequence_alignment`, then `v_`, `d_`, `j_`, `c_germline_alignment` |
+| 92–99 | `junction_length`, `junction_aa_length`, `np1_length`, `np2_length`, `v_frameshift`, `j_frameshift`, `d_frame`, `sequence_frame` |
+| 100–106 | `region_definition`, `v_annotation_source`, `j_annotation_source`, `v_alternatives`, `d_alternatives`, `j_alternatives`, `c_alternatives` |
+| 107–111 | `v_posterior`, `d_posterior`, `j_posterior`, `c_posterior`, `d_presence_posterior` |
+
+- **Reads.** `sequence` is the read as given, upper-cased, `U` as `T`, any
+  symbol that is no IUPAC nucleotide as `N`; `quality` holds its FASTQ (or
+  AIRR) qualities as given. A read without an identifier is `sequence_N`
+  (its 1-based position in the input). A read without a significant V or J
+  (see *Significance* below) keeps these columns and `rev_comp`, with empty
+  calls.
+- **Coordinates** are 1-based closed intervals on the *oriented* query (the
+  reverse complement of `sequence` when `rev_comp` is `T`) and on the
+  germline. CIGARs use `S`/`N` for unaligned query and germline bases and
+  `=`/`X`/`I`/`D` for columns. Flags are `T`/`F`, empty when unknown.
+- **Calls.** `v_call`, `d_call`, `j_call` and `c_call` list every
+  co-optimal allele, comma-separated: each placement of that kind whose clip
+  to the called interval is worth exactly the call under the call's model.
+  The best-supported allele is first. `*_score` is the clipped score,
+  `*_identity` matches over alignment columns (a fraction), and `*_support`
+  a Karlin–Altschul E-value (`c_support` is C's anchored E-value instead).
+- **N/P and stitched alignments.** `np1` follows V and `np2` follows D, as
+  AIRR names an N/P region by the segment it follows.
+  `sequence_alignment` and `germline_alignment` stitch V, D and J in read
+  order, N/P bases against `N`.
+- **Regions.** `fwr1`–`fwr4`, `cdr1`–`cdr3` and `junction` are projected
+  from the called V's and J's germline coordinates. The coordinates come
+  from `SWIGMETA=` (or header keys) when the reference gives them, and from
+  the engine's own annotation otherwise; `v_annotation_source` and
+  `j_annotation_source` name the source (a `SWIGMETA` provenance such as
+  `IMGT-gapped`, or `header`, `imgt-gaps`, `motif`, `consensus`,
+  `transfer:NAME`, `low-confidence`, `missing`). `region_definition` is
+  `IMGT` when the called V has an anchor or region starts. `productive`
+  means in frame, free of stop codons and of frameshifts; `d_frame` and
+  `sequence_frame` are 1-based; `complete_vdj` means the V starts within 3
+  bases of its germline start and the J ends within 3 of its germline end.
+- **Alternatives.** `*_alternatives` lists the alleles the call does not
+  name whose placement of the same kind, clipped to the called interval,
+  scores within `max(2, |S|/100)` of the call's score `S`, best first, as
+  `name|score|identity|sequence_start|sequence_end|germline_start|germline_end`
+  entries separated by `;` (coordinates as above).
+- **Posteriors.** `*_posterior` is the posterior probability that the
+  reported names include the read's allele up to germline equivalence, and
+  `d_presence_posterior` the probability that the read has a D (see
+  *Posterior probabilities* below). They print with six decimals, or ten
+  within 10⁻⁴ of 0 or 1. `--no-posterior` leaves the V, D, J and D-presence
+  columns empty; `c_posterior` comes with every C call.
+
+**Constant region (isotype).** The `c_` columns are filled only with `--c`
+(model: *Constant region* below). `c_support` is the anchored E-value
+`N_C·7·e^(−λS)` over the C genes of the J's locus and the 7 start
+diagonals, and C is called at `c_support ≤ 10⁻³` (`--c-evalue`).
+`c_prefix_identity` is the identity of the C germline from its first base:
+the germline bases the alignment leaves uncovered, compared base for base
+with the read bases before it, then the alignment's columns.
+`--c-prefix-identity F` empties the C columns of a row whose
+`c_prefix_identity` is below F. Give each locus' spliced coding C regions,
+CH1 onward (IMGT or codon-aligned records such as abstar's both work), since
+every gene of the locus counts. For a short C part shared by several genes
+(IGHG1/2/4 open alike), `c_call`'s *first* name is any of them: read the
+isotype from the genes listed.
+
+## Double-D screen
+
+`--double-d all` or `--double-d long-span` runs Swig's double-D screen
+(`double_d.rs`; Swig's method note:
+[04_DOUBLE_D_SCREEN.md](../public/methods/04_DOUBLE_D_SCREEN.md)). It leaves
+every AIRR row unchanged: the DAG calls VJ or VDJ, and the screen reports
+evidence for a second D in a sparse sidecar TSV (`--double-d-out FILE`).
+
+A read is screened when its call places V and J, its locus has D genes
+(IGH, TRB, TRD) or is unknown, and the V–J span (the bases between the
+called V's end and J's start) is at least two seed lengths; in `long-span`
+mode the span must also reach `--double-d-min-span` (40). The screen's
+evidence rules:
+
+- **Seeds.** Each D hit holds an exact `--double-d-seed-length`-word (11;
+  6–24) of a D allele of the read's locus, or a `max(6, L − 3)` rescue word
+  whose ungapped extension reaches `L` aligned bases. Seeds extend without
+  gaps (match +2, mismatch −2) to their best-scoring prefix on each side;
+  hits on one allele diagonal count once.
+- **Gain.** Two ordered, non-overlapping hits score at least
+  `--double-d-min-gain` (8) above the best single hit.
+- **Pseudo-tandem veto.** The read from D1's start to D2's end, shortened
+  by `--double-d-pseudo-trim` (5) bases, must be more than
+  `--double-d-pseudo-mismatches` (3) Hamming mismatches from every equally
+  long substring of a D allele of the locus (the IgScout Δ-distance test),
+  so that no single D explains it.
+
+Pairs are tried in evidence order (pair score, gain, matched bases, shorter
+NP2, names). The first that passes is reported, and other passing pairs
+within two score units are listed as alternatives (up to 12). A hit's call
+lists every allele with the same score and coordinates.
+
+The sidecar has 38 columns: `swig_batch_record_index` (the read's 0-based
+index in the input; in the WebAssembly ABI, in the batch), `sequence_id`,
+`locus`, `v_call`, `standard_d_call` (the AIRR row's `d_call`), `d_call`,
+`d2_call`, `j_call`; for D1 and D2 the score, identity and CIGAR, the
+sequence and germline start and end, and the sequence and germline
+alignments; `np2` and `np3` (the bases between D1 and D2, and between D2
+and J) and their lengths; then `swig_double_d_vj_span`, `_seed_length`,
+`_pair_score`, `_best_single_score`, `_score_gain`, `_pseudo_distance`
+(empty when the trimmed span is shorter than a seed or longer than every D
+allele, where the veto does not apply), `_mode` (`all` or `long_span`) and
+`swig_double_d_alternatives`, `;`-separated `D1+D2|pair score|gain|pseudo
+distance` entries (−1 for no distance).
+
+## As a library
 
 ```rust
 use swig::prelude::*;
@@ -148,92 +298,113 @@ let call = assigner.assign(&encode(b"CAGGTG..."), &mut workspace);
 let calls = assign_all(&assigner, &queries, 0);            // parallel, input order
 ```
 
-or a whole run as the command line performs it, from FASTA text to AIRR TSV
-(`swig::run`; options by their command-line names):
+or a whole run as the command line and the WebAssembly module perform it,
+from FASTA text to AIRR TSV (`swig::run`; options by their command-line
+names, without `--`):
 
 ```rust
 let mut options = RunOptions::default();
-options.set("tandem-d", None)?;
+options.set("profile", Some("sensitive-d"))?;
+options.set("double-d", Some("all"))?;
+options.set("no-posterior", None)?;                        // a flag takes no value
 let texts = GermlineTexts { v: &v_fasta, d: Some(&d_fasta), j: &j_fasta, c: None };
 let database = PreparedDatabase::from_fasta(texts, options.annotate())?;
-let tally = Run::new(&options, database)?.write_airr(reads.as_bytes(), &mut out)?;
+let mut run = Run::new(&options, database)?;
+let mut sidecar = Vec::new();
+let tally = run.write_airr(reads.as_bytes(), &mut out, Some(&mut sidecar))?;
+// or, batch by batch without headers: let rows = run.assign(&records);
+//   rows.airr, rows.double_d, rows.tally; run.airr_header(), run.double_d_header()
 ```
 
-## In the browser (WebAssembly)
+`RunOptions::NAMES` lists the 24 option names and whether each takes a
+value; `RunOptions::config` maps them onto the profile's `EngineConfig`.
 
-`wasm/` compiles the engine to a WebAssembly module, and `web/` holds its
-JavaScript API, a Web Worker and a page that assigns reads in the browser.
-The page reads the files and runs the module locally; nothing is uploaded.
+## In Swig (WebAssembly)
 
-```sh
-rustup target add wasm32-unknown-unknown
-wasm/build.sh                                 # web/swig_simd.wasm, web/swig.wasm, web/index.html
-# then open web/index.html in a browser: no server needed
-node web/test.mjs target/release/swig   # the modules against the command line
-node web/browser-test.mjs target/release/swig chromium,firefox,webkit
-                                              # the page from disk and from a server, and workers (needs playwright)
-```
+The `swig_wasm` crate (`wasm/src/lib.rs`) exposes the engine as a small C
+ABI over linear memory, without a bindings generator. It is built for
+`wasm32-unknown-unknown` with `simd128` and needs no imports: Swig
+instantiates it with `WebAssembly.instantiate(module, {})`. The module,
+`public/swig.wasm`, is about 1 MB (0.33 MB gzipped). Swig Web's aligner
+workers (`src/aligner-worker.ts`, `src/aligner-compute-worker.ts`) and
+swig-cli's workers (`cli-src/swig-worker.mjs`) each hold one instance
+through the TypeScript wrapper
+[`src/aligner-engine.ts`](../src/aligner-engine.ts).
 
-```js
-import { load, assignInWorkers } from './swig.js';
+Each instance holds one engine. Text crosses the boundary as UTF-8 in
+buffers from `swig_alloc`; a function borrows the buffers it is given, and
+the host frees them with `swig_free`. A function returns −1 on failure, with
+the message in the error buffer. Results stay readable until the next call.
 
-const vdj = await load();                     // browser or worker: fetches the SIMD build where the engine has SIMD
-// Node.js cannot fetch file: URLs; give it the bytes:
-// const vdj = await load({ bytes: fs.readFileSync('web/swig_simd.wasm') });
-const run = vdj.createRun({ v, d, j, c, options: { profile: 'r', 'tandem-d': true } });
-const tsv = run.assign(fastqText);            // AIRR TSV, header included, as one string;
-                                              // run.parts(reads) for any size (new Blob(parts))
-run.free();
+| Export | Does |
+|---|---|
+| `swig_alloc(len) → ptr`, `swig_free(ptr, len)` | buffers for the host to fill and free |
+| `swig_set_option(name, name_len, value, value_len) → 0 \| −1` | set an option by its command-line name without `--` (a flag with an empty value); the run is rebuilt at the next use. `swig_reset_options()` restores the defaults |
+| `swig_init_database(v, v_len, d, d_len, j, j_len, c, c_len) → records \| −1` | load the germline FASTA texts (V and J required, D and C empty when absent) and prepare them; the result buffer holds `{"summary": …, "warnings": […]}` as JSON |
+| `swig_annotate(reads, len) → reads \| −1` | assign FASTA, FASTQ or AIRR-table text; the result buffer holds the AIRR TSV, header first, then one row per input record in input order |
+| `swig_result_ptr()`, `swig_result_len()` | the result buffer |
+| `swig_double_d_result_ptr()`, `swig_double_d_result_len()`, `swig_double_d_count()` | the double-D sidecar of the last annotation (header first, a row per screened read) and its row count |
+| `swig_error_ptr()`, `swig_error_len()` | the last error message |
+| `swig_panic_message()` | after a trap, leave the panic's message in the error buffer; the host then discards the instance |
+| `swig_version()` | leave `{"version": …, "backend": …}` in the result buffer |
 
-// In a browser, one run on Web Workers, rows in input order:
-const { parts, called } = await assignInWorkers({ germlines: { v, d, j, options }, reads, workers: 4 });
-const file = new Blob(parts);                 // the AIRR TSV at any size: header, then blocks
-```
+- **Same engine, same rows.** The module runs `run::Run`, as the native
+  binary does: the same option names and validation, the same database
+  preparation and warnings, the same rows. Every batch carries its own
+  header line, which the wrapper splits off. The crate's test
+  `the_abi_runs_the_library_run` checks that the ABI's rows equal
+  `Run::write_airr` for FASTA and AIRR-table input. In the standalone
+  project, the module's TSV equalled the native command line's byte for
+  byte on 45,000 rows; a posterior can still differ in its last printed
+  digit where it lands within a last-bit difference of `exp` (WebAssembly's
+  portable libm against the platform's) of a rounding tie (2 of 260,000
+  rows in a test, every call identical).
+- **The wrapper.** `AlignerEngine.create(module, settings, germlines)` maps
+  Swig's settings to options (`profile`, `strand`, `min-identity`,
+  `c-prefix-identity`, the `double-d` options, and the `min-d-match`,
+  `d-mismatch`, `j-mismatch` and `min-j-length` overrides that
+  `swig-cli --vdj` uses), loads the germlines and reads the summary.
+  `annotate(reads, count, doubleD)` checks that the module returned one row
+  per record of the batch and returns the header, the rows and, with the
+  screen on, the sidecar.
+- **SIMD.** WebAssembly has no run-time feature detection, so the kernel is
+  chosen at build time: the `simd128` backend, 16 lanes in two `v128`
+  registers. Swig ships only this build, so a host without WebAssembly SIMD
+  cannot instantiate it; a build without `simd128` would use the scalar
+  kernel, since emulated lanes there run several times slower.
+- **Threads.** `wasm32-unknown-unknown` has none: `assign_map` runs every
+  chunk on the calling thread, and Swig parallelises by running one
+  instance per worker. In the standalone project's measurements, one
+  worker under V8 assigned 1,100–1,450 simulated reads/s, about 60 % of the
+  native AVX2 kernel on one thread.
 
-- **Same engine, same output.** The module runs `run::Run`, as the command
-  line does: the same options by the same names (`profile`, `tandem-d`,
-  `c-evalue`, …), the same database preparation and warnings, the same
-  AIRR rows. On 45,000 rows (three presets, three option sets) and in
-  headless Chromium, its TSV equals the command line's byte for byte; CI
-  checks both on every push (`web/test.mjs` in Node.js,
-  `web/browser-test.mjs` for the page and `assignInWorkers` in Chromium,
-  Firefox and WebKit).
-  A posterior can still differ in its last printed digit where it lands
-  within a last-bit difference of `exp` (WebAssembly's portable libm
-  against the platform's) of a rounding tie: 2 of 260,000 rows in a test,
-  with every call identical.
-- **Two modules.** WebAssembly has no run-time feature detection, so
-  `swig_simd.wasm` uses the `simd128` kernel (every current browser,
-  Node.js) and `swig.wasm` the scalar kernel; `load()` validates a
-  SIMD probe and fetches the right one. 0.9 MB each, 0.3 MB gzipped, no
-  imports.
-- **Speed.** With SIMD under V8, 1,100–1,450 reads/s per worker on
-  simulated reads, about 60 % of the native AVX2 kernel (1,850–1,970 on the
-  same hard-preset file, one thread). `assignInWorkers` gives each worker
-  every `n`-th block of 256 reads; workers share nothing, and each holds a
-  copy of the reads.
-- **Zero dependencies there too.** The module exposes a small C ABI over
-  linear memory (`wasm/src/lib.rs`), so it builds with `cargo` and the
-  `wasm32-unknown-unknown` target alone; `web/swig.js` wraps it, and
-  runs in browsers, Web Workers and Node.js 18 or later.
-- **The page.** Germline FASTA files (or demo data: a synthetic database
-  and simulated reads), reads as FASTA or FASTQ (gzip decompressed by the
-  browser), every assignment option and a worker count; it gives the AIRR
-  TSV, the prepared database files and a preview.
-- **One file, no server.** A browser will not let a page opened from disk
-  (`file:`) load a module script, fetch a `.wasm` file or start a worker
-  from a file. So `wasm/build.sh` writes `web/index.html` from the page's
-  source (`web/page.html`, `web/app.js`) with `swig.js`, `worker.js`
-  and both modules inlined (`web/standalone.js`, 2.5 MB): it compiles the
-  embedded bytes and starts its workers from a blob, so it fetches nothing
-  and runs opened from disk or from any static host. The browser test
-  opens it from disk in Chromium, Firefox and WebKit, and checks in
-  Chromium, which reports every load, that it requests nothing but itself
-  and its blobs. CI uploads it with the API and both modules as the
-  `swig-web` artifact, which `.github/workflows/pages.yml` publishes
-  to GitHub Pages after CI passes on `main`; each release ships it as
-  `swig-<version>.html` and, with the API, as
-  `swig-web-<version>.zip`.
+## Databases of several loci
+
+One database may hold several loci, as Swig composes them: IGH, IGK and IGL
+for a BCR study, or the TR loci (TRA, TRB, TRD, TRG). Each allele's locus is
+read from its name (`IGHV1-2*02`, `TRBJ2-7*01`: the locus code that occurs
+first, case-insensitively), or from the whole FASTA header when the name
+holds none. Shared TRA/TRD V genes (`TRAV14/DV4`) belong to both loci. An
+allele whose locus cannot be read belongs to every locus, so a database of
+unrecognised names is assigned as a single locus (`locus.rs`).
+
+- **One locus per rearrangement.** J candidates must share a locus with the
+  read's V placements, and D candidates with the V and J. When every
+  placement of a read shares a locus, the read is adjudicated once.
+  Otherwise each locus is adjudicated over its own placements, and the call
+  is the path of the locus with the largest likelihood `Z` (the best path
+  without posteriors); the posteriors are the mixture over loci weighted by
+  `Z`. C joins a J of its own locus. `locus` reports the locus the path's
+  alleles share, empty when it is unknown.
+- **Per-locus annotation.** The V and J alleles of each locus are annotated
+  on their own: chain type, FR3 length model and Cys23 priors differ between
+  heavy and light chains and between TR loci.
+- **Per-locus priors and gates.** A D database of several loci (TRB and TRD)
+  prices a D by its own locus' D genes (`P_D`, below), and the C gate's
+  `N_C` counts the C genes of the read's locus only.
+
+`tests/loci.rs` assigns IGH and IGK reads against one IGH + IGK database:
+every called allele belongs to the read's locus, and no IGK read gets a D.
 
 ## Germline annotation and regions
 
@@ -255,7 +426,7 @@ IG heavy and 36 in kappa, but by gene family in lambda (36/38), TRA (32–34),
 TRB (37/38), TRG and TRD (37–39). The CDR2/FR3 boundary therefore comes from
 annotated relatives or a length learned from the database (below).
 
-### Header keys
+### Header keys and `SWIGMETA`
 
 All positions are 0-based in the germline sequence; unknown keys are ignored.
 
@@ -263,7 +434,29 @@ All positions are 0-based in the germline sequence; unknown keys are ignored.
 |---|---|
 | `anchor=` | first base of V Cys104 / J Trp-Phe118 |
 | `fr1=` `cdr1=` `fr2=` `cdr2=` `fr3=` | V region starts |
+| `frame=` | offset (0–2) of the first complete codon (a V or J anchor also fixes it; a D needs it for `d_frame`) |
 | `aliases=A,B` | other names of this sequence |
+| `SWIGMETA=` | Swig's prepared coordinates (below) |
+
+Swig prepares every reference it ships, and every FASTA a user loads, with
+region coordinates transferred from IMGT-annotated relatives
+(`src/germline-preprocess.ts`), and writes them into the header as
+`SWIGMETA=` followed by 13 comma-separated integers (`metadata.rs`):
+
+| Index | Value |
+|---|---|
+| 0 | coding-frame start: offset (0–2) of the first complete codon, −1 if unknown |
+| 1 | J only: last base of CDR3 (the Trp/Phe118 codon starts one base later), else −1 |
+| 2–11 | V only: FWR1, CDR1, FWR2, CDR2 and FWR3 as `[start, end)` pairs, −1 if unknown |
+| 12 | provenance: 1 `IMGT-gapped`, 2 `AIRR-C`, 3 `IMGT-boundary-transfer`, 4 `validated-J-motif`, 5 `provided`, 6 `J-anchor-transfer` (other values `unclassified`) |
+
+FWR3 ends after the Cys104 codon, so a V anchor is FWR3's end − 3, and a J
+anchor is one past CDR3's last base. `SWIGMETA` values are given values,
+like header keys: they fill what the explicit keys leave open (when the
+result stays consistent) and win over everything the engine would derive.
+A malformed field is an error. The provenance becomes the allele's
+`v_annotation_source` or `j_annotation_source`; an allele without one
+reports the annotation's own source.
 
 ### IMGT-gapped input
 
@@ -279,15 +472,17 @@ IMGT columns 1, 79, 115, 166 and 196, and Cys104 is column 310.
 - An allele whose numbering ends before Cys104 gets no anchor (`3′-partial`).
 - A one- or two-column interior gap (an IMGT frameshift marker) is noted, and
   the columns after it still map exactly.
-- Header keys win over the gap columns.
+- Header keys and `SWIGMETA` win over the gap columns.
 - Ungapped alleles appended to a gapped set are annotated as below, and take
   their FR3 start from their gapped relatives.
 
 ### Sources, in order of trust
 
-A header value is never overridden.
+A given value is never overridden. With several loci, each locus is
+annotated on its own.
 
-1. **Header keys**, then the **IMGT gap columns** (source `imgt-gaps`).
+1. **Header keys and `SWIGMETA`**, then the **IMGT gap columns** (source
+   `imgt-gaps`).
 2. **Motif search** on a one-pass three-frame translation. For V, Cys23, Trp41
    and Cys104 are placed jointly under spacing constraints, scored by
    conserved context: `[ST]C`; `W` with `Q`+3, `P`+5, `G`+6 (`WVRQAPG` /
@@ -321,7 +516,7 @@ A header value is never overridden.
      out-of-frame TGT ~30 nt upstream, which shifted every junction they
      produced.
 5. **Database models**, for alleles that no relative settles. Both are
-   learned once per database, with Jeffreys (½) pseudo-counts:
+   learned once per database (per locus), with Jeffreys (½) pseudo-counts:
    - *FR3 length.* Trp41 → Cys104 spans `d = 14 + c + L` codons for a CDR2 of
      `c` and an FR3 of `L` codons. The model picks the `L` that maximises
      `P(L) · P(c = d − 14 − L)`, both estimated from the given FR3 starts. `L`
@@ -339,7 +534,7 @@ Every derived start that may be wrong is flagged in `annotation.tsv` as
 - every start of a low-confidence or missing anchor;
 - an FR3 length with model posterior below 0.95, or outside the model;
 - the chain default in a TR or IGL database without any given FR3 start
-  (`prepare` and `assign` also warn);
+  (`prepare` and assignment also warn);
 - a CDR1 from an ambiguous Cys23 that no relative settled, or from no Cys23;
 - a CDR of unusual length;
 - a start transferred from a relative whose own start is flagged.
@@ -364,8 +559,9 @@ Every derived start that may be wrong is flagged in `annotation.tsv` as
 
 Per read, regions are projected lazily when a call is reported, only through
 the called V and J alignments. Each boundary is one binary search in the
-clip index. This costs under a microsecond per read, against ~450 µs for assignment and
-11.8 µs for the whole AIRR record, and nothing is added to assignment itself.
+clip index. This costs under a microsecond per read, against ~450 µs for
+assignment and 11.8 µs for the whole AIRR record, and nothing is added to
+assignment itself.
 
 ### Reliability (tests/annotation.rs)
 
@@ -392,8 +588,9 @@ Synthetic genes are built from heavy and light framework templates:
 ### `prepare`
 
 `swig prepare` writes `V.fasta`, `D.fasta` and `J.fasta` with every
-anchor and region start in the headers (plus `annotation=SOURCE`), `C.fasta`
-with `--c`, and `annotation.tsv` with one row per allele:
+anchor, frame and region start in the headers as keys (plus
+`annotation=SOURCE`), `C.fasta` with `--c`, and `annotation.tsv` with one
+row per allele:
 
 - frame, anchor and its residue;
 - region starts, CDR1 and CDR2 lengths in codons;
@@ -409,8 +606,9 @@ allele whose bases past its anchor differ from most J alleles' by more than 3
 (bases past the splice donor move the J exit off the splice).
 
 Reloading the written FASTA uses the headers as-is, so manual corrections
-stick. Assignment runs log a one-line summary. They warn when any allele is
-transferred, low-confidence or missing, and when a TR or IGL database gives
+stick (a `SWIGMETA` provenance is not written, so reloaded alleles report
+`header`). Assignment runs log a one-line summary. They warn when any allele
+is transferred, low-confidence or missing, and when a TR or IGL locus gives
 no FR3 start, so that every FR3 start rests on one chain default.
 
 ## Architecture
@@ -418,11 +616,12 @@ no FR3 start, so that every FR3 start rests on one chain default.
 ```text
  chunk of reads ─► per read: strand from germline k-mer support; V candidates (gene frames)
                 ─► V stage, whole chunk: score batch, sibling bounds, traceback waves
-                ─► per read: J window right of V ─► J stage, whole chunk (every allele)
-                ─► per read: D windows from V/J geometry, D candidates (L-mer bitsets)
+                ─► per read: J window right of V, J alleles of the V's locus ─► J stage, whole chunk
+                ─► per read: D windows from V/J geometry, D candidates of the locus (L-mer bitsets)
                 ─► D stage, whole chunk ─► per read: admission gates
-                ─► per read: placement DAG over VJ / VDJ / VDDJ ─► anchor check ─► Call
-                ─► with --c, whole chunk: C anchored at the J exit (one job per reach class) ─► AIRR
+                ─► per read: placement DAG over VJ / VDJ, per locus ─► anchor check ─► Call
+                ─► with --c, whole chunk: C anchored at the J exit (one job per reach class)
+                ─► AIRR row; with --double-d, the double-D screen ─► sidecar row
 ```
 
 Every per-read decision is taken per read. Batch aligners must answer
@@ -433,24 +632,26 @@ stages are the methods `stage_orient`, `stage_v`, `stage_j`, `stage_d` and
 
 | Module | Responsibility |
 |---|---|
-| `alphabet`, `fasta`, `germline`, `reads` | 2-bit codes (N = 4), germline FASTA and sets with anchors, streaming FASTA/FASTQ |
-| `translate`, `annotate`, `prepare`, `read_regions` | Codon table, anchors and V regions (header > IMGT gaps > motif > consensus > relatives > database models), per-read FR/CDR/junction projection |
+| `alphabet`, `fasta`, `germline`, `reads` | 2-bit codes (N = 4), germline FASTA and sets with anchors, streaming FASTA/FASTQ/AIRR-table reads |
+| `locus`, `metadata` | Loci from allele names and which alleles may join; Swig's `SWIGMETA=` field |
+| `translate`, `annotate`, `prepare`, `read_regions` | Codon table, anchors and V regions per locus (header/`SWIGMETA` > IMGT gaps > motif > consensus > relatives > database models), per-read FR/CDR/junction projection |
 | `scoring`, `stats` | Log-odds substitution profiles (uniform or position-specific), affine gaps, Karlin–Altschul λ/K/E-values |
 | `orient` | Strand from germline k-mer presence on both strands, with a significance test |
 | `seed`, `index`, `retrieve/frames` | Rolling k-mers, CSR k-mer index over gene frames (alleles of a gene in one coordinate system) |
 | `retrieve/seed_vote`, `retrieve/budget` | Radix-sorted diagonal votes per frame, gene budget, candidate bands |
 | `retrieve/exhaustive`, `retrieve/lmer_mask`, `retrieve/ungapped` | J: every allele; D: lossless L-mer bitsets; optional ungapped pre-ranking |
-| `band`, `align/gotoh`, `align/inter_seq`, `align/lanes` | Diagonal bands; scalar banded Gotoh; inter-sequence Gotoh written once over a SIMD lane trait (AVX-512BW 32 lanes; AVX2, NEON, portable 16) |
+| `band`, `align/gotoh`, `align/inter_seq`, `align/lanes` | Diagonal bands; scalar banded Gotoh; inter-sequence Gotoh written once over a SIMD lane trait (AVX-512BW 32 lanes; AVX2, NEON, `simd128`, portable 16) |
 | `segment`, `family_bound` | One search stage: score → sibling bounds along the gene frame → traceback waves → acceptance and E-value gates → outer extension |
 | `clip`, `evidence`, `placement` | O(1) clip-and-rescore at any cut; exact-run / identity evidence |
 | `window`, `admission` | Where J and D are searched; D evidence gates |
 | `constant`, `retrieve/reach` | Constant region after adjudication: splice window, anchor-column DP, anchored E-value and posterior; one candidate per class of alleles the read cannot reach apart |
 | `adjudicate/{lattice,dag,posterior,units,model,decode,residual}` | The placement lattice; Viterbi and forward–backward over it; the per-read model in integer units both read; grammar and log-odds path model; max-marginal D decoding; residual baseline |
 | `flank` | Outer-flank extension of V and J alignments |
-| `pipeline`, `config`, `profiles` | Stage-wise composition, declarative configuration, calling profiles |
-| `run` | A whole run, shared by the command line and the WebAssembly module: options by their command-line names, the assigner they build, reads streamed to AIRR TSV |
-| `report`, `batch` | AIRR output, parallel batches |
-| `sim/{random,params,simulate,synthetic,evaluate}` | IgSim port, synthetic germlines, accuracy evaluation |
+| `pipeline`, `config`, `profiles` | Stage-wise composition with per-locus adjudication, declarative configuration, calling profiles |
+| `run` | A whole run, shared by the command line and the WebAssembly module: options by their command-line names, the assigner they build, the repeated-sequence cache, reads streamed to AIRR TSV |
+| `report`, `double_d`, `batch` | Swig's AIRR schema; the double-D screen and its sidecar; parallel batches |
+| `sim/{random,params,simulate,synthetic,truth,evaluate}` | IgSim port, synthetic germlines, truth records, accuracy evaluation |
+| `wasm/` (crate `swig_wasm`) | The WebAssembly module's C ABI |
 
 ## The model in brief
 
@@ -461,12 +662,14 @@ The full description, with the guarantee of each search step, is in
   log-likelihood ratio, in units of 1/λ nats with λ = 0.634, of "templated by
   this germline at 11.2 % divergence" against "random sequence". N and P bases
   score 0 under both hypotheses. Affine gaps price indels.
-- **The path objective** is `Σ clipped segment scores − P_D·#D − tandem·[2nd D]`,
-  maximised exactly over the topologies VJ / VDJ / VDDJ,
-  over the placements, and over both cuts between neighbours (the earlier one
-  exits at `x`, the later enters at `y ≥ x`, and the bases between are N/P).
-  Ties go to fewer D, then to more germline support (the summed unclipped
-  scores).
+- **The path objective** is `Σ clipped segment scores − P_D·#D`, maximised
+  exactly over the topologies VJ and VDJ, over the placements, and over both
+  cuts between neighbours (the earlier one exits at `x`, the later enters at
+  `y ≥ x`, and the bases between are N/P). Ties go to fewer D, then to more
+  germline support (the summed unclipped scores). The library's tandem
+  grammar (`VdjGrammar::TANDEM_D`) adds VDDJ, where a second D also pays
+  `tandem_d_penalty` (12); Swig's double-D screen is separate and leaves the
+  call alone.
 - **Calls come from the read's own model.** Each path is valued at the read's
   divergence `p̂`, estimated before adjudication from the V and J columns no
   path contests: a match is worth `ln 4(1−p̂)` nats, a mismatch `ln(4p̂/3)`, a
@@ -474,14 +677,21 @@ The full description, with the guarantee of each search step, is in
   maximum is exact, and the posterior reads the same integers: the call is a
   mode of the reported distribution. `--calls fixed` keeps the fixed scores,
   of which the per-read model at 11.2 % divergence is an exact multiple.
+  Paired against fixed-scale calls on 20,000 reads per preset, it left
+  4.0–4.3 pp more D-free reads without a D on mid sets and improved the
+  D-presence Brier score on every set (ASSESSMENT §9.8).
 - **`P_D` is derived, not tuned.** A D is one of `N` genes at one of `L`
   junction positions. Including it pays off when `λ·S_D > ln(N·L) − ln(prior
   odds)`, which gives `P*_D` = 10.55 for human IGH (32 genes, L = 25, even
   odds) and 6.17 for TRB, kept unrounded; on integer scores the fixed scale
-  charges `⌊P*_D⌋`, which decides `S > P*_D` exactly. `--d-presence-rate π`
-  counts what the D search tries instead (Karlin–Altschul `K·m·n_D` over
-  alleles × offsets × positions) at the D-presence rate `π`; the rate has to
-  come from the user, so it is not the default.
+  charges `⌊P*_D⌋`, which decides `S > P*_D` exactly. A D database of several
+  loci gives each locus its own `P*_D`. `--d-presence-rate π` counts what the
+  D search tries instead, `P*_D = [ln(K·m·n_D) − ln(π/(1 − π))]/λ` over
+  alleles × offsets × positions. At π = 0.9 it improved the D-presence Brier
+  score on all six sets of 20,000 reads, but that rate was found by
+  measuring; at the simulator's own rate (0.94) D-free specificity fell
+  14–26 pp. The rate has to come from the user, so it is not the default
+  (ASSESSMENT §9.9).
 - **Significance.** A V or J hit is kept at E ≤ 1 against its database and
   window. A read is called only when its path contains an *anchor*, a V or J
   hit at E ≤ 10⁻³, so random sequence receives no call.
@@ -489,13 +699,17 @@ The full description, with the guarantee of each search step, is in
   lies within `s = 3` bases of the J's exit. A bonus column in front of C
   turns every local aligner into an exact anchored one, and C is called at
   an anchored E-value `N_C·(2s + 1)·e^(−λS) ≤ 10⁻³`, after adjudication, so
-  it never moves a V, D or J call.
+  it never moves a V, D or J call. On 20,000 simulated reads per preset
+  (human IGH with abstar's IGHC; synthetic): ≤ 2 false calls on ~4,100
+  C-free reads, the primary C allele anchored-equivalent ≥ 99.6 % from 16 nt,
+  `c_posterior` ECE ≤ 0.18 %, 9 % more instructions with `--c`
+  (ASSESSMENT §11).
 - **Posterior probabilities.** Read as a distribution, `P(path, cuts) ∝
   exp(nats)`, the same model gives calibrated probabilities by
   forward–backward over the same DAG; the other priors stay at their
   derivation λ. `--d-allele max-marginal` reports the D allele of largest
   posterior marginal instead of the call's (off by default: it gains only on
-  heavily mutated reads).
+  heavily mutated reads, +0.25 pp on hard reads).
 
 ## Extension points
 
@@ -513,7 +727,7 @@ no runtime type checks.
 | `DWindowPolicy` | `WithAnchorWindow<ExpandedResidual>` | `ResidualWindow`, `ExpandedResidual` |
 | `Admission` | `AnyOf<ExactRunFloor, Option<DistributedEvidence>>` (distributed-D off by default) | `AdmitAll`, `AllOf`, any `Option<A>` |
 | `Adjudicator` | `PlacementDag<VdjGrammar, EngineeringObjective>` | `ResidualAdjudicator` |
-| `Grammar`, `PathModel` | `VdjGrammar::{VDJ, TANDEM_D, VJ}`, `EngineeringObjective` | your own path grammar / objective |
+| `Grammar`, `PathModel` | `VdjGrammar::VDJ`, `EngineeringObjective` | `VdjGrammar::{TANDEM_D, VJ}`; your own path grammar / objective |
 | `VdjAssigner` (+ `assign_many`) | chunk-staged `Assigner` | default `assign_many` loops `assign` |
 
 ```rust
@@ -551,9 +765,9 @@ on the hard preset and 6 % at 30 % SHM; wall-clock differences were within
 the container's noise. On the IMGT human IGH reference, 20,000 hard reads,
 one thread, by kernel backend (identical calls): AVX-512BW ~2340, AVX2
 ~1870, portable ~1500, scalar ~730 reads/s. Calls are identical across the
-pure-speed steps; the steps
-that changed calls are listed in [docs/ASSESSMENT.md](docs/ASSESSMENT.md)
-with their accuracy effect.
+pure-speed steps; the steps that changed calls are listed in
+[docs/ASSESSMENT.md](docs/ASSESSMENT.md) with their accuracy effect. These
+timings were taken on the standalone engine.
 
 ### Data and retrieval
 
@@ -574,21 +788,12 @@ gene over the seven conditions 85.2 → 88.1 %, 30 % SHM 75.7 → 84.7 %, hard
 preset 98.36 → 98.50 %. A proportional margin (10–30 % of `L`) loses 4–9
 points at 30 % SHM; z above 2 adds at most 0.1 point (the 16-gene cap binds).
 
-Sampled seeds (`SeedSampling`) remain available and correct: closed syncmers
-(Edgar 2021; the smallest `s`-mer of the seed's key, `s = k − w`, first or
-last) are context-free, so a seed shared by read and germline is kept in both
-or neither, and have a *window guarantee*: any `w` consecutive k-mers hold
-one on a contiguous shape, so every unmutated stretch of `k + w − 1` bases
-(12 for 9-mers, `w = 4`) yields a shared seed (0 seedless 12-base windows on
-IGHV). Open syncmers (the smallest `s`-mer in the middle, Shaw & Yu 2022) are
-context-free without that guarantee (5 % of 12-base IGHV windows seedless at
-`w = 2`); minimisers have the guarantee but are not context-free. Under the
-noise-based margin every k-mer beats closed and open syncmers (minimisers
-were not re-measured): closed syncmers (`w = 4`, 40 % of k-mers) are 1.1
-points of mean V gene behind (4.4 at 30 % SHM) for 0.4 % fewer instructions
-on the hard preset (and slightly more at 30 % SHM). Their earlier parity came
-from the fixed margin and was fragile: a different hash order alone moved
-them 0.3 points on the hard preset.
+Sampled seeds (`SeedSampling`: closed and open syncmers, minimisers) remain
+available and correct. Closed syncmers are context-free and have a window
+guarantee (every unmutated 12-base stretch yields a shared 9-mer seed at
+`w = 4`), but under the noise-based margin every k-mer beats them: 1.1
+points of mean V gene (4.4 at 30 % SHM) for 0.4 % fewer instructions on the
+hard preset (ASSESSMENT §8).
 
 **Strand from a k-mer bitset.** A presence bitset over all 4¹¹ k-mers of the V
 and J germline (512 KiB). One pass computes forward and reverse-complement
@@ -596,7 +801,7 @@ keys together, so each strand costs one bit test per base. Each read position
 counts at most once, so repeats cannot inflate the evidence. The count is
 trusted only when it exceeds its Poisson null (`λ₀ + 3√λ₀`); otherwise the
 read falls back to seed votes on both strands. Only the chosen strand is
-searched for V.
+searched for V. `--strand forward` or `reverse` skips the test.
 
 **Gene frames.** The alleles of a gene share almost all seeds. A frame maps
 each allele into the gene's longest allele by the offset at which its shared
@@ -619,9 +824,10 @@ does not vote (it cannot locate the diagonal).
 range, shifted by the allele's frame offset and widened by 8 diagonals.
 Narrowing from ≥ 57 to ~17–25 diagonals changed no call on reads with indels.
 
-**Exhaustive J, small window.** The J set is tiny (10–20 alleles) and under
-heavy SHM keeps few intact seeds, so every J allele is aligned, unbanded, in
-the read right of V (from 12 bases before the earliest V end).
+**Exhaustive J, small window.** The J set is tiny (10–20 alleles per locus)
+and under heavy SHM keeps few intact seeds, so every J allele of the V's
+locus is aligned, unbanded, in the read right of V (from 12 bases before the
+earliest V end).
 
 **Ungapped pre-ranking** (`retrieve/ungapped`): Kadane's maximum segment sum
 along diagonals around the band centre ranks candidates before DP. It is
@@ -717,9 +923,11 @@ exact run ≥ 4, by pigeonhole).
 alignment never outscores the whole alignment. So a D scoring at most `P_D`
 can only add ≤ 0 to a path, and the strict with-D-beats-no-D rule rejects it;
 dropping a D leaves its neighbours' cuts valid. The floor `P_D + 1` is
-therefore exact for the call. A D below it still carries posterior mass, so
-the floor applies only with `--no-posterior`; posteriors keep every
-admissible D (+1 % of instructions).
+therefore exact for a fixed-scale call. A D below it still carries posterior
+mass and can win a per-read call, so the floor applies only to fixed-scale
+calls without posteriors (`--no-posterior --calls fixed`): posteriors keep
+every admissible D (+1 % of instructions), and so do per-read calls. With
+several loci the floor is the lowest locus' `P_D`.
 
 ### Adjudication
 
@@ -754,9 +962,10 @@ ones.
 ### Parallelism and allocation
 
 One workspace per thread means no DP allocation after warm-up. Work is
-self-scheduled in chunks of 64 from an atomic counter over scoped threads.
-Results come back in input order, and reporting is formatted on the workers
-(`assign_map`).
+self-scheduled in chunks of 64 from an atomic counter over scoped threads;
+the calling thread is one of the workers, and a target without threads
+(WebAssembly) runs every chunk on it. Results come back in input order, and
+reporting is formatted on the workers (`assign_map`).
 
 ## Simulation and evaluation
 
@@ -811,22 +1020,11 @@ residual adjudicator gains +0.4–0.6 pp of D accuracy (p < 10⁻⁴) only by
 giving 21–25 pp more D-free reads a D; see
 [docs/ASSESSMENT.md §9.5](docs/ASSESSMENT.md) for the full table.
 
-Human IGH (541 V / 90 D / 16 J; a local copy, not shipped), 5000 reads per
-preset, germline-equivalent accuracy in %, before → after the redesign:
-
-| Preset (IgSim) | Orientation | V | V gene | D | J | Junction | Random reads called |
-|---|---|---|---|---|---|---|---|
-| easy (no SHM) | 99.94 → **100** | 99.54 → **99.84** | 99.92 → **99.98** | 98.78 → **99.29** | 99.90 → **99.94** | 99.94 → **100** | 30.5 → **0** |
-| mid (IgM-like) | 100 → 100 | 97.76 → **97.94** | 99.84 → 99.84 | 91.96 → **93.00** | 98.84 → 98.80 | 99.93 → **99.97** | 30.2 → **0** |
-| hard (IgG-like) | 99.98 → 99.98 | 89.74 → **89.96** | 98.44 → **98.50** | 81.72 → **83.58** | 92.70 → **93.32** | 98.39 → **99.55** | 31.2 → **0** |
-
-Junctions "after" use the corrected anchors of 3′-partial V alleles, which
-leave those alleles' reads without a templated junction (hard: 2416 → 2214
-scored reads); with the old annotation the same calls scored 98.47 %.
-
-The synthetic database (`SyntheticSpec::default()`, seed 1) gives, after:
-easy V/D/J 99.98/99.82/99.98, mid 99.54/87.90/98.92, hard 97.18/79.69/94.06,
-and junctions ≥ 99.8 %.
+The measurements below were made on the standalone engine, on single-locus
+human IGH databases; [docs/ASSESSMENT.md](docs/ASSESSMENT.md) gives the
+protocols, and its §4 the accuracy before and after the redesign (on human
+IGH, random reads called fell from ~30 % to 0, and hard-preset junctions
+rose from 98.39 to 99.55 %).
 
 At 20,000 reads per preset on the public IMGT human IGH reference (the one
 shipped in the `airrship` PyPI package: 415 V / 37 D / 13 J after merging
@@ -859,6 +1057,22 @@ IgBLAST takes J anchors from its auxiliary file, which lacks three of this
 database's J alleles; the comparison adds them (frame and CDR3 end from
 `swig prepare`, which agrees with the file on all 13 shared alleles).
 Without them IgBLAST reports no junction for 18 % of reads.
+
+The examples measure and diagnose; without `--v`/`--j` they use the
+synthetic database:
+
+```sh
+# accuracy and throughput on simulated reads (also --shm, --seed, --rc, --profile,
+# --simd, --tandem-d and the ablation switches listed in examples/benchmark.rs)
+cargo run --release --manifest-path engine/Cargo.toml --example benchmark -- \
+    [--v V.fasta --d D.fasta --j J.fasta] [--preset easy|mid|hard] [--reads N] [--threads N] [--random N]
+# search errors vs model errors against an exhaustive oracle
+cargo run --release --manifest-path engine/Cargo.toml --example diagnose -- \
+    --v V.fasta --d D.fasta --j J.fasta --preset hard [--reads N] [--show K]
+# where D errors arise: adjudication, not found, outside the D windows, eaten by J or V
+cargo run --release --manifest-path engine/Cargo.toml --example d_errors -- \
+    --v V.fasta --d D.fasta --j J.fasta [--preset hard] [--reads N] [--no-anchor-window] [--j-reclaim N]
+```
 
 `examples/diagnose` separates errors by aligning every allele unbanded under
 the same objective. If that exhaustive optimum is right but the pipeline is
@@ -953,22 +1167,38 @@ window; searching J over the whole read lets 0.05 % fall outside.
   Gotoh on 500 random cases through every backend; reach-class members align
   identically; V, D and J calls, placements and posteriors are identical with
   and without the C stage, and batched SIMD C calls equal per-read scalar
-  ones; anchored
-  truth, C-length strata and the simulator's reading frame are tested, and
-  `tests/simulated.rs` bounds C accuracy, false calls and `c_posterior`
-  calibration.
-- **Cross-architecture:** the suite passes on x86-64 and on AArch64 (CI runs
-  both), and AArch64 output equals x86-64 output byte for byte. It also
-  passes on `wasm32-wasip1` with `simd128` under Wasmtime (CI), where the
-  kernel tests compare the `simd128`, portable and scalar kernels, and the
-  browser modules' output equals the native command line's
-  (`web/test.mjs`).
+  ones; anchored truth, C-length strata and the simulator's reading frame are
+  tested, and `tests/simulated.rs` bounds C accuracy, false calls and
+  `c_posterior` calibration.
+- **Loci (`tests/loci.rs`):** one IGH + IGK database; every rearrangement
+  stays within the read's locus, each locus is annotated on its own, and no
+  IGK read gets a D.
+- **The run and the module:** `run.rs` checks that options are read by
+  their command-line names, that a run writes the header and one row per
+  read equal to `AirrRecord::from_call`, that repeated sequences within and
+  across batches reuse their rows under their own identifiers and
+  qualities, that the double-D screen leaves the AIRR rows unchanged and
+  writes well-formed sidecar rows for tandem-D reads, and that `--c-evalue`
+  needs a C database. `wasm/src/lib.rs` checks that the ABI's rows equal
+  `Run::write_airr` for FASTA and AIRR-table input, and that options
+  rebuild the run and bad ones are refused. `metadata.rs` checks that
+  `SWIGMETA` fields are read and malformed ones rejected.
+- **Platforms:** in the standalone project's CI the suite passed on x86-64
+  and AArch64 Linux, with AArch64 output equal to x86-64 output byte for
+  byte, and on `wasm32-wasip1` with `simd128` under Wasmtime, where the
+  kernel tests compare the `simd128`, portable and scalar kernels. Swig's CI
+  runs the suite natively (`npm run test:engine`) before building
+  `public/swig.wasm`, then tests the built module in Node.js
+  (`tests/swig-wasm.test.mjs`: profiles, FASTA/FASTQ/AIRR input, heavy,
+  light and TR loci, strands, constant regions, independence from batching,
+  the repeated-sequence cache and the double-D screen).
 - **Synthetic calling (`tests/synthetic.rs`):** D genes, D-free junctions,
   tandem VDDJ, hypermutated V, reverse complements, residual adjudicator.
 - **Batch consistency:** chunk-batched parallel output equals per-read
   sequential output.
 - **Input parsing:** multi-line FASTA/FASTQ, `@`/`+` at the start of quality
-  lines, empty reads, CRLF, batch resumption, and every error case.
+  lines, empty reads, CRLF, AIRR tables, batch resumption, and every error
+  case.
 - **Karlin–Altschul:** the series reproduces K = 1/3 for the ±1 walk and
   NCBI's ungapped blastn table (reward 1 / penalty −3 → λ 1.374, K 0.711, H 1.31).
 - **Germline annotation and read regions:** see *Reliability* under
@@ -976,7 +1206,9 @@ window; searching J over the whole read lets 0.05 % fall outside.
 
 ## Calling profiles
 
-The default is `r`. `r_optimized` is accepted as an alias.
+The default is `r`. Swig's interface names the profiles `r_optimized`,
+`truth_optimized`, `igblast_compatible` and `sensitive_d`; both spellings
+are accepted.
 
 | Profile | V tuple | D tuple | J tuple | `min_d_match` | `P_D` (human IGH) |
 |---|---|---|---|---|---|
@@ -989,7 +1221,8 @@ Every profile gates V and J hits by E-value (accept 1, anchor 10⁻³) and
 stitches the co-linear V prefix and J suffix back onto the local alignment
 before ranking, and calls each read with its own model. A with-D path must
 strictly beat the no-D path; ties go to fewer D segments, then to more
-germline support.
+germline support. `--min-d-match`, `--d-mismatch`, `--j-mismatch` and
+`--min-j-length` override a profile's D and J settings.
 
 ## Assumptions and deviations from the method note
 
@@ -998,7 +1231,8 @@ Each is a named field you can change.
 1. **D presence.** `P_D` is derived from the D database (`DPrior::Derived`)
    instead of the note's 12-relaxed-to-10 rule. A sweep of constant costs put
    the relaxed rule on the same precision/recall curve as a single constant.
-2. **Tandem D.** A second D pays its own `P_D` plus 12 (`tandem_d_penalty`).
+2. **Tandem D.** Off by default; under `VdjGrammar::TANDEM_D` a second D
+   pays its own `P_D` plus 12 (`tandem_d_penalty`).
 3. **Retrieval.** Every 9-mer votes, and 7-mers too while the leader holds
    fewer than 25 seeds. V keeps 3 genes and walks up to 16 while gene votes
    stay within two standard deviations of the leader's (`z·√(2·4·L)` votes
@@ -1049,7 +1283,7 @@ Each is a named field you can change.
   inflate the database length (conservative). They gate hits; they are not
   calibrated p-values.
 - **Segment type is not checked from FASTA.** FASTA carries no segment type, so
-  the CLI cannot detect a D file passed as `--j`.
+  the command line cannot detect a D file passed as `--j`.
 - **Compressed input.** Gzip must be piped through `zcat`; there is no built-in
   decompression.
 - **FR3 starts need some annotated alleles.** The CDR2/FR3 boundary has no
@@ -1060,10 +1294,12 @@ Each is a named field you can change.
   - with `fr3=` on the \*01 alleles, 1 of 872 others is wrong, flagged;
   - with `fr3=` on 10 %, 73 of 1,519 are wrong, all flagged, most of them
     behind a low-confidence anchor.
-  Supply an IMGT-gapped V set, or `fr3=` on a few alleles per gene family.
-- **Chain type is one per database.** It is voted per database, so a mixed
-  IGK + IGL database is fine, but a mixed heavy + light database needs
-  `--chain` or separate runs.
+  Supply an IMGT-gapped V set, `SWIGMETA`, or `fr3=` on a few alleles per
+  gene family.
+- **Loci come from names.** Chain type is voted per locus, and a locus is
+  read from allele names or headers. A database whose names carry no locus
+  code is annotated and assigned as one locus, so a mixed heavy + light
+  database with such names needs `--chain` or separate runs.
 - **FR1 start.** FR1 starts at the first complete codon. A V sequence that
   includes a leader needs `fr1=` in the header.
 - **A lone decoy Cys23.** When the Cys23 window holds exactly one Cys
@@ -1084,48 +1320,22 @@ Each is a named field you can change.
   - 3′-partial J records (IMGT IGHJ6\*02/\*03) lose J calls to their longer
     siblings on reads that continue into C, whose first base completes them
     (−0.5 pp J on hard simulated reads, with or without `--c`).
+- **The double-D screen** is evidence beside the call, not a VDDJ call:
+  exact seeds lose sensitivity under mutation, extension is ungapped, and the
+  pseudo-tandem veto is a bounded alternative-explanation test, not a
+  probability over recombination histories.
 
 ## Roadmap
 
-In order of expected value; reasons and measurements are in
-[docs/ASSESSMENT.md](docs/ASSESSMENT.md).
+The earlier roadmap is done: calls from the per-read model, a D prior from
+the D search's statistics (as `--d-presence-rate`), the AVX-512BW, NEON and
+portable backends of one kernel, allele rescoring along the gene frame, the
+annotation priors, C-segment assignment and the WebAssembly build
+(ASSESSMENT §9.7–§11). Open, in order of expected value; reasons and
+measurements are in [docs/ASSESSMENT.md](docs/ASSESSMENT.md):
 
-1. ~~**Calls from the per-read model.**~~ Done: one integer model at the
-   read's divergence drives the Viterbi call and forward–backward, so the
-   call is a mode of its posterior. Paired on 20,000 reads per preset:
-   4.0–4.3 pp more D-free reads left without a D on mid sets, D-presence
-   Brier better on every set (t −5 to −24), D allele within noise for
-   remnants of 4 nt or more (the overall −0.3–0.4 pp on the synthetic
-   database lies in 1–3 nt remnants, below `min_d_match`). Max-marginal D
-   alleles are a switch (+0.25 pp on hard reads only). See ASSESSMENT §9.8.
-2. ~~**D prior from the D search's statistics.**~~ Done as a switch,
-   `--d-presence-rate π`: `P*_D = [ln(K·m·n_D) − ln(π/(1 − π))]/λ` counts
-   every distinct allele, offset and read position the search tries, and is
-   read per read like the default. At π = 0.9 it meets every criterion on
-   20,000 reads per preset (D-presence Brier better on all six sets, no D
-   call +0.77 pp on human hard, D on remnants of 4 nt or more within
-   noise), but that rate was found by measuring; at the simulator's own
-   rate (0.94) exact 5-mers win and D-free specificity falls 14–26 pp. The
-   default stays `ln(N·L)` at even odds. Next on that line: a prior on N/P
-   lengths, which the remaining miscalibration follows. See ASSESSMENT §9.9.
-3. ~~**Wider SIMD.**~~ Done: AVX-512BW, NEON and portable backends of one
-   kernel. Next on that line: 8-bit lanes for D jobs (32 per AVX2 register).
-4. ~~**Allele rescoring along the gene frame.**~~ Done: siblings are bounded
-   from both sides along their representative's traceback, and DP runs only
-   where the bounds straddle the cutoff (V and J); calls unchanged, 9 % fewer
-   instructions on hard reads.
-5. ~~**Annotation.**~~ Done: IMGT gap numbering, FR3 from annotated relatives
-   or a learned length, a learned Cys23 model, and structured `uncertain=`
-   flags (see the assessment, §10).
-6. ~~**C-segment assignment.**~~ Done: `--c` anchors C's base 0 at the
-   called J's exit and aligns it exactly with any kernel, after
-   adjudication, so V/D/J output is byte-identical with and without it and
-   costs nothing without it. On 20,000 simulated reads per preset (human IGH
-   with abstar's IGHC; synthetic): ≤ 2 false calls on ~4,100 C-free reads,
-   primary C allele anchored-equivalent ≥ 99.6 % from 16 nt, `c_posterior`
-   ECE ≤ 0.18 %, 9 % of instructions with `--c`. See ASSESSMENT §11.
-7. ~~**WebAssembly.**~~ Done: a `simd128` kernel backend, a zero-dependency
-   module (`wasm/`) and a browser page (`web/`) whose calls equal the
-   command line's (rows byte for byte but for a rare last posterior digit),
-   at about 60 % of native AVX2 speed per worker. Next on that line: shared-memory threads (one copy of the reads
-   for all workers), which need cross-origin isolation from the host.
+1. **A prior on N/P lengths**, which the remaining D-presence
+   miscalibration follows (ASSESSMENT §9.9).
+2. **8-bit lanes for D jobs** (32 per AVX2 register).
+3. **The open review findings**: [docs/REVIEW.md](docs/REVIEW.md) §3 ranks
+   them and §4 gives the design recommendations.
