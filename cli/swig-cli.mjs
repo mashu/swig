@@ -13533,6 +13533,16 @@ async function* sequenceBatches(input, batchRecords, preprocessing, airrMode, da
 	if (!state.inputRecords) throw new Error(`No sequence records were found in ${input.path}.`);
 	if (!state.eligibleRecords && state.fastqFilter.applicable) throw new Error(`The FASTQ quality filter rejected all ${state.inputRecords.toLocaleString()} reads in ${input.path}.`);
 }
+/**
+* A Bun worker for the CLI entry `name` (cli-src/<name>.mjs). A standalone executable embeds it as
+* <name>.js and finds it from a relative specifier. Given a file URL there instead, Bun 1.3 on
+* Windows finds the embedded entry as B:\~BUN\root\<name>.js but then looks that spelling up
+* verbatim and reads it from disk (ENOENT).
+*/
+function bunWorker(name) {
+	const standalone = /\$bunfs|~BUN|%7EBUN/i.test(import.meta.url);
+	return new globalThis.Worker(standalone ? `./${name}.mjs` : new URL(`./${name}.js`, import.meta.url));
+}
 var WasmPool = class {
 	constructor(size, init) {
 		this.size = size;
@@ -13547,7 +13557,7 @@ var WasmPool = class {
 	async start() {
 		for (let index = 0; index < this.size; index += 1) {
 			const webWorker = Boolean(process.versions.bun && globalThis.Worker);
-			const worker = webWorker ? new globalThis.Worker(new URL("./swig-worker.js", import.meta.url)) : new Worker(new URL("./swig-worker.mjs", import.meta.url));
+			const worker = webWorker ? bunWorker("swig-worker") : new Worker(new URL("./swig-worker.mjs", import.meta.url));
 			const receive = (message) => {
 				const pending = this.pending.get(message.id);
 				if (!pending) return;
@@ -13670,7 +13680,7 @@ async function runPostAnalysisTasks(tasks, requestedWorkers, onCompleted) {
 		};
 		for (let index = 0; index < workerCount; index += 1) {
 			const webWorker = Boolean(process.versions.bun && globalThis.Worker);
-			const worker = webWorker ? new globalThis.Worker(new URL("./post-analysis-worker.js", import.meta.url)) : new Worker(new URL("./post-analysis-worker.mjs", import.meta.url));
+			const worker = webWorker ? bunWorker("post-analysis-worker") : new Worker(new URL("./post-analysis-worker.mjs", import.meta.url));
 			const receive = (message) => {
 				if (settled) return;
 				if (message.error || !message.result) {
@@ -13712,7 +13722,7 @@ var ChmmPool = class {
 	async start() {
 		for (let index = 0; index < this.size; index += 1) {
 			const webWorker = Boolean(process.versions.bun && globalThis.Worker);
-			const worker = webWorker ? new globalThis.Worker(new URL("./chmmairra-worker.js", import.meta.url)) : new Worker(new URL("./chmmairra-worker.mjs", import.meta.url));
+			const worker = webWorker ? bunWorker("chmmairra-worker") : new Worker(new URL("./chmmairra-worker.mjs", import.meta.url));
 			const receive = (message) => {
 				const pending = this.pending.get(message.id);
 				if (!pending) return;

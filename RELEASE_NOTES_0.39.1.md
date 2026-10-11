@@ -58,6 +58,13 @@ every other tool are unchanged.
 - **Blank AIRR sequences.** An AIRR row whose `sequence` is only whitespace
   is skipped, in Swig Web and in the CLI, as the aligner always did. Before,
   it counted as a record that the aligner then dropped.
+- **Worker threads on Windows.** The Windows executable could not start any
+  worker thread: the WebAssembly aligner pool, or the pools for post-analysis
+  and CHMMAIRRa. Bun 1.3 resolves an embedded worker given as a file URL, but
+  then reads its backslash path (`B:\~BUN\root\…`) from disk and fails with
+  ENOENT. The 0.39.0 executable has the same code and Bun version. The CLI
+  now names embedded workers with a relative specifier, which Bun maps to
+  the embedded entry. The new Windows release job runs these workers.
 - **Cleaner failures.** When the aligner fails, the CLI prints one message
   and exits with status 1. It no longer adds an unhandled-rejection trace
   or a dump of bundle source, or loses the real error behind "worker pool

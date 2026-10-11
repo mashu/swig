@@ -351,12 +351,23 @@ async function* sequenceBatches(input,batchRecords,preprocessing,airrMode,datase
   if(!state.eligibleRecords&&state.fastqFilter.applicable)throw new Error(`The FASTQ quality filter rejected all ${state.inputRecords.toLocaleString()} reads in ${input.path}.`);
 }
 
+/**
+ * A Bun worker for the CLI entry `name` (cli-src/<name>.mjs). A standalone executable embeds it as
+ * <name>.js and finds it from a relative specifier. Given a file URL there instead, Bun 1.3 on
+ * Windows finds the embedded entry as B:\~BUN\root\<name>.js but then looks that spelling up
+ * verbatim and reads it from disk (ENOENT).
+ */
+function bunWorker(name){
+  const standalone=/\$bunfs|~BUN|%7EBUN/i.test(import.meta.url);
+  return new globalThis.Worker(standalone?`./${name}.mjs`:new URL(`./${name}.js`,import.meta.url));
+}
+
 class WasmPool {
   constructor(size,init){this.size=size;this.init=init;this.workers=[];this.available=[];this.queued=[];this.pending=new Map();this.nextId=1;this.failed=null;}
   async start(){
     for(let index=0;index<this.size;index+=1){
       const webWorker=Boolean(process.versions.bun&&globalThis.Worker);
-      const worker=webWorker?new globalThis.Worker(new URL("./swig-worker.js",import.meta.url)):new NodeWorker(new URL("./swig-worker.mjs",import.meta.url));
+      const worker=webWorker?bunWorker("swig-worker"):new NodeWorker(new URL("./swig-worker.mjs",import.meta.url));
       const receive=(message)=>{
         const pending=this.pending.get(message.id);if(!pending)return;
         this.pending.delete(message.id);
@@ -418,7 +429,7 @@ async function runPostAnalysisTasks(tasks,requestedWorkers,onCompleted){
     const dispatch=(worker)=>{if(next>=tasks.length)return;const id=next++;worker.postMessage({id,...tasks[id]});};
     for(let index=0;index<workerCount;index+=1){
       const webWorker=Boolean(process.versions.bun&&globalThis.Worker);
-      const worker=webWorker?new globalThis.Worker(new URL("./post-analysis-worker.js",import.meta.url)):new NodeWorker(new URL("./post-analysis-worker.mjs",import.meta.url));
+      const worker=webWorker?bunWorker("post-analysis-worker"):new NodeWorker(new URL("./post-analysis-worker.mjs",import.meta.url));
       const receive=(message)=>{if(settled)return;if(message.error||!message.result){fail(new Error(message.error||"A post-analysis worker returned no result."));return;}results[message.id]=message.result;onCompleted?.(message.result);completed+=1;if(completed===tasks.length){settled=true;close();resolvePromise(results);}else dispatch(worker);};
       if(webWorker){worker.addEventListener("message",(event)=>receive(event.data));worker.addEventListener("error",fail);}
       else{worker.on("message",receive);worker.on("error",fail);}
@@ -432,7 +443,7 @@ class ChmmPool {
   async start(){
     for(let index=0;index<this.size;index+=1){
       const webWorker=Boolean(process.versions.bun&&globalThis.Worker);
-      const worker=webWorker?new globalThis.Worker(new URL("./chmmairra-worker.js",import.meta.url)):new NodeWorker(new URL("./chmmairra-worker.mjs",import.meta.url));
+      const worker=webWorker?bunWorker("chmmairra-worker"):new NodeWorker(new URL("./chmmairra-worker.mjs",import.meta.url));
       const receive=(message)=>{const pending=this.pending.get(message.id);if(!pending)return;this.pending.delete(message.id);if(message.error)pending.reject(new Error(message.error));else pending.resolve(message.result);if(pending.release)this.release(worker);};
       const fail=(error)=>{const failure=error instanceof Error?error:new Error(error?.message??String(error));this.failed=failure;for(const [id,pending] of this.pending){this.pending.delete(id);pending.reject(failure);}while(this.queued.length)this.queued.shift().reject(failure);};
       if(webWorker){worker.addEventListener("message",(event)=>receive(event.data));worker.addEventListener("error",fail);}else{worker.on("message",receive);worker.on("error",fail);}
