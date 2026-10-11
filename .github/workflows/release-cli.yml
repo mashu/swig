@@ -5,9 +5,26 @@ on:
   push:
     tags:
       - "v*"
+  # A pull request that touches the aligner or the executable builds every release binary
+  # and runs the smoke tests on them; only a tag publishes.
+  pull_request:
+    paths:
+      - ".cargo/**"
+      - ".github/workflows/release-cli.yml"
+      - "cli-src/**"
+      - "engine/**"
+      - "package.json"
+      - "package-lock.json"
+      - "scripts/build-swig-wasm.sh"
+      - "scripts/stage-native-aligner.mjs"
+      - "tests/cli-smoke.test.mjs"
 
 permissions:
   contents: write
+
+concurrency:
+  group: release-cli-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   wasm:
