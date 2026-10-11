@@ -15,8 +15,12 @@ on:
       - "engine/**"
       - "package.json"
       - "package-lock.json"
+      - "public/references/**"
       - "scripts/build-swig-wasm.sh"
       - "scripts/stage-native-aligner.mjs"
+      # The CLI compiles the shared TypeScript in; the .tsx files are Swig Web's alone.
+      - "src/**"
+      - "!src/**/*.tsx"
       - "tests/cli-smoke.test.mjs"
 
 permissions:
