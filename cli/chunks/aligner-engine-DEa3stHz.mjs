@@ -134,4 +134,4 @@ var AlignerEngine = class AlignerEngine {
 	}
 };
 //#endregion
-export { CALLING_PROFILES as n, isCallingProfile as r, AlignerEngine as t };
+export { isCallingProfile as i, CALLING_PROFILES as n, alignerOptions as r, AlignerEngine as t };

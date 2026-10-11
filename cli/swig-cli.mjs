@@ -1,18 +1,19 @@
 #!/usr/bin/env node
 import { _ as annotateDoubleDBatch, a as deduplicate, c as parseFasta$2, d as runDenoisePartitionJob, f as runExactDedupJob, g as annotateAirrBatch, h as DEFAULT_PIPELINE_PLAN, i as createExactDedupPlan, l as prepareReferenceMsa, n as assignLineages, o as finishExactDedupPlan, p as sequenceFingerprint, s as normalizeNt, t as DenoiseAccumulator, v as datasetScopeValue, y as stableDatasetSeed } from "./chunks/post-analysis-core-DJA1I-YZ.mjs";
-import { n as CALLING_PROFILES, r as isCallingProfile } from "./chunks/aligner-engine-DxPuuP9Z.mjs";
-import { createReadStream, createWriteStream, readFileSync, writeFileSync } from "node:fs";
+import { i as isCallingProfile, n as CALLING_PROFILES, r as alignerOptions } from "./chunks/aligner-engine-DEa3stHz.mjs";
+import { chmodSync, createReadStream, createWriteStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createGunzip, createGzip, gunzipSync, gzipSync } from "node:zlib";
 import { createInterface } from "node:readline";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import { once } from "node:events";
-import { availableParallelism } from "node:os";
+import { availableParallelism, homedir, tmpdir } from "node:os";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { spawn, spawnSync } from "node:child_process";
 function terminalChangeIdentifiable(length, positions) {
 	return positions.some((p) => p <= length - 2);
 }
@@ -11110,6 +11111,15 @@ function addFastqQualityFilterStats(target, source) {
 		basesTrimmed: target.basesTrimmed + source.basesTrimmed
 	};
 }
+/**
+* True when `value` holds only Unicode White_Space, the whitespace the aligner
+* trims (Rust's `char::is_whitespace`): JavaScript's `\s` without U+FEFF, and
+* with U+0085. A record the two sides judged differently would leave the aligner
+* with a different record count, so every emptiness test here uses it.
+*/
+function isBlank(value) {
+	return /^[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*$/.test(value ?? "");
+}
 async function* fastaRecords(source) {
 	let header = "";
 	let sequence = [];
@@ -11126,7 +11136,7 @@ async function* fastaRecords(source) {
 		}
 		if (!line.trim()) continue;
 		if (!header) throw new Error("Expected a FASTA header beginning with '>'.");
-		sequence.push(line.replace(/\s/g, ""));
+		sequence.push(line.replace(/[\s>]/g, ""));
 	}
 	if (header) {
 		const joined = sequence.join("");
@@ -11192,12 +11202,12 @@ async function* airrRecords(source) {
 			if (!line.trim()) continue;
 			header = line;
 			delimiter = header.includes("	") ? "	" : ",";
-			sequenceColumn = header.split(delimiter).indexOf("sequence");
+			sequenceColumn = header.split(delimiter).map((name) => name.trim()).indexOf("sequence");
 			if (sequenceColumn < 0) throw new Error("AIRR input requires a 'sequence' column.");
 			continue;
 		}
 		if (!line.trim()) continue;
-		if (line.split(delimiter)[sequenceColumn]) yield {
+		if (!isBlank(line.split(delimiter)[sequenceColumn])) yield {
 			header,
 			row: line
 		};
@@ -12844,8 +12854,394 @@ var ShmAccumulator = class {
 	}
 };
 //#endregion
+//#region cli-src/native-aligner.mjs
+/** `swig::run::BATCH` (engine/src/run.rs): records the engine reads before it writes rows. */
+const ENGINE_BATCH = 16384;
+/** The aligner a run uses: "auto" (native when available, else WebAssembly), "native" or "wasm". */
+const ALIGNER_MODES = [
+	"auto",
+	"native",
+	"wasm"
+];
+function executableName() {
+	return process.platform === "win32" ? "swig.exe" : "swig";
+}
+/**
+* Where an embedded binary is extracted to, most preferred first, built as
+* they are tried so that a missing home directory costs only its own root. The
+* last resort is the shared temporary directory, so on POSIX it gets a
+* directory of its own per user (`private`: checked before anything in it is run).
+*/
+function* cacheRoots() {
+	if (process.env.SWIG_CLI_CACHE_DIR) yield {
+		path: process.env.SWIG_CLI_CACHE_DIR,
+		private: false
+	};
+	if (process.platform === "win32") {
+		if (process.env.LOCALAPPDATA) yield {
+			path: process.env.LOCALAPPDATA,
+			private: false
+		};
+	} else if (process.platform === "darwin") yield {
+		path: () => join(homedir(), "Library", "Caches"),
+		private: false
+	};
+	else yield {
+		path: () => process.env.XDG_CACHE_HOME || join(homedir(), ".cache"),
+		private: false
+	};
+	if (typeof process.getuid === "function") yield {
+		path: join(tmpdir(), `swig-cli-${process.getuid()}`),
+		private: true
+	};
+	else yield {
+		path: tmpdir(),
+		private: false
+	};
+}
+/** Create `path` for this user only, and refuse it if another user could change what is in it. */
+function privateDirectory(path) {
+	mkdirSync(path, {
+		recursive: true,
+		mode: 448
+	});
+	const status = lstatSync(path);
+	if (!status.isDirectory() || status.uid !== process.getuid() || (status.mode & 63) !== 0) throw new Error(`${path} is not a directory private to this user`);
+}
+function sha256$1(bytes) {
+	return createHash("sha256").update(bytes).digest("hex");
+}
+function message(error) {
+	return error instanceof Error ? error.message : String(error);
+}
+/**
+* A binary embedded in a Bun executable cannot be executed in place: copy it
+* once per version and content hash to a cache directory (atomically, so
+* concurrent first runs agree) and reuse the copy after checking its hash.
+* Yields the copy in each cache root in turn, so a root whose copy cannot run
+* (mounted noexec, say) gives way to the next; `failures` collects the roots
+* that could hold no copy.
+*/
+function* extractions(sourcePath, version, failures) {
+	const bytes = readFileSync(sourcePath);
+	const digest = sha256$1(bytes);
+	for (const root of cacheRoots()) {
+		let directory = root.path;
+		let target;
+		try {
+			if (typeof root.path === "function") directory = root.path();
+			if (root.private) privateDirectory(directory);
+			directory = join(directory, "swig-cli", `${version}-${digest.slice(0, 16)}`);
+			target = join(directory, executableName());
+			if (!(existsSync(target) && sha256$1(readFileSync(target)) === digest)) {
+				mkdirSync(directory, { recursive: true });
+				const temporary = `${target}.${randomUUID()}.tmp`;
+				writeFileSync(temporary, bytes, { mode: 493 });
+				chmodSync(temporary, 493);
+				try {
+					renameSync(temporary, target);
+				} catch (error) {
+					rmSync(temporary, { force: true });
+					if (!(existsSync(target) && sha256$1(readFileSync(target)) === digest)) throw error;
+				}
+			}
+			if (process.platform !== "win32" && (statSync(target).mode & 73) === 0) chmodSync(target, 493);
+		} catch (error) {
+			failures.push(`${typeof directory === "function" ? "the home cache" : directory}: ${message(error)}`);
+			continue;
+		}
+		yield target;
+	}
+}
+/** Why `binary` cannot serve this CLI version, or null. */
+function probe(binary, version) {
+	const result = spawnSync(binary, ["--version"], {
+		encoding: "utf8",
+		timeout: 15e3,
+		windowsHide: true
+	});
+	if (result.error) return `${binary}: ${result.error.message}`;
+	if (result.status !== 0) {
+		const detail = (result.stderr ?? "").trim().split(/\r?\n/).at(-1);
+		return `${binary} --version exited with ${result.status === null ? `signal ${result.signal}` : `status ${result.status}`}${detail ? `: ${detail}` : ""}`;
+	}
+	const reported = result.stdout.trim();
+	return reported === `swig ${version}` ? null : `${binary} reports '${reported}', not 'swig ${version}'`;
+}
+/**
+* The native aligner to run, or null with the reasons appended to `notes`:
+* SWIG_CLI_ALIGNER_PATH, then the binary embedded in a standalone executable
+* (`assets.nativeAlignerPath`, extracted to the first cache root where it
+* runs). It must report this CLI's version.
+*/
+function resolveNativeAligner(assets, version, notes = []) {
+	const usable = (path) => {
+		if (!existsSync(path)) {
+			notes.push(`${path}: not found`);
+			return false;
+		}
+		const problem = probe(path, version);
+		if (problem) notes.push(problem);
+		return !problem;
+	};
+	if (process.env.SWIG_CLI_ALIGNER_PATH && usable(process.env.SWIG_CLI_ALIGNER_PATH)) return process.env.SWIG_CLI_ALIGNER_PATH;
+	if (!assets.nativeAlignerPath) return null;
+	if (!/\$bunfs|~BUN/.test(assets.nativeAlignerPath)) return usable(assets.nativeAlignerPath) ? assets.nativeAlignerPath : null;
+	const failures = [];
+	try {
+		for (const target of extractions(assets.nativeAlignerPath, version, failures)) if (usable(target)) return target;
+	} catch (error) {
+		failures.push(message(error));
+	}
+	if (failures.length) notes.push(`the embedded native aligner could not be extracted (${failures.join("; ")})`);
+	return null;
+}
+/** A refused batch: the caller may never await it (ready() throws first), so it is marked handled. */
+function refuse(error) {
+	const refused = Promise.reject(error);
+	refused.catch(() => {});
+	return refused;
+}
+var NativePool = class {
+	/**
+	* @param binary the native `swig` executable
+	* @param threads its `--threads`
+	* @param init {references: {V, D, J, C}, settings}, as for the WebAssembly pool
+	* @param batchRecords records per run() call, which sets the in-flight window
+	*/
+	constructor(binary, threads, init, batchRecords) {
+		this.binary = binary;
+		this.threads = threads;
+		this.init = init;
+		this.batchRecords = batchRecords;
+		this.jobs = [];
+		this.header = null;
+		this.failed = null;
+		this.stderr = "";
+		this.airrHeader = null;
+		this.carry = null;
+		this.ended = false;
+		this.drain = null;
+		this.records = 0;
+		this.rows = 0;
+	}
+	/**
+	* Batches the caller may hold before it awaits the oldest one. The caller
+	* awaits the oldest only when a further batch is ready to queue, so every
+	* batch held is full and (window - 1) × batchRecords > ENGINE_BATCH records
+	* follow the oldest: enough to close the engine batch that holds its rows.
+	*/
+	get window() {
+		return Math.floor(ENGINE_BATCH / Math.max(1, this.batchRecords)) + 2;
+	}
+	async start() {
+		this.directory = mkdtempSync(join(tmpdir(), "swig-cli-native-"));
+		const args = [];
+		for (const segment of [
+			"V",
+			"D",
+			"J",
+			"C"
+		]) {
+			const text = this.init.references[segment];
+			if (!text) continue;
+			const path = join(this.directory, `${segment}.fasta`);
+			writeFileSync(path, text);
+			args.push(`--${segment.toLowerCase()}`, path);
+		}
+		args.push("--threads", String(this.threads));
+		for (const [name, value] of alignerOptions(this.init.settings)) {
+			if (name.startsWith("double-d")) throw new Error("the native route does not carry the double-D screen's sidecar");
+			args.push(`--${name}`, value);
+		}
+		args.push("-");
+		this.child = spawn(this.binary, args, {
+			stdio: [
+				"pipe",
+				"pipe",
+				"pipe"
+			],
+			windowsHide: true
+		});
+		this.exited = new Promise((resolve) => this.child.on("close", (code, signal) => resolve({
+			code,
+			signal
+		})));
+		this.child.on("error", (error) => this.fail(error));
+		this.child.stdin.on("error", (error) => {
+			if (error.code !== "EPIPE") this.fail(error);
+		});
+		this.child.stdout.on("data", (chunk) => this.receive(chunk));
+		this.child.stderr.setEncoding("utf8");
+		let readyResolve;
+		let readyReject;
+		const ready = new Promise((resolve, reject) => {
+			readyResolve = resolve;
+			readyReject = reject;
+		});
+		this.child.stderr.on("data", (text) => {
+			this.stderr = (this.stderr + text).slice(-65536);
+			if (/database prepared/.test(this.stderr)) readyResolve();
+		});
+		this.exited.then(({ code, signal }) => {
+			const message = this.exitMessage(code, signal) ?? (this.jobs.length ? `The native aligner exited with ${this.jobs.length} batch(es) unanswered (${this.rows.toLocaleString()} rows for ${this.records.toLocaleString()} records).` : this.ended ? null : "The native aligner exited before its input ended.");
+			if (message) {
+				const error = new Error(message);
+				readyReject(error);
+				this.fail(error);
+			}
+			readyResolve();
+		});
+		await ready;
+		try {
+			rmSync(this.directory, {
+				recursive: true,
+				force: true
+			});
+		} catch {}
+	}
+	exitMessage(code, signal) {
+		if (code === 0) return null;
+		const lines = this.stderr.split(/\r?\n/).filter((line) => line && !/^swig: (database prepared|warning:)/.test(line));
+		const error = lines.findLast((line) => line.startsWith("swig: "));
+		const panic = lines.findIndex((line) => / panicked at /.test(line));
+		let detail = error ? error.slice(6) : panic >= 0 ? lines.slice(panic, panic + 2).join(" ") : lines.at(-1) ?? "";
+		for (const segment of [
+			"V",
+			"D",
+			"J",
+			"C"
+		]) detail = detail.split(join(this.directory, `${segment}.fasta`)).join(`${segment} database`);
+		return `The native Swig aligner ${signal ? `was stopped by ${signal}` : `exited with status ${code}`}${detail ? `: ${detail}` : "."}`;
+	}
+	fail(error) {
+		if (this.failed) return;
+		this.failed = error;
+		for (const job of this.jobs.splice(0)) job.reject(error);
+	}
+	/** Rows from stdout, handed to the oldest unanswered batch by line count. */
+	receive(chunk) {
+		const buffer = this.carry ? Buffer.concat([this.carry, chunk]) : chunk;
+		this.carry = null;
+		let start = 0;
+		if (this.header === null) {
+			const newline = buffer.indexOf(10);
+			if (newline < 0) {
+				this.carry = buffer;
+				return;
+			}
+			this.header = buffer.toString("utf8", 0, newline).replace(/\r$/, "");
+			start = newline + 1;
+		}
+		while (start < buffer.length) {
+			const job = this.jobs[0];
+			if (!job) {
+				this.fail(/* @__PURE__ */ new Error("The native aligner returned more rows than records."));
+				return;
+			}
+			let end = -1;
+			let position = start;
+			while (job.remaining > 0) {
+				const newline = buffer.indexOf(10, position);
+				if (newline < 0) break;
+				job.remaining -= 1;
+				this.rows += 1;
+				position = newline + 1;
+				end = position;
+			}
+			if (end < 0) {
+				job.parts.push(buffer.subarray(start));
+				return;
+			}
+			job.parts.push(buffer.subarray(start, end));
+			start = end;
+			if (job.remaining === 0) {
+				this.jobs.shift();
+				const body = job.parts.length === 1 ? job.parts[0] : Buffer.concat(job.parts);
+				job.resolve({
+					header: this.header,
+					body: job.bytes ? body : body.toString("utf8"),
+					count: job.count
+				});
+			}
+		}
+	}
+	/**
+	* Queue `count` records (`text`). AIRR input repeats its header line in
+	* every batch; the child reads it once per stream. With `bytes`, the rows
+	* come back as a Buffer.
+	*/
+	run({ text, count, bytes = false }) {
+		if (this.failed) return refuse(this.failed);
+		if (this.ended) return refuse(/* @__PURE__ */ new Error("The native aligner's input is closed."));
+		if (!text.startsWith(">") && !text.startsWith("@")) {
+			const newline = text.indexOf("\n");
+			const header = text.slice(0, newline);
+			if (this.airrHeader === null) this.airrHeader = header;
+			else if (header !== this.airrHeader) return refuse(/* @__PURE__ */ new Error("The AIRR input changed its columns between batches."));
+			else text = text.slice(newline + 1);
+		}
+		this.records += count;
+		const promise = new Promise((resolve, reject) => {
+			this.jobs.push({
+				count,
+				remaining: count,
+				parts: [],
+				resolve,
+				reject,
+				bytes
+			});
+			if (!this.child.stdin.write(text)) this.drain ??= new Promise((done) => {
+				const finish = () => {
+					this.child.stdin.off("drain", finish);
+					this.child.stdin.off("close", finish);
+					this.drain = null;
+					done();
+				};
+				this.child.stdin.on("drain", finish);
+				this.child.stdin.on("close", finish);
+			});
+		});
+		promise.catch(() => {});
+		return promise;
+	}
+	/** Back-pressure for the producer: waits for stdin to drain, and throws the child's failure. */
+	async ready() {
+		if (this.drain) await this.drain;
+		if (this.child.stdin.destroyed && !this.ended) await this.exited;
+		if (this.failed) throw this.failed;
+	}
+	/** No more records: the child assigns what it holds and exits. */
+	finishInput() {
+		if (!this.ended) {
+			this.ended = true;
+			this.child?.stdin.end();
+		}
+	}
+	/**
+	* After the caller has taken every batch: waits for the child to exit and
+	* throws unless it wrote exactly one row per record. A surplus row arrives
+	* after the last batch was answered, and nothing else would report it.
+	*/
+	async finish() {
+		this.finishInput();
+		await this.exited;
+		if (this.failed) throw this.failed;
+		if (this.rows !== this.records) throw new Error(`The native aligner wrote ${this.rows.toLocaleString()} rows for ${this.records.toLocaleString()} records.`);
+	}
+	async close() {
+		this.finishInput();
+		if (this.child && this.child.exitCode === null && this.child.signalCode === null && this.jobs.length) this.child.kill();
+		if (this.exited) await this.exited;
+		if (this.directory) rmSync(this.directory, {
+			recursive: true,
+			force: true
+		});
+	}
+};
+//#endregion
 //#region cli-src/swig-cli.mjs
-const VERSION = "0.39.0";
+const VERSION = "0.39.1";
 const CLI_STREAM_HIGH_WATER_MARK = 8388608;
 const CLI_GZIP_CHUNK_SIZE = 1048576;
 const CLI_DIRECTORY = dirname(fileURLToPath(import.meta.url));
@@ -12857,13 +13253,13 @@ function defaultCliAssets() {
 	};
 }
 function usage() {
-	return `swig-cli ${VERSION}\n\nRun a complete non-phylogenetic Swig pipeline:\n  swig-cli run reads.fastq.gz --out swig-output\n  swig-cli run --config swig.config.json [--out DIRECTORY] [--workers N] [--airr-compression none|gzip]\n\nExperimental joint inherited/SHM model: swig-cli joint-germline --help\n\nInfer personalized V alleles from lineage-assigned AIRR:\n  swig-cli personalized-germline --airr processed.airr.tsv.gz --v-reference V.fasta --out germline\n\nRun only streaming V(D)J assignment (AIRR outfmt 19):\n  swig-cli --vdj -query reads.fasta -germline_db_V V.fasta -germline_db_D D.fasta \\\n    -germline_db_J J.fasta -out calls.airr.tsv\n\nPrepare custom germlines once and reuse their inferred annotations:\n  swig-cli prepare-reference -germline_db_V V.fasta -germline_db_D D.fasta \\\n    -germline_db_J J.fasta -organism human -ig_seqtype Ig --out-prefix refs/custom\n\nDisplay bundled-data attribution and license:\n  swig-cli notices\n\nCreate an editable config:\n  swig-cli init swig.config.json\n\nSingle-input metadata options:\n  --sample SAMPLE_ID  --donor SUBJECT_ID  --dataset DATASET_ID\n\nSamples with the same subjectId/--donor are treated as the same donor.\nLineage phylogenetics is intentionally not run by swig-cli.`;
+	return `swig-cli ${VERSION}\n\nRun a complete non-phylogenetic Swig pipeline:\n  swig-cli run reads.fastq.gz --out swig-output\n  swig-cli run --config swig.config.json [--out DIRECTORY] [--workers N] [--airr-compression none|gzip]\n      [--aligner auto|native|wasm]\n\nExperimental joint inherited/SHM model: swig-cli joint-germline --help\n\nInfer personalized V alleles from lineage-assigned AIRR:\n  swig-cli personalized-germline --airr processed.airr.tsv.gz --v-reference V.fasta --out germline\n\nRun only streaming V(D)J assignment (AIRR outfmt 19):\n  swig-cli --vdj -query reads.fasta -germline_db_V V.fasta -germline_db_D D.fasta \\\n    -germline_db_J J.fasta -out calls.airr.tsv\n\nPrepare custom germlines once and reuse their inferred annotations:\n  swig-cli prepare-reference -germline_db_V V.fasta -germline_db_D D.fasta \\\n    -germline_db_J J.fasta -organism human -ig_seqtype Ig --out-prefix refs/custom\n\nDisplay bundled-data attribution and license:\n  swig-cli notices\n\nCreate an editable config:\n  swig-cli init swig.config.json\n\nSingle-input metadata options:\n  --sample SAMPLE_ID  --donor SUBJECT_ID  --dataset DATASET_ID\n\nSamples with the same subjectId/--donor are treated as the same donor.\nThe aligner runs natively where this executable carries the platform's binary (--aligner auto,\nthe default), else as WebAssembly; --aligner wasm forces WebAssembly, --aligner native fails\ninstead of falling back. Double-D screening always uses WebAssembly.\nLineage phylogenetics is intentionally not run by swig-cli.`;
 }
 function prepareReferenceUsage() {
 	return `swig-cli ${VERSION} prepare-reference\n\nInfer, validate, and persist reusable SWIGMETA germline annotations.\n\nRequired:\n  -germline_db_V FASTA  -germline_db_J FASTA  --out-prefix PREFIX\n\nOptional references and exact metadata:\n  -germline_db_D FASTA  -c_region_db FASTA\n  -custom_internal_data FILE  -auxiliary_data FILE  -d_frame_data FILE\n  -organism NAME (default human)  -ig_seqtype Ig|TCR (default Ig)\n\nMatching controls:\n  --match-mode strict|permissive|best-guess  (default strict)\n  --best-guess             Alias for --match-mode best-guess; disables identity floors\n  --nearest-candidates N   Non-gene candidates aligned after named candidates fail\n  --v-same-gene-min-identity X  --v-nearest-min-identity X\n  --j-same-gene-min-identity X  --j-nearest-min-identity X\n  --require-complete       Exit nonzero if any V/J record remains unresolved\n\nOutputs are PREFIX.V/D/J/C.fasta, PREFIX.swig-reference.json, and\nPREFIX.annotation-diagnostics.tsv. The manifest can be passed directly to\nswig-cli --vdj with --prepared-reference.`;
 }
 function vdjUsage() {
-	return `swig-cli ${VERSION} --vdj\n\nLow-overhead, streaming V(D)J assignment by the Swig aligner with IgBLAST-style option names.\n\nRequired:\n  -out AIRR_TSV, plus either --prepared-reference MANIFEST or\n  -germline_db_V FASTA and -germline_db_J FASTA\n\nInput and optional references:\n  -query FASTA            Query FASTA or '-' for stdin (default '-')\n  -germline_db_D FASTA    D germline FASTA\n  -c_region_db FASTA      Constant-region FASTA\n\nAnnotation modes (default: the aligner's own annotation from conserved motifs and annotated\nrelatives of the ungapped FASTA; v_annotation_source and j_annotation_source name each source):\n  -custom_internal_data FILE  IgBLAST V .ndm.imgt data (1-based inclusive intervals)\n  -auxiliary_data FILE        IgBLAST J .aux data (0-based frame/CDR3 stop)\n  -d_frame_data FILE          IgBLAST D frame-one starts\n  --swigannots                Infer/validate metadata as in Swig Web\n\n  --prepared-reference FILE   Reuse a prepare-reference manifest and its FASTAs\n  --match-mode MODE           Metadata transfer only: strict, permissive, best-guess\n  --best-guess                Disable metadata-transfer identity floors (not read mapping)\nExecution:\n  -num_threads N          Exact worker count; --workers N overrides it\n  --workers N             Exact workers with no CLI cap; 0 chooses up to 8\n  --batch-records N       Records per bounded WASM batch; 0/omitted selects 2000, 1000,\n                          or 500 according to worker count\n  --calling-profile NAME  r_optimized (default), sensitive_d, truth_optimized or igblast_compatible\n    r_optimized: 4-nt D exact-run floor; a D pays its prior cost, derived from the D genes of\n                 the read's locus (10.55 score units for human IGH)\n    sensitive_d: the same scores with a D twice as likely a priori (9.45 for human IGH)\n  C is anchored at the called J's end and called at an anchored E-value of at most 1e-3\n  --minimum-c-prefix-identity X  Optional 0..1 identity gate over the complete covered C prefix\n  --minimum-identity X    Drop V, D and J hits below identity X (default 0.6)\n  -min_D_match N  -D_penalty S  -J_penalty S  -min_J_length N   override the profile's D/J settings\n  -num_alignments_D/J N   accepted for IgBLAST compatibility; every admissible D and the best J\n                          alignments enter adjudication, and near-tied alleles are in *_alternatives\n  -strand both|plus|minus -outfmt 19 -organism NAME -ig_seqtype Ig|TCR\n\nThe germline options take FASTA files, not makeblastdb binary prefixes. Output is Swig AIRR,\nnot IgBLAST pairwise/tabular formatting. The output path is mandatory and is written incrementally;\na path ending in .gz is gzip-compressed.`;
+	return `swig-cli ${VERSION} --vdj\n\nLow-overhead, streaming V(D)J assignment by the Swig aligner with IgBLAST-style option names.\n\nRequired:\n  -out AIRR_TSV, plus either --prepared-reference MANIFEST or\n  -germline_db_V FASTA and -germline_db_J FASTA\n\nInput and optional references:\n  -query FASTA            Query FASTA or '-' for stdin (default '-')\n  -germline_db_D FASTA    D germline FASTA\n  -c_region_db FASTA      Constant-region FASTA\n\nAnnotation modes (default: the aligner's own annotation from conserved motifs and annotated\nrelatives of the ungapped FASTA; v_annotation_source and j_annotation_source name each source):\n  -custom_internal_data FILE  IgBLAST V .ndm.imgt data (1-based inclusive intervals)\n  -auxiliary_data FILE        IgBLAST J .aux data (0-based frame/CDR3 stop)\n  -d_frame_data FILE          IgBLAST D frame-one starts\n  --swigannots                Infer/validate metadata as in Swig Web\n\n  --prepared-reference FILE   Reuse a prepare-reference manifest and its FASTAs\n  --match-mode MODE           Metadata transfer only: strict, permissive, best-guess\n  --best-guess                Disable metadata-transfer identity floors (not read mapping)\nExecution:\n  -num_threads N          Exact thread count; --workers N overrides it\n  --workers N             Exact threads (or WebAssembly workers); 0 or omitted uses every core\n  --aligner MODE          auto (default): the native aligner this executable carries, else\n                          WebAssembly; native: fail instead of falling back; wasm: WebAssembly\n  --batch-records N       Records per bounded batch; 0/omitted selects 2000, 1000,\n                          or 500 according to worker count\n  --calling-profile NAME  r_optimized (default), sensitive_d, truth_optimized or igblast_compatible\n    r_optimized: 4-nt D exact-run floor; a D pays its prior cost, derived from the D genes of\n                 the read's locus (10.55 score units for human IGH)\n    sensitive_d: the same scores with a D twice as likely a priori (9.45 for human IGH)\n  C is anchored at the called J's end and called at an anchored E-value of at most 1e-3\n  --minimum-c-prefix-identity X  Optional 0..1 identity gate over the complete covered C prefix\n  --minimum-identity X    Drop V, D and J hits below identity X (default 0.6)\n  -min_D_match N  -D_penalty S  -J_penalty S  -min_J_length N   override the profile's D/J settings\n  -num_alignments_D/J N   accepted for IgBLAST compatibility; every admissible D and the best J\n                          alignments enter adjudication, and near-tied alleles are in *_alternatives\n  -strand both|plus|minus -outfmt 19 -organism NAME -ig_seqtype Ig|TCR\n\nThe germline options take FASTA files, not makeblastdb binary prefixes. Output is Swig AIRR,\nnot IgBLAST pairwise/tabular formatting. The output path is mandatory and is written incrementally;\na path ending in .gz is gzip-compressed.`;
 }
 function thirdPartyNotices() {
 	return "Bundled IMGT/GENE-DB reference data\n\nSource: IMGT/GENE-DB release 202632-7, retrieved 2026-08-08.\nCopyright © 1995-2026 IMGT®, the international ImMunoGeneTics information system®.\nAttribution: IMGT®, the international ImMunoGeneTics information system®, https://www.imgt.org/, Institute of Human Genetics, Université de Montpellier and CNRS.\nLicense: CC BY 4.0, https://creativecommons.org/licenses/by/4.0/\nTerms: https://www.imgt.org/about/termsofuse.php\nCitation: Giudicelli V, Chaume D, Lefranc M-P. Nucleic Acids Research. 2005;33:D593-D597. https://doi.org/10.1093/nar/gki010\n\nSwig modifies the source data by selecting and reorganizing IG/TR V/D/J/C records, normalizing and ungapping nucleotide sequences, deriving compact coordinate metadata, selecting one source sequence per allele identifier, and joining selected coding IGH/TR constant exons. Membrane-only and untranslated constant exons are omitted. IMGT, Université de Montpellier, and CNRS do not endorse Swig or warrant the modified pack or its use.";
@@ -12946,7 +13342,8 @@ function parseVdjArguments(rawArgs, context = "vdj") {
 		"--v-same-gene-min-identity",
 		"--v-nearest-min-identity",
 		"--j-same-gene-min-identity",
-		"--j-nearest-min-identity"
+		"--j-nearest-min-identity",
+		"--aligner"
 	]);
 	const flags = /* @__PURE__ */ new Set([
 		"--swigannots",
@@ -13059,8 +13456,10 @@ async function* sequenceBatches(input, batchRecords, preprocessing, airrMode, da
 	const filter = preprocessing.fastqFilter;
 	validateFastqQualityFilter(filter);
 	state.fastqFilter = emptyFastqQualityFilterStats(filter.enabled, filter.enabled && format === "fastq");
+	const unnamed = () => `sequence_${state.inputRecords}`;
 	const parsed = async function* () {
 		if (format === "airr") {
+			let identifiers = null;
 			for await (const record of airrRecords(lines)) {
 				state.inputRecords += 1;
 				state.eligibleRecords += 1;
@@ -13069,8 +13468,31 @@ async function* sequenceBatches(input, batchRecords, preprocessing, airrMode, da
 					state.fastqFilter.recordsPassedThrough += 1;
 				}
 				const delimiter = record.header.includes("	") ? "	" : ",";
-				const header = delimiter === "	" ? record.header : record.header.split(delimiter).join("	");
-				const row = delimiter === "	" ? record.row : record.row.split(delimiter).join("	");
+				let header = delimiter === "	" ? record.header : record.header.split(delimiter).join("	");
+				let row = delimiter === "	" ? record.row : record.row.split(delimiter).map((value) => value.replace(/\t/g, " ")).join("	");
+				if (airrMode !== "preserve") {
+					if (identifiers?.source !== header) {
+						const columns = header.split("	");
+						const column = columns.findIndex((name) => name.trim() === "sequence_id");
+						identifiers = {
+							source: header,
+							columns: columns.length,
+							column,
+							header: column < 0 ? `${header}\tsequence_id` : header
+						};
+					}
+					const values = row.split("	");
+					if (identifiers.column < 0) {
+						values.length = identifiers.columns;
+						values.push(unnamed());
+						row = values.join("	");
+					} else if (isBlank(values[identifiers.column])) {
+						while (values.length <= identifiers.column) values.push("");
+						values[identifiers.column] = unnamed();
+						row = values.join("	");
+					}
+					header = identifiers.header;
+				}
 				yield {
 					ordinal: state.inputRecords - 1,
 					text: `${row}\n`,
@@ -13080,13 +13502,15 @@ async function* sequenceBatches(input, batchRecords, preprocessing, airrMode, da
 			return;
 		}
 		if (format === "fasta") {
-			for await (const text of fastaRecords(lines)) {
+			for await (const record of fastaRecords(lines)) {
 				state.inputRecords += 1;
 				state.eligibleRecords += 1;
 				if (filter.enabled) {
 					state.fastqFilter.recordsRetained += 1;
 					state.fastqFilter.recordsPassedThrough += 1;
 				}
+				const newline = record.indexOf("\n");
+				const text = isBlank(record.slice(1, newline)) ? `>${unnamed()}${record.slice(newline)}` : record;
 				yield {
 					ordinal: state.inputRecords - 1,
 					text
@@ -13096,6 +13520,7 @@ async function* sequenceBatches(input, batchRecords, preprocessing, airrMode, da
 		}
 		for await (const record of fastqRecords(lines)) {
 			state.inputRecords += 1;
+			if (isBlank(record.header.slice(1))) record.header = `@${unnamed()}`;
 			const text = filter.enabled ? filterFastqRecord(record, filter, state.fastqFilter) : canonicalFastq(record);
 			if (text !== null) {
 				state.eligibleRecords += 1;
@@ -13147,6 +13572,16 @@ async function* sequenceBatches(input, batchRecords, preprocessing, airrMode, da
 	if (!state.inputRecords) throw new Error(`No sequence records were found in ${input.path}.`);
 	if (!state.eligibleRecords && state.fastqFilter.applicable) throw new Error(`The FASTQ quality filter rejected all ${state.inputRecords.toLocaleString()} reads in ${input.path}.`);
 }
+/**
+* A Bun worker for the CLI entry `name` (cli-src/<name>.mjs). A standalone executable embeds it as
+* <name>.js and finds it from a relative specifier. Given a file URL there instead, Bun 1.3 on
+* Windows finds the embedded entry as B:\~BUN\root\<name>.js but then looks that spelling up
+* verbatim and reads it from disk (ENOENT).
+*/
+function bunWorker(name) {
+	const standalone = /\$bunfs|~BUN|%7EBUN/i.test(import.meta.url);
+	return new globalThis.Worker(standalone ? `./${name}.mjs` : new URL(`./${name}.js`, import.meta.url));
+}
 var WasmPool = class {
 	constructor(size, init) {
 		this.size = size;
@@ -13161,7 +13596,7 @@ var WasmPool = class {
 	async start() {
 		for (let index = 0; index < this.size; index += 1) {
 			const webWorker = Boolean(process.versions.bun && globalThis.Worker);
-			const worker = webWorker ? new globalThis.Worker(new URL("./swig-worker.js", import.meta.url)) : new Worker(new URL("./swig-worker.mjs", import.meta.url));
+			const worker = webWorker ? bunWorker("swig-worker") : new Worker(new URL("./swig-worker.mjs", import.meta.url));
 			const receive = (message) => {
 				const pending = this.pending.get(message.id);
 				if (!pending) return;
@@ -13189,9 +13624,11 @@ var WasmPool = class {
 			}
 			this.workers.push(worker);
 		}
+		const module = await WebAssembly.compile(readFileSync(this.init.wasmPath));
 		await Promise.all(this.workers.map((worker) => this.request(worker, {
 			type: "init",
-			...this.init
+			...this.init,
+			module
 		})));
 		this.available.push(...this.workers);
 	}
@@ -13230,8 +13667,7 @@ var WasmPool = class {
 		else this.available.push(worker);
 	}
 	run(message) {
-		if (this.failed) return Promise.reject(this.failed);
-		return new Promise((resolvePromise, reject) => {
+		const promise = this.failed ? Promise.reject(this.failed) : new Promise((resolvePromise, reject) => {
 			const job = {
 				message,
 				resolve: resolvePromise,
@@ -13241,6 +13677,8 @@ var WasmPool = class {
 			if (worker) this.dispatch(worker, job);
 			else this.queued.push(job);
 		});
+		promise.catch(() => {});
+		return promise;
 	}
 	async close() {
 		const error = /* @__PURE__ */ new Error("The aligner's worker pool closed before queued work completed.");
@@ -13281,7 +13719,7 @@ async function runPostAnalysisTasks(tasks, requestedWorkers, onCompleted) {
 		};
 		for (let index = 0; index < workerCount; index += 1) {
 			const webWorker = Boolean(process.versions.bun && globalThis.Worker);
-			const worker = webWorker ? new globalThis.Worker(new URL("./post-analysis-worker.js", import.meta.url)) : new Worker(new URL("./post-analysis-worker.mjs", import.meta.url));
+			const worker = webWorker ? bunWorker("post-analysis-worker") : new Worker(new URL("./post-analysis-worker.mjs", import.meta.url));
 			const receive = (message) => {
 				if (settled) return;
 				if (message.error || !message.result) {
@@ -13323,7 +13761,7 @@ var ChmmPool = class {
 	async start() {
 		for (let index = 0; index < this.size; index += 1) {
 			const webWorker = Boolean(process.versions.bun && globalThis.Worker);
-			const worker = webWorker ? new globalThis.Worker(new URL("./chmmairra-worker.js", import.meta.url)) : new Worker(new URL("./chmmairra-worker.mjs", import.meta.url));
+			const worker = webWorker ? bunWorker("chmmairra-worker") : new Worker(new URL("./chmmairra-worker.mjs", import.meta.url));
 			const receive = (message) => {
 				const pending = this.pending.get(message.id);
 				if (!pending) return;
@@ -14105,6 +14543,7 @@ async function runChimera(rows, activeMask, config, scope, headers, references, 
 	};
 }
 function writeChunk(stream, chunk) {
+	if (stream.errored) return Promise.reject(stream.errored);
 	if (stream.write(chunk)) return Promise.resolve();
 	return once(stream, "drain");
 }
@@ -14113,12 +14552,19 @@ function createCliWriteStream(path) {
 }
 function createVdjOutput(path) {
 	const file = createCliWriteStream(path);
-	if (!/\.gz$/i.test(path)) return {
-		stream: file,
-		opened: once(file, "open"),
-		finish: () => finishWritable(file),
-		destroy: () => file.destroy()
+	const discard = (stream) => {
+		stream.on("error", () => {});
+		stream.destroy();
 	};
+	if (!/\.gz$/i.test(path)) {
+		file.on("error", () => {});
+		return {
+			stream: file,
+			opened: once(file, "open"),
+			finish: () => finishWritable(file),
+			destroy: () => discard(file)
+		};
+	}
 	const gzip = createGzip();
 	const completed = pipeline(gzip, file);
 	return {
@@ -14129,8 +14575,8 @@ function createVdjOutput(path) {
 			await completed;
 		},
 		destroy: () => {
-			gzip.destroy();
-			file.destroy();
+			discard(gzip);
+			discard(file);
 			completed.catch(() => {});
 		}
 	};
@@ -14139,6 +14585,7 @@ function airrOutputName(prefix, kind, compression) {
 	return `${prefix}.${kind}.airr.tsv${compression === "gzip" ? ".gz" : ""}`;
 }
 async function finishWritable(stream) {
+	if (stream.errored) throw stream.errored;
 	const completed = once(stream, "finish");
 	stream.end();
 	await completed;
@@ -14288,11 +14735,27 @@ async function runPipeline(config, base, assets) {
 		strand: config.annotation.strand,
 		doubleD: config.annotation.doubleD
 	};
-	const pool = needsAnnotation ? new WasmPool(config.annotation.workers, workerInitialization(assets.wasmPath, references, settings)) : null;
-	if (pool) {
-		process.stderr.write(`Starting the aligner pool (${config.annotation.workers} worker${config.annotation.workers === 1 ? "" : "s"}; ${annotationBatchRecords.toLocaleString()} records/batch).\n`);
-		await pool.start();
-	}
+	const init = workerInitialization(assets.wasmPath, references, settings);
+	const mode = config.annotation.aligner;
+	let nativeBinary = needsAnnotation ? chooseNativeAligner(mode, assets, config.annotation.doubleD.mode !== "off" ? "the double-D screen" : "", config.annotation.alignerLabel) : null;
+	let pool = null;
+	const wasmPool = async () => {
+		if (!pool) {
+			process.stderr.write(`Starting the WebAssembly aligner pool (${config.annotation.workers} worker${config.annotation.workers === 1 ? "" : "s"}; ${annotationBatchRecords.toLocaleString()} records/batch).\n`);
+			pool = new WasmPool(config.annotation.workers, init);
+			try {
+				await pool.start();
+			} catch (error) {
+				const failed = pool;
+				pool = null;
+				await failed.close().catch(() => {});
+				throw error;
+			}
+		}
+		return pool;
+	};
+	if (nativeBinary) process.stderr.write(`Using the native aligner (${config.annotation.workers} thread${config.annotation.workers === 1 ? "" : "s"}; ${annotationBatchRecords.toLocaleString()} records/batch).\n`);
+	else if (needsAnnotation) await wasmPool();
 	const annotatedName = airrOutputName(prefix, "annotated", config.output.airrCompression);
 	const annotatedOutput = config.output.writeAnnotatedAirr ? createVdjOutput(join(outputDirectory, annotatedName)) : null;
 	const annotatedStream = annotatedOutput?.stream ?? null;
@@ -14316,6 +14779,23 @@ async function runPipeline(config, base, assets) {
 				fastqFilter: emptyFastqQualityFilterStats(false, false)
 			};
 			const pending = [];
+			let datasetPool = null;
+			if (needsAnnotation && !preserveAirr) {
+				if (nativeBinary) {
+					const native = new NativePool(nativeBinary, config.annotation.workers, init, annotationBatchRecords);
+					try {
+						await native.start();
+						datasetPool = native;
+					} catch (error) {
+						await native.close().catch(() => {});
+						if (mode === "native" || /database/i.test(error.message)) throw error;
+						process.stderr.write(`The native aligner did not start (${error.message}); using WebAssembly.\n`);
+						nativeBinary = null;
+					}
+				}
+				datasetPool ??= await wasmPool();
+			}
+			const window = datasetPool instanceof NativePool ? datasetPool.window : Math.max(2, config.annotation.workers * 2);
 			const consume = async (item) => {
 				const result = await item.promise;
 				const manifest = {
@@ -14352,21 +14832,28 @@ async function runPipeline(config, base, assets) {
 				}
 				annotatedRecords += table.rows.length;
 			};
-			for await (const batch of sequenceBatches(input, annotationBatchRecords, config.preprocessing, config.annotation.airrMode, datasetIndex, preprocessingState)) {
-				const promise = batch.format === "airr" && config.annotation.airrMode === "preserve" ? Promise.resolve({
-					direct: true,
-					header: batch.header,
-					body: batch.body,
-					doubleDHeader: "",
-					doubleDBody: ""
-				}) : pool.run(workerAnnotation(batch.text, batch.count));
-				pending.push({
-					promise,
-					count: batch.count
-				});
-				if (pending.length >= Math.max(2, config.annotation.workers * 2)) await consume(pending.shift());
+			try {
+				for await (const batch of sequenceBatches(input, annotationBatchRecords, config.preprocessing, config.annotation.airrMode, datasetIndex, preprocessingState)) {
+					if (pending.length >= window) await consume(pending.shift());
+					const promise = batch.format === "airr" && config.annotation.airrMode === "preserve" ? Promise.resolve({
+						direct: true,
+						header: batch.header,
+						body: batch.body,
+						doubleDHeader: "",
+						doubleDBody: ""
+					}) : datasetPool.run(workerAnnotation(batch.text, batch.count));
+					pending.push({
+						promise,
+						count: batch.count
+					});
+					if (datasetPool instanceof NativePool) await datasetPool.ready();
+				}
+				if (datasetPool instanceof NativePool) datasetPool.finishInput();
+				while (pending.length) await consume(pending.shift());
+				if (datasetPool instanceof NativePool) await datasetPool.finish();
+			} finally {
+				if (datasetPool instanceof NativePool) await datasetPool.close();
 			}
-			while (pending.length) await consume(pending.shift());
 			inputRecords += preprocessingState.inputRecords;
 			eligibleRecords += preprocessingState.eligibleRecords;
 			fastqFilterStats = addFastqQualityFilterStats(fastqFilterStats, preprocessingState.fastqFilter);
@@ -14581,6 +15068,38 @@ function vdjTuning(options) {
 	});
 	return tuning;
 }
+/**
+* The aligner mode, "auto", "native" or "wasm" (a non-empty SWIG_CLI_ALIGNER sets the default),
+* and the setting that chose it, for messages. `source` names `value`.
+*/
+function alignerMode(value, source = "--aligner") {
+	const origin = value == null && process.env.SWIG_CLI_ALIGNER ? "SWIG_CLI_ALIGNER" : source;
+	const mode = String(value ?? (process.env.SWIG_CLI_ALIGNER || "auto")).toLowerCase();
+	if (!ALIGNER_MODES.includes(mode)) throw new Error(`${origin} must be ${ALIGNER_MODES.join(", ")}.`);
+	return {
+		mode,
+		label: origin === "SWIG_CLI_ALIGNER" ? `SWIG_CLI_ALIGNER=${mode}` : origin === "--aligner" ? `--aligner ${mode}` : `${origin} "${mode}"`
+	};
+}
+/**
+* The native aligner binary for `mode`, or null for WebAssembly (saying why on stderr in auto
+* mode). `unsupported` names a setting only the WebAssembly route carries.
+*/
+function chooseNativeAligner(mode, assets, unsupported = "", label = `--aligner ${mode}`) {
+	if (mode === "wasm") return null;
+	if (unsupported) {
+		if (mode === "native") throw new Error(`${label}: ${unsupported} runs only on WebAssembly.`);
+		process.stderr.write(`Using the WebAssembly aligner: ${unsupported} runs only on it.\n`);
+		return null;
+	}
+	const notes = [];
+	const binary = resolveNativeAligner(assets, VERSION, notes);
+	if (binary) return binary;
+	const reason = notes.length ? notes.join("; ") : "this build carries no native aligner";
+	if (mode === "native") throw new Error(`${label}: ${reason}.`);
+	process.stderr.write(`Using the WebAssembly aligner (${reason}).\n`);
+	return null;
+}
 async function runVdj(rawArgs, assets) {
 	const options = parseVdjArguments(rawArgs);
 	if (options.help) {
@@ -14604,9 +15123,10 @@ async function runVdj(rawArgs, assets) {
 	const minimumIdentity = options["--minimum-identity"] === void 0 ? .6 : parseFiniteOption(options["--minimum-identity"], "--minimum-identity");
 	if (minimumIdentity < 0 || minimumIdentity > 1) throw new Error("--minimum-identity must be between 0 and 1.");
 	const threadValue = options["--workers"] ?? options["-num_threads"];
-	let workers = threadValue === void 0 ? Math.max(1, Math.min(4, availableParallelism())) : parseIntegerOption(threadValue, options["--workers"] !== void 0 ? "--workers" : "-num_threads", { minimum: 0 });
+	let workers = threadValue === void 0 ? 0 : parseIntegerOption(threadValue, options["--workers"] !== void 0 ? "--workers" : "-num_threads", { minimum: 0 });
 	if (options["--workers"] === void 0 && threadValue !== void 0 && workers === 0) throw new Error("-num_threads must be at least 1; use --workers 0 for automatic selection.");
-	if (workers === 0) workers = Math.max(1, Math.min(8, availableParallelism()));
+	if (workers === 0) workers = Math.max(1, availableParallelism());
+	const { mode, label: alignerLabel } = alignerMode(options["--aligner"]);
 	const batchRecords = (options["--batch-records"] === void 0 ? 0 : parseIntegerOption(options["--batch-records"], "--batch-records", { minimum: 0 })) || automaticBatchRecords(workers);
 	const callingProfile = String(options["--calling-profile"] ?? "r_optimized");
 	if (!isCallingProfile(callingProfile)) throw new Error(`--calling-profile must be ${CALLING_PROFILES.join(", ")}.`);
@@ -14618,14 +15138,32 @@ async function runVdj(rawArgs, assets) {
 	const tuning = vdjTuning(options);
 	const minimumConstantPrefixIdentity = options["--minimum-c-prefix-identity"] === void 0 ? null : parseFiniteOption(options["--minimum-c-prefix-identity"], "--minimum-c-prefix-identity");
 	if (minimumConstantPrefixIdentity !== null && (minimumConstantPrefixIdentity < 0 || minimumConstantPrefixIdentity > 1)) throw new Error("--minimum-c-prefix-identity must be between 0 and 1.");
-	const pool = new WasmPool(workers, workerInitialization(assets.wasmPath, prepared.references, {
+	const init = workerInitialization(assets.wasmPath, prepared.references, {
 		callingProfile,
 		minimumIdentity,
 		minimumConstantPrefixIdentity,
 		strand,
 		tuning
-	}));
-	await pool.start();
+	});
+	const nativeBinary = chooseNativeAligner(mode, assets, "", alignerLabel);
+	let pool = nativeBinary ? new NativePool(nativeBinary, workers, init, batchRecords) : new WasmPool(workers, init);
+	try {
+		await pool.start();
+	} catch (error) {
+		await pool.close().catch(() => {});
+		if (!nativeBinary || mode === "native" || /database/i.test(error.message)) throw error;
+		process.stderr.write(`The native aligner did not start (${error.message}); using WebAssembly.\n`);
+		pool = new WasmPool(workers, init);
+		try {
+			await pool.start();
+		} catch (fallbackError) {
+			await pool.close().catch(() => {});
+			throw fallbackError;
+		}
+	}
+	const native = pool instanceof NativePool;
+	const window = native ? pool.window : Math.max(2, workers * 2);
+	const bytes = native && !Object.keys(prepared.fwr4EndOffsets).length;
 	const outputHandle = outputPath === "-" ? null : createVdjOutput(outputPath);
 	const output = outputHandle?.stream ?? process.stdout;
 	let outputHeader = null;
@@ -14634,7 +15172,7 @@ async function runVdj(rawArgs, assets) {
 	try {
 		if (outputHandle) await outputHandle.opened;
 		const profileLabel = callingProfile === "r_optimized" ? "R-optimized" : callingProfile === "sensitive_d" ? "Sensitive-D" : callingProfile === "igblast_compatible" ? "IgBLAST-agreement" : "truth-optimized";
-		process.stderr.write(`Streaming Swig aligner V(D)J assignments (${prepared.mode}; ${workers} worker${workers === 1 ? "" : "s"}; ${batchRecords.toLocaleString()} records/batch; ${profileLabel} profile) to ${outputPath}.\n`);
+		process.stderr.write(`Streaming Swig aligner V(D)J assignments (${native ? "native aligner" : "WebAssembly aligner"}; ${prepared.mode}; ${workers} ${native ? "thread" : "worker"}${workers === 1 ? "" : "s"}; ${batchRecords.toLocaleString()} records/batch; ${profileLabel} profile) to ${outputPath}.\n`);
 		const state = {
 			inputRecords: 0,
 			eligibleRecords: 0,
@@ -14667,10 +15205,16 @@ async function runVdj(rawArgs, assets) {
 			format: "fasta"
 		};
 		for await (const batch of sequenceBatches(input, batchRecords, preprocessing, "reannotate", 0, state)) {
-			pending.push({ promise: pool.run(workerAnnotation(batch.text, batch.count)) });
-			if (pending.length >= Math.max(2, workers * 2)) await consume(pending.shift());
+			if (pending.length >= window) await consume(pending.shift());
+			pending.push({ promise: pool.run({
+				...workerAnnotation(batch.text, batch.count),
+				bytes
+			}) });
+			if (native) await pool.ready();
 		}
+		if (native) pool.finishInput();
 		while (pending.length) await consume(pending.shift());
+		if (native) await pool.finish();
 		if (outputHandle) await outputHandle.finish();
 		completed = true;
 	} finally {
@@ -14757,6 +15301,11 @@ async function runCli(assets = defaultCliAssets()) {
 		...raw.annotation ?? {},
 		workers: parseIntegerOption(commandWorkers, "--workers", { minimum: 0 })
 	};
+	const commandAligner = argumentValue(rest, "--aligner");
+	if (commandAligner !== void 0) raw.annotation = {
+		...raw.annotation ?? {},
+		aligner: commandAligner
+	};
 	const commandCompression = argumentValue(rest, "--airr-compression");
 	if (commandCompression !== void 0) {
 		if (!["none", "gzip"].includes(commandCompression)) throw new Error("--airr-compression must be none or gzip.");
@@ -14766,6 +15315,9 @@ async function runCli(assets = defaultCliAssets()) {
 		};
 	}
 	const config = normalizeCliConfig(raw);
+	const aligner = alignerMode(raw.annotation?.aligner, commandAligner !== void 0 ? "--aligner" : "annotation.aligner");
+	config.annotation.aligner = aligner.mode;
+	config.annotation.alignerLabel = aligner.label;
 	if (!isCallingProfile(config.annotation.callingProfile)) throw new Error(`annotation.callingProfile must be ${CALLING_PROFILES.join(", ")}.`);
 	if (config.annotation.workers === 0) config.annotation.workers = Math.max(1, Math.min(8, availableParallelism()));
 	config.inputs = config.inputs.map((input) => ({

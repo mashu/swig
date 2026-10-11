@@ -1,4 +1,4 @@
-import { t as AlignerEngine } from "./chunks/aligner-engine-DxPuuP9Z.mjs";
+import { t as AlignerEngine } from "./chunks/aligner-engine-DEa3stHz.mjs";
 import { readFileSync } from "node:fs";
 import { parentPort } from "node:worker_threads";
 //#region cli-src/swig-worker.mjs
@@ -7,7 +7,7 @@ const decoder = new TextDecoder();
 let engine = null;
 let doubleD = false;
 async function initialize(message) {
-	const module = await WebAssembly.compile(readFileSync(message.wasmPath));
+	const module = message.module ?? await WebAssembly.compile(readFileSync(message.wasmPath));
 	const created = await AlignerEngine.create(module, message.settings, message.references);
 	engine = created.engine;
 	doubleD = Boolean(message.settings.doubleD && message.settings.doubleD.mode !== "off");

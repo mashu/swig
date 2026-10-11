@@ -256,6 +256,16 @@ async function* lines(
   if (carry) { onConsumed?.(carry.length); yield carry.replace(/\r$/, ""); }
 }
 
+/**
+ * True when `value` holds only Unicode White_Space, the whitespace the aligner
+ * trims (Rust's `char::is_whitespace`): JavaScript's `\s` without U+FEFF, and
+ * with U+0085. A record the two sides judged differently would leave the aligner
+ * with a different record count, so every emptiness test here uses it.
+ */
+export function isBlank(value: string | undefined): boolean {
+  return /^[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*$/.test(value ?? "");
+}
+
 export async function* fastaRecords(source: AsyncIterable<string>): AsyncGenerator<string> {
   let header = "";
   let sequence: string[] = [];
@@ -272,7 +282,9 @@ export async function* fastaRecords(source: AsyncIterable<string>): AsyncGenerat
     }
     if (!line.trim()) continue;
     if (!header) throw new Error("Expected a FASTA header beginning with '>'.");
-    sequence.push(line.replace(/\s/g, ""));
+    // The aligner keeps only the letters of a sequence line. Dropping '>' too keeps a
+    // line such as " >x" from becoming a header once its whitespace is gone.
+    sequence.push(line.replace(/[\s>]/g, ""));
   }
   if (header) {
     const joined = sequence.join("");
@@ -347,13 +359,15 @@ export async function* airrRecords(source: AsyncIterable<string>): AsyncGenerato
       if (!line.trim()) continue;
       header = line;
       delimiter = header.includes("\t") ? "\t" : ",";
-      sequenceColumn = header.split(delimiter).indexOf("sequence");
+      // The aligner matches column names after trimming them.
+      sequenceColumn = header.split(delimiter).map((name) => name.trim()).indexOf("sequence");
       if (sequenceColumn < 0) throw new Error("AIRR input requires a 'sequence' column.");
       continue;
     }
     if (!line.trim()) continue;
     const values = line.split(delimiter);
-    if (values[sequenceColumn]) yield { header, row: line };
+    // A blank sequence is no record, as for the aligner, which counts on one row per record.
+    if (!isBlank(values[sequenceColumn])) yield { header, row: line };
   }
 }
 

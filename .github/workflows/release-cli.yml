@@ -5,9 +5,32 @@ on:
   push:
     tags:
       - "v*"
+  # A pull request that touches the aligner or the executable builds every release binary
+  # and runs the smoke tests on them; only a tag publishes.
+  pull_request:
+    paths:
+      - ".cargo/**"
+      - ".github/workflows/release-cli.yml"
+      - "cli-src/**"
+      - "engine/**"
+      - "package.json"
+      - "package-lock.json"
+      - "public/references/**"
+      - "scripts/build-swig-wasm.sh"
+      - "scripts/stage-native-aligner.mjs"
+      # The CLI compiles the shared TypeScript in; the .tsx files are Swig Web's alone.
+      - "src/**"
+      - "!src/**/*.tsx"
+      - "tests/cli-smoke.test.mjs"
+      - "tests/fixtures/**"
+      - "tsconfig.json"
 
 permissions:
   contents: write
+
+concurrency:
+  group: release-cli-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   wasm:
@@ -68,13 +91,43 @@ jobs:
         run: |
           rustup update stable --no-self-update
           rustup default stable
+      # Linux links glibc statically: a dynamic build from these runners needs glibc 2.34,
+      # while swig-cli itself runs from glibc 2.17 (RHEL 8, Ubuntu 20.04, Debian 11 and most
+      # HPC hosts in between). --target keeps the flag off build scripts. Windows links the
+      # C runtime statically through .cargo/config.toml.
       - name: Build the native swig aligner
-        run: cargo build --release --locked --manifest-path engine/Cargo.toml --bin swig
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            triple=$(rustc -vV | sed -n 's/^host: //p')
+            RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --locked --manifest-path engine/Cargo.toml --bin swig --target "$triple"
+            built="engine/target/$triple/release/${{ matrix.binary }}"
+            dynamic=$(readelf -d "$built")
+            if grep -q '(NEEDED)' <<< "$dynamic"; then
+              echo "$dynamic"
+              echo "::error::$built links shared libraries"
+              exit 1
+            fi
+          else
+            cargo build --release --locked --manifest-path engine/Cargo.toml --bin swig
+            built="engine/target/release/${{ matrix.binary }}"
+            if [ "$RUNNER_OS" = Windows ]; then
+              rustup component add llvm-tools
+              objdump="$(cygpath -u "$(rustc --print sysroot)")/lib/rustlib/x86_64-pc-windows-msvc/bin/llvm-objdump.exe"
+              imports=$("$objdump" -p "$built" | grep 'DLL Name')
+              echo "$imports"
+              if grep -qi 'vcruntime' <<< "$imports"; then
+                echo "::error::$built needs the Visual C++ Redistributable"
+                exit 1
+              fi
+            fi
+          fi
+          echo "BUILT_ALIGNER=$built" >> "$GITHUB_ENV"
       - name: Name the release asset
         shell: bash
         run: |
           mkdir -p release
-          cp "engine/target/release/${{ matrix.binary }}" "release/${{ matrix.artifact }}"
+          cp "$BUILT_ALIGNER" "release/${{ matrix.artifact }}"
           "release/${{ matrix.artifact }}" --version
       - uses: actions/upload-artifact@v4
         with:
@@ -84,7 +137,7 @@ jobs:
 
   build:
     name: ${{ matrix.label }}
-    needs: wasm
+    needs: [wasm, aligner]
     strategy:
       fail-fast: false
       matrix:
@@ -93,26 +146,32 @@ jobs:
             target: bun-linux-x64-baseline
             label: Linux x86-64 baseline
             artifact: swig-cli-linux-x64
+            aligner: swig-aligner-linux-x64
           - os: ubuntu-latest
             target: bun-linux-x64-modern
             label: Linux x86-64 modern (Haswell/AVX2)
             artifact: swig-cli-linux-x64-modern
+            aligner: swig-aligner-linux-x64
           - os: ubuntu-24.04-arm
             target: bun-linux-arm64
             label: Linux ARM64
             artifact: swig-cli-linux-arm64
+            aligner: swig-aligner-linux-arm64
           - os: macos-15-intel
             target: bun-darwin-x64
             label: macOS Intel
             artifact: swig-cli-macos-x64
+            aligner: swig-aligner-macos-x64
           - os: macos-14
             target: bun-darwin-arm64
             label: macOS Apple silicon
             artifact: swig-cli-macos-arm64
+            aligner: swig-aligner-macos-arm64
           - os: ubuntu-latest
             target: bun-windows-x64-baseline
             label: Windows x86-64
             artifact: swig-cli-windows-x64.exe
+            aligner: swig-aligner-windows-x64.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -120,6 +179,18 @@ jobs:
         with:
           name: release-swig-wasm
           path: public
+      # The executable embeds its platform's native aligner as native/swig; swig-cli
+      # extracts it to the user cache and runs it, with WebAssembly as the fallback.
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.aligner }}
+          path: native-download
+      - name: Stage the native aligner
+        shell: bash
+        run: |
+          mkdir -p native
+          mv "native-download/${{ matrix.aligner }}" native/swig
+          chmod +x native/swig
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -144,9 +215,46 @@ jobs:
           path: release/${{ matrix.artifact }}
           if-no-files-found: error
 
+  # The Windows executable is cross-compiled on Linux: run its native route (the embedded
+  # swig.exe extracted under LOCALAPPDATA and piped as a child process) on Windows itself.
+  windows-smoke:
+    name: Windows x86-64 executable
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v4
+        with:
+          name: swig-cli-windows-x64.exe
+          path: release
+      - name: Native-route smoke tests
+        env:
+          SWIG_CLI_EXECUTABLE: ${{ github.workspace }}\release\swig-cli-windows-x64.exe
+        run: node --test --test-name-pattern="native|both aligners" tests/cli-smoke.test.mjs
+      - name: Two first runs share the default cache
+        shell: bash
+        run: |
+          exe=release/swig-cli-windows-x64.exe
+          refs=public/references/kimdb-1.1/Macaca_mulatta/IGH
+          args=(--vdj -query tests/fixtures/kimdb-perfect-d-regression.fasta -germline_db_V "$refs/V.fasta" -germline_db_D "$refs/D.fasta" -germline_db_J "$refs/J.fasta" -outfmt 19)
+          "$exe" "${args[@]}" -out first.tsv 2> first.err & one=$!
+          "$exe" "${args[@]}" -out second.tsv 2> second.err & two=$!
+          wait "$one"; wait "$two"
+          "$exe" "${args[@]}" --aligner wasm -out wasm.tsv 2> wasm.err
+          cat first.err second.err wasm.err
+          grep -q 'native aligner;' first.err
+          grep -q 'native aligner;' second.err
+          cmp first.tsv second.tsv
+          cmp first.tsv wasm.tsv
+          ls -l "$(cygpath "$LOCALAPPDATA")"/swig-cli/*/swig.exe
+
   publish:
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build, aligner]
+    needs: [build, aligner, windows-smoke]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

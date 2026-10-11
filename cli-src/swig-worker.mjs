@@ -8,7 +8,8 @@ let engine=null;
 let doubleD=false;
 
 async function initialize(message){
-  const module=await WebAssembly.compile(readFileSync(message.wasmPath));
+  // The pool compiles the module once and shares it; compile here only if it did not.
+  const module=message.module??await WebAssembly.compile(readFileSync(message.wasmPath));
   const created=await AlignerEngine.create(module,message.settings,message.references);
   engine=created.engine;
   doubleD=Boolean(message.settings.doubleD&&message.settings.doubleD.mode!=="off");
