@@ -22,6 +22,8 @@ on:
       - "src/**"
       - "!src/**/*.tsx"
       - "tests/cli-smoke.test.mjs"
+      - "tests/fixtures/**"
+      - "tsconfig.json"
 
 permissions:
   contents: write

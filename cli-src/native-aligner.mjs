@@ -13,7 +13,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { alignerOptions } from "../src/aligner-engine.ts";
@@ -29,23 +29,22 @@ function executableName() {
 }
 
 /**
- * Where an embedded binary is extracted to, most preferred first. The last
- * resort is the shared temporary directory, so on POSIX it gets a directory of
- * its own per user (`private`: checked before anything in it is run).
+ * Where an embedded binary is extracted to, most preferred first, built as
+ * they are tried so that a missing home directory costs only its own root. The
+ * last resort is the shared temporary directory, so on POSIX it gets a
+ * directory of its own per user (`private`: checked before anything in it is run).
  */
-function cacheRoots() {
-  const roots = [];
-  if (process.env.SWIG_CLI_CACHE_DIR) roots.push({ path: process.env.SWIG_CLI_CACHE_DIR, private: false });
+function* cacheRoots() {
+  if (process.env.SWIG_CLI_CACHE_DIR) yield { path: process.env.SWIG_CLI_CACHE_DIR, private: false };
   if (process.platform === "win32") {
-    if (process.env.LOCALAPPDATA) roots.push({ path: process.env.LOCALAPPDATA, private: false });
+    if (process.env.LOCALAPPDATA) yield { path: process.env.LOCALAPPDATA, private: false };
   } else if (process.platform === "darwin") {
-    roots.push({ path: join(homedir(), "Library", "Caches"), private: false });
+    yield { path: () => join(homedir(), "Library", "Caches"), private: false };
   } else {
-    roots.push({ path: process.env.XDG_CACHE_HOME || join(homedir(), ".cache"), private: false });
+    yield { path: () => process.env.XDG_CACHE_HOME || join(homedir(), ".cache"), private: false };
   }
-  if (typeof process.getuid === "function") roots.push({ path: join(tmpdir(), `swig-cli-${process.getuid()}`), private: true });
-  else roots.push({ path: tmpdir(), private: false });
-  return roots;
+  if (typeof process.getuid === "function") yield { path: join(tmpdir(), `swig-cli-${process.getuid()}`), private: true };
+  else yield { path: tmpdir(), private: false };
 }
 
 /** Create `path` for this user only, and refuse it if another user could change what is in it. */
@@ -61,38 +60,50 @@ function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+function message(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
 /**
  * A binary embedded in a Bun executable cannot be executed in place: copy it
  * once per version and content hash to a cache directory (atomically, so
  * concurrent first runs agree) and reuse the copy after checking its hash.
+ * Yields the copy in each cache root in turn, so a root whose copy cannot run
+ * (mounted noexec, say) gives way to the next; `failures` collects the roots
+ * that could hold no copy.
  */
-function extract(sourcePath, version) {
+function* extractions(sourcePath, version, failures) {
   const bytes = readFileSync(sourcePath);
   const digest = sha256(bytes);
-  const failures = [];
   for (const root of cacheRoots()) {
-    const directory = join(root.path, "swig-cli", `${version}-${digest.slice(0, 16)}`);
-    const target = join(directory, executableName());
+    let directory = root.path;
+    let target;
     try {
-      if (root.private) privateDirectory(root.path);
-      if (existsSync(target) && sha256(readFileSync(target)) === digest) return target;
-      mkdirSync(directory, { recursive: true });
-      const temporary = `${target}.${randomUUID()}.tmp`;
-      writeFileSync(temporary, bytes, { mode: 0o755 });
-      chmodSync(temporary, 0o755);
-      try {
-        renameSync(temporary, target);
-      } catch (error) {
-        // Another process may have won the race (Windows refuses to replace a running file).
-        rmSync(temporary, { force: true });
-        if (!(existsSync(target) && sha256(readFileSync(target)) === digest)) throw error;
+      if (typeof root.path === "function") directory = root.path();
+      if (root.private) privateDirectory(directory);
+      directory = join(directory, "swig-cli", `${version}-${digest.slice(0, 16)}`);
+      target = join(directory, executableName());
+      if (!(existsSync(target) && sha256(readFileSync(target)) === digest)) {
+        mkdirSync(directory, { recursive: true });
+        const temporary = `${target}.${randomUUID()}.tmp`;
+        writeFileSync(temporary, bytes, { mode: 0o755 });
+        chmodSync(temporary, 0o755);
+        try {
+          renameSync(temporary, target);
+        } catch (error) {
+          // Another process may have won the race (Windows refuses to replace a running file).
+          rmSync(temporary, { force: true });
+          if (!(existsSync(target) && sha256(readFileSync(target)) === digest)) throw error;
+        }
       }
-      return target;
+      // A copy that lost its execute bit would otherwise fail every run.
+      if (process.platform !== "win32" && (statSync(target).mode & 0o111) === 0) chmodSync(target, 0o755);
     } catch (error) {
-      failures.push(`${directory}: ${error instanceof Error ? error.message : String(error)}`);
+      failures.push(`${typeof directory === "function" ? "the home cache" : directory}: ${message(error)}`);
+      continue;
     }
+    yield target;
   }
-  throw new Error(`the embedded native aligner could not be extracted (${failures.join("; ")})`);
 }
 
 /** Why `binary` cannot serve this CLI version, or null. */
@@ -111,32 +122,30 @@ function probe(binary, version) {
 /**
  * The native aligner to run, or null with the reasons appended to `notes`:
  * SWIG_CLI_ALIGNER_PATH, then the binary embedded in a standalone executable
- * (`assets.nativeAlignerPath`). It must report this CLI's version.
+ * (`assets.nativeAlignerPath`, extracted to the first cache root where it
+ * runs). It must report this CLI's version.
  */
 export function resolveNativeAligner(assets, version, notes = []) {
-  const candidates = [];
-  if (process.env.SWIG_CLI_ALIGNER_PATH) candidates.push(() => process.env.SWIG_CLI_ALIGNER_PATH);
-  if (assets.nativeAlignerPath) {
-    // Bun serves embedded files from a virtual file system ($bunfs, or ~BUN on Windows).
-    const embedded = /\$bunfs|~BUN/.test(assets.nativeAlignerPath);
-    candidates.push(() => (embedded ? extract(assets.nativeAlignerPath, version) : assets.nativeAlignerPath));
-  }
-  for (const candidate of candidates) {
-    let path;
-    try {
-      path = candidate();
-    } catch (error) {
-      notes.push(error instanceof Error ? error.message : String(error));
-      continue;
-    }
+  const usable = (path) => {
     if (!existsSync(path)) {
       notes.push(`${path}: not found`);
-      continue;
+      return false;
     }
     const problem = probe(path, version);
-    if (!problem) return path;
-    notes.push(problem);
+    if (problem) notes.push(problem);
+    return !problem;
+  };
+  if (process.env.SWIG_CLI_ALIGNER_PATH && usable(process.env.SWIG_CLI_ALIGNER_PATH)) return process.env.SWIG_CLI_ALIGNER_PATH;
+  if (!assets.nativeAlignerPath) return null;
+  // Bun serves embedded files from a virtual file system ($bunfs, or ~BUN on Windows).
+  if (!/\$bunfs|~BUN/.test(assets.nativeAlignerPath)) return usable(assets.nativeAlignerPath) ? assets.nativeAlignerPath : null;
+  const failures = [];
+  try {
+    for (const target of extractions(assets.nativeAlignerPath, version, failures)) if (usable(target)) return target;
+  } catch (error) {
+    failures.push(message(error));
   }
+  if (failures.length) notes.push(`the embedded native aligner could not be extracted (${failures.join("; ")})`);
   return null;
 }
 
@@ -216,21 +225,27 @@ export class NativePool {
       if (/database prepared/.test(this.stderr)) readyResolve();
     });
     this.exited.then(({ code, signal }) => {
-      const message = this.exitMessage(code, signal);
+      const message =
+        this.exitMessage(code, signal) ??
+        (this.jobs.length
+          ? `The native aligner exited with ${this.jobs.length} batch(es) unanswered (${this.rows.toLocaleString()} rows for ${this.records.toLocaleString()} records).`
+          : this.ended
+            ? null
+            : "The native aligner exited before its input ended.");
       if (message) {
         const error = new Error(message);
         readyReject(error);
         this.fail(error);
-      } else if (this.jobs.length) {
-        this.fail(
-          new Error(
-            `The native aligner exited with ${this.jobs.length} batch(es) unanswered (${this.rows.toLocaleString()} rows for ${this.records.toLocaleString()} records).`,
-          ),
-        );
       }
       readyResolve();
     });
     await ready;
+    // The engine has read its germlines: an interrupted run leaves no copy of them behind.
+    try {
+      rmSync(this.directory, { recursive: true, force: true });
+    } catch {
+      // close() tries again.
+    }
   }
 
   exitMessage(code, signal) {
@@ -240,7 +255,9 @@ export class NativePool {
     // report the engine's own "swig: " line, or the panic message.
     const error = lines.findLast((line) => line.startsWith("swig: "));
     const panic = lines.findIndex((line) => / panicked at /.test(line));
-    const detail = error ? error.slice("swig: ".length) : panic >= 0 ? lines.slice(panic, panic + 2).join(" ") : (lines.at(-1) ?? "");
+    let detail = error ? error.slice("swig: ".length) : panic >= 0 ? lines.slice(panic, panic + 2).join(" ") : (lines.at(-1) ?? "");
+    // A germline error names the temporary FASTA; say which database it is, as WebAssembly does.
+    for (const segment of ["V", "D", "J", "C"]) detail = detail.split(join(this.directory, `${segment}.fasta`)).join(`${segment} database`);
     return `The native Swig aligner ${signal ? `was stopped by ${signal}` : `exited with status ${code}`}${detail ? `: ${detail}` : "."}`;
   }
 

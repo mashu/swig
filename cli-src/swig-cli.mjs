@@ -287,7 +287,8 @@ async function* sequenceBatches(input,batchRecords,preprocessing,airrMode,datase
         if(filter.enabled){state.fastqFilter.recordsRetained+=1;state.fastqFilter.recordsPassedThrough+=1;}
         const delimiter=record.header.includes("\t")?"\t":",";
         let header=delimiter==="\t"?record.header:record.header.split(delimiter).join("\t");
-        let row=delimiter==="\t"?record.row:record.row.split(delimiter).join("\t");
+        // A tab inside a CSV value would add a column once the row is tab-separated.
+        let row=delimiter==="\t"?record.row:record.row.split(delimiter).map((value)=>value.replace(/\t/g," ")).join("\t");
         if(airrMode!=="preserve"){
           if(identifiers?.source!==header){
             // Column names as the aligner matches them: trimmed.
@@ -901,7 +902,7 @@ async function runChimera(rows,activeMask,config,scope,headers,references,worker
   return {evaluated,flagged,unevaluated,threshold:config.posteriorThreshold};
 }
 
-function writeChunk(stream,chunk){if(stream.write(chunk))return Promise.resolve();return once(stream,"drain");}
+function writeChunk(stream,chunk){if(stream.errored)return Promise.reject(stream.errored);if(stream.write(chunk))return Promise.resolve();return once(stream,"drain");}
 
 function createCliWriteStream(path){return createWriteStream(path,{highWaterMark:CLI_STREAM_HIGH_WATER_MARK});}
 
@@ -909,7 +910,12 @@ function createVdjOutput(path){
   const file=createCliWriteStream(path);
   // A failed run abandons its output: late write errors must not be reported over the real one.
   const discard=(stream)=>{stream.on("error",()=>{});stream.destroy();};
-  if(!/\.gz$/i.test(path))return {stream:file,opened:once(file,"open"),finish:()=>finishWritable(file),destroy:()=>discard(file)};
+  if(!/\.gz$/i.test(path)){
+    // A write error (a full disk, say) is reported by the next write or by finish(), not as an
+    // unhandled 'error' event.
+    file.on("error",()=>{});
+    return {stream:file,opened:once(file,"open"),finish:()=>finishWritable(file),destroy:()=>discard(file)};
+  }
   const gzip=createGzip();
   const completed=pipeline(gzip,file);
   return {
@@ -924,7 +930,7 @@ function airrOutputName(prefix,kind,compression){
   return `${prefix}.${kind}.airr.tsv${compression==="gzip"?".gz":""}`;
 }
 
-async function finishWritable(stream){const completed=once(stream,"finish");stream.end();await completed;}
+async function finishWritable(stream){if(stream.errored)throw stream.errored;const completed=once(stream,"finish");stream.end();await completed;}
 
 async function writeRowsFile(path,headers,rows,include=()=>true){
   const output=createVdjOutput(path);const stream=output.stream;
@@ -975,12 +981,14 @@ async function runPipeline(config,base,assets){
   const settings={callingProfile:config.annotation.callingProfile,minimumIdentity:config.annotation.minimumIdentity,minimumConstantPrefixIdentity:config.annotation.minimumConstantPrefixIdentity,strand:config.annotation.strand,doubleD:config.annotation.doubleD};
   const init=workerInitialization(assets.wasmPath,references,settings);
   const mode=config.annotation.aligner;
-  let nativeBinary=needsAnnotation?chooseNativeAligner(mode,assets,config.annotation.doubleD.mode!=="off"?"the double-D screen":""):null;
+  let nativeBinary=needsAnnotation?chooseNativeAligner(mode,assets,config.annotation.doubleD.mode!=="off"?"the double-D screen":"",config.annotation.alignerLabel):null;
   let pool=null;
   const wasmPool=async()=>{
     if(!pool){
       process.stderr.write(`Starting the WebAssembly aligner pool (${config.annotation.workers} worker${config.annotation.workers===1?"":"s"}; ${annotationBatchRecords.toLocaleString()} records/batch).\n`);
-      pool=new WasmPool(config.annotation.workers,init);await pool.start();
+      pool=new WasmPool(config.annotation.workers,init);
+      try{await pool.start();}
+      catch(error){const failed=pool;pool=null;await failed.close().catch(()=>{});throw error;}
     }
     return pool;
   };
@@ -1172,29 +1180,33 @@ function vdjTuning(options){
   return tuning;
 }
 
-/** "auto", "native" or "wasm"; a non-empty SWIG_CLI_ALIGNER sets the default. `source` names `value` in errors. */
+/**
+ * The aligner mode, "auto", "native" or "wasm" (a non-empty SWIG_CLI_ALIGNER sets the default),
+ * and the setting that chose it, for messages. `source` names `value`.
+ */
 function alignerMode(value,source="--aligner"){
-  const fromEnvironment=value==null&&Boolean(process.env.SWIG_CLI_ALIGNER);
+  const origin=value==null&&process.env.SWIG_CLI_ALIGNER?"SWIG_CLI_ALIGNER":source;
   const mode=String(value??(process.env.SWIG_CLI_ALIGNER||"auto")).toLowerCase();
-  if(!ALIGNER_MODES.includes(mode))throw new Error(`${fromEnvironment?"SWIG_CLI_ALIGNER":source} must be ${ALIGNER_MODES.join(", ")}.`);
-  return mode;
+  if(!ALIGNER_MODES.includes(mode))throw new Error(`${origin} must be ${ALIGNER_MODES.join(", ")}.`);
+  const label=origin==="SWIG_CLI_ALIGNER"?`SWIG_CLI_ALIGNER=${mode}`:origin==="--aligner"?`--aligner ${mode}`:`${origin} "${mode}"`;
+  return {mode,label};
 }
 
 /**
  * The native aligner binary for `mode`, or null for WebAssembly (saying why on stderr in auto
  * mode). `unsupported` names a setting only the WebAssembly route carries.
  */
-function chooseNativeAligner(mode,assets,unsupported=""){
+function chooseNativeAligner(mode,assets,unsupported="",label=`--aligner ${mode}`){
   if(mode==="wasm")return null;
   if(unsupported){
-    if(mode==="native")throw new Error(`--aligner native: ${unsupported} runs only on WebAssembly.`);
+    if(mode==="native")throw new Error(`${label}: ${unsupported} runs only on WebAssembly.`);
     process.stderr.write(`Using the WebAssembly aligner: ${unsupported} runs only on it.\n`);
     return null;
   }
   const notes=[];const binary=resolveNativeAligner(assets,VERSION,notes);
   if(binary)return binary;
   const reason=notes.length?notes.join("; "):"this build carries no native aligner";
-  if(mode==="native")throw new Error(`--aligner native: ${reason}.`);
+  if(mode==="native")throw new Error(`${label}: ${reason}.`);
   process.stderr.write(`Using the WebAssembly aligner (${reason}).\n`);
   return null;
 }
@@ -1218,7 +1230,7 @@ async function runVdj(rawArgs,assets){
   let workers=threadValue===undefined?0:parseIntegerOption(threadValue,options["--workers"]!==undefined?"--workers":"-num_threads",{minimum:0});
   if(options["--workers"]===undefined&&threadValue!==undefined&&workers===0)throw new Error("-num_threads must be at least 1; use --workers 0 for automatic selection.");
   if(workers===0)workers=Math.max(1,availableParallelism());
-  const mode=alignerMode(options["--aligner"]);
+  const {mode,label:alignerLabel}=alignerMode(options["--aligner"]);
   const requestedBatchRecords=options["--batch-records"]===undefined?0:parseIntegerOption(options["--batch-records"],"--batch-records",{minimum:0});
   const batchRecords=requestedBatchRecords||automaticBatchRecords(workers);
   const callingProfile=String(options["--calling-profile"]??"r_optimized");
@@ -1232,7 +1244,7 @@ async function runVdj(rawArgs,assets){
   const minimumConstantPrefixIdentity=options["--minimum-c-prefix-identity"]===undefined?null:parseFiniteOption(options["--minimum-c-prefix-identity"],"--minimum-c-prefix-identity");
   if(minimumConstantPrefixIdentity!==null&&(minimumConstantPrefixIdentity<0||minimumConstantPrefixIdentity>1))throw new Error("--minimum-c-prefix-identity must be between 0 and 1.");
   const init=workerInitialization(assets.wasmPath,prepared.references,{callingProfile,minimumIdentity,minimumConstantPrefixIdentity,strand,tuning});
-  const nativeBinary=chooseNativeAligner(mode,assets);
+  const nativeBinary=chooseNativeAligner(mode,assets,"",alignerLabel);
   let pool=nativeBinary?new NativePool(nativeBinary,workers,init,batchRecords):new WasmPool(workers,init);
   try{await pool.start();}
   catch(error){
@@ -1318,7 +1330,8 @@ export async function runCli(assets=defaultCliAssets()){
   if(commandCompression!==undefined){if(!["none","gzip"].includes(commandCompression))throw new Error("--airr-compression must be none or gzip.");raw.output={...(raw.output??{}),airrCompression:commandCompression};}
   const config=normalizeCliConfig(raw);
   // An explicit --aligner or annotation.aligner wins over SWIG_CLI_ALIGNER.
-  config.annotation.aligner=alignerMode(raw.annotation?.aligner,commandAligner!==undefined?"--aligner":"annotation.aligner");
+  const aligner=alignerMode(raw.annotation?.aligner,commandAligner!==undefined?"--aligner":"annotation.aligner");
+  config.annotation.aligner=aligner.mode;config.annotation.alignerLabel=aligner.label;
   if(!isCallingProfile(config.annotation.callingProfile)){
     throw new Error(`annotation.callingProfile must be ${CALLING_PROFILES.join(", ")}.`);
   }

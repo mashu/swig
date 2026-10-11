@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { _ as annotateDoubleDBatch, a as deduplicate, c as parseFasta$2, d as runDenoisePartitionJob, f as runExactDedupJob, g as annotateAirrBatch, h as DEFAULT_PIPELINE_PLAN, i as createExactDedupPlan, l as prepareReferenceMsa, n as assignLineages, o as finishExactDedupPlan, p as sequenceFingerprint, s as normalizeNt, t as DenoiseAccumulator, v as datasetScopeValue, y as stableDatasetSeed } from "./chunks/post-analysis-core-DJA1I-YZ.mjs";
 import { i as isCallingProfile, n as CALLING_PROFILES, r as alignerOptions } from "./chunks/aligner-engine-DEa3stHz.mjs";
-import { chmodSync, createReadStream, createWriteStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, createReadStream, createWriteStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createGunzip, createGzip, gunzipSync, gzipSync } from "node:zlib";
 import { createInterface } from "node:readline";
@@ -12867,38 +12867,37 @@ function executableName() {
 	return process.platform === "win32" ? "swig.exe" : "swig";
 }
 /**
-* Where an embedded binary is extracted to, most preferred first. The last
-* resort is the shared temporary directory, so on POSIX it gets a directory of
-* its own per user (`private`: checked before anything in it is run).
+* Where an embedded binary is extracted to, most preferred first, built as
+* they are tried so that a missing home directory costs only its own root. The
+* last resort is the shared temporary directory, so on POSIX it gets a
+* directory of its own per user (`private`: checked before anything in it is run).
 */
-function cacheRoots() {
-	const roots = [];
-	if (process.env.SWIG_CLI_CACHE_DIR) roots.push({
+function* cacheRoots() {
+	if (process.env.SWIG_CLI_CACHE_DIR) yield {
 		path: process.env.SWIG_CLI_CACHE_DIR,
 		private: false
-	});
+	};
 	if (process.platform === "win32") {
-		if (process.env.LOCALAPPDATA) roots.push({
+		if (process.env.LOCALAPPDATA) yield {
 			path: process.env.LOCALAPPDATA,
 			private: false
-		});
-	} else if (process.platform === "darwin") roots.push({
-		path: join(homedir(), "Library", "Caches"),
+		};
+	} else if (process.platform === "darwin") yield {
+		path: () => join(homedir(), "Library", "Caches"),
 		private: false
-	});
-	else roots.push({
-		path: process.env.XDG_CACHE_HOME || join(homedir(), ".cache"),
+	};
+	else yield {
+		path: () => process.env.XDG_CACHE_HOME || join(homedir(), ".cache"),
 		private: false
-	});
-	if (typeof process.getuid === "function") roots.push({
+	};
+	if (typeof process.getuid === "function") yield {
 		path: join(tmpdir(), `swig-cli-${process.getuid()}`),
 		private: true
-	});
-	else roots.push({
+	};
+	else yield {
 		path: tmpdir(),
 		private: false
-	});
-	return roots;
+	};
 }
 /** Create `path` for this user only, and refuse it if another user could change what is in it. */
 function privateDirectory(path) {
@@ -12912,37 +12911,47 @@ function privateDirectory(path) {
 function sha256$1(bytes) {
 	return createHash("sha256").update(bytes).digest("hex");
 }
+function message(error) {
+	return error instanceof Error ? error.message : String(error);
+}
 /**
 * A binary embedded in a Bun executable cannot be executed in place: copy it
 * once per version and content hash to a cache directory (atomically, so
 * concurrent first runs agree) and reuse the copy after checking its hash.
+* Yields the copy in each cache root in turn, so a root whose copy cannot run
+* (mounted noexec, say) gives way to the next; `failures` collects the roots
+* that could hold no copy.
 */
-function extract(sourcePath, version) {
+function* extractions(sourcePath, version, failures) {
 	const bytes = readFileSync(sourcePath);
 	const digest = sha256$1(bytes);
-	const failures = [];
 	for (const root of cacheRoots()) {
-		const directory = join(root.path, "swig-cli", `${version}-${digest.slice(0, 16)}`);
-		const target = join(directory, executableName());
+		let directory = root.path;
+		let target;
 		try {
-			if (root.private) privateDirectory(root.path);
-			if (existsSync(target) && sha256$1(readFileSync(target)) === digest) return target;
-			mkdirSync(directory, { recursive: true });
-			const temporary = `${target}.${randomUUID()}.tmp`;
-			writeFileSync(temporary, bytes, { mode: 493 });
-			chmodSync(temporary, 493);
-			try {
-				renameSync(temporary, target);
-			} catch (error) {
-				rmSync(temporary, { force: true });
-				if (!(existsSync(target) && sha256$1(readFileSync(target)) === digest)) throw error;
+			if (typeof root.path === "function") directory = root.path();
+			if (root.private) privateDirectory(directory);
+			directory = join(directory, "swig-cli", `${version}-${digest.slice(0, 16)}`);
+			target = join(directory, executableName());
+			if (!(existsSync(target) && sha256$1(readFileSync(target)) === digest)) {
+				mkdirSync(directory, { recursive: true });
+				const temporary = `${target}.${randomUUID()}.tmp`;
+				writeFileSync(temporary, bytes, { mode: 493 });
+				chmodSync(temporary, 493);
+				try {
+					renameSync(temporary, target);
+				} catch (error) {
+					rmSync(temporary, { force: true });
+					if (!(existsSync(target) && sha256$1(readFileSync(target)) === digest)) throw error;
+				}
 			}
-			return target;
+			if (process.platform !== "win32" && (statSync(target).mode & 73) === 0) chmodSync(target, 493);
 		} catch (error) {
-			failures.push(`${directory}: ${error instanceof Error ? error.message : String(error)}`);
+			failures.push(`${typeof directory === "function" ? "the home cache" : directory}: ${message(error)}`);
+			continue;
 		}
+		yield target;
 	}
-	throw new Error(`the embedded native aligner could not be extracted (${failures.join("; ")})`);
 }
 /** Why `binary` cannot serve this CLI version, or null. */
 function probe(binary, version) {
@@ -12962,31 +12971,29 @@ function probe(binary, version) {
 /**
 * The native aligner to run, or null with the reasons appended to `notes`:
 * SWIG_CLI_ALIGNER_PATH, then the binary embedded in a standalone executable
-* (`assets.nativeAlignerPath`). It must report this CLI's version.
+* (`assets.nativeAlignerPath`, extracted to the first cache root where it
+* runs). It must report this CLI's version.
 */
 function resolveNativeAligner(assets, version, notes = []) {
-	const candidates = [];
-	if (process.env.SWIG_CLI_ALIGNER_PATH) candidates.push(() => process.env.SWIG_CLI_ALIGNER_PATH);
-	if (assets.nativeAlignerPath) {
-		const embedded = /\$bunfs|~BUN/.test(assets.nativeAlignerPath);
-		candidates.push(() => embedded ? extract(assets.nativeAlignerPath, version) : assets.nativeAlignerPath);
-	}
-	for (const candidate of candidates) {
-		let path;
-		try {
-			path = candidate();
-		} catch (error) {
-			notes.push(error instanceof Error ? error.message : String(error));
-			continue;
-		}
+	const usable = (path) => {
 		if (!existsSync(path)) {
 			notes.push(`${path}: not found`);
-			continue;
+			return false;
 		}
 		const problem = probe(path, version);
-		if (!problem) return path;
-		notes.push(problem);
+		if (problem) notes.push(problem);
+		return !problem;
+	};
+	if (process.env.SWIG_CLI_ALIGNER_PATH && usable(process.env.SWIG_CLI_ALIGNER_PATH)) return process.env.SWIG_CLI_ALIGNER_PATH;
+	if (!assets.nativeAlignerPath) return null;
+	if (!/\$bunfs|~BUN/.test(assets.nativeAlignerPath)) return usable(assets.nativeAlignerPath) ? assets.nativeAlignerPath : null;
+	const failures = [];
+	try {
+		for (const target of extractions(assets.nativeAlignerPath, version, failures)) if (usable(target)) return target;
+	} catch (error) {
+		failures.push(message(error));
 	}
+	if (failures.length) notes.push(`the embedded native aligner could not be extracted (${failures.join("; ")})`);
 	return null;
 }
 /** A refused batch: the caller may never await it (ready() throws first), so it is marked handled. */
@@ -13077,22 +13084,34 @@ var NativePool = class {
 			if (/database prepared/.test(this.stderr)) readyResolve();
 		});
 		this.exited.then(({ code, signal }) => {
-			const message = this.exitMessage(code, signal);
+			const message = this.exitMessage(code, signal) ?? (this.jobs.length ? `The native aligner exited with ${this.jobs.length} batch(es) unanswered (${this.rows.toLocaleString()} rows for ${this.records.toLocaleString()} records).` : this.ended ? null : "The native aligner exited before its input ended.");
 			if (message) {
 				const error = new Error(message);
 				readyReject(error);
 				this.fail(error);
-			} else if (this.jobs.length) this.fail(/* @__PURE__ */ new Error(`The native aligner exited with ${this.jobs.length} batch(es) unanswered (${this.rows.toLocaleString()} rows for ${this.records.toLocaleString()} records).`));
+			}
 			readyResolve();
 		});
 		await ready;
+		try {
+			rmSync(this.directory, {
+				recursive: true,
+				force: true
+			});
+		} catch {}
 	}
 	exitMessage(code, signal) {
 		if (code === 0) return null;
 		const lines = this.stderr.split(/\r?\n/).filter((line) => line && !/^swig: (database prepared|warning:)/.test(line));
 		const error = lines.findLast((line) => line.startsWith("swig: "));
 		const panic = lines.findIndex((line) => / panicked at /.test(line));
-		const detail = error ? error.slice(6) : panic >= 0 ? lines.slice(panic, panic + 2).join(" ") : lines.at(-1) ?? "";
+		let detail = error ? error.slice(6) : panic >= 0 ? lines.slice(panic, panic + 2).join(" ") : lines.at(-1) ?? "";
+		for (const segment of [
+			"V",
+			"D",
+			"J",
+			"C"
+		]) detail = detail.split(join(this.directory, `${segment}.fasta`)).join(`${segment} database`);
 		return `The native Swig aligner ${signal ? `was stopped by ${signal}` : `exited with status ${code}`}${detail ? `: ${detail}` : "."}`;
 	}
 	fail(error) {
@@ -13450,7 +13469,7 @@ async function* sequenceBatches(input, batchRecords, preprocessing, airrMode, da
 				}
 				const delimiter = record.header.includes("	") ? "	" : ",";
 				let header = delimiter === "	" ? record.header : record.header.split(delimiter).join("	");
-				let row = delimiter === "	" ? record.row : record.row.split(delimiter).join("	");
+				let row = delimiter === "	" ? record.row : record.row.split(delimiter).map((value) => value.replace(/\t/g, " ")).join("	");
 				if (airrMode !== "preserve") {
 					if (identifiers?.source !== header) {
 						const columns = header.split("	");
@@ -14524,6 +14543,7 @@ async function runChimera(rows, activeMask, config, scope, headers, references, 
 	};
 }
 function writeChunk(stream, chunk) {
+	if (stream.errored) return Promise.reject(stream.errored);
 	if (stream.write(chunk)) return Promise.resolve();
 	return once(stream, "drain");
 }
@@ -14536,12 +14556,15 @@ function createVdjOutput(path) {
 		stream.on("error", () => {});
 		stream.destroy();
 	};
-	if (!/\.gz$/i.test(path)) return {
-		stream: file,
-		opened: once(file, "open"),
-		finish: () => finishWritable(file),
-		destroy: () => discard(file)
-	};
+	if (!/\.gz$/i.test(path)) {
+		file.on("error", () => {});
+		return {
+			stream: file,
+			opened: once(file, "open"),
+			finish: () => finishWritable(file),
+			destroy: () => discard(file)
+		};
+	}
 	const gzip = createGzip();
 	const completed = pipeline(gzip, file);
 	return {
@@ -14562,6 +14585,7 @@ function airrOutputName(prefix, kind, compression) {
 	return `${prefix}.${kind}.airr.tsv${compression === "gzip" ? ".gz" : ""}`;
 }
 async function finishWritable(stream) {
+	if (stream.errored) throw stream.errored;
 	const completed = once(stream, "finish");
 	stream.end();
 	await completed;
@@ -14713,13 +14737,20 @@ async function runPipeline(config, base, assets) {
 	};
 	const init = workerInitialization(assets.wasmPath, references, settings);
 	const mode = config.annotation.aligner;
-	let nativeBinary = needsAnnotation ? chooseNativeAligner(mode, assets, config.annotation.doubleD.mode !== "off" ? "the double-D screen" : "") : null;
+	let nativeBinary = needsAnnotation ? chooseNativeAligner(mode, assets, config.annotation.doubleD.mode !== "off" ? "the double-D screen" : "", config.annotation.alignerLabel) : null;
 	let pool = null;
 	const wasmPool = async () => {
 		if (!pool) {
 			process.stderr.write(`Starting the WebAssembly aligner pool (${config.annotation.workers} worker${config.annotation.workers === 1 ? "" : "s"}; ${annotationBatchRecords.toLocaleString()} records/batch).\n`);
 			pool = new WasmPool(config.annotation.workers, init);
-			await pool.start();
+			try {
+				await pool.start();
+			} catch (error) {
+				const failed = pool;
+				pool = null;
+				await failed.close().catch(() => {});
+				throw error;
+			}
 		}
 		return pool;
 	};
@@ -15037,21 +15068,27 @@ function vdjTuning(options) {
 	});
 	return tuning;
 }
-/** "auto", "native" or "wasm"; a non-empty SWIG_CLI_ALIGNER sets the default. `source` names `value` in errors. */
+/**
+* The aligner mode, "auto", "native" or "wasm" (a non-empty SWIG_CLI_ALIGNER sets the default),
+* and the setting that chose it, for messages. `source` names `value`.
+*/
 function alignerMode(value, source = "--aligner") {
-	const fromEnvironment = value == null && Boolean(process.env.SWIG_CLI_ALIGNER);
+	const origin = value == null && process.env.SWIG_CLI_ALIGNER ? "SWIG_CLI_ALIGNER" : source;
 	const mode = String(value ?? (process.env.SWIG_CLI_ALIGNER || "auto")).toLowerCase();
-	if (!ALIGNER_MODES.includes(mode)) throw new Error(`${fromEnvironment ? "SWIG_CLI_ALIGNER" : source} must be ${ALIGNER_MODES.join(", ")}.`);
-	return mode;
+	if (!ALIGNER_MODES.includes(mode)) throw new Error(`${origin} must be ${ALIGNER_MODES.join(", ")}.`);
+	return {
+		mode,
+		label: origin === "SWIG_CLI_ALIGNER" ? `SWIG_CLI_ALIGNER=${mode}` : origin === "--aligner" ? `--aligner ${mode}` : `${origin} "${mode}"`
+	};
 }
 /**
 * The native aligner binary for `mode`, or null for WebAssembly (saying why on stderr in auto
 * mode). `unsupported` names a setting only the WebAssembly route carries.
 */
-function chooseNativeAligner(mode, assets, unsupported = "") {
+function chooseNativeAligner(mode, assets, unsupported = "", label = `--aligner ${mode}`) {
 	if (mode === "wasm") return null;
 	if (unsupported) {
-		if (mode === "native") throw new Error(`--aligner native: ${unsupported} runs only on WebAssembly.`);
+		if (mode === "native") throw new Error(`${label}: ${unsupported} runs only on WebAssembly.`);
 		process.stderr.write(`Using the WebAssembly aligner: ${unsupported} runs only on it.\n`);
 		return null;
 	}
@@ -15059,7 +15096,7 @@ function chooseNativeAligner(mode, assets, unsupported = "") {
 	const binary = resolveNativeAligner(assets, VERSION, notes);
 	if (binary) return binary;
 	const reason = notes.length ? notes.join("; ") : "this build carries no native aligner";
-	if (mode === "native") throw new Error(`--aligner native: ${reason}.`);
+	if (mode === "native") throw new Error(`${label}: ${reason}.`);
 	process.stderr.write(`Using the WebAssembly aligner (${reason}).\n`);
 	return null;
 }
@@ -15089,7 +15126,7 @@ async function runVdj(rawArgs, assets) {
 	let workers = threadValue === void 0 ? 0 : parseIntegerOption(threadValue, options["--workers"] !== void 0 ? "--workers" : "-num_threads", { minimum: 0 });
 	if (options["--workers"] === void 0 && threadValue !== void 0 && workers === 0) throw new Error("-num_threads must be at least 1; use --workers 0 for automatic selection.");
 	if (workers === 0) workers = Math.max(1, availableParallelism());
-	const mode = alignerMode(options["--aligner"]);
+	const { mode, label: alignerLabel } = alignerMode(options["--aligner"]);
 	const batchRecords = (options["--batch-records"] === void 0 ? 0 : parseIntegerOption(options["--batch-records"], "--batch-records", { minimum: 0 })) || automaticBatchRecords(workers);
 	const callingProfile = String(options["--calling-profile"] ?? "r_optimized");
 	if (!isCallingProfile(callingProfile)) throw new Error(`--calling-profile must be ${CALLING_PROFILES.join(", ")}.`);
@@ -15108,7 +15145,7 @@ async function runVdj(rawArgs, assets) {
 		strand,
 		tuning
 	});
-	const nativeBinary = chooseNativeAligner(mode, assets);
+	const nativeBinary = chooseNativeAligner(mode, assets, "", alignerLabel);
 	let pool = nativeBinary ? new NativePool(nativeBinary, workers, init, batchRecords) : new WasmPool(workers, init);
 	try {
 		await pool.start();
@@ -15278,7 +15315,9 @@ async function runCli(assets = defaultCliAssets()) {
 		};
 	}
 	const config = normalizeCliConfig(raw);
-	config.annotation.aligner = alignerMode(raw.annotation?.aligner, commandAligner !== void 0 ? "--aligner" : "annotation.aligner");
+	const aligner = alignerMode(raw.annotation?.aligner, commandAligner !== void 0 ? "--aligner" : "annotation.aligner");
+	config.annotation.aligner = aligner.mode;
+	config.annotation.alignerLabel = aligner.label;
 	if (!isCallingProfile(config.annotation.callingProfile)) throw new Error(`annotation.callingProfile must be ${CALLING_PROFILES.join(", ")}.`);
 	if (config.annotation.workers === 0) config.annotation.workers = Math.max(1, Math.min(8, availableParallelism()));
 	config.inputs = config.inputs.map((input) => ({

@@ -81,6 +81,20 @@ every other tool are unchanged.
   running. Native start-up errors report the engine's own message, not its
   usage text, and a binary that fails `--version` reports the loader's
   reason.
+  - A bad germline stops the run on either route with the same
+    `<segment> database: …` message. The native route no longer falls back
+    to WebAssembly first. A pipeline whose WebAssembly workers cannot start
+    exits instead of hanging.
+  - An aligner that exits before its input ended is an error, not an empty
+    success.
+  - A write error on the output, such as a full disk, is reported as such.
+  - The native route deletes its temporary germline copies as soon as the
+    engine has read them, so an interrupted run leaves none behind.
+  - A cache root whose extracted copy cannot run (a noexec mount, a lost
+    execute bit) gives way to the next one, and a missing home directory no
+    longer stops extraction.
+  - Messages name the setting that asked for the native aligner
+    (`--aligner`, `annotation.aligner` or `SWIG_CLI_ALIGNER`).
 
 ## Output
 
