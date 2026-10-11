@@ -11111,6 +11111,15 @@ function addFastqQualityFilterStats(target, source) {
 		basesTrimmed: target.basesTrimmed + source.basesTrimmed
 	};
 }
+/**
+* True when `value` holds only Unicode White_Space, the whitespace the aligner
+* trims (Rust's `char::is_whitespace`): JavaScript's `\s` without U+FEFF, and
+* with U+0085. A record the two sides judged differently would leave the aligner
+* with a different record count, so every emptiness test here uses it.
+*/
+function isBlank(value) {
+	return /^[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*$/.test(value ?? "");
+}
 async function* fastaRecords(source) {
 	let header = "";
 	let sequence = [];
@@ -11127,7 +11136,7 @@ async function* fastaRecords(source) {
 		}
 		if (!line.trim()) continue;
 		if (!header) throw new Error("Expected a FASTA header beginning with '>'.");
-		sequence.push(line.replace(/\s/g, ""));
+		sequence.push(line.replace(/[\s>]/g, ""));
 	}
 	if (header) {
 		const joined = sequence.join("");
@@ -11193,12 +11202,12 @@ async function* airrRecords(source) {
 			if (!line.trim()) continue;
 			header = line;
 			delimiter = header.includes("	") ? "	" : ",";
-			sequenceColumn = header.split(delimiter).indexOf("sequence");
+			sequenceColumn = header.split(delimiter).map((name) => name.trim()).indexOf("sequence");
 			if (sequenceColumn < 0) throw new Error("AIRR input requires a 'sequence' column.");
 			continue;
 		}
 		if (!line.trim()) continue;
-		if (line.split(delimiter)[sequenceColumn]?.trim()) yield {
+		if (!isBlank(line.split(delimiter)[sequenceColumn])) yield {
 			header,
 			row: line
 		};
@@ -13190,6 +13199,17 @@ var NativePool = class {
 			this.child?.stdin.end();
 		}
 	}
+	/**
+	* After the caller has taken every batch: waits for the child to exit and
+	* throws unless it wrote exactly one row per record. A surplus row arrives
+	* after the last batch was answered, and nothing else would report it.
+	*/
+	async finish() {
+		this.finishInput();
+		await this.exited;
+		if (this.failed) throw this.failed;
+		if (this.rows !== this.records) throw new Error(`The native aligner wrote ${this.rows.toLocaleString()} rows for ${this.records.toLocaleString()} records.`);
+	}
 	async close() {
 		this.finishInput();
 		if (this.child && this.child.exitCode === null && this.child.signalCode === null && this.jobs.length) this.child.kill();
@@ -13434,7 +13454,7 @@ async function* sequenceBatches(input, batchRecords, preprocessing, airrMode, da
 				if (airrMode !== "preserve") {
 					if (identifiers?.source !== header) {
 						const columns = header.split("	");
-						const column = columns.indexOf("sequence_id");
+						const column = columns.findIndex((name) => name.trim() === "sequence_id");
 						identifiers = {
 							source: header,
 							columns: columns.length,
@@ -13444,10 +13464,10 @@ async function* sequenceBatches(input, batchRecords, preprocessing, airrMode, da
 					}
 					const values = row.split("	");
 					if (identifiers.column < 0) {
-						while (values.length < identifiers.columns) values.push("");
+						values.length = identifiers.columns;
 						values.push(unnamed());
 						row = values.join("	");
-					} else if (!(values[identifiers.column] ?? "").trim()) {
+					} else if (isBlank(values[identifiers.column])) {
 						while (values.length <= identifiers.column) values.push("");
 						values[identifiers.column] = unnamed();
 						row = values.join("	");
@@ -13471,7 +13491,7 @@ async function* sequenceBatches(input, batchRecords, preprocessing, airrMode, da
 					state.fastqFilter.recordsPassedThrough += 1;
 				}
 				const newline = record.indexOf("\n");
-				const text = record.slice(1, newline).trim() ? record : `>${unnamed()}${record.slice(newline)}`;
+				const text = isBlank(record.slice(1, newline)) ? `>${unnamed()}${record.slice(newline)}` : record;
 				yield {
 					ordinal: state.inputRecords - 1,
 					text
@@ -13481,7 +13501,7 @@ async function* sequenceBatches(input, batchRecords, preprocessing, airrMode, da
 		}
 		for await (const record of fastqRecords(lines)) {
 			state.inputRecords += 1;
-			if (!record.header.slice(1).trim()) record.header = `@${unnamed()}`;
+			if (isBlank(record.header.slice(1))) record.header = `@${unnamed()}`;
 			const text = filter.enabled ? filterFastqRecord(record, filter, state.fastqFilter) : canonicalFastq(record);
 			if (text !== null) {
 				state.eligibleRecords += 1;
@@ -14799,6 +14819,7 @@ async function runPipeline(config, base, assets) {
 				}
 				if (datasetPool instanceof NativePool) datasetPool.finishInput();
 				while (pending.length) await consume(pending.shift());
+				if (datasetPool instanceof NativePool) await datasetPool.finish();
 			} finally {
 				if (datasetPool instanceof NativePool) await datasetPool.close();
 			}
@@ -15156,6 +15177,7 @@ async function runVdj(rawArgs, assets) {
 		}
 		if (native) pool.finishInput();
 		while (pending.length) await consume(pending.shift());
+		if (native) await pool.finish();
 		if (outputHandle) await outputHandle.finish();
 		completed = true;
 	} finally {

@@ -51,6 +51,7 @@ import {
   fastaRecords,
   fastqRecords,
   filterFastqRecord,
+  isBlank,
   seededRandom,
   validateFastqQualityFilter,
 } from "../src/sequence-stream.ts";
@@ -289,14 +290,17 @@ async function* sequenceBatches(input,batchRecords,preprocessing,airrMode,datase
         let row=delimiter==="\t"?record.row:record.row.split(delimiter).join("\t");
         if(airrMode!=="preserve"){
           if(identifiers?.source!==header){
-            const columns=header.split("\t");const column=columns.indexOf("sequence_id");
+            // Column names as the aligner matches them: trimmed.
+            const columns=header.split("\t");const column=columns.findIndex((name)=>name.trim()==="sequence_id");
             identifiers={source:header,columns:columns.length,column,header:column<0?`${header}\tsequence_id`:header};
           }
           const values=row.split("\t");
           if(identifiers.column<0){
-            while(values.length<identifiers.columns)values.push("");
+            // The new column follows the header's last one, whatever the row's length (join
+            // writes the holes of a short row as empty fields).
+            values.length=identifiers.columns;
             values.push(unnamed());row=values.join("\t");
-          }else if(!(values[identifiers.column]??"").trim()){
+          }else if(isBlank(values[identifiers.column])){
             while(values.length<=identifiers.column)values.push("");
             values[identifiers.column]=unnamed();row=values.join("\t");
           }
@@ -311,14 +315,14 @@ async function* sequenceBatches(input,batchRecords,preprocessing,airrMode,datase
         state.inputRecords+=1;state.eligibleRecords+=1;
         if(filter.enabled){state.fastqFilter.recordsRetained+=1;state.fastqFilter.recordsPassedThrough+=1;}
         const newline=record.indexOf("\n");
-        const text=record.slice(1,newline).trim()?record:`>${unnamed()}${record.slice(newline)}`;
+        const text=isBlank(record.slice(1,newline))?`>${unnamed()}${record.slice(newline)}`:record;
         yield {ordinal:state.inputRecords-1,text};
       }
       return;
     }
     for await(const record of fastqRecords(lines)){
       state.inputRecords+=1;
-      if(!record.header.slice(1).trim())record.header=`@${unnamed()}`;
+      if(isBlank(record.header.slice(1)))record.header=`@${unnamed()}`;
       const text=filter.enabled?filterFastqRecord(record,filter,state.fastqFilter):canonicalFastq(record);
       if(text!==null){state.eligibleRecords+=1;yield {ordinal:state.inputRecords-1,text};}
     }
@@ -1051,6 +1055,7 @@ async function runPipeline(config,base,assets){
         }
         if(datasetPool instanceof NativePool)datasetPool.finishInput();
         while(pending.length)await consume(pending.shift());
+        if(datasetPool instanceof NativePool)await datasetPool.finish();
       }finally{
         if(datasetPool instanceof NativePool)await datasetPool.close();
       }
@@ -1270,6 +1275,7 @@ async function runVdj(rawArgs,assets){
     }
     if(native)pool.finishInput();
     while(pending.length)await consume(pending.shift());
+    if(native)await pool.finish();
     if(outputHandle)await outputHandle.finish();
     completed=true;
   }finally{

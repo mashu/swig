@@ -347,6 +347,20 @@ export class NativePool {
     }
   }
 
+  /**
+   * After the caller has taken every batch: waits for the child to exit and
+   * throws unless it wrote exactly one row per record. A surplus row arrives
+   * after the last batch was answered, and nothing else would report it.
+   */
+  async finish() {
+    this.finishInput();
+    await this.exited;
+    if (this.failed) throw this.failed;
+    if (this.rows !== this.records) {
+      throw new Error(`The native aligner wrote ${this.rows.toLocaleString()} rows for ${this.records.toLocaleString()} records.`);
+    }
+  }
+
   async close() {
     this.finishInput();
     if (this.child && this.child.exitCode === null && this.child.signalCode === null && this.jobs.length) this.child.kill();

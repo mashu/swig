@@ -50,14 +50,23 @@ every other tool are unchanged.
   still exact. The pipeline's `annotation.workers: 0` still selects up to
   eight, because that count also sizes the collapse, denoising and
   CHMMAIRRa pools.
-- **Records without an identifier.** A FASTA or FASTQ record with an empty
-  header, or an AIRR row with an empty or missing `sequence_id`, is named
-  `sequence_N` by its position N in the input, before batching. Before, each
-  WebAssembly worker numbered its own records. That repeated names, and the
-  names depended on the worker count.
-- **Blank AIRR sequences.** An AIRR row whose `sequence` is only whitespace
-  is skipped, in Swig Web and in the CLI, as the aligner always did. Before,
-  it counted as a record that the aligner then dropped.
+- **Records without an identifier.** A record the aligner annotates is named
+  `sequence_N` by its position N in the input, before batching, when it has
+  no identifier. That covers FASTA and FASTQ records with an empty header,
+  and AIRR rows with an empty or missing `sequence_id` under
+  `annotation.airrMode: "reannotate"`. Before, each WebAssembly worker
+  numbered its own records. That repeated names, and the names depended on
+  the worker count. Preserved AIRR calls (`airrMode: "preserve"`) never reach
+  the aligner and keep their existing naming.
+- **The same records as the aligner.** The CLI and Swig Web now split input
+  into records exactly as the aligner reads it:
+  - "Blank" means the aligner's Unicode whitespace, so an AIRR row whose
+    `sequence` is only whitespace is no record.
+  - AIRR column names are matched after trimming.
+  - A FASTA sequence line such as ` >x` stays sequence.
+  - Before, such input could leave the aligner with a different record
+    count. The native route also checks the count: if its rows do not match
+    the records, the run fails instead of dropping a record.
 - **Worker threads on Windows.** The Windows executable could not start any
   worker thread: the WebAssembly aligner pool, or the pools for post-analysis
   and CHMMAIRRa. Bun 1.3 resolves an embedded worker given as a file URL, but

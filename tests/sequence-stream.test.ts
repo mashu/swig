@@ -4,6 +4,7 @@ import { gzipSync } from "node:zlib";
 
 import {
   DEFAULT_FASTQ_QUALITY_FILTER,
+  isBlank,
   streamSequenceBatches,
   type FastqQualityFilterOptions,
   type SequenceSource,
@@ -223,6 +224,18 @@ test("AIRR input retains its header in every compute batch", async () => {
   assert.deepEqual(result.batches.map((batch) => batch.count), [2, 1]);
   assert.ok(result.batches.every((batch) => batch.text.startsWith("sequence_id\tsequence\tlocus\n")));
   assert.ok(!result.batches.some((batch) => batch.text.includes("\nc\t")));
+});
+
+test("blank means the aligner's Unicode whitespace, and FASTA records keep the aligner's boundaries", async () => {
+  assert.ok(isBlank("") && isBlank(" \t\u00a0") && isBlank("\u0085") && isBlank(undefined));
+  assert.ok(!isBlank("\ufeff") && !isBlank(" a "));
+  // " >b" is a sequence line to the aligner; without its whitespace it must not become a header.
+  const result = await collect(">a\nACGT\n >b\nTTGG\n>c\nGGCC\n", 1, 10);
+  assert.equal(result.batches[0].count, 2);
+  assert.equal(result.batches[0].text, ">a\nACGTbTTGG\n>c\nGGCC\n");
+  // Column names are matched trimmed, and a sequence of only U+0085 is blank.
+  const airr = await collect("sequence_id\tsequence \na\tACGT\nnel\t\u0085\n", 3, 10);
+  assert.deepEqual(airr.batches.map((batch) => batch.count), [1]);
 });
 
 test("AIRR rows whose sequence is only whitespace are no records, as for the aligner", async () => {

@@ -578,7 +578,9 @@ test("native and WebAssembly routes name unnamed reads by input position",async(
     const {reads,references}=syntheticRearrangements(pack,1_200);
     // Every third read has no identifier; each WebAssembly worker would otherwise number its own.
     let index=0;
-    const unnamed=reads.replace(/^>read_\d+$/gm,(header)=>(index++%3===0?">":header));
+    // ...and read_7's sequence carries a line " >x7": a sequence line to the aligner, which
+    // must not turn into a header (an extra row) once the CLI drops its whitespace.
+    const unnamed=reads.replace(/^>read_\d+$/gm,(header)=>(index++%3===0?">":header)).replace(/^(>read_7\n)/m,"$1 >x7\n");
     const paths={query:join(temporary,"reads.fasta"),V:join(temporary,"V.fasta"),D:join(temporary,"D.fasta"),J:join(temporary,"J.fasta")};
     await writeFile(paths.query,unnamed);for(const segment of ["V","D","J"])await writeFile(paths[segment],references[segment]);
     const run=(aligner)=>{
@@ -608,9 +610,12 @@ test("the pipeline annotates FASTA, FASTQ and AIRR datasets identically on both 
     await writeFile(fastaPath,`${fasta.trimEnd()}\n>\n${records[0].sequence}\n`);
     await writeFile(fastqPath,records.map((r)=>`@${r.id}\n${r.sequence}\n+\n${"I".repeat(r.sequence.length)}\n`).join(""));
     await writeFile(airrPath,`sequence_id\tsequence\n${records.map((r)=>`${r.id}\t${r.sequence}`).join("\n")}\nblank\t  \n\t${records[1].sequence}\n`);
+    // Names padded as the aligner trims them, no sequence_id column, rows longer than the header.
+    const loosePath=join(temporary,"loose.airr.tsv");
+    await writeFile(loosePath,`v_call\t sequence \n${records.map((r)=>`IGHV1-2*02\t${r.sequence}\textra`).join("\n")}\n`);
     const annotate=async(aligner,doubleD="off")=>{
       const output=join(temporary,`${aligner}-${doubleD}`),configPath=join(temporary,`${aligner}-${doubleD}.json`);
-      await writeFile(configPath,JSON.stringify({inputs:[{path:fastaPath,sampleId:"a",subjectId:"d"},{path:fastqPath,sampleId:"b",subjectId:"d"},{path:airrPath,format:"airr",sampleId:"c",subjectId:"d"}],annotation:{workers:2,batchRecords:1,airrMode:"reannotate",aligner,doubleD:{mode:doubleD}},pipeline:{collapse:{enabled:false},lineage:{enabled:false},shm:{enabled:false}},output:{directory:output,prefix:"run",writeLineageStudy:false}}));
+      await writeFile(configPath,JSON.stringify({inputs:[{path:fastaPath,sampleId:"a",subjectId:"d"},{path:fastqPath,sampleId:"b",subjectId:"d"},{path:airrPath,format:"airr",sampleId:"c",subjectId:"d"},{path:loosePath,format:"airr",sampleId:"e",subjectId:"d"}],annotation:{workers:2,batchRecords:1,airrMode:"reannotate",aligner,doubleD:{mode:doubleD}},pipeline:{collapse:{enabled:false},lineage:{enabled:false},shm:{enabled:false}},output:{directory:output,prefix:"run",writeLineageStudy:false}}));
       const result=runCli(root,configPath,[],env);
       return {result,table:result.status===0?await readFile(join(output,"run.annotated.airr.tsv")):null};
     };
@@ -620,8 +625,9 @@ test("the pipeline annotates FASTA, FASTQ and AIRR datasets identically on both 
     assert.equal(wasm.result.status,0,wasm.result.stderr);assert.match(wasm.result.stderr,/Starting the WebAssembly aligner pool \(2 workers; 1 records\/batch\)/);
     assert.deepEqual(native.table,wasm.table);
     const ids=native.table.toString("utf8").trimEnd().split("\n").slice(1).map((row)=>row.split("\t")[0]);
-    assert.equal(ids.length,records.length*3+2);
+    assert.equal(ids.length,records.length*4+2);
     assert.equal(ids.filter((id)=>id.endsWith(`::sequence_${records.length+1}`)).length,2);
+    assert.deepEqual(ids.slice(-records.length),records.map((_,index)=>`loose::sequence_${index+1}`));
     // The double-D sidecar runs only on WebAssembly: auto switches, native refuses.
     const screened=await annotate("auto","all");
     assert.equal(screened.result.status,0,screened.result.stderr);assert.match(screened.result.stderr,/Using the WebAssembly aligner: the double-D screen runs only on it/);
@@ -664,6 +670,12 @@ test("an unusable native aligner falls back to WebAssembly unless --aligner nati
     assert.match(fellBack.stderr,/WebAssembly aligner;/);
     const crashed=runRawCli(root,args("native"),crashEnv);
     assert.notEqual(crashed.status,0);assert.match(crashed.stderr,/swig-cli: The native Swig aligner exited with status 132: Illegal instruction/);
+    // A binary that answers every record and then writes one row too many: the extra row comes
+    // after the last batch was answered, and the run must still fail rather than drop a record.
+    const surplus=join(temporary,"surplus-swig");
+    await writeFile(surplus,`#!/bin/sh\nif [ "$1" = "--version" ]; then echo 'swig ${version}'; exit 0; fi\necho 'swig: database prepared in 1 ms' >&2\nprintf 'sequence_id\\tsequence\\n'\nwhile IFS= read -r line; do case "$line" in '>'*) printf '%s\\tACGT\\n' "\${line#>}";; esac; done\nprintf 'extra\\tACGT\\n'\n`);await chmod(surplus,0o755);
+    const overflow=runRawCli(root,args("native"),{...env,SWIG_CLI_ALIGNER_PATH:surplus});
+    assert.notEqual(overflow.status,0,overflow.stderr);assert.match(overflow.stderr,/swig-cli: The native aligner returned more rows than records\./);
     // SWIG_CLI_ALIGNER: empty means unset; a bad value is named as such.
     const unset=runRawCli(root,args("auto").filter((value,index,all)=>value!=="--aligner"&&all[index-1]!=="--aligner"),{...env,SWIG_CLI_ALIGNER:""});
     assert.equal(unset.status,0,unset.stderr);
