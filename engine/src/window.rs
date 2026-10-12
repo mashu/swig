@@ -21,6 +21,9 @@ pub trait DWindowPolicy: Send + Sync {
     );
 }
 
+/// `[b_V − margin, a_J + margin)` of the best V and J, clamped to the read
+/// and to V's start; empty (never inverted) when V reaches past the J's
+/// start by more than the margin.
 fn residual(query_len: usize, v: &[Placement], j: &[Placement], margin: u32) -> Range<usize> {
     let v_best = v.first();
     let j_best = j.first();
@@ -31,7 +34,7 @@ fn residual(query_len: usize, v: &[Placement], j: &[Placement], margin: u32) -> 
     let end = j_best
         .map_or(query_len, |p| (p.q_start() + margin) as usize)
         .min(query_len);
-    start..end
+    start..end.max(start)
 }
 
 /// The ordinary residual `[b_V − margin, a_J + margin)` of the best V and J.
@@ -55,7 +58,8 @@ impl DWindowPolicy for ResidualWindow {
     }
 }
 
-/// Residual widened by `reclaim` bases into V and J.
+/// Residual widened by `reclaim` bases into V and J, searched when it holds
+/// at least `min_width` bases (and at least one).
 ///
 /// This replaces the note's gated *boundary rescue*: D hits that overlap an
 /// over-extended V or J are found up front, and the adjudicator's exact cut
@@ -91,7 +95,7 @@ impl DWindowPolicy for ExpandedResidual {
         out: &mut Vec<Range<usize>>,
     ) {
         let window = residual(query_len, v, j, self.reclaim);
-        if window.len() >= self.min_width {
+        if window.len() >= self.min_width.max(1) {
             out.push(window);
         }
     }
@@ -161,11 +165,16 @@ impl<P: DWindowPolicy> DWindowPolicy for WithAnchorWindow<P> {
 
 /// Where J is searched: right of V, reaching `reclaim` bases back into it.
 ///
-/// J follows V on every path, and a J alignment can only reach into V by
-/// chance matches at the junction edge, which [`ExpandedResidual`] bounds by
-/// the same margin. The window starts `reclaim` bases before the earliest V
-/// end, so it contains every J that a path through any V placement can use
-/// up to that overlap. Without V placements the whole read is searched.
+/// J follows V on every path through a V, and a J alignment can only reach
+/// into V by chance matches at the junction edge, which [`ExpandedResidual`]
+/// bounds by the same margin. When some V placement is significant on its
+/// own ([`Placement::anchor`]), the window starts `reclaim` bases before the
+/// earliest V end, so it contains every J that a path through any V
+/// placement can use up to that overlap. Otherwise the read may hold no V at
+/// all (it starts inside CDR3, or is a J–C fragment), and its V placements
+/// are chance hits that can lie downstream of the real J, in its 3′ flank or
+/// C region; a path may skip V, so the whole read is searched. So it is
+/// when no hit can anchor (a V stage without E-value gates).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DownstreamWindow {
     pub reclaim: u32,
@@ -181,6 +190,9 @@ impl Default for DownstreamWindow {
 
 impl DownstreamWindow {
     pub fn window(&self, query_len: usize, upstream: &[Placement]) -> Range<usize> {
+        if !upstream.iter().any(|p| p.anchor) {
+            return 0..query_len;
+        }
         let start = upstream
             .iter()
             .map(|p| p.q_end().saturating_sub(self.reclaim) as usize)
@@ -208,6 +220,7 @@ pub fn merge_windows(windows: &mut Vec<Range<usize>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::germline::SegmentKind;
 
     #[test]
     fn merges_overlapping_windows() {
@@ -227,5 +240,48 @@ mod tests {
         let window = DownstreamWindow { reclaim: 12 };
         assert_eq!(window.window(80, &[]), 0..80);
         assert_eq!(window.window(0, &[]), 0..0);
+    }
+
+    /// A V hit that is not significant on its own may be a chance hit
+    /// downstream of the real J (a read that starts inside CDR3): only a
+    /// significant V bounds where J can start.
+    #[test]
+    fn j_window_starts_after_significant_v_only() {
+        let mut next = crate::testing::rng(4);
+        let query = crate::testing::random_codes(&mut next, 218);
+        let mut v = crate::testing::placement(SegmentKind::V, &query, &query[..150], 0);
+        let window = DownstreamWindow { reclaim: 12 };
+        v.anchor = false;
+        assert_eq!(window.window(218, std::slice::from_ref(&v)), 0..218);
+        let mut anchor = v.clone();
+        anchor.anchor = true;
+        assert_eq!(window.window(218, &[anchor, v]), 138..218);
+    }
+
+    /// A V that reaches past the J's start by more than the margin makes the
+    /// residual empty; no policy may propose an inverted window.
+    #[test]
+    fn crossing_v_and_j_propose_no_window() {
+        let mut next = crate::testing::rng(6);
+        let query = crate::testing::random_codes(&mut next, 100);
+        let v = crate::testing::placement(SegmentKind::V, &query, &query[..80], 0);
+        let j = crate::testing::placement(SegmentKind::J, &query, &query[40..60], 40);
+        for min_width in [0, 1, 4] {
+            let mut out = Vec::new();
+            ExpandedResidual {
+                reclaim: 12,
+                min_width,
+            }
+            .windows(
+                100,
+                std::slice::from_ref(&v),
+                std::slice::from_ref(&j),
+                &mut out,
+            );
+            assert!(
+                out.iter().all(|w| w.start < w.end),
+                "min_width {min_width}: {out:?}"
+            );
+        }
     }
 }

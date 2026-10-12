@@ -66,9 +66,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Some(z) = value("--margin-z") {
         config.v.budget.z = z.parse()?;
     }
-    if let Some(limit) = value("--max-alleles") {
-        config.v.seeds.max_alleles = limit.parse()?;
-    }
     if let Some(limit) = value("--max-occ") {
         config.v.seeds.max_occurrences = limit.parse()?;
     }

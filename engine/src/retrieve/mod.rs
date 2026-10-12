@@ -34,7 +34,8 @@ pub struct Candidate {
     pub votes: u32,
 }
 
-/// Best diagonal cluster of one indexed sequence (a gene frame).
+/// Best diagonal cluster of one indexed sequence (a gene frame), spanning
+/// the far side of an indel when the frame's runner-up cluster is one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClusterVote {
     pub target: u32,
