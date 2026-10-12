@@ -4,6 +4,9 @@
 //! across tools: a call is an [`Assignment`], built from this crate's
 //! [`AirrRecord`] or from any AIRR Rearrangement TSV row.
 //!
+//! Allele identity, D presence and the junction do not depend on how the
+//! caller oriented the read; read positions do.
+//!
 //! * **Exact** — the primary (first) called allele is the simulated allele.
 //! * **Equivalent** — the primary allele is *germline-equivalent* on this
 //!   read: its sequence contains the trimmed, pre-mutation germline body that
@@ -12,7 +15,8 @@
 //! * **Truth listed** — the simulated allele is among the reported names.
 //! * **Gene** — the primary allele's gene is the gene of an equivalent allele.
 //! * **Boundaries** — absolute error of the called segment ends against the
-//!   labelled read positions (only for correctly oriented reads).
+//!   labelled read positions (only for reads whose reported orientation,
+//!   `rev_comp`, is the true one).
 //! * **D presence**, stratified by the length of the simulated D remnant:
 //!   a 2-nt remnant is not identifiable, a 20-nt one must be found.
 //! * **Junction** — the called junction sequence equals the true one
@@ -65,7 +69,8 @@ pub struct SegmentCall {
 /// A caller's answer for one read, from any tool.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Assignment {
-    pub rev_comp: bool,
+    /// The reported orientation; `None` when the caller does not report one.
+    pub rev_comp: Option<bool>,
     /// Indexed by [`Slot::index`].
     pub segments: [Option<SegmentCall>; 5],
     pub junction: Option<String>,
@@ -83,7 +88,7 @@ impl Assignment {
             })
         };
         Self {
-            rev_comp: record.rev_comp,
+            rev_comp: Some(record.rev_comp),
             segments: [
                 segment(&record.v),
                 segment(&record.d),
@@ -97,7 +102,8 @@ impl Assignment {
     }
 
     /// Parse one AIRR Rearrangement TSV row; returns `(sequence_id, assignment)`.
-    /// Only `sequence_id` is required. `{v,d,d2,j,c}_call` may list several
+    /// Only `sequence_id` is required; without a `rev_comp` value the
+    /// orientation is unknown. `{v,d,d2,j,c}_call` may list several
     /// comma-separated names (primary first); coordinates are AIRR 1-based closed.
     pub fn from_airr(header: &[&str], line: &str) -> Result<(String, Self), String> {
         let fields: Vec<&str> = line.split('\t').collect();
@@ -111,7 +117,11 @@ impl Assignment {
         let id = get("sequence_id").ok_or("AIRR row without sequence_id")?;
         let probability = |name: &str| get(name).and_then(|v| v.parse::<f64>().ok());
         let mut assignment = Self {
-            rev_comp: matches!(get("rev_comp"), Some("T" | "TRUE" | "true" | "True")),
+            rev_comp: get("rev_comp").and_then(|v| match v {
+                "T" | "TRUE" | "true" | "True" => Some(true),
+                "F" | "FALSE" | "false" | "False" => Some(false),
+                _ => None,
+            }),
             junction: get("junction").map(|j| j.to_ascii_uppercase()),
             d_presence: probability("d_presence_posterior"),
             ..Self::default()
@@ -141,6 +151,12 @@ impl Assignment {
     pub fn assigned(&self) -> bool {
         self.segment(Slot::V).is_some() || self.segment(Slot::J).is_some()
     }
+
+    /// Whether the reported orientation is `truth`'s, so that read
+    /// positions are comparable.
+    pub fn oriented(&self, truth: &Truth) -> bool {
+        self.rev_comp == Some(truth.reverse_complemented)
+    }
 }
 
 /// Whether the primary allele of `call` is germline-equivalent to `truth`.
@@ -165,7 +181,8 @@ pub struct SegmentStats {
     pub names: usize,
     /// Calls on reads whose truth lacks the segment.
     pub spurious: usize,
-    /// Boundary errors over called, correctly oriented reads.
+    /// Boundary errors over called reads whose reported orientation is the
+    /// true one.
     pub start_error: usize,
     pub end_error: usize,
     pub start_exact: usize,
@@ -211,14 +228,11 @@ impl SegmentStats {
         let Some(primary) = call.names.first() else {
             return;
         };
-        if !oriented {
-            return;
-        }
         self.exact += usize::from(*primary == truth.allele);
         self.equivalent += usize::from(primary_equivalent(truth, call));
         self.truth_listed += usize::from(call.names.contains(&truth.allele));
         self.gene += usize::from(truth.equivalent.iter().any(|e| gene(e) == gene(primary)));
-        if let Some(span) = &call.span {
+        if let Some(span) = call.span.as_ref().filter(|_| oriented) {
             self.boundary_reads += 1;
             self.start_error += span.start.abs_diff(truth.span.start);
             self.end_error += span.end.abs_diff(truth.span.end);
@@ -263,7 +277,7 @@ pub struct ConstantStats {
 }
 
 impl ConstantStats {
-    fn add(&mut self, truth: Option<&TrueSegment>, call: Option<&SegmentCall>, oriented: bool) {
+    fn add(&mut self, truth: Option<&TrueSegment>, call: Option<&SegmentCall>) {
         self.reads += 1;
         if let Some(truth) = truth {
             self.genes_equivalent += genes(&truth.equivalent).len();
@@ -275,10 +289,7 @@ impl ConstantStats {
             return;
         };
         let listed_equivalent = call.names.iter().all(|n| truth.equivalent.contains(n));
-        self.over_call += usize::from(!oriented || !listed_equivalent);
-        if !oriented {
-            return;
-        }
+        self.over_call += usize::from(!listed_equivalent);
         self.equivalent += usize::from(primary_equivalent(truth, call));
         self.first_gene += usize::from(gene(primary) == gene(&truth.allele));
         self.gene_set += usize::from(genes(&call.names) == genes(&truth.equivalent));
@@ -424,7 +435,7 @@ pub struct Evaluation {
 impl Evaluation {
     pub fn add(&mut self, truth: &Truth, call: &Assignment) {
         self.reads += 1;
-        let oriented = call.rev_comp == truth.reverse_complemented;
+        let oriented = call.oriented(truth);
         self.oriented += usize::from(oriented);
         self.unassigned += usize::from(!call.assigned());
         for (slot, stats) in [
@@ -445,13 +456,12 @@ impl Evaluation {
         let called_d = call.segment(Slot::D);
         presence.called += usize::from(called_d.is_some());
         if let (Some(called), Some(true_d)) = (called_d, truth.segment(Slot::D)) {
-            presence.correct += usize::from(oriented && primary_equivalent(true_d, called));
+            presence.correct += usize::from(primary_equivalent(true_d, called));
         }
 
         if let Some(junction) = &truth.junction {
             self.junction_reads += 1;
-            self.junction_exact +=
-                usize::from(oriented && call.junction.as_deref() == Some(junction.as_str()));
+            self.junction_exact += usize::from(call.junction.as_deref() == Some(junction.as_str()));
         }
 
         if truth.constant {
@@ -460,7 +470,7 @@ impl Evaluation {
                 .iter()
                 .position(|&(lo, hi)| (lo..=hi).contains(&length))
                 .expect("bins cover every length");
-            self.c[bin].add(truth.segment(Slot::C), call.segment(Slot::C), oriented);
+            self.c[bin].add(truth.segment(Slot::C), call.segment(Slot::C));
         }
 
         for (slot, calibration) in [
@@ -473,10 +483,9 @@ impl Evaluation {
                 continue;
             };
             if let Some(posterior) = segment.posterior {
-                let correct = oriented
-                    && truth
-                        .segment(slot)
-                        .is_some_and(|t| segment.names.iter().any(|n| t.equivalent.contains(n)));
+                let correct = truth
+                    .segment(slot)
+                    .is_some_and(|t| segment.names.iter().any(|n| t.equivalent.contains(n)));
                 calibration.add(posterior, correct);
             }
         }
@@ -843,10 +852,8 @@ pub struct Paired {
 impl Paired {
     pub fn add(&mut self, truth: &Truth, first: &Assignment, second: &Assignment) {
         let correct = |call: &Assignment, slot: Slot, truth_segment: &TrueSegment| {
-            call.rev_comp == truth.reverse_complemented
-                && call
-                    .segment(slot)
-                    .is_some_and(|c| primary_equivalent(truth_segment, c))
+            call.segment(slot)
+                .is_some_and(|c| primary_equivalent(truth_segment, c))
         };
         for (slot, outcome) in [
             (Slot::V, &mut self.v),
@@ -884,10 +891,9 @@ impl Paired {
         // equivalent to the truth; the read has a D.
         let d_posterior = |call: &Assignment| {
             let segment = call.segment(Slot::D)?;
-            let listed = call.rev_comp == truth.reverse_complemented
-                && truth
-                    .segment(Slot::D)
-                    .is_some_and(|t| segment.names.iter().any(|n| t.equivalent.contains(n)));
+            let listed = truth
+                .segment(Slot::D)
+                .is_some_and(|t| segment.names.iter().any(|n| t.equivalent.contains(n)));
             Some((segment.posterior?, listed))
         };
         if let (Some(a), Some(b)) = (d_posterior(first), d_posterior(second)) {
@@ -898,10 +904,7 @@ impl Paired {
             self.d_presence_brier.add((a, has_d), (b, has_d));
         }
         if let Some(junction) = &truth.junction {
-            let exact = |call: &Assignment| {
-                call.rev_comp == truth.reverse_complemented
-                    && call.junction.as_deref() == Some(junction.as_str())
-            };
+            let exact = |call: &Assignment| call.junction.as_deref() == Some(junction.as_str());
             self.junction.add(exact(first), exact(second));
         }
     }
@@ -1015,6 +1018,71 @@ mod tests {
         assert!((o.half_width() - 1.2334).abs() < 1e-3, "{}", o.half_width());
     }
 
+    fn segment(allele: &str, span: Range<usize>) -> TrueSegment {
+        TrueSegment {
+            allele: allele.into(),
+            equivalent: vec![allele.into()],
+            span,
+        }
+    }
+
+    /// A read with V, J and a templated junction, emitted reverse
+    /// complemented.
+    fn reversed_truth() -> Truth {
+        Truth {
+            id: "r".into(),
+            reverse_complemented: true,
+            segments: [
+                Some(segment("V1*01", 0..9)),
+                None,
+                None,
+                Some(segment("J1*01", 40..60)),
+                None,
+            ],
+            constant: false,
+            junction: Some("TGTGCG".into()),
+            d_length: 0,
+            shm_rate: 0.0,
+        }
+    }
+
+    /// Allele identity and the junction do not depend on the reported
+    /// orientation; boundaries need it, and a calls file without `rev_comp`
+    /// reports none: a perfect caller without the column is perfect.
+    #[test]
+    fn orientation_gates_boundaries_only() {
+        let truth = reversed_truth();
+        let header = [
+            "sequence_id",
+            "v_call",
+            "v_sequence_start",
+            "v_sequence_end",
+            "j_call",
+            "junction",
+        ];
+        let row = "r\tV1*01\t1\t9\tJ1*01\ttgtgcg";
+        let (_, unknown) = Assignment::from_airr(&header, row).unwrap();
+        assert_eq!(unknown.rev_comp, None);
+        let with_column = [&header[..], &["rev_comp"]].concat();
+        let (_, reported) = Assignment::from_airr(&with_column, &format!("{row}\tT")).unwrap();
+        assert_eq!(reported.rev_comp, Some(true));
+        let (_, wrong) = Assignment::from_airr(&with_column, &format!("{row}\tF")).unwrap();
+        assert_eq!(wrong.rev_comp, Some(false));
+        for (call, oriented) in [(unknown, false), (wrong, false), (reported, true)] {
+            let mut e = Evaluation::default();
+            e.add(&truth, &call);
+            assert_eq!(e.oriented, usize::from(oriented));
+            assert_eq!(
+                (e.v.equivalent, e.j.equivalent, e.junction_exact),
+                (1, 1, 1)
+            );
+            assert_eq!(e.v.boundary_reads, usize::from(oriented));
+            let mut paired = Paired::default();
+            paired.add(&truth, &call, &call);
+            assert_eq!((paired.v.both, paired.junction.both), (1, 1));
+        }
+    }
+
     #[test]
     fn constant_calls_are_scored_by_gene_set_and_first_name() {
         let names = |list: &[&str]| list.iter().map(|n| n.to_string()).collect::<Vec<_>>();
@@ -1030,27 +1098,22 @@ mod tests {
         };
         let mut stats = ConstantStats::default();
         // Equivalent, but the first name is the other gene.
-        stats.add(Some(&truth), Some(&call(&["G2*01", "G1*01"])), true);
+        stats.add(Some(&truth), Some(&call(&["G2*01", "G1*01"])));
         // Right gene first; a gene missing from the list.
-        stats.add(Some(&truth), Some(&call(&["G1*02"])), true);
+        stats.add(Some(&truth), Some(&call(&["G1*02"])));
         // An over-call: G3 is not equivalent.
-        stats.add(
-            Some(&truth),
-            Some(&call(&["G1*01", "G2*01", "G3*01"])),
-            true,
-        );
-        // Misoriented calls are wrong; no call is not an over-call.
-        stats.add(Some(&truth), Some(&call(&["G1*01", "G2*01"])), false);
-        stats.add(Some(&truth), None, true);
+        stats.add(Some(&truth), Some(&call(&["G1*01", "G2*01", "G3*01"])));
+        // No call is not an over-call.
+        stats.add(Some(&truth), None);
         let expected = ConstantStats {
-            reads: 5,
-            called: 4,
+            reads: 4,
+            called: 3,
             equivalent: 3,
             first_gene: 2,
             gene_set: 1,
-            over_call: 2,
-            genes_listed: 2 + 1 + 3 + 2,
-            genes_equivalent: 5 * 2,
+            over_call: 1,
+            genes_listed: 2 + 1 + 3,
+            genes_equivalent: 4 * 2,
         };
         assert_eq!(stats, expected);
     }
