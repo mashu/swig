@@ -53,8 +53,19 @@
 //!
 //! **16-bit safety.** Lanes are 16-bit with saturating arithmetic and
 //! `−∞ = −16384`. A job enters a lane only if its attainable score
-//! ([`SubstitutionProfile::local_bound`] over `min(n, m)` columns) and its
-//! costs stay far from that sentinel; others fall back to the scalar kernel.
+//! ([`SubstitutionProfile::local_bound`] over `min(n, m)` columns) is at
+//! most 30,000 and its costs at least −1,000; others fall back to the
+//! scalar kernel. A real cell then holds `H` in `[0, bound]` and gap states
+//! of at least −1,000 (an `H` plus one cost), and a cell outside the matrix
+//! at most its real neighbour's `H − 16384`, so saturation never clips a
+//! real cell and profile entries narrow to 16 bits exactly. Anchored C jobs
+//! (bonus `2·ℓ + 1`, `ℓ` the longest C record) stay in lanes for records up
+//! to about 15 kb.
+//!
+//! **Bounded traceback memory.** A traceback pass stores one byte per cell
+//! and register lane. A group ends before a job that would take its trace
+//! above 64 MiB, and a job that alone exceeds it runs on the scalar kernel,
+//! whose trace holds only its own band.
 
 use super::gotoh::{BandedGotoh, GotohWorkspace, traceback_with};
 #[cfg(target_arch = "aarch64")]
@@ -80,12 +91,15 @@ const REF_SENTINEL: i16 = N as i16 + 2;
 /// outside the matrix.
 const ANCHOR: i16 = -1;
 const NEG: i16 = -16_384;
-/// Largest attainable score admitted into a lane.
-const MAX_SCORE: i64 = 8_000;
+/// Largest attainable score admitted into a lane (see the module's 16-bit
+/// safety): below `i16::MAX`, and `NEG` below `−MAX_SCORE / 2`.
+const MAX_SCORE: i64 = 30_000;
 /// Most negative single-step score or gap cost admitted into a lane.
 const MIN_STEP: i64 = -1_000;
 /// Largest row count / band width admitted into a lane (positions are i16).
 const MAX_DIM: usize = 16_000;
+/// Largest traceback buffer of one lane group, in cells of one byte.
+const MAX_TRACE_CELLS: usize = 1 << 26;
 
 /// Instruction set of the inter-sequence kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -689,6 +703,23 @@ fn run_group<K, const L: usize, const DIAG: bool, const TRACE: bool>(
     }
 }
 
+/// Lanes in the next group of `lanes` (sorted by rows, then width,
+/// descending, so the first has the group's rows): at most `L`, and on a
+/// traceback pass no more than keep its trace (rows × widest width × `L`
+/// bytes) within [`MAX_TRACE_CELLS`]; none when the first alone exceeds it.
+fn group_len<const L: usize>(lanes: &[Lane], trace: bool) -> usize {
+    let rows = lanes.first().map_or(0, |lane| lane.rows);
+    let mut width = 0;
+    lanes
+        .iter()
+        .take(L)
+        .take_while(|lane| {
+            width = width.max(lane.width);
+            !trace || rows.saturating_mul(width).saturating_mul(L) <= MAX_TRACE_CELLS
+        })
+        .count()
+}
+
 /// Run the diagonal and rectangular groups on backend `K`; route
 /// singleton groups to `ws.scalar_jobs`.
 fn run_groups<K, const L: usize, const TRACE: bool>(
@@ -704,7 +735,10 @@ fn run_groups<K, const L: usize, const TRACE: bool>(
         } else {
             &mut ws.rectangular
         });
-        for group in groups.chunks(L) {
+        let mut rest = &groups[..];
+        while !rest.is_empty() {
+            let (group, tail) = rest.split_at(group_len::<L>(rest, TRACE).max(1));
+            rest = tail;
             match (group.len(), diagonal) {
                 (1, _) => ws.scalar_jobs.push(group[0].job),
                 (_, true) => run_group::<K, L, true, TRACE>(jobs, group, ws, emit),
@@ -1034,12 +1068,13 @@ mod tests {
     }
 
     /// C-like jobs: anchor profiles (one outsized column) on 1.3 kb
-    /// references under 7-diagonal bands, batched with uniform jobs. They
-    /// stay in SIMD lanes and match the scalar kernel.
+    /// references under 7-diagonal bands, batched with uniform jobs, in a
+    /// database whose longest record has 13 kb (bonus 26,001). They stay in
+    /// SIMD lanes and match the scalar kernel.
     #[test]
     fn anchor_profiles_on_long_references_match_the_scalar_kernel() {
         let scoring = AffineScoring::new(2, -3, -9, -1);
-        let model = AnchorColumn::new(scoring, 1300);
+        let model = AnchorColumn::new(scoring, 13_000);
         let mut next = rng(9);
         let mut cases = Vec::new();
         for k in 0..48 {
@@ -1102,9 +1137,66 @@ mod tests {
         }
     }
 
+    /// A traceback group keeps its trace within the budget, splitting
+    /// large jobs into smaller groups or sending one alone to the scalar
+    /// kernel, and the results stay the scalar kernel's.
+    #[test]
+    fn traceback_groups_stay_within_the_trace_budget() {
+        let lane = |rows: usize, width: usize| Lane {
+            job: 0,
+            shift: 0,
+            lo: 0,
+            width,
+            rows,
+            n: rows,
+            m: width,
+        };
+        assert_eq!(group_len::<16>(&vec![lane(500, 300); 40], true), 16);
+        // The group's trace has its first lane's rows and its widest lane's width.
+        let mixed = [lane(4_000, 500), lane(3_000, 1_500), lane(3_000, 100)];
+        assert_eq!(group_len::<16>(&mixed, true), 1);
+        // A 2,100 × 2,100 job needs 70.6 M trace bytes in a 16-lane register.
+        let large = vec![lane(2_100, 2_100); 4];
+        assert_eq!(group_len::<16>(&large, false), 4);
+        assert_eq!(group_len::<16>(&large, true), 0);
+        let scoring = AffineScoring::new(2, -3, -9, -1);
+        let mut next = rng(3);
+        let reference = random_codes(&mut next, 2_100);
+        let mut query = reference.clone();
+        query[700] = (query[700] + 1) % 4;
+        query.remove(1_400);
+        query.push(0);
+        let profile = SubstitutionProfile::build(&scoring, &reference);
+        let job = AlignJob {
+            query: &query,
+            profile: &profile,
+            gaps: scoring.gaps,
+            band: Band::Full,
+        };
+        let jobs = vec![job; 4];
+        let expected = BandedGotoh.align(
+            &query,
+            &profile,
+            scoring.gaps,
+            Band::Full,
+            &mut Default::default(),
+        );
+        let mut alignments = Vec::new();
+        for simd in backends() {
+            let mut ws = InterSequenceWorkspace::default();
+            simd.align_batch(&jobs, &mut ws, &mut alignments);
+            assert!(ws.trace.len() <= MAX_TRACE_CELLS, "{:?}", simd.backend());
+            assert!(
+                alignments.iter().all(|a| *a == expected),
+                "{:?}",
+                simd.backend()
+            );
+        }
+    }
+
     #[test]
     fn oversized_scores_fall_back_to_scalar() {
-        let scoring = AffineScoring::new(100, -3, -5, -1);
+        let scoring = AffineScoring::new(200, -3, -5, -1);
         let reference: Vec<u8> = (0..200).map(|i| (i % 4) as u8).collect();
         let profile = SubstitutionProfile::build(&scoring, &reference);
         assert!(
@@ -1131,13 +1223,24 @@ mod tests {
         let (mut out, mut alignments) = (Vec::new(), Vec::new());
         let mut ws = InterSequenceWorkspace::default();
         InterSequenceGotoh::new().score_batch(&jobs, &mut ws, &mut out);
-        assert!(out.iter().all(|hit| hit.map(|h| h.score) == Some(20_000)));
+        assert!(out.iter().all(|hit| hit.map(|h| h.score) == Some(40_000)));
         // The scalar fallback's traceback reports the same score.
         InterSequenceGotoh::new().align_batch(&jobs, &mut ws, &mut alignments);
         assert!(
             alignments
                 .iter()
-                .all(|a| a.as_ref().map(|a| a.score) == Some(20_000))
+                .all(|a| a.as_ref().map(|a| a.score) == Some(40_000))
         );
+        // Half that score stays in a lane.
+        let half = SubstitutionProfile::build(&AffineScoring::new(100, -3, -5, -1), &reference);
+        let job = AlignJob {
+            query: &reference,
+            profile: &half,
+            gaps: scoring.gaps,
+            band: Band::Full,
+        };
+        assert!(lane_of(0, &job).is_some());
+        InterSequenceGotoh::new().score_batch(&[job; 3], &mut ws, &mut out);
+        assert!(out.iter().all(|hit| hit.map(|h| h.score) == Some(20_000)));
     }
 }
