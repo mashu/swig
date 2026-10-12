@@ -25,9 +25,7 @@
 //! Swapping a component changes the type:
 //!
 //! ```ignore
-//! let experimental = assigner
-//!     .with_adjudicator(ResidualAdjudicator::default())
-//!     .with_d_window(ResidualWindow { overlap_margin: 2 });
+//! let scalar = assigner.with_aligner(BandedGotoh);
 //! ```
 
 use std::ops::Range;
@@ -216,32 +214,6 @@ impl<A, RV, RJ, RD, W, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj> {
         d_admission: Adm2,
     ) -> Assigner<A, RV, RJ, RD, W, Adm2, Adj> {
         replace!(self { v, j, d, strand, j_window, aligner, d_window, adjudicator, locus_adjudicators, c, options } d_admission: d_admission)
-    }
-
-    /// Swap the adjudicator, for reads of every locus. The D stage keeps
-    /// the D placements the original one needed: built with posteriors, it
-    /// keeps those below the DAG's D floor, so pair an adjudicator without
-    /// its own D significance floor (such as
-    /// [`crate::adjudicate::ResidualAdjudicator`]) with `posterior: false`.
-    pub fn with_adjudicator<Adj2>(
-        self,
-        adjudicator: Adj2,
-    ) -> Assigner<A, RV, RJ, RD, W, Adm, Adj2> {
-        let assigner = self;
-        Assigner {
-            adjudicator,
-            locus_adjudicators: Vec::new(),
-            v: assigner.v,
-            j: assigner.j,
-            d: assigner.d,
-            strand: assigner.strand,
-            j_window: assigner.j_window,
-            aligner: assigner.aligner,
-            d_window: assigner.d_window,
-            d_admission: assigner.d_admission,
-            c: assigner.c,
-            options: assigner.options,
-        }
     }
 
     pub fn with_options(mut self, options: AssignerOptions) -> Self {

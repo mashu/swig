@@ -331,26 +331,6 @@ fn tandem_d_is_a_first_class_path() {
 }
 
 #[test]
-fn residual_adjudicator_is_a_drop_in_replacement() {
-    let db = Db::new();
-    let config = EngineConfig {
-        posterior: false,
-        ..EngineConfig::default()
-    };
-    let residual = db
-        .assigner(&config)
-        .with_adjudicator(ResidualAdjudicator::default());
-    let mut rng = Rng::new(11);
-    for _ in 0..20 {
-        let d = rng.below(8);
-        let sim = simulate(&db, &mut rng, &[d], 0.0);
-        let rec = record(&residual, &sim.query);
-        assert_eq!(first_label(&rec.v).as_deref(), Some(sim.v.as_str()));
-        assert_eq!(first_label(&rec.j).as_deref(), Some(sim.j.as_str()));
-    }
-}
-
-#[test]
 fn called_segments_never_share_query_bases() {
     let db = Db::new();
     let assigner = db.assigner(&EngineConfig {

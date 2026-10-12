@@ -35,8 +35,8 @@ pub enum DAlleleDecoding {
     #[default]
     Map,
     /// The allele of largest posterior marginal, given the call's D presence
-    /// and topology. Needs posteriors: without them (`--no-posterior`,
-    /// `--residual`) the D allele is the call's.
+    /// and topology. Needs posteriors: without them (`--no-posterior`) the
+    /// D allele is the call's.
     MaxMarginal,
 }
 

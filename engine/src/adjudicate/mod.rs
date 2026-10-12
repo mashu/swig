@@ -3,14 +3,13 @@
 //! Input: all admitted V, D and J placements of one oriented query.
 //! Output: a [`CallPath`] — an ordered list of clipped placements.
 //!
-//! Two implementations:
-//! * [`PlacementDag`] — the note's target architecture: semi-Markov Viterbi
-//!   over placements with a pluggable [`Grammar`] (VJ / VDJ / VDDJ …) and
-//!   [`PathModel`] (bonuses, D-presence prior, N/P edge scores). It subsumes
-//!   AER-R: "candidate A" and "candidate B" are two particular cuts of an
-//!   overlap, and the DAG evaluates *every* cut exactly.
-//! * [`ResidualAdjudicator`] — the ordinary commit-V/J-then-D path, kept as a
-//!   baseline and for regression comparisons.
+//! [`PlacementDag`] is the note's target architecture: semi-Markov Viterbi
+//! over placements with a pluggable [`Grammar`] and [`PathModel`]
+//! (presence priors, N/P edge scores). It evaluates every cut of an
+//! overlap exactly, including the two extreme cuts (the D takes the
+//! overlap, or the V or J does). The note's ordinary path, which commits V
+//! and J first and searches a D in the residual between them, was a
+//! baseline exhibiting "V/J eat D"; the DAG replaced it.
 //!
 //! [`PlacementDag`] also reads the objective as a distribution over paths and
 //! cuts, `P ∝ exp(nats)`, and returns posterior [`Marginals`] of the
@@ -24,14 +23,12 @@ mod decode;
 mod lattice;
 mod model;
 mod posterior;
-mod residual;
 mod units;
 
 pub use dag::{DagScratch, PlacementDag};
 pub use decode::{DAlleleDecoding, Topology, Within};
 pub use model::{EngineeringObjective, Grammar, PathModel, VdjGrammar};
 pub use posterior::{MAX_SPREAD, Marginals, OVERLAP_SPREAD, PosteriorScratch};
-pub use residual::{ResidualAdjudicator, ResidualScratch};
 pub use units::{
     CallModel, EvidenceModel, EvidenceScale, PathNats, ReadModel, UNITS_PER_NAT, Units, divergence,
 };
