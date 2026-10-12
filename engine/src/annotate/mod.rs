@@ -137,6 +137,35 @@ impl AnchorSource {
         }
     }
 
+    /// The source a label names ([`Self::label`]), if any.
+    pub fn from_label(label: &str) -> Option<Self> {
+        Some(match label {
+            "header" => Self::Header,
+            "imgt-gaps" => Self::ImgtGaps,
+            "motif" => Self::Motif,
+            "consensus" => Self::Consensus,
+            "low-confidence" => Self::LowConfidence,
+            "missing" => Self::Missing,
+            _ => Self::Transfer {
+                from: label.strip_prefix("transfer:")?.to_string(),
+            },
+        })
+    }
+
+    /// The source of `allele`'s header anchor: the one a prepared database
+    /// records for it (`annotation=`, [`Allele::source`]), so values an
+    /// earlier annotation derived stay as trusted as they were; else
+    /// [`Self::Header`]. A record for an anchor annotation found missing
+    /// names none: such an anchor was added by hand.
+    fn given(allele: &Allele) -> Self {
+        allele
+            .source
+            .as_deref()
+            .and_then(Self::from_label)
+            .filter(|source| *source != Self::Missing)
+            .unwrap_or(Self::Header)
+    }
+
     /// Reliable enough to serve as a transfer donor.
     fn trusted(&self) -> bool {
         matches!(
@@ -182,18 +211,21 @@ impl AlleleAnnotation {
                 .any(|n| matches!(n, Note::AnchorContradicted { .. }))
     }
 
-    /// The notes, then `uncertain=` and the keys of the uncertain starts
-    /// (`uncertain=cdr1,fr3`), as one `; `-separated field.
-    pub fn notes_field(&self) -> String {
+    /// `uncertain=` and the keys of the uncertain starts (`uncertain=cdr1,fr3`),
+    /// `None` when every start is certain.
+    pub fn uncertain_field(&self) -> Option<String> {
         let keys: Vec<&str> = RegionStarts::KEYS
             .iter()
             .zip(self.uncertain)
             .filter_map(|(&key, uncertain)| uncertain.then_some(key))
             .collect();
+        (!keys.is_empty()).then(|| format!("uncertain={}", keys.join(",")))
+    }
+
+    /// The notes, then [`Self::uncertain_field`], as one `; `-separated field.
+    pub fn notes_field(&self) -> String {
         let mut fields: Vec<String> = self.notes.iter().map(Note::to_string).collect();
-        if !keys.is_empty() {
-            fields.push(format!("uncertain={}", keys.join(",")));
-        }
+        fields.extend(self.uncertain_field());
         fields.join("; ")
     }
 }
@@ -506,7 +538,7 @@ impl Fr3Notes<'_> {
 }
 
 /// For every trusted allele (`hits`) whose FR3 start is open, the FR3 start
-/// of its nearest relative with a given FR3 start and an anchor, and that
+/// of its nearest trusted relative with a certain given FR3 start, and that
 /// relative: the relative's Cys104 → FR3 distance when the two share a
 /// Trp41 → Cys104 spacing, else its FR3 start mapped by alignment. The FR3
 /// start is a homologous position, so an indel between the two falls in
@@ -520,7 +552,11 @@ fn fr3_from_relatives(
     index: &mut Option<RelativeIndex>,
     workspace: &mut GotohWorkspace,
 ) -> Vec<Option<(u32, usize)>> {
-    let fr3_of = |i: usize| given[i].regions[4].known().filter(|_| anchors[i].is_some());
+    let fr3_of = |i: usize| {
+        given[i]
+            .certain(4)
+            .filter(|_| anchors[i].is_some() && hits[i].is_some())
+    };
     let eligible: Vec<bool> = (0..set.len()).map(|i| fr3_of(i).is_some()).collect();
     let mut found = vec![None; set.len()];
     if !eligible.contains(&true) {
@@ -603,7 +639,7 @@ fn annotate_j(
             if !matches!(residue, b'W' | b'F') {
                 notes.push(Note::HeaderResidue(residue));
             }
-            result.push(AlleleAnnotation::new(AnchorSource::Header, notes));
+            result.push(AlleleAnnotation::new(AnchorSource::given(allele), notes));
             anchors.push(Some(anchor));
             weak.push(None);
             continue;
@@ -876,7 +912,10 @@ pub fn annotate(
         .map(|allele| {
             let mut notes = Vec::new();
             let given = Given::read(allele, imgt_gaps.used(), &mut notes);
-            result.push(AlleleAnnotation::new(AnchorSource::Missing, notes));
+            result.push(AlleleAnnotation {
+                uncertain: given.uncertain,
+                ..AlleleAnnotation::new(AnchorSource::Missing, notes)
+            });
             given
         })
         .collect();
@@ -928,27 +967,30 @@ pub fn annotate(
         _ => None,
     });
 
-    // FR3 and CDR2 lengths of the alleles whose FR3 start is given.
+    // FR3 and CDR2 lengths of the trusted alleles whose FR3 start is given
+    // and certain.
     let fr3_varies = 2 * v
         .alleles()
         .iter()
         .filter(|a| a.name.starts_with("TR") || a.name.starts_with("IGL"))
         .count()
         > v.len();
-    let fr3_model = Fr3Model::learn((0..v.len()).filter_map(|i| {
-        let fr3 = given[i].regions[4].known()?;
-        let hit = hits[i].filter(|_| result[i].trusted());
-        let anchor = given[i].anchor.or(hit.map(|h| h.anchor()))?;
-        let codons = anchor.checked_sub(fr3).filter(|d| d.is_multiple_of(3))? / 3 + 1;
-        let cdr2 = given[i].regions[3]
-            .known()
-            .or(hit.and_then(|h| h.trp41_nt()).map(|w| w + 45));
-        let cdr2_codons = cdr2
-            .and_then(|c| fr3.checked_sub(c))
-            .filter(|d| d.is_multiple_of(3))
-            .map(|d| d / 3);
-        Some((codons, cdr2_codons))
-    }));
+    let fr3_model = Fr3Model::learn((0..v.len()).filter(|&i| result[i].trusted()).filter_map(
+        |i| {
+            let fr3 = given[i].certain(4)?;
+            let hit = hits[i];
+            let anchor = given[i].anchor.or(hit.map(|h| h.anchor()))?;
+            let codons = anchor.checked_sub(fr3).filter(|d| d.is_multiple_of(3))? / 3 + 1;
+            let cdr2 = given[i]
+                .certain(3)
+                .or(hit.and_then(|h| h.trp41_nt()).map(|w| w + 45));
+            let cdr2_codons = cdr2
+                .and_then(|c| fr3.checked_sub(c))
+                .filter(|d| d.is_multiple_of(3))
+                .map(|d| d / 3);
+            Some((codons, cdr2_codons))
+        },
+    ));
     // The Trp41 search covers every FR3 length the chain or the model admits.
     let fr3_range = match (chain.map(ChainType::fr3_codons), fr3_model.as_ref()) {
         (Some(l), Some(model)) => {
@@ -1002,8 +1044,13 @@ pub fn annotate(
             fr3_codons: fr3_range,
         };
         let refined = find_v(&allele.codes, search, &mut frames);
+        if given[index].anchor.is_some() {
+            if let Some(h) = refined {
+                hits[index] = Some(h);
+            }
+            continue;
+        }
         match (&result[index].source, refined) {
-            (AnchorSource::Header | AnchorSource::ImgtGaps, Some(h)) => hits[index] = Some(h),
             (AnchorSource::Motif, Some(h)) if h.confident => hits[index] = Some(h),
             (AnchorSource::Missing, Some(h)) if h.confident => {
                 hits[index] = Some(h);
@@ -1088,6 +1135,7 @@ pub fn annotate(
             .map(|i| {
                 regions[i].cdr1.is_some()
                     && trusted_hits[i].is_some()
+                    && !given[i].uncertain[1]
                     && (given[i].regions[1].known().is_some() || open_cys23[i].is_none())
             })
             .collect();

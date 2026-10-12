@@ -143,3 +143,55 @@ fn header_words_name_no_locus() {
     assert_eq!(d_calls, 0);
     assert!(kappa_j >= 145, "{kappa_j} of 150 reads called a kappa J");
 }
+
+/// A prepared database read back keeps what its annotation knew: values
+/// annotation derived stay as trusted as they were (a transferred anchor is
+/// no donor and still counts as uncertain), doubtful starts stay flagged,
+/// and every allele reports the provenance it had.
+#[test]
+fn a_prepared_database_reloads_with_its_annotation() {
+    let v = TRAV1_2.lines().nth(1).unwrap();
+    let mut broken = v.as_bytes().to_vec();
+    broken[99..102].copy_from_slice(b"TTG"); // Trp41
+    broken[261..264].copy_from_slice(b"AGT"); // Cys104
+    let broken = String::from_utf8(broken).unwrap();
+    let v_text = format!(
+        "{TRAV1_2}>TRAV1-2*02\n{broken}\n>TRAV1-2*03\n{}\n",
+        &v[..240]
+    );
+    let prepare = |v: &str, j: &str| {
+        let texts = GermlineTexts {
+            v,
+            d: None,
+            j,
+            c: None,
+        };
+        PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap()
+    };
+    let first = prepare(&v_text, TRAJ);
+    let labels = |db: &PreparedDatabase| -> Vec<(String, [bool; 5], Option<String>)> {
+        db.annotation
+            .v
+            .iter()
+            .chain(&db.annotation.j)
+            .zip(db.v.alleles().iter().chain(db.j.alleles()))
+            .map(|(a, allele)| (a.source.label(), a.uncertain, allele.source.clone()))
+            .collect()
+    };
+    let expected = labels(&first);
+    assert_eq!(expected[1].0, "transfer:TRAV1-2*01");
+    assert_eq!(
+        (expected[2].0.as_str(), expected[2].1),
+        ("missing", [true; 5])
+    );
+    assert_eq!(expected[0].2.as_deref(), Some("IMGT-gapped"));
+    let files: std::collections::HashMap<&str, String> = first.files().into_iter().collect();
+    let again = prepare(&files["V.fasta"], &files["J.fasta"]);
+    assert_eq!(labels(&again), expected);
+    assert_eq!(again.annotation.uncertain(), first.annotation.uncertain());
+    assert_eq!(again.warnings(3), first.warnings(3));
+    for (allele, before) in again.v.alleles().iter().zip(first.v.alleles()) {
+        assert_eq!(allele.anchor, before.anchor, "{}", allele.name);
+        assert_eq!(allele.regions, before.regions, "{}", allele.name);
+    }
+}

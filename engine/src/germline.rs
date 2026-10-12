@@ -317,6 +317,10 @@ pub struct Allele {
     /// provenance when its coordinates are used, else the database
     /// annotation's source ([`crate::prepare`]).
     pub source: Option<String>,
+    /// Region starts (FR1, CDR1, FR2, CDR2, FR3) the header marks
+    /// `uncertain=`: given, but derived by the annotation of a prepared
+    /// database, which doubted them ([`crate::prepare`]).
+    pub uncertain: [bool; 5],
     /// The anchor was read from `SWIGMETA=`, not from an `anchor=` key:
     /// a coordinate Swig transferred from IMGT-annotated relatives, which
     /// annotation drops when the allele's own motifs confidently contradict
@@ -353,6 +357,7 @@ impl Allele {
             && copy.regions.check(self.anchor, len).is_ok()
         {
             self.regions = copy.regions;
+            self.uncertain = copy.uncertain;
             taken = true;
         }
         self.imgt = self.imgt.take().or(copy.imgt);
@@ -553,18 +558,22 @@ impl GermlineSet {
             loci: Loci::infer(name, name),
             frame: None,
             source: None,
+            uncertain: [false; 5],
             anchor_from_meta: false,
         });
         Ok(id)
     }
 
     /// Load from FASTA. Header: `>NAME [anchor=POS] [fr1= cdr1= fr2= cdr2= fr3=]
-    /// [frame=F] [aliases=A,B] [locus=L,…] [SWIGMETA=…]` (0-based positions;
-    /// unknown keys are ignored). Swig's `SWIGMETA=` field
-    /// ([`crate::metadata`]) fills what the keys leave open. A gapped V
-    /// record keeps its IMGT numbering in [`Allele::imgt`]; the loci come
-    /// from `locus=` (as [`Self::write_fasta`] writes them), else the label,
-    /// else the header ([`Loci::infer`]).
+    /// [frame=F] [aliases=A,B] [locus=L,…] [annotation=SOURCE]
+    /// [uncertain=fr1,…] [SWIGMETA=…]` (0-based positions; unknown keys are
+    /// ignored). Swig's `SWIGMETA=` field ([`crate::metadata`]) fills what
+    /// the keys leave open. `annotation=` and `uncertain=`, as a prepared
+    /// database writes them, give the provenance of the header's values
+    /// ([`Allele::source`]) and the starts it doubts ([`Allele::uncertain`]).
+    /// A gapped V record keeps its IMGT numbering in [`Allele::imgt`]; the
+    /// loci come from `locus=` (as [`Self::write_fasta`] writes them), else
+    /// the label, else the header ([`Loci::infer`]).
     pub fn from_fasta(kind: SegmentKind, text: &str) -> Result<Self, GermlineError> {
         let mut set = Self::new(kind);
         for record in parse_fasta(text)? {
@@ -591,6 +600,20 @@ impl GermlineSet {
                 *slot = position(key)?;
             }
             let regions = RegionStarts::from_values(values);
+            let mut uncertain = [false; 5];
+            for key in record
+                .attribute("uncertain")
+                .into_iter()
+                .flat_map(|l| l.split(','))
+            {
+                let slot = RegionStarts::KEYS.iter().position(|&k| k == key);
+                let slot = slot.ok_or_else(|| GermlineError::BadAttribute {
+                    name: name.to_string(),
+                    key: "uncertain".to_string(),
+                    value: key.to_string(),
+                })?;
+                uncertain[slot] = true;
+            }
             let len = record.sequence.len();
             regions
                 .check(anchor, len)
@@ -628,7 +651,9 @@ impl GermlineSet {
             allele.source = meta
                 .filter(|_| meta_used)
                 .and_then(|m| m.source)
+                .or(record.attribute("annotation"))
                 .map(str::to_string);
+            allele.uncertain = uncertain;
             allele.anchor_from_meta = anchor_from_meta;
             allele.loci = match record.attribute("locus") {
                 Some(list) => {
@@ -726,6 +751,7 @@ impl GermlineSet {
             target.loci = allele.loci;
             target.frame = allele.frame;
             target.source = allele.source;
+            target.uncertain = allele.uncertain;
             target.anchor_from_meta = allele.anchor_from_meta;
         }
         *self = rebuilt;
@@ -916,6 +942,21 @@ mod tests {
         assert_eq!(again.allele(0).anchor, Some(12));
         assert!(GermlineSet::from_fasta(SegmentKind::V, ">V anchor=2 fr2=5\nACGTACGT\n").is_err());
         assert!(GermlineSet::from_fasta(SegmentKind::V, ">V cdr1=x\nACGT\n").is_err());
+    }
+
+    /// A prepared header's `annotation=` and `uncertain=` are read back as
+    /// the provenance and the doubted starts of its values.
+    #[test]
+    fn prepared_headers_give_provenance_and_uncertain_starts() {
+        let text = ">V1*01 anchor=12 fr1=0 fr3=3 annotation=transfer:V2*01 uncertain=fr1,fr3\nACGTACGTACGTACG\n";
+        let set = GermlineSet::from_fasta(SegmentKind::V, text).unwrap();
+        let allele = set.allele(0);
+        assert_eq!(allele.source.as_deref(), Some("transfer:V2*01"));
+        assert_eq!(allele.uncertain, [true, false, false, false, true]);
+        assert!(matches!(
+            GermlineSet::from_fasta(SegmentKind::V, ">V1*01 uncertain=fr9\nACGT\n"),
+            Err(GermlineError::BadAttribute { key, .. }) if key == "uncertain"
+        ));
     }
 
     /// The written FASTA keeps every allele's loci, also those read from

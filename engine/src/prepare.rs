@@ -27,10 +27,19 @@ use crate::translate::open_frames;
 /// `2` per column).
 pub const MAX_CODING_C: usize = 2000;
 
-fn label(annotations: &[AlleleAnnotation], id: u32) -> Option<String> {
-    annotations
-        .get(id as usize)
-        .map(|a| format!("annotation={}", a.source.label()))
+/// The `annotation=` and `uncertain=` tokens of a prepared V or J header:
+/// the allele's provenance ([`crate::germline::Allele::source`]) and the
+/// region starts its annotation doubts, which a reload reads back.
+fn annotation_tokens(
+    set: &GermlineSet,
+    annotations: &[AlleleAnnotation],
+    id: u32,
+) -> Option<String> {
+    let mut tokens = format!("annotation={}", set.allele(id).source.as_deref()?);
+    if let Some(field) = annotations.get(id as usize)?.uncertain_field() {
+        tokens += &format!(" {field}");
+    }
+    Some(tokens)
 }
 
 /// A germline set that could not be read or deduplicated.
@@ -352,14 +361,20 @@ impl PreparedDatabase {
         let (v_labels, j_labels) = (&self.annotation.v, &self.annotation.j);
         let mut files = vec![(
             "V.fasta",
-            text(|out| self.v.write_fasta(out, |id| label(v_labels, id))),
+            text(|out| {
+                self.v
+                    .write_fasta(out, |id| annotation_tokens(&self.v, v_labels, id))
+            }),
         )];
         if let Some(d) = &self.d {
             files.push(("D.fasta", text(|out| d.write_fasta(out, |_| None))));
         }
         files.push((
             "J.fasta",
-            text(|out| self.j.write_fasta(out, |id| label(j_labels, id))),
+            text(|out| {
+                self.j
+                    .write_fasta(out, |id| annotation_tokens(&self.j, j_labels, id))
+            }),
         ));
         if let Some(c) = &self.c {
             files.push(("C.fasta", text(|out| c.write_fasta(out, |_| None))));
