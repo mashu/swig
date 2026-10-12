@@ -3,7 +3,7 @@
 //! [`extend_outer`] stitches the co-linear V prefix or J suffix back onto a
 //! local alignment and adds its substitution score, so a V (J) alignment
 //! reaches the germline's 5′ (3′) end or the read's end, whichever comes
-//! first. The flank carries allele evidence that a local alignment would drop
+//! first, unless the flank stops looking like germline (below). The flank carries allele evidence that a local alignment would drop
 //! (a mismatch-rich 5′ end of V), and ranking on the extended score uses it.
 //!
 //! The stitch stops where the flank stops looking like germline: once its

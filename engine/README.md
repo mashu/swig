@@ -758,7 +758,6 @@ no runtime type checks.
 
 ```rust
 let experiment = DefaultAssigner::from_config(&config, v, Some(d), j)?
-    .with_adjudicator(ResidualAdjudicator::default())
     .with_d_window(ResidualWindow { overlap_margin: 2 })
     .with_d_admission(AllOf(ExactRunFloor { min_run: 5 }, MyNewGate));
 ```
@@ -954,7 +953,7 @@ therefore exact for a fixed-scale call. A D below it still carries posterior
 mass and can win a per-read call, so the floor applies only to fixed-scale
 calls without posteriors (`--no-posterior --calls fixed`): posteriors keep
 every admissible D (+1 % of instructions), and so do per-read calls. With
-several loci the floor is the lowest locus' `P_D`.
+several loci the floor is the lowest `P_D` of a locus that has D genes.
 
 ### Adjudication
 
@@ -1273,8 +1272,9 @@ Each is a named field you can change.
 5. **Windows.** D windows reclaim 12 bases into V and J (the note's rescue of
    24/10 is realised by this window and the DAG's exact cut choice). The
    conserved-anchor window is always added when anchors are present. J is
-   searched from 12 bases before the earliest end of a V that is an anchor,
-   and over the whole read when no V is.
+   searched from 12 bases before the earliest V end when some V is an
+   anchor, and over the whole read when none is; only anchors choose the
+   locus of the J and D candidates.
 6. **Significance.** V and J hits need E ≤ 1, and a call needs a V or J hit
    at E ≤ 10⁻³ (`EvalueGates`). The note has no reporting threshold.
 7. **Tie-breaks.** Equal-score paths go to fewer D, then to more germline
