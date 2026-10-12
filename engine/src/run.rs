@@ -57,6 +57,11 @@ pub const BATCH: usize = 16_384;
 /// Rows [`Run`] keeps for sequences it may see again.
 pub const CACHE: usize = 4096;
 
+/// The most negative mismatch score an option takes. Alignment scores then
+/// stay far inside `i32` on any read, and within the step the SIMD kernels
+/// admit.
+pub const MIN_MISMATCH: Score = -1_000;
+
 /// An option that is unknown, lacks its value, or cannot take the one given.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OptionError(pub String);
@@ -168,6 +173,15 @@ fn parsed<T>(
     parse(value).ok_or_else(|| OptionError(format!("--{name} expects {expects}, got '{value}'")))
 }
 
+/// The mismatch score `value` of option `name`: negative, down to
+/// [`MIN_MISMATCH`].
+fn mismatch(name: &str, value: &str) -> Result<Score, OptionError> {
+    let expects = format!("a negative score down to {MIN_MISMATCH}");
+    parsed(name, value, &expects, |v| {
+        v.parse().ok().filter(|s| (MIN_MISMATCH..0).contains(s))
+    })
+}
+
 /// A fraction in [0, 1].
 fn fraction(value: &str) -> Option<f64> {
     value.parse().ok().filter(|f: &f64| (0.0..=1.0).contains(f))
@@ -238,7 +252,6 @@ impl RunOptions {
         };
         let count = |v: &str| v.parse::<u32>().ok();
         let positive = |v: &str| v.parse::<u32>().ok().filter(|&n| n > 0);
-        let penalty = |v: &str| v.parse::<Score>().ok().filter(|s| *s < 0);
         match name {
             "profile" => {
                 self.profile = parsed(
@@ -297,12 +310,8 @@ impl RunOptions {
             "min-d-match" => {
                 self.min_d_match = Some(parsed(name, value, "a positive number", positive)?);
             }
-            "d-mismatch" => {
-                self.d_mismatch = Some(parsed(name, value, "a negative score", penalty)?);
-            }
-            "j-mismatch" => {
-                self.j_mismatch = Some(parsed(name, value, "a negative score", penalty)?);
-            }
+            "d-mismatch" => self.d_mismatch = Some(mismatch(name, value)?),
+            "j-mismatch" => self.j_mismatch = Some(mismatch(name, value)?),
             "min-j-length" => self.min_j_length = Some(parsed(name, value, "a number", count)?),
             "double-d" => {
                 self.double_d.mode =
@@ -806,6 +815,8 @@ mod tests {
             RunOptions::default().config(),
             CallingProfile::ROptimized.config()
         );
+        options.set("j-mismatch", Some("-1000")).unwrap();
+        assert_eq!(options.j_mismatch, Some(MIN_MISMATCH));
         for (name, value) in [
             ("profile", Some("best")),
             ("strand", Some("plus")),
@@ -814,6 +825,8 @@ mod tests {
             ("c-evalue", Some("0")),
             ("c-prefix-identity", Some("1.5")),
             ("d-mismatch", Some("3")),
+            ("d-mismatch", Some("-1001")),
+            ("j-mismatch", Some("-2147483648")),
             ("double-d", Some("some")),
             ("simd", Some("mmx")),
             ("profile", None),

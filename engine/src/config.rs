@@ -117,7 +117,9 @@ impl DSegmentConfig {
     /// only has a positive score. Raising the floor to that bound therefore
     /// drops nothing the gates would admit.
     pub fn lossless_min_score(&self) -> Score {
-        let run = self.scoring.matched * self.min_exact_run as Score;
+        // Saturating: a run no alignment score can reach admits nothing.
+        let run = Score::try_from(self.min_exact_run)
+            .map_or(Score::MAX, |k| self.scoring.matched.saturating_mul(k));
         let admissible = match &self.distributed {
             None => run,
             Some(gate) if gate.scoring == self.scoring => run.min(gate.min_rescore),
@@ -708,6 +710,20 @@ mod tests {
             genes,
             offsets: genes,
         }
+    }
+
+    /// An exact-run gate no score can reach raises the D floor to the
+    /// largest score instead of wrapping below the keep floor.
+    #[test]
+    fn an_unreachable_exact_run_saturates_the_d_floor() {
+        let mut d = crate::profiles::CallingProfile::ROptimized.config().d;
+        d.distributed = None;
+        for run in [1 << 30, u32::MAX] {
+            d.min_exact_run = run;
+            assert_eq!(d.lossless_min_score(), Score::MAX, "{run}");
+        }
+        d.min_exact_run = 5;
+        assert_eq!(d.lossless_min_score(), d.keep.min_score.max(10));
     }
 
     #[test]
