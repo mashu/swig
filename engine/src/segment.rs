@@ -4,10 +4,17 @@
 //! every request (a query window and its retrieved candidates) it runs:
 //!
 //! ```text
-//! candidates ─► score-only DP ─► (V, J) sibling bounds ─► rank by score
-//!            ─► traceback in waves until `top` alignments pass acceptance (+ ties)
-//!            ─► outer flank extension ─► rank ─► merge identical alignments
+//! candidates ─► score-only DP ─► (V, J) sibling bounds ─► rank by local score
+//!            ─► traceback in waves ─► acceptance ─► outer flank extension
+//!               until `top` extended scores are kept (+ ties)
+//!            ─► rank by extended score ─► merge identical alignments
 //! ```
+//!
+//! The stage's objective is the *extended* score: a V (J) is valued with
+//! its co-linear 5′ (3′) flank stitched on, as adjudication values it. The
+//! extension never raises a score, so the local score bounds the extended
+//! one, and the waves walk the local ranking until it falls below the
+//! `top`-th extended score kept.
 //!
 //! Every request of a batch is processed in the same waves, so a SIMD
 //! aligner sees one score batch and one traceback batch per wave for the
@@ -107,11 +114,13 @@ impl PreparedSegment {
 
 /// Which alignments a stage keeps per request.
 ///
-/// The stage keeps the `top` best *accepted* local alignments and every
-/// alignment tied with the last of them. A high score that fails
-/// [`HitAcceptance`] does not take a slot, so traceback proceeds in waves
-/// down the score-ranked list until `top` alignments are accepted, the list
-/// is exhausted, or `cap` candidates were traced.
+/// The stage keeps the `top` best *accepted* alignments by extended score
+/// (the local score when the stage extends no flank) and every alignment
+/// tied with the last of them. A high score that fails [`HitAcceptance`]
+/// does not take a slot, so traceback proceeds in waves down the
+/// local-score ranking until `top` alignments are accepted and the next
+/// local score is below the `top`-th extended score, the list is exhausted,
+/// or `cap` candidates were traced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeepPolicy {
     pub top: usize,
@@ -126,8 +135,9 @@ impl KeepPolicy {
     ///
     /// While fewer than `top` hits are accepted, the wave takes as many more
     /// candidates as slots are open, plus the tie group of the last one. Once
-    /// `top` are accepted, `cutoff` is the worst accepted score and the wave
-    /// takes only the remaining candidates tied with it.
+    /// `top` are accepted, `cutoff` is the `top`-th best kept score and the
+    /// wave takes the remaining candidates whose score reaches it: a score
+    /// bounds the kept (extended) score from above.
     pub fn next_wave(
         &self,
         scores: &[Score],
@@ -202,8 +212,14 @@ pub struct BatchScratch {
     /// Per request: `(candidate index, local score)` ranked by score, then
     /// by the stage's [`TieOrder`]; `Score::MAX` = not scored.
     ranked: Vec<Vec<(u32, Score)>>,
-    /// Per request: local scores of accepted alignments.
+    /// Per request: extended scores of accepted alignments, descending.
     accepted: Vec<Vec<Score>>,
+    /// Per request: siblings whose bound fell below the bounded ranking's
+    /// cutoff, `(candidate index, upper bound)`, and that cutoff, the
+    /// *barrier* the traceback waves stop at until they are settled (see
+    /// [`SegmentStage::rank_with_bounds`]).
+    deferred: Vec<Vec<(u32, Score)>>,
+    barriers: Vec<Option<Score>>,
     /// Per request: accepted placements before ranking.
     pending: Vec<Vec<Placement>>,
     /// `(request, candidate index)` of each job of the current batch.
@@ -251,7 +267,10 @@ impl BatchScratch {
         }
         clear(&mut self.ranked, requests.len());
         clear(&mut self.accepted, requests.len());
+        clear(&mut self.deferred, requests.len());
         clear(&mut self.pending, requests.len());
+        self.barriers.clear();
+        self.barriers.resize(requests.len(), None);
         self.starts.clear();
         self.starts.push(0);
         let mut total = 0;
@@ -346,7 +365,11 @@ pub struct SegmentStage<R> {
     pub accept: HitAcceptance,
     /// `None` accepts hits of any significance, and none anchors a call.
     pub significance: Option<Significance>,
-    /// Stitch the co-linear V prefix or J suffix back on after traceback, then re-rank.
+    /// Stitch the co-linear V prefix or J suffix onto every accepted
+    /// alignment; the kept alignments are ranked with it. The flank must
+    /// lie in the searched window (V windows start at the read's start, J
+    /// windows end at its end): a local optimum's flank then scores at most
+    /// 0, so the local score bounds the extended one.
     pub outer: OuterExtend,
     /// Order of equal local scores in the ranking.
     pub ties: TieOrder,
@@ -464,7 +487,7 @@ impl<R: Retriever> SegmentStage<R> {
             let out = &mut outs[request.read];
             let first = out.len();
             out.append(&mut batch.pending[index]);
-            self.finish(out, first, request.query);
+            self.finish(out, first);
         }
     }
 
@@ -528,12 +551,18 @@ impl<R: Retriever> SegmentStage<R> {
         }
         for (index, request) in requests.iter().enumerate() {
             if self.needs_scores(request) {
-                let leaders = &batch.leaders[batch.starts[index]..batch.starts[index + 1]];
-                batch.ranked[index].sort_unstable_by_key(|&(candidate, score)| {
-                    (std::cmp::Reverse(score), self.ties.key(leaders, candidate))
-                });
+                self.sort_ranked(batch, index, 0);
             }
         }
+    }
+
+    /// Sort `batch.ranked[index][from..]` by local score, ties in the
+    /// stage's [`TieOrder`].
+    fn sort_ranked(&self, batch: &mut BatchScratch, index: usize, from: usize) {
+        let leaders = &batch.leaders[batch.starts[index]..batch.starts[index + 1]];
+        batch.ranked[index][from..].sort_unstable_by_key(|&(candidate, score)| {
+            (std::cmp::Reverse(score), self.ties.key(leaders, candidate))
+        });
     }
 
     /// Score-only DP for every job in `batch.owners`: record each exact
@@ -582,20 +611,29 @@ impl<R: Retriever> SegmentStage<R> {
     ///    per candidate that ranks — `S*(R)` of a representative, `L` of a
     ///    sibling — so `c ≤ T`, the `top`-th largest exact score.
     /// 4. Decide each sibling, in this order:
-    ///    * *pruned* when `U < floor` or `U < c`: it scores below `T`, so
-    ///      it can enter neither the top `top` scores nor their ties, and
-    ///      the ranking from `T` up is that of full scoring;
+    ///    * *pruned* when `U < floor`: it does not rank;
+    ///    * *deferred* when `U < c`: it scores below `T`, so the ranking
+    ///      from `c` up is that of full scoring;
     ///    * *known* when `U = L`: that is its exact score, without DP;
     ///    * *traced now* when `L ≥ c`: it likely reaches the traceback, so
     ///      it is aligned instead of scored, its alignment's score is its
     ///      exact score ([`Aligner`]'s contract) and traceback reuses it;
     ///    * *scored* otherwise.
+    /// 5. The traceback waves stop at `c`, the request's *barrier*. Waves
+    ///    that end above it end as under full scoring: a deferred sibling
+    ///    scores below `c`, below every wave's cutoff. When they reach it,
+    ///    every deferred sibling that may still be traced is scored and
+    ///    ranked — all of them while fewer than `top` alignments are kept,
+    ///    else those with `U` at least the `top`-th kept score (the outer
+    ///    extension can put it below `c`) — and the waves continue past
+    ///    the barrier over a ranking that is, from the cutoff up, that of
+    ///    full scoring, positions included (so `cap` binds alike).
     ///
     /// Aligning representatives, the cutoff and early tracing apply only
     /// under permissive acceptance ([`HitAcceptance::is_permissive`]).
     /// Otherwise a rejected alignment makes the traceback waves refill from
-    /// below `T`, where a pruned sibling may lie, so siblings are pruned only
-    /// below the floor.
+    /// below `T`, where a deferred sibling may lie, so siblings are pruned
+    /// only below the floor.
     /// A sibling without an upper bound (another frame, or a band that is
     /// not its representative's frame band) is never pruned or known.
     fn rank_with_bounds<'a, A: Aligner>(
@@ -709,7 +747,11 @@ impl<R: Retriever> SegmentStage<R> {
                 let lower = batch.lower[slot];
                 let reaches = |bound: Score| cutoff.is_none_or(|cutoff| bound >= cutoff);
                 match upper {
-                    Some(upper) if upper < floor || !reaches(upper) => {}
+                    Some(upper) if upper < floor => {}
+                    Some(upper) if !reaches(upper) => {
+                        batch.deferred[index].push((c, upper));
+                        batch.barriers[index] = cutoff;
+                    }
                     Some(upper) if upper == lower => {
                         batch.exact[slot] = upper;
                         if ranks(upper, floor) {
@@ -848,9 +890,83 @@ impl<R: Retriever> SegmentStage<R> {
         }
     }
 
+    /// The next traceback wave of request `index` from `cursor`, stopping
+    /// at its barrier: `(end, barrier reached)`.
+    fn wave(&self, batch: &mut BatchScratch, index: usize, cursor: usize) -> (usize, bool) {
+        let ranked = &batch.ranked[index];
+        batch.scores.clear();
+        batch.scores.extend(ranked.iter().map(|&(_, s)| s));
+        let shared = batch.barriers[index].map_or(ranked.len(), |barrier| {
+            batch.scores.partition_point(|&s| s >= barrier)
+        });
+        // `accepted` is kept in descending order.
+        let accepted = &batch.accepted[index];
+        let end = self.keep.next_wave(
+            &batch.scores[..shared],
+            cursor,
+            accepted.len(),
+            self.cutoff(accepted),
+        );
+        (end, end == cursor && batch.barriers[index].is_some())
+    }
+
+    /// The `top`-th best kept score of a request, once `top` are kept.
+    fn cutoff(&self, accepted: &[Score]) -> Option<Score> {
+        self.keep
+            .top
+            .checked_sub(1)
+            .and_then(|k| accepted.get(k))
+            .copied()
+    }
+
+    /// Lift the barriers the traceback waves have reached: score and rank
+    /// the deferred siblings that may still be traced (see
+    /// [`Self::rank_with_bounds`]).
+    fn lift_barriers<'a, A: Aligner>(
+        &'a self,
+        aligner: &A,
+        requests: &[SegmentRequest<'a>],
+        dp: &mut A::Workspace,
+        batch: &mut BatchScratch,
+    ) {
+        batch.owners.clear();
+        for index in 0..requests.len() {
+            let cursor = batch.cursors[index];
+            if cursor == DONE
+                || batch.barriers[index].is_none()
+                || !self.wave(batch, index, cursor).1
+            {
+                continue;
+            }
+            batch.barriers[index] = None;
+            // At or past `cap` no further candidate is traced.
+            if cursor < self.keep.cap {
+                let reach = self.cutoff(&batch.accepted[index]).unwrap_or(Score::MIN);
+                batch.owners.extend(
+                    batch.deferred[index]
+                        .iter()
+                        .filter(|&&(_, upper)| upper >= reach)
+                        .map(|&(c, _)| (index, c)),
+                );
+            }
+        }
+        if batch.owners.is_empty() {
+            return;
+        }
+        self.score_owners(aligner, requests, dp, batch);
+        // They score below the barrier, below every candidate traced so far.
+        let mut owners = std::mem::take(&mut batch.owners);
+        owners.dedup_by_key(|&mut (index, _)| index);
+        for &(index, _) in &owners {
+            self.sort_ranked(batch, index, batch.cursors[index]);
+        }
+        batch.owners = owners;
+    }
+
     /// Traceback waves until every request has `top` accepted alignments
-    /// (plus ties), runs out of candidates, or reaches `cap`. Alignments
-    /// cached while ranking are taken, not recomputed.
+    /// (plus ties) and the next local score is below the `top`-th extended
+    /// one, runs out of candidates, or reaches `cap`. Alignments cached
+    /// while ranking are taken, not recomputed.
     fn trace<'a, A: Aligner>(
         &'a self,
         aligner: &A,
@@ -861,30 +977,21 @@ impl<R: Retriever> SegmentStage<R> {
         batch.cursors.clear();
         batch.cursors.resize(requests.len(), 0);
         loop {
+            self.lift_barriers(aligner, requests, dp, batch);
             batch.owners.clear();
-            for (index, cursor) in batch.cursors.iter_mut().enumerate() {
-                if *cursor == DONE {
+            for index in 0..requests.len() {
+                let cursor = batch.cursors[index];
+                if cursor == DONE {
                     continue;
                 }
-                let ranked = &batch.ranked[index];
-                batch.scores.clear();
-                batch.scores.extend(ranked.iter().map(|&(_, s)| s));
-                // `accepted` is kept in descending order.
-                let accepted = &batch.accepted[index];
-                let cutoff = self
-                    .keep
-                    .top
-                    .checked_sub(1)
-                    .and_then(|k| accepted.get(k))
-                    .copied();
-                let end = self
-                    .keep
-                    .next_wave(&batch.scores, *cursor, accepted.len(), cutoff);
-                batch
-                    .owners
-                    .extend(ranked[*cursor..end].iter().map(|&(c, _)| (index, c)));
+                let (end, _) = self.wave(batch, index, cursor);
+                batch.owners.extend(
+                    batch.ranked[index][cursor..end]
+                        .iter()
+                        .map(|&(c, _)| (index, c)),
+                );
                 // An empty wave changes nothing the next one depends on.
-                *cursor = if end == *cursor { DONE } else { end };
+                batch.cursors[index] = if end == cursor { DONE } else { end };
             }
             if batch.owners.is_empty() {
                 break;
@@ -926,8 +1033,9 @@ impl<R: Retriever> SegmentStage<R> {
         }
     }
 
-    /// Place a traced alignment of candidate `candidate` of `request` and
-    /// keep it when it clears the floor and acceptance.
+    /// Place a traced alignment of candidate `candidate` of `request` and,
+    /// when it clears the floor and acceptance, extend its outer flank and
+    /// keep it under its extended score.
     fn keep_alignment(
         &self,
         request: &SegmentRequest<'_>,
@@ -952,15 +1060,19 @@ impl<R: Retriever> SegmentStage<R> {
             .significance
             .is_some_and(|s| local >= s.min_score(request.window.len(), s.gates.anchor));
         if self.accept.allows(&placement.evidence) {
-            let at = accepted.partition_point(|&s| s >= local);
-            accepted.insert(at, local);
+            self.extend_outer(&mut placement, request.query);
+            let key = placement.score();
+            debug_assert!(key <= local, "the outer flank lies in the searched window");
+            let at = accepted.partition_point(|&s| s >= key);
+            accepted.insert(at, key);
             pending.push(placement);
         }
     }
 
-    /// Keep the top accepted alignments and their ties (by local score),
-    /// extend their outer flanks, rank, and merge identical alignments.
-    fn finish(&self, out: &mut Vec<Placement>, first: usize, query: &[u8]) {
+    /// Keep the top accepted alignments and their ties by extended score,
+    /// rank them, and merge identical alignments. Equal keys keep the
+    /// traceback order: local score, then the stage's [`TieOrder`].
+    fn finish(&self, out: &mut Vec<Placement>, first: usize) {
         let rank = |p: &Placement| std::cmp::Reverse((p.score(), p.evidence.longest_exact_run));
         out[first..].sort_by_key(rank);
         if self.keep.top > 0 && out.len() - first > self.keep.top {
@@ -971,10 +1083,6 @@ impl<R: Retriever> SegmentStage<R> {
                 .count();
             out.truncate(first + kept);
         }
-        for placement in &mut out[first..] {
-            self.extend_outer(placement, query);
-        }
-        out[first..].sort_by_key(rank);
         merge_identical(out, first);
     }
 
@@ -1135,6 +1243,53 @@ mod tests {
             &mut out,
         );
         out.iter().map(|p| (p.alleles.clone(), p.score())).collect()
+    }
+
+    /// The kept placements are the top ones by the *extended* score, the
+    /// stage's objective: a 5′-partial allele whose full-length sibling
+    /// scores higher locally but loses more to its stitched-on flank is the
+    /// one kept, ranked or not, bounded or not.
+    #[test]
+    fn top_cut_uses_the_extended_score() {
+        let scoring = AffineScoring::new(2, -3, -9, -1);
+        let mut next = crate::testing::rng(11);
+        let full = crate::testing::random_codes(&mut next, 60);
+        let decoy = crate::testing::random_codes(&mut next, 60);
+        let partial = full[12..].to_vec();
+        let mut set = GermlineSet::new(SegmentKind::V);
+        for (name, codes) in [
+            ("IGHV1-1*01", &full),
+            ("IGHV1-1*02", &partial),
+            ("IGHV2-1*01", &decoy),
+        ] {
+            set.push(name, decode(codes).as_bytes(), None).unwrap();
+        }
+        let segment = Arc::new(PreparedSegment::new(set, &scoring, scoring.gaps));
+        // Twelve flank bases that mismatch the full allele, but for two
+        // chance matches just before the partial allele's start.
+        let mut query: Vec<u8> = full[..12].iter().map(|&b| (b + 1) % 4).collect();
+        query[10] = full[10];
+        query[11] = full[11];
+        query.extend_from_slice(&partial);
+        let keep = KeepPolicy {
+            top: 1,
+            min_score: 1,
+            cap: 8,
+        };
+        for family_delta in [false, true] {
+            let mut stage = SegmentStage::new(Arc::clone(&segment), EmptyRetriever, keep);
+            stage.outer = OuterExtend::Prefix;
+            stage.family_delta = family_delta.then(|| FamilyBoundTable::build(&segment));
+            let candidates = [0, 1, 2].map(|allele| Candidate {
+                allele,
+                band: Band::Full,
+                votes: 0,
+            });
+            // Local: full 100 > partial 96. Extended: full 70 < partial 96.
+            assert_eq!(placed(&stage, &candidates, &query)[0], (vec![1], 96));
+            // Two candidates are traced unranked.
+            assert_eq!(placed(&stage, &candidates[..2], &query)[0], (vec![1], 96));
+        }
     }
 
     /// A request of `top + 1` candidates is ranked by score when `cap` binds
@@ -1380,9 +1535,12 @@ mod tests {
     /// alleles, their order and alignments — for batches of requests with
     /// more candidates than `top + 1` (and some with fewer), shifted frame
     /// bands with either edge moved, unbanded requests, siblings with an
-    /// inconsistent band, every `top` and `cap`, and both acceptance kinds;
-    /// and it skips the DP of some siblings entirely and aligns others
-    /// without scoring them (known exactly, or traced early).
+    /// inconsistent band, every `top` and `cap`, both acceptance kinds and
+    /// every outer extension; and it skips the DP of some siblings entirely
+    /// and aligns others without scoring them (known exactly, or traced
+    /// early). Without a binding `cap`, both keep the `top` accepted
+    /// alignments and their ties by extended score, as aligning every
+    /// candidate does.
     #[test]
     fn bounded_ranking_equals_brute_force() {
         let (segment, frames) = frame_family();
@@ -1390,12 +1548,14 @@ mod tests {
         let alleles = segment.set().len() as AlleleId;
         let mut next = crate::testing::rng(23);
         let (mut pruned, mut unscored) = (0, 0);
-        for case in 0..240 {
+        for case in 0..720 {
             let keep = KeepPolicy {
                 top: [1, 2, 3, 5][case % 4],
                 min_score: 1,
                 cap: [2, 3, 64][case / 4 % 3],
             };
+            let outer =
+                [OuterExtend::None, OuterExtend::Prefix, OuterExtend::Suffix][case / 12 % 3];
             let accept = if case % 7 == 6 {
                 HitAcceptance {
                     min_subst: 40,
@@ -1467,6 +1627,7 @@ mod tests {
             let run = |bounded: bool, aligner: &Recording| {
                 let mut stage = SegmentStage::new(Arc::clone(&segment), EmptyRetriever, keep);
                 stage.accept = accept;
+                stage.outer = outer;
                 stage.ties = TieOrder::GeneLeadersFirst;
                 stage.family_delta = bounded.then(|| table.clone());
                 let requests: Vec<SegmentRequest<'_>> = (0..3)
@@ -1494,6 +1655,43 @@ mod tests {
             let (expected, all) = run(false, &full);
             let (placed, ranked) = run(true, &bounded);
             assert_eq!(placed, expected, "case {case}");
+            // Brute force: align, accept and extend every candidate.
+            for read in (0..3).filter(|_| keep.cap >= 64) {
+                let window = starts[read]..queries[read].len();
+                let mut kept = Vec::new();
+                for candidate in &candidates[read] {
+                    let profile = segment.profile(candidate.allele);
+                    let query = &queries[read][window.clone()];
+                    let mut ws = Default::default();
+                    let alignment =
+                        BandedGotoh.align(query, profile, segment.gaps(), candidate.band, &mut ws);
+                    let Some(mut alignment) = alignment.filter(|a| a.score >= keep.min_score)
+                    else {
+                        continue;
+                    };
+                    alignment.shift_query(window.start as u32);
+                    let allele = candidate.allele;
+                    let placement =
+                        Placement::new(SegmentKind::V, allele, alignment, &queries[read], &segment);
+                    if accept.allows(&placement.evidence) {
+                        let mut alignment = placement.alignment;
+                        let reference = segment.reference(allele);
+                        extend_outer(&mut alignment, &queries[read], reference, profile, outer);
+                        kept.push((allele, alignment.score));
+                    }
+                }
+                let mut scores: Vec<Score> = kept.iter().map(|&(_, s)| s).collect();
+                if let Some(cutoff) = nth_largest(&mut scores, keep.top) {
+                    kept.retain(|&(_, s)| s >= cutoff);
+                }
+                kept.sort_unstable();
+                let mut stage: Vec<(AlleleId, Score)> = expected[read]
+                    .iter()
+                    .flat_map(|(alleles, alignment)| alleles.iter().map(|&a| (a, alignment.score)))
+                    .collect();
+                stage.sort_unstable();
+                assert_eq!(stage, kept, "case {case} read {read}");
+            }
             let ran = bounded.0.into_inner();
             for (read, request) in candidates.iter().enumerate() {
                 if request.len() <= keep.top + 1 {
