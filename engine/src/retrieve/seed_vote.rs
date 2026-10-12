@@ -5,6 +5,13 @@
 //! collect many votes on (nearly) one diagonal; the cluster's diagonal range,
 //! widened by `band_pad`, becomes the DP band.
 //!
+//! **Indels.** An indel of `n` bases moves the seeds past it `n` diagonals
+//! away, and clusters merge only diagonals a few bins apart, so an indel of
+//! more than 8 bases splits the allele's seeds into two clusters. A frame's
+//! runner-up cluster that lies within `max_indel` diagonals of its best and
+//! is not chance-sized is taken as the far side of an indel: the band spans
+//! both, and the gene is ranked on the votes of both.
+//!
 //! **Gene frames.** Seeds are indexed per gene frame ([`GeneFrames`]), not
 //! per allele, so a seed shared by a gene's alleles is one posting and one
 //! vote. Retrieval ranks genes; every allele of a kept gene becomes a
@@ -57,6 +64,11 @@ pub struct SeedVoteParams {
     /// side, at most `2 · band_max + 1` diagonals wide.
     pub band_pad: i32,
     pub band_max: i32,
+    /// A frame's runner-up cluster within this many diagonals of its best
+    /// (both clusters' extent), holding at least 3 primary seeds and 1/8 of
+    /// the best's votes, is the far side of an indel of up to this length:
+    /// the band spans both clusters and their votes add.
+    pub max_indel: i32,
     /// Ignore seed geometry and align unbanded (`w < 0` in the note).
     pub unbanded: bool,
     /// Minimum weighted votes for an allele to be a candidate.
@@ -76,6 +88,7 @@ impl Default for SeedVoteParams {
             cluster_gap_bins: 1,
             band_pad: 8,
             band_max: 256,
+            max_indel: 64,
             unbanded: false,
             min_votes: 1,
             // Every k-mer: with the noise-based gene margin, sampled seeds
@@ -123,6 +136,16 @@ impl VoteLayout {
     /// Sort-key bits above the weight.
     fn key_bits(&self, alleles: usize) -> u32 {
         self.diagonal_bits + (64 - (alleles as u64).leading_zeros())
+    }
+}
+
+/// Keep the two strongest clusters of a frame; a tie keeps the earlier one
+/// (the lower diagonals).
+fn rank_cluster(best: &mut ClusterVote, second: &mut ClusterVote, cluster: ClusterVote) {
+    if cluster.votes > best.votes {
+        *second = std::mem::replace(best, cluster);
+    } else if cluster.votes > second.votes {
+        *second = cluster;
     }
 }
 
@@ -238,7 +261,9 @@ impl<B: CandidateBudget> SeedVoteRetriever<B> {
         }
     }
 
-    /// Sort votes and keep each frame's best diagonal cluster. Returns the best cluster's votes.
+    /// Sort votes and keep each frame's best diagonal cluster, joined with
+    /// the far side of an indel ([`Self::join_indel`]). Returns the
+    /// strongest frame's votes.
     fn cluster(
         &self,
         layout: &VoteLayout,
@@ -255,12 +280,13 @@ impl<B: CandidateBudget> SeedVoteRetriever<B> {
         let mut i = 0;
         while i < keys.len() {
             let (target, d0, w0) = layout.unpack(keys[i]);
-            let mut best = ClusterVote {
+            let empty = ClusterVote {
                 target,
                 votes: 0,
                 d_lo: d0,
                 d_hi: d0,
             };
+            let (mut best, mut second) = (empty, empty);
             let mut current = ClusterVote {
                 target,
                 votes: w0,
@@ -277,9 +303,7 @@ impl<B: CandidateBudget> SeedVoteRetriever<B> {
                     current.votes += w;
                     current.d_hi = d;
                 } else {
-                    if current.votes > best.votes {
-                        best = current;
-                    }
+                    rank_cluster(&mut best, &mut second, current);
                     current = ClusterVote {
                         target,
                         votes: w,
@@ -289,13 +313,33 @@ impl<B: CandidateBudget> SeedVoteRetriever<B> {
                 }
                 i += 1;
             }
-            if current.votes > best.votes {
-                best = current;
-            }
-            strongest = strongest.max(best.votes);
-            out.push(best);
+            rank_cluster(&mut best, &mut second, current);
+            let vote = self.join_indel(best, second);
+            strongest = strongest.max(vote.votes);
+            out.push(vote);
         }
         strongest
+    }
+
+    /// `best` spanning `second` too when that is the far side of an indel:
+    /// within `max_indel` diagonals, and too strong for a chance cluster
+    /// (3 primary seeds) or a stray repeat (1/8 of the best's votes).
+    fn join_indel(&self, best: ClusterVote, second: ClusterVote) -> ClusterVote {
+        let (d_lo, d_hi) = (best.d_lo.min(second.d_lo), best.d_hi.max(second.d_hi));
+        let floor = 3 * u32::from(self.params.primary_weight);
+        if second.votes >= floor
+            && second.votes.saturating_mul(8) >= best.votes
+            && d_hi - d_lo <= self.params.max_indel
+        {
+            ClusterVote {
+                votes: best.votes + second.votes,
+                d_lo,
+                d_hi,
+                ..best
+            }
+        } else {
+            best
+        }
     }
 
     /// Band of `allele` from its frame's cluster: allele diagonals are frame
@@ -558,5 +602,30 @@ mod tests {
         let seeds = 60 - 9 + 1;
         assert_eq!(out[0].allele, 0, "{out:?}");
         assert_eq!(out[0].votes, 4 * seeds, "{out:?}");
+    }
+
+    /// A deletion or insertion of 9–30 bases at germline 180 puts the seeds
+    /// past it on a diagonal `len` away: the band spans both sides.
+    #[test]
+    fn band_spans_both_sides_of_a_long_indel() {
+        let mut next = crate::testing::rng(3);
+        let germline = crate::testing::random_codes(&mut next, 300);
+        let mut set = GermlineSet::new(SegmentKind::V);
+        push_codes(&mut set, "IGHV1-1*01", &germline);
+        let retriever = retriever(&set);
+        for len in [9usize, 12, 18, 30] {
+            let deleted = [&germline[..180], &germline[180 + len..]].concat();
+            let filler = crate::testing::random_codes(&mut next, len);
+            let inserted = [&germline[..180], &filler[..], &germline[180..]].concat();
+            for (query, far) in [(deleted, -(len as i64)), (inserted, len as i64)] {
+                let mut out = Vec::new();
+                retriever.retrieve(&query, &mut RetrievalScratch::default(), &mut out);
+                // Germline 100 lies on diagonal 0, germline 250 on diagonal `far`.
+                let band = out[0].band;
+                assert!(band.contains(100, 100), "{len}: 5′ side, band {band:?}");
+                let row = (250 + far) as usize;
+                assert!(band.contains(row, 250), "{len}: 3′ side, band {band:?}");
+            }
+        }
     }
 }
