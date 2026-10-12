@@ -836,7 +836,7 @@ fn annotation_loci(set: &GermlineSet) -> Vec<Option<Locus>> {
 }
 
 /// [`annotate`] each locus of the database on its own
-/// ([`annotation_loci`]): V and J alleles of one locus share a chain type,
+/// (`annotation_loci`): V and J alleles of one locus share a chain type,
 /// an FR3 length model and Cys23 priors, which differ between loci (heavy
 /// and light chains, TR loci). A database of one locus is annotated as a
 /// whole.

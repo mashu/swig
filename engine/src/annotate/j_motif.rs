@@ -28,7 +28,7 @@ impl JHit {
         (3 * self.codon + self.frame) as u32
     }
 
-    /// `+1` heavy (`W`), `−1` light (`F`) ([`residue_vote`]).
+    /// `+1` heavy (`W`), `−1` light (`F`) (`residue_vote`).
     pub fn chain_vote(&self) -> i8 {
         residue_vote(self.residue)
     }

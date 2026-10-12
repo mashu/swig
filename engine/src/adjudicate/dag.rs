@@ -8,9 +8,9 @@
 //! clipped independently: the earlier of two consecutive placements keeps
 //! query bases before its **exit cut** `x`, the later one keeps bases from
 //! its **entry cut** `y ≥ x` on, and the bases in between are N/P. This is
-//! the full segmentation model: when two placements overlap, AER-R's
-//! candidate A (D wins the overlap), candidate B (V/J win it), every
-//! allocation in between, and leaving any part of the overlap or of either
+//! the full segmentation model: when two placements overlap, the cut where
+//! D wins the overlap, the cut where V/J win it, every allocation in
+//! between, and leaving any part of the overlap or of either
 //! alignment to N/P are all evaluated exactly. The first segment keeps its
 //! start and the last its end (V and J are extended to the read's ends on
 //! purpose, see [`crate::flank::extend_outer`]).

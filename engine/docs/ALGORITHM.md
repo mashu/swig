@@ -52,7 +52,7 @@ placements that the grammar allows (`adjudicate/model.rs`), with their
 retained bases in read order:
 
 ```text
-V → D{0..max_d} → J,     partial paths allowed (V…, …J, V…J);  max_d = 1 (VDJ) or 2 (VDDJ)
+V → D{0..max_d} → J,     partial paths allowed (V…, …J, V…J);  max_d = 1 (VDJ), 0 (VJ)
 ```
 
 Between two consecutive placements there are two *cuts*: the first keeps
@@ -62,14 +62,14 @@ then *clipped* to the alignment columns it keeps. Overlapping placements may
 therefore split the overlap at any point, or leave part of it to neither.
 Only the cuts order two segments of different kinds: a D may precede a J
 whose alignment starts before the D's, as long as the J is entered after the
-D's exit. Two segments of one kind (tandem D) follow the order of their
-alignment starts.
+D's exit. Two segments of one kind (a grammar with `max_d > 1`) follow the
+order of their alignment starts.
 
 ### 2.3 Objective
 
 ```text
 score(path) = Σ_segments S_clip(segment)
-            − P_D · #D − tandem · [second D]
+            − P_D · #D − P_J · #J
             + pair_bonus · [path starts with V and ends with J]  (0 by default)
             + insertion_per_base · #N/P bases                    (0 by default)
 ```
@@ -116,7 +116,13 @@ The non-alignment terms are log prior odds in score units:
   was found by measuring (ASSESSMENT §9.9). The per-read window, `m = W`,
   measured worse on every set: long junctions carry a D more often, which
   outweighs their larger chance-hit count.
-- **`tandem`**: the prior odds of a second D (DJ → DDJ), on top of its own `P_D`.
+- **`P_J`, J presence** (`ObjectiveConfig::j_prior`). The rule of `Derived`
+  over the J database: `N` J genes at `L = 25` positions, even odds, so
+  `P*_J = ln(N·L)/λ_J` (7.91 for the 6 human IGHJ genes). Without it any J
+  clip of positive score completed a path for free, and a read that stops
+  before its J got one from a few chance bases: on 3,000 mid and 3,000 hard
+  IGH reads cut before the J, spurious J calls were 7.9 % and 9.6 %, and are
+  0.9 % and 1.8 % with it. V pays nothing.
 - **`pair_bonus`**: the prior odds of a complete V…J rearrangement against a
   partial read. It is 0 by default: on full-length reads the J's own clip
   score completes the path, and values 0–48 changed no call.
@@ -147,7 +153,10 @@ query window that was searched:
 - A hit is kept only at **E ≤ 1**: at most one chance hit of that score is
   expected.
 - A read is *called* only when its path contains an **anchor**, a V or J hit
-  at **E ≤ 10⁻³** (`segment::EvalueGates`, `Placement::anchor`).
+  at **E ≤ 10⁻³** (`segment::EvalueGates`, `Placement::anchor`) whose clip on
+  that path still reaches the anchor score (`Placement::anchors`). A path
+  that keeps only a few bases of an anchoring V beside a chance J is not
+  called. The same test applies to a path decoded from the posterior.
 
 Random sequence therefore receives no call. A J downstream of a significant V
 needs only E ≤ 1, because given the V a J is expected there.
@@ -244,7 +253,7 @@ silent error. The bit is set for:
 Placements are nodes, sorted by segment kind (V, D, J), then read start.
 Every transition between kinds goes forward in this order wherever the two
 alignments start, and the cuts alone decide whether it is feasible
-(`x ≤ y`); two segments of one kind (tandem D) follow the order of their
+(`x ≤ y`); two segments of one kind (`max_d > 1`) follow the order of their
 starts. The paths through a node with a given D count and first segment kind
 form a **slot**. A slot holds one value
 per canonical entry cut `y` of the node: the best key (score, then germline
@@ -292,8 +301,9 @@ distribution. Every term is an integer in units of `1/F` nats, `F = 2¹⁶`:
 
 ```text
 column(kind, s)  = s·u_r + v_r     u_r = round(F·λ_r(p̂)),  v_r = round(F·μ_r(p̂))   (0 for s = 0)
-gap, ι, tandem, pair bonus scoring k:   k·u0,   u0 = round(F·λ)
+gap, ι, pair bonus scoring k:   k·u0,   u0 = round(F·λ)
 D cost  c_D(p̂)   = (P*_D / m)·ln 4(1 − p̂)  =  ⌊P*_D·(m·u_D + v_D)/m⌋ units
+J cost  c_J(p̂)   = (P*_J / m)·ln 4(1 − p̂), the same with the J scores
 ```
 
 with `(λ_r, μ_r)` the per-column log-odds of §4a and `m` the D match score.
@@ -398,8 +408,8 @@ is worth `ln 4(1 − p̂)` and a mismatch `ln(4p̂/3)`: the log-odds of
 (`s = 0`) is worth 0, as it is to the scoring: it supports neither
 hypothesis. Gaps stay at the prior λ, because `p̂` measures substitutions, not
 indels. Each segment kind uses its own match/mismatch scores. The prior
-terms (pair bonus, tandem, `ι`) stay at the λ they were derived with, and a D
-costs `c_D(p̂)` (§4). At `p̂ = 11.2 %`, `λ_r = λ` and `μ_r = 0`. The map is
+terms (pair bonus, `ι`) stay at the λ they were derived with, and a D
+costs `c_D(p̂)`, a J `c_J(p̂)` (§4). At `p̂ = 11.2 %`, `λ_r = λ` and `μ_r = 0`. The map is
 affine per column, so clip scores stay separable in their cuts. With
 `--calls fixed` the call keeps the fixed scores while the posterior reads
 this evidence unquantised with the D cost `λ·P*_D`; its mode can then differ
@@ -482,7 +492,7 @@ call it changes 0.3–1.1 % of rows and gains D allele accuracy significantly
 only on human hard reads (+0.25 pp, p 6·10⁻⁵; syn.hard +0.14, p 0.017; mid
 sets within noise), with D-free reads untouched; on the fixed-scale call it
 gains +0.20 and +0.27 pp (mid, hard). It needs posteriors, so
-`--no-posterior` and `--residual` report the call's allele.
+`--no-posterior` reports the call's allele.
 
 **Theorem 2.** The marginals equal exhaustive summation over all grammatical
 paths and canonical cut pairs (unit tests in `adjudicate/posterior.rs`):
@@ -572,8 +582,8 @@ E_C(S) = N_C · (2s + 1) · e^(−λS)
 for the clipped score `S`, reported as `c_support`. C is called iff
 `E_C ≤ 10⁻³` (`--c-evalue`), the gate of a hit that must stand on its own:
 C is not implied by V(D)J. For `(2, −3)` that is `S ≥ 18` (nine exact
-bases) for the 10 human IGHC genes. `N_C` counts every gene of the file, so
-one C database per locus keeps the gate tight. On about 4,000 C-free reads
+bases) for the 10 human IGHC genes. `N_C` counts the C genes of the read's
+(J's) locus: a database of several loci gets one gate per locus. On about 4,000 C-free reads
 per 20,000-read hard set, the false-call rate is 2–6× below the bound at
 every gate from 1 to 10⁻³ (ASSESSMENT §11).
 
@@ -611,10 +621,10 @@ step can lose.
 | V scoring | `segment.rs`, `family_bound.rs` | lossless | Score-only DP on one representative `R` per gene frame (most votes, then the frame's medoid, then lowest id). A sibling `A` in `R`'s frame diagonals satisfies `L ≤ S*(A) ≤ S*(R) + Δ(R, A)`: `Δ` sums the best profile gain per frame position both cover plus the best score where only `A` does; `L` is a traced representative path clipped to `A`'s span and rescored with `A`'s profile. The cutoff `c` is the 3rd largest of one lower bound per candidate, so `c ≤` the exact 3rd score. `A` is skipped when `U < c`, known when `U = L`, aligned outright when `L ≥ c` (its traceback reused), scored otherwise. The ranking from the 3rd score up is that of full scoring; ties follow an explicit key (gene leaders first, then retrieval order), never the schedule. Under a length or identity floor only `U <` floor prunes. |
 | J scoring | `segment.rs`, `family_bound.rs` | lossless | The same bounds with each gene one frame, its alleles at offset 0 (sound because J is unbanded); ties in allele order. |
 | V/J keep | `segment.rs` | defined | Trace back until the top 3 alignments with E ≤ 1, plus ties. No length or identity floor: a positive `(2, −3)` local alignment has identity > 3/5 and the E-value implies a length. |
-| J | `retrieve/exhaustive.rs`, `window.rs` | bounded | Every J allele, unbanded, in `[min V end − 12, read end)`: a J can reach back into V only through chance edge matches. Whole-read J search is 18 % slower and changes a few hard-preset calls (D −0.04 pp, J −0.02 pp), none on mid. The J is not placed jointly with the D, yet it does not "eat" it: the D windows reach 12 bases into J and include the conserved-anchor window, and the DAG orders segments by kind, so a D can precede a J whose alignment reaches back over it and the cuts give any J/D overlap to whichever explains it better. With a D remnant ≥ 8 nt (`examples/d_errors.rs`, human IGH), a missing D whose bases the called J covers is 0.00 % of reads on mid and hard, and a true D outside the windows 0 %; whole-read J lets 0.05 % fall outside. |
+| J | `retrieve/exhaustive.rs`, `window.rs` | bounded | Every J allele, unbanded, in `[min V end − 12, read end)` over the V placements that are anchors (E ≤ 10⁻³), or the whole read when none is: a chance V hit on a read without V (one starting in CDR3) no longer pushes the window past the J. A J can reach back into V only through chance edge matches. Whole-read J search is 18 % slower and changes a few hard-preset calls (D −0.04 pp, J −0.02 pp), none on mid. The J is not placed jointly with the D, yet it does not "eat" it: the D windows reach 12 bases into J and include the conserved-anchor window, and the DAG orders segments by kind, so a D can precede a J whose alignment reaches back over it and the cuts give any J/D overlap to whichever explains it better. With a D remnant ≥ 8 nt (`examples/d_errors.rs`, human IGH), a missing D whose bases the called J covers is 0.00 % of reads on mid and hard, and a true D outside the windows 0 %; whole-read J lets 0.05 % fall outside. |
 | D windows | `window.rs` | bounded | `[best V end − 12, best J start + 12)` plus the conserved-anchor window `[V Cys104 + 3, J Trp/Phe118)`. |
 | D prefilter | `retrieve/lmer_mask.rs` | lossless w.r.t. gates | Shares ≥ 1 L-mer, with `L` derived from the gates (`min_d_match`; 4 with the optional distributed-D gate, by pigeonhole). |
-| D floor | `config.rs`, `adjudicate/model.rs` | lossless for the call | Only when the DAG computes no posteriors (`--no-posterior`; `--residual` turns posteriors off): score ≥ max(gate floor, `P_D + 1`). By Lemma 1 a D at or below `P_D` adds ≤ 0, and dropping it leaves its neighbours' cuts valid (exit ≤ entry), so the no-D path is at least as good (requires `ι = 0`, the default). With posteriors every admissible D is kept: a D below the floor cannot be called but carries mass `e^{s − P_D}`, and dropping it would bias `d_presence_posterior` down. |
+| D floor | `config.rs`, `adjudicate/model.rs` | lossless for the call | Only when the DAG computes no posteriors (`--no-posterior`): score ≥ max(gate floor, `P_D + 1`). By Lemma 1 a D at or below `P_D` adds ≤ 0, and dropping it leaves its neighbours' cuts valid (exit ≤ entry), so the no-D path is at least as good (requires `ι = 0`, the default). With posteriors every admissible D is kept: a D below the floor cannot be called but carries mass `e^{s − P_D}`, and dropping it would bias `d_presence_posterior` down. |
 | C | `constant.rs`, `retrieve/reach.rs` | exact for `\|δ\| ≤ s` | One anchored job per reach class, window `[x − s − 1, n)`, band `[0, 2s]`; the anchor column makes the local optimum the anchored one. Net indel drift inside C beyond `s ∓ δ` truncates the alignment. |
 | D admission | `admission.rs` | defined | Exact run ≥ `min_d_match` = 4 (3, 5 and 6 are all worse). The note's distributed-evidence alternative is optional and off: it admitted no D that changed a call. |
 
@@ -679,7 +689,6 @@ Metrics (`sim/evaluate.rs`):
 - boundary error;
 - D presence by remnant length;
 - junction exactness;
-- a random-read negative control;
 - for reads simulated with C (`simulate --c`), C by the length of the C part
   against **anchored** equivalence: an allele is equivalent when its germline
   from its own splice offset equals the simulated C bases. Containment

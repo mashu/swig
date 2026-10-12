@@ -432,7 +432,8 @@ impl From<FastaError> for GermlineError {
     }
 }
 
-/// All alleles of one segment kind for one locus.
+/// All alleles of one segment kind, possibly from several loci
+/// ([`Allele::loci`], [`GermlineSet::loci`]).
 #[derive(Clone, Debug)]
 pub struct GermlineSet {
     kind: SegmentKind,

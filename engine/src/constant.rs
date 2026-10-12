@@ -44,8 +44,8 @@
 //! ([`crate::segment::EvalueGates::anchor`]): C is not implied by V(D)J, it
 //! depends on the library. For `(2, −3)` scoring
 //! (`λ = 0.634`) that is `S ≥ 18` for the 10 human IGHC genes. `N_C`
-//! counts every gene of the C database, so one database per locus keeps the
-//! gate tight. This is not the K·m·n E-value of V, D and J.
+//! counts the C genes of the read's (J's) locus: a database of several loci
+//! gets one gate per locus. This is not the K·m·n E-value of V, D and J.
 //!
 //! **Posterior.** Among the read's C placements (the best `top` classes and
 //! ties), a placement's weight is the log-odds of its alignment at C's own

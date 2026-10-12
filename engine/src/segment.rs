@@ -1,6 +1,7 @@
 //! One segment kind's search stage: prepared database + retriever + keep policy.
 //!
-//! `SegmentStage` is the unit reused for V, D and J (and would be for C). For
+//! `SegmentStage` is the unit reused for V, D, J and C (C as
+//! `SegmentStage<ReachClasses>`, see [`crate::constant`]). For
 //! every request (a query window and its retrieved candidates) it runs:
 //!
 //! ```text

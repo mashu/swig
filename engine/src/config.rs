@@ -92,7 +92,7 @@ pub struct DSegmentConfig {
     pub keep: KeepPolicy,
     /// `min_d_match`.
     pub min_exact_run: u32,
-    /// Distributed-D gate (`None` = disabled; the note makes it AER-R only).
+    /// Distributed-D gate (`None` = disabled, the default).
     pub distributed: Option<DistributedEvidence>,
 }
 

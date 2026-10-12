@@ -182,7 +182,6 @@ fn fraction(value: &str) -> Option<f64> {
     value.parse().ok().filter(|f: &f64| (0.0..=1.0).contains(f))
 }
 
-
 /// `scoring` with mismatch score `mismatch`.
 fn with_mismatch(scoring: AffineScoring, mismatch: Score) -> AffineScoring {
     AffineScoring::new(

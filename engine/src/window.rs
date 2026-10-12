@@ -102,7 +102,7 @@ impl DWindowPolicy for ExpandedResidual {
 }
 
 /// Adds the conserved-anchor window `[q(V Cys) + 3, q(J Trp/Phe))` — the
-/// CDR3 interior — as a second location hypothesis (AER-R). Anchors are
+/// CDR3 interior — as a second location hypothesis for D. Anchors are
 /// projected through the best V and J alignments (extrapolated along their
 /// diagonals when the anchor lies outside the aligned part).
 pub struct WithAnchorWindow<P> {

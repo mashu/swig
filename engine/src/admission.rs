@@ -55,8 +55,8 @@ impl Admission for ExactRunFloor {
     }
 }
 
-/// AER-R distributed-D gate: many aligned columns at high identity, rescored
-/// under a fixed tuple.
+/// Distributed-D gate: many aligned columns at high identity, rescored under
+/// a fixed tuple.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DistributedEvidence {
     pub min_columns: u32,

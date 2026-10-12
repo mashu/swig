@@ -1,4 +1,5 @@
-//! Minimal FASTA reader shared by germline loading and query input.
+//! Minimal FASTA reader for germline databases (query reads use
+//! [`crate::reads`]).
 
 use std::fmt;
 
