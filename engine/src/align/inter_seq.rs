@@ -60,7 +60,7 @@ use super::lanes::Simd128;
 #[cfg(target_arch = "x86_64")]
 use super::lanes::{Avx2, Avx512};
 use super::lanes::{Kernel, Lanes, Portable};
-use super::{AlignJob, Aligner, Alignment, Op, ScoreHit};
+use super::{AlignJob, Aligner, Alignment, ScoreHit};
 use crate::alphabet::N;
 use crate::band::Band;
 use crate::scoring::{GapCosts, Score, SubstitutionProfile};
@@ -356,12 +356,10 @@ fn lane_rows<T: Copy, const L: usize>(buffer: &mut Vec<T>, rows: usize, value: T
     buffer.as_chunks_mut::<L>().0
 }
 
-/// Best cell and (for traceback passes) the alignment start and columns.
+/// A lane's best local score and, on a traceback pass, its alignment.
 struct LaneResult {
     score: Score,
-    row: usize,
-    col: usize,
-    start: Option<(usize, usize, Vec<Op>)>,
+    alignment: Option<Alignment>,
 }
 
 /// Reference indices `j0` whose layout position `t = j0 + offset` lies in
@@ -569,10 +567,13 @@ where
                 del = next_del;
                 del_extends = next_extends;
 
-                let improved = score.gt(best);
+                if TRACE {
+                    // The end cell seeds traceback; the score pass needs only the score.
+                    let improved = score.gt(best);
+                    best_row = V::select(improved, row_vector, best_row);
+                    best_k = V::select(improved, k_vector, best_k);
+                }
                 best = best.max(score);
-                best_row = V::select(improved, row_vector, best_row);
-                best_k = V::select(improved, k_vector, best_k);
             }
         }
         let mut out = LaneBest {
@@ -630,23 +631,23 @@ fn run_group<K, const L: usize, const DIAG: bool, const TRACE: bool>(
             emit(lane.job, None);
             continue;
         }
-        let (row, col) = lane.cell_of::<DIAG>(best.row[l] as usize, best.k[l] as usize);
-        let start = TRACE.then(|| {
-            traceback_with(
+        let alignment = TRACE.then(|| {
+            let (row, col) = lane.cell_of::<DIAG>(best.row[l] as usize, best.k[l] as usize);
+            let (q_start, r_start, ops) = traceback_with(
                 |i, j| lane.trace_code::<DIAG, L>(trace, width, l, i, j),
                 row,
                 col,
-            )
-        });
-        emit(
-            lane.job,
-            Some(LaneResult {
+            );
+            Alignment {
+                q_start: q_start as u32,
+                q_end: row as u32,
+                r_start: r_start as u32,
+                r_end: col as u32,
                 score,
-                row,
-                col,
-                start,
-            }),
-        );
+                ops,
+            }
+        });
+        emit(lane.job, Some(LaneResult { score, alignment }));
     }
 }
 
@@ -756,11 +757,7 @@ impl Aligner for InterSequenceGotoh {
         out.clear();
         out.resize(jobs.len(), None);
         self.simd_groups::<false>(jobs, ws, |job, result| {
-            out[job] = result.map(|r| ScoreHit {
-                score: r.score,
-                q_end: r.row as u32,
-                r_end: r.col as u32,
-            });
+            out[job] = result.map(|r| ScoreHit { score: r.score });
         });
         for &index in &ws.scalar_jobs {
             let job = &jobs[index];
@@ -778,17 +775,7 @@ impl Aligner for InterSequenceGotoh {
         out.clear();
         out.resize(jobs.len(), None);
         self.simd_groups::<true>(jobs, ws, |job, result| {
-            out[job] = result.map(|r| {
-                let (q_start, r_start, ops) = r.start.expect("traceback pass records the start");
-                Alignment {
-                    q_start: q_start as u32,
-                    q_end: r.row as u32,
-                    r_start: r_start as u32,
-                    r_end: r.col as u32,
-                    score: r.score,
-                    ops,
-                }
-            });
+            out[job] = result.map(|r| r.alignment.expect("a traceback pass aligns"));
         });
         for &index in &ws.scalar_jobs {
             let job = &jobs[index];
