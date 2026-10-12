@@ -150,9 +150,11 @@ pub struct Marginals {
 }
 
 impl Marginals {
-    /// Probability that the path contains at least one D.
+    /// Probability that the path contains at least one D: `+0.0` when no
+    /// path can hold one (an empty `f64` sum is `−0.0`). Summed over the D
+    /// counts, not `1 − P(no D)`, which loses a small probability.
     pub fn d_present(&self) -> f64 {
-        self.d_count.iter().skip(1).sum()
+        self.d_count.iter().skip(1).fold(0.0, |sum, p| sum + p)
     }
 }
 
@@ -1293,6 +1295,25 @@ mod tests {
             placement(SegmentKind::J, &query, &query[260..360], 260),
         ];
         check_fixed(&dag, &short, EvidenceScale::at_divergence(0.01, 2, -3));
+    }
+
+    /// A lattice without a D (a light chain, or a D-free database) has one
+    /// D count: D presence is `+0.0`, which prints as `0.000000`.
+    #[test]
+    fn d_presence_without_a_d_class_is_positive_zero() {
+        let (_, placements) = junction();
+        let dag = PlacementDag::new(VdjGrammar::VJ, EngineeringObjective::default(), [4, 3, 4]);
+        let nats = PathNats {
+            lambda: LAMBDA,
+            evidence: [EvidenceScale::fixed(LAMBDA); 3],
+            d_cost: LAMBDA * dag.model.d_presence,
+        };
+        let m = dag
+            .posterior(&placements, &nats, &mut PosteriorScratch::default())
+            .expect("a path exists");
+        assert_eq!(m.d_count.len(), 1);
+        assert!(m.d_present().is_sign_positive(), "{}", m.d_present());
+        assert_eq!(crate::report::probability(m.d_present()), "0.000000");
     }
 
     #[test]
