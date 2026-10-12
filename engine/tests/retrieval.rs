@@ -148,3 +148,51 @@ fn reads_starting_in_cdr3_keep_their_j() {
         "J gene right {default}, whole-read search {whole}"
     );
 }
+
+/// Alleles A and B of one gene differ only at germline position 5. A read
+/// holds A from position 30, behind 30 bases of adapter that match neither
+/// allele except at position 5, where they carry B's base. The adapter is
+/// not V: once the stitch has seen enough of it to drop, the call must not
+/// depend on it.
+#[test]
+fn non_v_bases_before_a_truncated_v_do_not_pick_the_allele() {
+    let db = database();
+    let a = db.v.alleles()[0].codes.clone();
+    let mut b = a.clone();
+    b[5] = (b[5] + 1) % 4;
+    let mut v = GermlineSet::new(SegmentKind::V);
+    v.push("IGHV1-1*01", decode(&a).as_bytes(), None).unwrap();
+    v.push("IGHV1-1*02", decode(&b).as_bytes(), None).unwrap();
+    for allele in &db.v.alleles()[1..] {
+        if !allele.name.starts_with("IGHV1-1*") {
+            v.push(&allele.name, decode(&allele.codes).as_bytes(), None)
+                .unwrap();
+        }
+    }
+    let assigner = assigner(&v, &db, &EngineConfig::default());
+    let mut adapter: Vec<u8> = (0..30).map(|i| (a[i] + 2) % 4).collect();
+    adapter[5] = b[5];
+    let mut query = adapter;
+    query.extend_from_slice(&a[30..]);
+    query.extend_from_slice(&encode(b"GGTACTAC"));
+    query.extend_from_slice(&db.j.alleles()[0].codes);
+    let mut workspace = assigner.workspace();
+    let call = assigner.assign(&query, &mut workspace);
+    let called = names(&assigner, &call, SegmentKind::V);
+    let start = called_v_start(&call);
+    println!("V {called:?} from germline {start:?}");
+    assert!(
+        called.iter().any(|n| n == "IGHV1-1*01") && called.iter().any(|n| n == "IGHV1-1*02"),
+        "V call {called:?}"
+    );
+    // A mismatch costs 3, so at most 10 adapter bases (a drop of 30) are
+    // stitched on.
+    assert!(
+        start.is_some_and(|s| s >= 20),
+        "V starts at germline {start:?}"
+    );
+}
+
+fn called_v_start(call: &Call) -> Option<u32> {
+    called(call, SegmentKind::V).map(|p| p.alignment.r_start)
+}
