@@ -615,15 +615,8 @@ impl Assigner {
         let objective = config
             .objective
             .resolve(d.as_ref(), &config.d, &j, &config.j.scoring);
-        let substitution = |s: &AffineScoring| (s.matched, s.mismatch);
-        let evidence = KarlinAltschul::ungapped(&config.v.scoring).map(|ka| EvidenceModel {
-            lambda: ka.lambda,
-            substitution: [
-                substitution(&config.v.scoring),
-                substitution(&config.d.scoring),
-                substitution(&config.j.scoring),
-            ],
-        });
+        let evidence =
+            EvidenceModel::new([&config.v.scoring, &config.d.scoring, &config.j.scoring]);
         let adjudicator = PlacementDag {
             evidence,
             calls: config.calls,
@@ -907,6 +900,24 @@ mod tests {
             .map(|(locus, dag)| (*locus, j_cost(dag)))
             .collect();
         assert_eq!(by_locus, [(Locus::Igh, cost(3)), (Locus::Igk, cost(2))]);
+    }
+
+    /// The fixed-scale posterior reads each presence cost at the λ of the
+    /// scoring it was derived with: the D's, not the V's.
+    #[test]
+    fn presence_costs_are_read_at_their_own_lambda() {
+        let mut config = EngineConfig::default();
+        config.d.scoring = AffineScoring::new(2, -4, -13, -1);
+        let db = crate::sim::SyntheticDatabase::generate(&crate::sim::SyntheticSpec::default(), 5);
+        let assigner = Assigner::from_config(&config, db.v, Some(db.d), db.j).unwrap();
+        let evidence = assigner.adjudicator.evidence.expect("an evidence model");
+        let lambda = |s: &AffineScoring| KarlinAltschul::ungapped(s).unwrap().lambda;
+        assert_eq!(evidence.lambda, lambda(&config.v.scoring));
+        assert_eq!(
+            evidence.presence_lambda,
+            [&config.v.scoring, &config.d.scoring, &config.j.scoring].map(lambda)
+        );
+        assert_ne!(evidence.presence_lambda[1], evidence.lambda);
     }
 
     #[test]

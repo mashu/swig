@@ -789,10 +789,8 @@ mod tests {
 
     /// `(2, −3)` scored at the KA λ0 for every kind.
     fn evidence() -> EvidenceModel {
-        EvidenceModel {
-            lambda: 0.633_731_443_097_907_7,
-            substitution: [(2, -3); 3],
-        }
+        let scoring = crate::scoring::AffineScoring::new(2, -3, -9, -1);
+        EvidenceModel::new([&scoring; 3]).expect("λ")
     }
 
     /// A read with two D candidates in its N region: an exact 7-mer (score

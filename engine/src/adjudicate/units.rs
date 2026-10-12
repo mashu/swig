@@ -24,9 +24,11 @@
 //! Every term of a path is then an integer, so the DAG's maximum and its ties
 //! are exact, and the posterior reads the same integers as nats,
 //! `P(path, cuts) ∝ e^{units/F}` ([`ReadModel::nats`]): the call is a mode of
-//! the reported distribution. At `p̂ = δ0`, `u_r = u0` and `v_r = 0`, so the
-//! per-read model is the fixed model times `u0`, and the fixed model
-//! ([`ReadModel::fixed`], one unit per score unit) is its exact special case.
+//! the reported distribution. At `p̂ = δ0`, `u_r = u0` and `v_r = 0` for
+//! every kind whose match and mismatch scores have `λ0` as their own
+//! Karlin–Altschul λ (all three by default), so the per-read model is then
+//! the fixed model times `u0`, and the fixed model ([`ReadModel::fixed`], one
+//! unit per score unit) is its exact special case.
 //! `F` is a power of two, so `units/F` is exact in `f64`; a mismatch at
 //! `p̂ = 10⁻⁴` is about `−6·10⁵` units, so `i64` holds any read.
 //!
@@ -56,7 +58,8 @@
 
 use crate::germline::SegmentKind;
 use crate::placement::Placement;
-use crate::scoring::Score;
+use crate::scoring::{AffineScoring, Score};
+use crate::stats::KarlinAltschul;
 
 /// An integer value in a [`ReadModel`]'s units.
 pub type Units = i64;
@@ -114,9 +117,24 @@ pub struct EvidenceModel {
     /// Match and mismatch score per rearranged kind ([`SegmentKind::REARRANGED`]), indexed by
     /// [`SegmentKind::index`].
     pub substitution: [(Score, Score); 3],
+    /// Nats per score unit of each kind's presence cost `P*_k`: the
+    /// Karlin–Altschul λ of the kind's scoring, the one
+    /// [`crate::config::DPrior::cost`] derives `P*_k` with (1 without one).
+    pub presence_lambda: [f64; 3],
 }
 
 impl EvidenceModel {
+    /// The model of the V, D and J scorings, `None` when the V scoring has
+    /// no Karlin–Altschul λ (its scores are then not log-odds).
+    pub fn new(scorings: [&AffineScoring; 3]) -> Option<Self> {
+        let lambda = |s: &AffineScoring| KarlinAltschul::ungapped(s).map(|ka| ka.lambda);
+        Some(Self {
+            lambda: lambda(scorings[0])?,
+            substitution: scorings.map(|s| (s.matched, s.mismatch)),
+            presence_lambda: scorings.map(|s| lambda(s).unwrap_or(1.0)),
+        })
+    }
+
     /// Evidence scales of the three rearranged kinds at divergence `p`.
     pub fn evidence(&self, p: f64) -> [EvidenceScale; 3] {
         self.substitution
@@ -131,13 +149,13 @@ impl EvidenceModel {
     }
 
     /// The posterior of a [`CallModel::FixedScale`] call: evidence at `p`,
-    /// unquantised, and the prior terms, the presence costs `P*_k` included,
-    /// at `lambda`.
+    /// unquantised, the prior terms at `lambda`, and the presence costs at
+    /// the λ they were derived with, `λ_k·P*_k = ln(N·L) − ln odds`.
     pub fn nats(&self, p: f64, presence: [f64; 3]) -> PathNats {
         PathNats {
             lambda: self.lambda,
             evidence: self.evidence(p),
-            presence: presence.map(|cost| self.lambda * cost),
+            presence: std::array::from_fn(|k| self.presence_lambda[k] * presence[k]),
         }
     }
 }
@@ -295,7 +313,6 @@ mod tests {
     use super::*;
     use crate::alphabet::N;
     use crate::scoring::AffineScoring;
-    use crate::stats::KarlinAltschul;
 
     /// An ungapped placement of `kind` on `query[q_start..q_start + len]`
     /// with mismatches at the `mismatched` offsets.
@@ -348,9 +365,36 @@ mod tests {
 
     fn model() -> EvidenceModel {
         let scoring = AffineScoring::new(2, -3, -9, -1);
-        EvidenceModel {
-            lambda: KarlinAltschul::ungapped(&scoring).expect("λ").lambda,
-            substitution: [(2, -3); 3],
+        EvidenceModel::new([&scoring; 3]).expect("λ")
+    }
+
+    /// Under `--calls fixed` the posterior charges a presence cost at the λ
+    /// it was derived with: `P*_D = ln(N·L)/λ_D` costs `ln(N·L)` nats even
+    /// when the D scoring's λ is not the V scoring's.
+    #[test]
+    fn fixed_scale_posterior_charges_the_derived_presence_prior_in_nats() {
+        use crate::config::{DPrior, DSearchSpace};
+        let (v, d) = (
+            AffineScoring::new(2, -3, -13, -1),
+            AffineScoring::new(2, -4, -13, -1),
+        );
+        let space = DSearchSpace {
+            genes: 30,
+            offsets: 1,
+        };
+        let presence = [
+            0.0,
+            DPrior::DERIVED.cost(space, &d),
+            DPrior::DERIVED.cost(space, &v),
+        ];
+        let model = EvidenceModel::new([&v, &d, &v]).expect("λ");
+        assert_ne!(model.presence_lambda[1], model.lambda);
+        for p in [0.01, 0.112, 0.3] {
+            let nats = model.nats(p, presence);
+            assert_eq!(nats.presence[0], 0.0);
+            for k in [1, 2] {
+                assert!((nats.presence[k] - 750f64.ln()).abs() < 1e-9, "{nats:?}");
+            }
         }
     }
 

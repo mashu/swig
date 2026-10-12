@@ -835,6 +835,7 @@ mod tests {
     const EVIDENCE: EvidenceModel = EvidenceModel {
         lambda: LAMBDA,
         substitution: [(2, -3); 3],
+        presence_lambda: [LAMBDA; 3],
     };
 
     /// Exhaustive search over grammatical paths and canonical cut pairs: the

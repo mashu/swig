@@ -838,12 +838,8 @@ fn per_read_dag_equals_exhaustive_enumeration() {
     let base = config
         .objective
         .resolve(Some(&db.d), &config.d, &db.j, &config.j.scoring);
-    let lambda = KarlinAltschul::ungapped(&config.v.scoring).unwrap().lambda;
-    let substitution = |s: &AffineScoring| (s.matched, s.mismatch);
-    let evidence = EvidenceModel {
-        lambda,
-        substitution: [&config.v.scoring, &config.d.scoring, &config.j.scoring].map(substitution),
-    };
+    let evidence =
+        EvidenceModel::new([&config.v.scoring, &config.d.scoring, &config.j.scoring]).unwrap();
     let delta0 = evidence.log_odds_divergence(SegmentKind::D);
     let mut ws = assigner.workspace();
     let mut scratch = DagScratch::default();
@@ -925,11 +921,8 @@ fn conditioned_dag_equals_exhaustive_enumeration() {
     let objective = config
         .objective
         .resolve(Some(&db.d), &config.d, &db.j, &config.j.scoring);
-    let lambda = KarlinAltschul::ungapped(&config.v.scoring).unwrap().lambda;
-    let evidence = EvidenceModel {
-        lambda,
-        substitution: [(2, -3); 3],
-    };
+    let evidence =
+        EvidenceModel::new([&config.v.scoring, &config.d.scoring, &config.j.scoring]).unwrap();
     let dag = PlacementDag::new(VdjGrammar::VDJ, objective, config.min_retained);
     let sim = Simulator::new(&db.v, Some(&db.d), &db.j, SimParams::hard()).unwrap();
     let mut ws = assigner.workspace();
