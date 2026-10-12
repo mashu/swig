@@ -19,10 +19,11 @@
 //! control characters are errors, and qualities (optional in a table) must
 //! match the sequence in length.
 //!
-//! Lines end in `\n` or `\r\n`; a carriage return inside a line (CR-only
-//! line endings) is an error rather than one long line. Gzip input is
-//! recognised by its magic bytes and rejected with a hint to decompress on
-//! the fly (the crate has no dependencies).
+//! A leading UTF-8 byte-order mark is skipped. Lines end in `\n` or
+//! `\r\n`; a carriage return inside a line (CR-only line endings) is an
+//! error rather than one long line. Gzip input is recognised by its magic
+//! bytes and rejected with a hint to decompress on the fly (the crate has no
+//! dependencies).
 
 use std::fmt;
 use std::io::{self, BufRead};
@@ -46,6 +47,11 @@ pub struct ReadRecord {
     /// FASTQ qualities or an AIRR row's `quality`; empty for FASTA.
     pub quality: String,
 }
+
+/// The UTF-8 encoding of U+FEFF, which Windows editors and spreadsheet
+/// "CSV UTF-8" exports put before the text. It is no symbol of the input:
+/// the Swig app's `TextDecoder` drops it as well.
+const BYTE_ORDER_MARK: &[u8] = "\u{feff}".as_bytes();
 
 /// The identifier of a FASTA/FASTQ header line (without `>`/`@`).
 fn header_id(header: &str) -> String {
@@ -244,18 +250,21 @@ impl<R: BufRead> ReadReader<R> {
         }
     }
 
-    /// Skip leading blank space, reject gzip, and classify the first symbol.
+    /// Reject gzip, skip a UTF-8 byte-order mark and leading blank space,
+    /// and classify the first symbol.
     fn detect(&mut self) -> Result<Option<ReadFormat>, ReadError> {
-        let mut first_chunk = true;
+        let start = self.input.fill_buf()?;
+        if start.starts_with(&[0x1f, 0x8b]) {
+            return Err(ReadError::Gzip);
+        }
+        if start.starts_with(BYTE_ORDER_MARK) {
+            self.input.consume(BYTE_ORDER_MARK.len());
+        }
         loop {
             let chunk = self.input.fill_buf()?;
             if chunk.is_empty() {
                 return Ok(None);
             }
-            if first_chunk && chunk.starts_with(&[0x1f, 0x8b]) {
-                return Err(ReadError::Gzip);
-            }
-            first_chunk = false;
             let blank = chunk.iter().take_while(|b| b.is_ascii_whitespace()).count();
             let newlines = chunk[..blank].iter().filter(|&&b| b == b'\n').count();
             if blank == chunk.len() {
@@ -543,6 +552,25 @@ mod tests {
             read_all(b">r1\nAC\rGT\n"),
             Err(ReadError::CarriageReturn { line: 2 })
         ));
+    }
+
+    #[test]
+    fn skips_a_utf8_byte_order_mark() {
+        // Windows editors and spreadsheet "CSV UTF-8" exports start with one;
+        // the Swig app's TextDecoder drops it too.
+        assert_eq!(
+            read_all(b"\xef\xbb\xbf>r\nACGT\n").unwrap(),
+            [record("r", "ACGT")]
+        );
+        assert_eq!(
+            read_all(b"\xef\xbb\xbfsequence_id,sequence\nq,ACGT\n").unwrap(),
+            [record("q", "ACGT")]
+        );
+        assert_eq!(
+            read_all(b"\xef\xbb\xbf\n\n@r\nAC\n+\nII\n").unwrap(),
+            [fastq("r", "AC", "II")]
+        );
+        assert!(read_all(b"\xef\xbb\xbf").unwrap().is_empty());
     }
 
     #[test]
