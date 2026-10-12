@@ -173,6 +173,12 @@ fn fraction(value: &str) -> Option<f64> {
     value.parse().ok().filter(|f: &f64| (0.0..=1.0).contains(f))
 }
 
+/// Most negative `--d-mismatch` / `--j-mismatch`.
+const MIN_MISMATCH: Score = -1_000;
+
+/// What `--d-mismatch` / `--j-mismatch` take.
+const PENALTY: &str = "a negative score of at least -1000";
+
 /// `scoring` with mismatch score `mismatch`.
 fn with_mismatch(scoring: AffineScoring, mismatch: Score) -> AffineScoring {
     AffineScoring::new(
@@ -238,7 +244,13 @@ impl RunOptions {
         };
         let count = |v: &str| v.parse::<u32>().ok();
         let positive = |v: &str| v.parse::<u32>().ok().filter(|&n| n > 0);
-        let penalty = |v: &str| v.parse::<Score>().ok().filter(|s| *s < 0);
+        // Alignment scores sum per-column scores in `Score`: a mismatch score
+        // far below any real one (IgBLAST takes −1 to −5) would wrap them.
+        let penalty = |v: &str| {
+            v.parse::<Score>()
+                .ok()
+                .filter(|s| (MIN_MISMATCH..0).contains(s))
+        };
         match name {
             "profile" => {
                 self.profile = parsed(
@@ -298,10 +310,10 @@ impl RunOptions {
                 self.min_d_match = Some(parsed(name, value, "a positive number", positive)?);
             }
             "d-mismatch" => {
-                self.d_mismatch = Some(parsed(name, value, "a negative score", penalty)?);
+                self.d_mismatch = Some(parsed(name, value, PENALTY, penalty)?);
             }
             "j-mismatch" => {
-                self.j_mismatch = Some(parsed(name, value, "a negative score", penalty)?);
+                self.j_mismatch = Some(parsed(name, value, PENALTY, penalty)?);
             }
             "min-j-length" => self.min_j_length = Some(parsed(name, value, "a number", count)?),
             "double-d" => {
@@ -821,6 +833,8 @@ mod tests {
             ("c-evalue", Some("0")),
             ("c-prefix-identity", Some("1.5")),
             ("d-mismatch", Some("3")),
+            ("d-mismatch", Some("-1001")),
+            ("j-mismatch", Some("-2147483648")),
             ("double-d", Some("some")),
             ("simd", Some("mmx")),
             ("profile", None),
@@ -829,6 +843,7 @@ mod tests {
         ] {
             assert!(options.set(name, value).is_err(), "--{name} {value:?}");
         }
+        options.set("j-mismatch", Some("-1000")).unwrap();
     }
 
     fn texts_and_reads(count: usize) -> ([String; 4], String) {
