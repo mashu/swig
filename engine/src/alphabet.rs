@@ -42,12 +42,6 @@ pub fn encode_base(symbol: u8) -> u8 {
     ENCODE[usize::from(symbol)]
 }
 
-/// `true` for `A`, `C`, `G`, `T`.
-#[inline]
-pub fn is_canonical(code: u8) -> bool {
-    code < N
-}
-
 /// Watson–Crick complement of a code; `N` stays `N`.
 #[inline]
 pub fn complement(code: u8) -> u8 {
@@ -60,17 +54,9 @@ pub fn decode_base(code: u8) -> u8 {
     b"ACGTN"[usize::from(code.min(N))]
 }
 
-/// Encode an ASCII sequence into `out` (cleared first, so buffers can be reused).
-pub fn encode_into(sequence: &[u8], out: &mut Vec<u8>) {
-    out.clear();
-    out.extend(sequence.iter().map(|&b| encode_base(b)));
-}
-
-/// Encode an ASCII sequence into a fresh vector.
+/// Encode an ASCII sequence.
 pub fn encode(sequence: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(sequence.len());
-    encode_into(sequence, &mut out);
-    out
+    sequence.iter().map(|&b| encode_base(b)).collect()
 }
 
 /// Reverse complement of encoded `codes` into `out` (cleared first).
