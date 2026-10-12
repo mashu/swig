@@ -72,7 +72,7 @@ pub use transfer::{
 pub use v_motif::{VHit, VSearch, find_v};
 
 use crate::align::GotohWorkspace;
-use crate::germline::{Allele, GermlineSet, RegionSlot, RegionStarts};
+use crate::germline::{Allele, AlleleId, GermlineSet, RegionSlot, RegionStarts};
 use crate::locus::{Loci, Locus};
 use crate::translate::{codon, translate};
 use given::Given;
@@ -221,8 +221,9 @@ pub struct DatabaseAnnotation {
     /// varies by gene family, so one chain default is wrong for some.
     pub fr3_varies: bool,
     /// For a database of several loci, each locus annotated on its own
-    /// ([`annotate_by_locus`]); `None` for alleles of unknown locus. `v` and
-    /// `j` above then hold every allele's annotation.
+    /// ([`annotate_by_locus`]): an allele of unknown locus with the locus of
+    /// its nearest relative of known locus, `None` for those without one.
+    /// `v` and `j` above then hold every allele's annotation.
     pub parts: Vec<(Option<Locus>, DatabaseAnnotation)>,
 }
 
@@ -769,28 +770,43 @@ fn check_given_v_anchor(
     }
 }
 
-/// The locus an allele is annotated with: its first, `None` if unknown.
+/// The locus an allele's name gives: its first, `None` if unknown.
 fn annotation_locus(allele: &Allele) -> Option<Locus> {
     (allele.loci != Loci::ANY)
         .then(|| allele.loci.first())
         .flatten()
 }
 
-/// [`annotate`] each locus of the database on its own: V and J alleles of
-/// one locus share a chain type, an FR3 length model and Cys23 priors,
-/// which differ between loci (heavy and light chains, TR loci). A
-/// database of one locus is annotated as a whole.
+/// The locus each allele of `set` is annotated with: the one its name gives
+/// ([`annotation_locus`]), else that of its nearest relative whose name
+/// gives one. An allele of unknown locus pairs with every locus when reads
+/// are assigned, so it is annotated in the context of the locus it
+/// resembles; `None` only when no allele of known locus is related.
+fn annotation_loci(set: &GermlineSet) -> Vec<Option<Locus>> {
+    let named: Vec<Option<Locus>> = set.alleles().iter().map(annotation_locus).collect();
+    if named.iter().all(Option::is_some) || named.iter().all(Option::is_none) {
+        return named;
+    }
+    let eligible: Vec<bool> = named.iter().map(Option::is_some).collect();
+    let mut index = RelativeIndex::build(set.alleles().iter().map(|a| a.codes.as_slice()));
+    (0..set.len())
+        .map(|i| named[i].or_else(|| index.nearest(i, &eligible).and_then(|d| named[d])))
+        .collect()
+}
+
+/// [`annotate`] each locus of the database on its own
+/// ([`annotation_loci`]): V and J alleles of one locus share a chain type,
+/// an FR3 length model and Cys23 priors, which differ between loci (heavy
+/// and light chains, TR loci). A database of one locus is annotated as a
+/// whole.
 pub fn annotate_by_locus(
     v: &mut GermlineSet,
     mut j: Option<&mut GermlineSet>,
     options: AnnotateOptions,
 ) -> DatabaseAnnotation {
-    let mut loci: Vec<Option<Locus>> = v
-        .alleles()
-        .iter()
-        .chain(j.iter().flat_map(|j| j.alleles()))
-        .map(annotation_locus)
-        .collect();
+    let v_loci = annotation_loci(v);
+    let j_loci = j.as_deref().map(annotation_loci).unwrap_or_default();
+    let mut loci: Vec<Option<Locus>> = v_loci.iter().chain(&j_loci).copied().collect();
     loci.sort_unstable();
     loci.dedup();
     if loci.len() <= 1 {
@@ -805,10 +821,18 @@ pub fn annotate_by_locus(
         ..DatabaseAnnotation::default()
     };
     for locus in loci {
-        let of_locus = |a: &Allele| annotation_locus(a) == locus;
-        let (mut v_part, v_ids) = v.subset(of_locus);
-        let mut j_part = j.as_deref().map(|j| j.subset(of_locus));
-        let part = annotate(&mut v_part, j_part.as_mut().map(|(set, _)| set), options);
+        let of_locus = |loci: &[Option<Locus>]| -> Vec<AlleleId> {
+            (0..)
+                .zip(loci)
+                .filter(|&(_, &l)| l == locus)
+                .map(|(id, _)| id)
+                .collect()
+        };
+        let v_ids = of_locus(&v_loci);
+        let mut v_part = v.select(&v_ids);
+        let j_ids = of_locus(&j_loci);
+        let mut j_part = j.as_deref().map(|j| j.select(&j_ids));
+        let part = annotate(&mut v_part, j_part.as_mut(), options);
         for (copy, &id) in v_part.alleles().iter().zip(&v_ids) {
             let (anchor, regions, _) = v.annotation_mut(id);
             (*anchor, *regions) = (copy.anchor, copy.regions);
@@ -816,11 +840,11 @@ pub fn annotate_by_locus(
         for (annotation, &id) in part.v.iter().zip(&v_ids) {
             merged.v[id as usize] = annotation.clone();
         }
-        if let (Some(j), Some((j_part, j_ids))) = (j.as_deref_mut(), &j_part) {
-            for (copy, &id) in j_part.alleles().iter().zip(j_ids) {
+        if let (Some(j), Some(j_part)) = (j.as_deref_mut(), &j_part) {
+            for (copy, &id) in j_part.alleles().iter().zip(&j_ids) {
                 *j.annotation_mut(id).0 = copy.anchor;
             }
-            for (annotation, &id) in part.j.iter().zip(j_ids) {
+            for (annotation, &id) in part.j.iter().zip(&j_ids) {
                 merged.j[id as usize] = annotation.clone();
             }
         }
@@ -1441,6 +1465,74 @@ mod tests {
     /// Human IGHV1/OR15-5*01, 5′-partial: its region starts lie in frame 2,
     /// and no Cys104 there has confident motifs.
     const IGHV1_OR15_5: &str = "AGAAGCCTGGGGCCTCAGTGAAGGTCTCCTGCAAGGCTTCTGGATACACCTTCACCAGCTACTGTATGCACTGGGTGCACCAGGTCCATGCACAAGGGCTTGAGTGGATGGGATTGGTGTGCCCTAGTGATGGCAGCACAAGCTATGCACAGAAGTTCCAGGCCAGAGTCACCATAACCAGGGACACATCCATGAGCACAGCCTACATGGAGCTAAGCAGTCTGAGATCTGAGGACACGGCCATGTATTACTGTGTGAGA";
+
+    /// Human IGHV3-23*01, IGKV1-5*01 and IGLV2-14*01 (`swig` 0.7 reference).
+    const IGHV3_23: &str = "GAGGTGCAGCTGTTGGAGTCTGGGGGAGGCTTGGTACAGCCTGGGGGGTCCCTGAGACTCTCCTGTGCAGCCTCTGGATTCACCTTTAGCAGCTATGCCATGAGCTGGGTCCGCCAGGCTCCAGGGAAGGGGCTGGAGTGGGTCTCAGCTATTAGTGGTAGTGGTGGTAGCACATACTACGCAGACTCCGTGAAGGGCCGGTTCACCATCTCCAGAGACAATTCCAAGAACACGCTGTATCTGCAAATGAACAGCCTGAGAGCCGAGGACACGGCCGTATATTACTGTGCGAAAGA";
+    const IGKV1_5: &str = "GACATCCAGATGACCCAGTCTCCTTCCACCCTGTCTGCATCTGTAGGAGACAGAGTCACCATCACTTGCCGGGCCAGTCAGAGTATTAGTAGCTGGTTGGCCTGGTATCAGCAGAAACCAGGGAAAGCCCCTAAGCTCCTGATCTATGATGCCTCCAGTTTGGAAAGTGGGGTCCCATCAAGGTTCAGCGGCAGTGGATCTGGGACAGAATTCACTCTCACCATCAGCAGCCTGCAGCCTGATGATTTTGCAACTTATTACTGCCAACAGTATAATAGTTATTCTCC";
+    const IGLV2_14: &str = "CAGTCTGCCCTGACTCAGCCTGCCTCCGTGTCTGGGTCTCCTGGACAGTCGATCACCATCTCCTGCACTGGAACCAGCAGTGACGTTGGTGGTTATAACTATGTCTCCTGGTACCAACAGCACCCAGGCAAAGCCCCCAAACTCATGATTTATGAGGTCAGTAATCGGCCCTCAGGGGTTTCTAATCGCTTCTCTGGCTCCAAGTCTGGCAACACGGCCTCCCTGACCATCTCTGGGCTCCAGGCTGAGGACGAGGCTGATTATTACTGCAGCTCATATACAAGCAGCAGCACTCTC";
+
+    /// `sequence` with base `at` changed: a new allele of the same gene.
+    fn variant(sequence: &str, at: usize) -> String {
+        let mut bases = sequence.as_bytes().to_vec();
+        bases[at] = if bases[at] == b'A' { b'C' } else { b'A' };
+        String::from_utf8(bases).unwrap()
+    }
+
+    /// Alleles whose names give no locus (`novel_*`) in a heavy + kappa +
+    /// lambda database join the locus of their nearest named relative:
+    /// novel_h1 takes IGHV3-23*01's FR3 start (174, CDR2 8 codons), where a
+    /// group of its own, voted light, gave it the light FR3 length (180).
+    #[test]
+    fn alleles_of_unknown_locus_are_annotated_with_their_relatives_locus() {
+        let keys = |cdr1: u32, fr2: u32, cdr2: u32, fr3: u32, anchor: u32| {
+            format!("anchor={anchor} fr1=0 cdr1={cdr1} fr2={fr2} cdr2={cdr2} fr3={fr3}")
+        };
+        let text = [
+            (
+                ">IGHV3-23*01",
+                keys(75, 99, 150, 174, 285),
+                IGHV3_23.to_string(),
+            ),
+            (
+                ">IGKV1-5*01",
+                keys(78, 96, 147, 156, 261),
+                IGKV1_5.to_string(),
+            ),
+            (
+                ">IGLV2-14*01",
+                keys(75, 102, 153, 162, 267),
+                IGLV2_14.to_string(),
+            ),
+            (">novel_h1", String::new(), variant(IGHV3_23, 30)),
+            (">novel_k1", String::new(), variant(IGKV1_5, 30)),
+            (">novel_l1", String::new(), variant(IGLV2_14, 30)),
+        ]
+        .map(|(name, header, sequence)| format!("{name} {header}\n{sequence}\n"))
+        .concat();
+        let mut v = GermlineSet::from_fasta(SegmentKind::V, &text).unwrap();
+        let mut j = GermlineSet::from_fasta(
+            SegmentKind::J,
+            ">IGHJ4*02\nACTACTTTGACTACTGGGGCCAGGGAACCCTGGTCACCGTCTCCTCAG\n\
+             >IGKJ1*01\nGTGGACGTTCGGCCAAGGGACCAAGGTGGAAATCAAAC\n\
+             >IGLJ2*01\nTGTGGTATTCGGCGGAGGGACCAAGCTGACCGTCCTAG\n",
+        )
+        .unwrap();
+        let report = annotate_by_locus(&mut v, Some(&mut j), AnnotateOptions::default());
+        let parts: Vec<Option<Locus>> = report.parts.iter().map(|(l, _)| *l).collect();
+        assert_eq!(
+            parts,
+            [Some(Locus::Igh), Some(Locus::Igk), Some(Locus::Igl)]
+        );
+        let novel = v.allele(3);
+        assert_eq!(novel.anchor, Some(285));
+        assert_eq!(novel.regions.fr3, Some(174), "{:?}", report.v[3]);
+        let relative = Note::Fr3FromRelative {
+            relative: "IGHV3-23*01".into(),
+        };
+        assert!(report.v[3].notes.contains(&relative), "{:?}", report.v[3]);
+        // Each keeps the unknown locus it pairs with.
+        assert_eq!(novel.loci, Loci::ANY);
+    }
 
     fn annotate_j(text: &str) -> (GermlineSet, DatabaseAnnotation) {
         let mut j = GermlineSet::from_fasta(SegmentKind::J, text).unwrap();

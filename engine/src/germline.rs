@@ -810,22 +810,29 @@ impl GermlineSet {
     /// The alleles for which `keep` holds, in order, as a set of their own,
     /// with their ids in this set.
     pub fn subset(&self, keep: impl Fn(&Allele) -> bool) -> (Self, Vec<AlleleId>) {
+        let ids: Vec<AlleleId> = (0..)
+            .zip(&self.alleles)
+            .filter(|(_, allele)| keep(allele))
+            .map(|(id, _)| id)
+            .collect();
+        (self.select(&ids), ids)
+    }
+
+    /// The alleles `ids`, in that order, as a set of their own.
+    pub fn select(&self, ids: &[AlleleId]) -> Self {
         let mut set = Self::new(self.kind);
-        let mut ids = Vec::new();
-        for (id, allele) in (0..).zip(&self.alleles) {
-            if keep(allele) {
-                let new = set
-                    .push_codes(&allele.name, allele.codes.clone(), allele.anchor)
-                    .expect("a copied allele is valid");
-                let gene = set.alleles[new as usize].gene;
-                set.alleles[new as usize] = Allele {
-                    gene,
-                    ..allele.clone()
-                };
-                ids.push(id);
-            }
+        for &id in ids {
+            let allele = &self.alleles[id as usize];
+            let new = set
+                .push_codes(&allele.name, allele.codes.clone(), allele.anchor)
+                .expect("a copied allele is valid");
+            let gene = set.alleles[new as usize].gene;
+            set.alleles[new as usize] = Allele {
+                gene,
+                ..allele.clone()
+            };
         }
-        (set, ids)
+        set
     }
 }
 
