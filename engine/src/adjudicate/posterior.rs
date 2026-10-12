@@ -65,8 +65,10 @@
 //! [`OVERLAP_SPREAD`], would leave the `f64` range, and the read then gets no
 //! marginals.
 
+use std::cell::Cell;
+
 use super::PlacementDag;
-use super::lattice::{Group, KINDS, Lattice, Node};
+use super::lattice::{Group, KINDS, Lattice, Node, column_steps};
 use super::model::{Grammar, PathModel};
 #[cfg(doc)]
 use super::units::{CallModel, ReadModel};
@@ -97,23 +99,38 @@ const TABLE_RANGE: Score = 1024;
 #[derive(Clone, Debug)]
 struct Steps {
     scale: EvidenceScale,
-    /// `exp(λd + μ)` and `exp(−(λd + μ))` for `|d| ≤ STEP_RANGE`.
-    up: Vec<f64>,
-    down: Vec<f64>,
+    /// `exp(λd + μ)` and `exp(−(λd + μ))` for `|d| ≤ STEP_RANGE`, each
+    /// computed when first needed (NaN until then): a read's columns score
+    /// a match or a mismatch, so a few of them are.
+    up: [Cell<f64>; STEPS],
+    down: [Cell<f64>; STEPS],
 }
 
 /// Steps between consecutive `Match` columns that are tabulated.
 const STEP_RANGE: Score = 24;
 
+/// Tabulated steps, `−STEP_RANGE..=STEP_RANGE`.
+const STEPS: usize = 2 * STEP_RANGE as usize + 1;
+
+/// The value of `cell`, computing it with `value` the first time.
+#[inline]
+fn tabulated(cell: &Cell<f64>, value: impl FnOnce() -> f64) -> f64 {
+    let known = cell.get();
+    if known.is_nan() {
+        let value = value();
+        cell.set(value);
+        value
+    } else {
+        known
+    }
+}
+
 impl Steps {
     fn new(scale: EvidenceScale) -> Self {
-        let nats = |d: Score| scale.lambda * f64::from(d) + scale.mu;
         Self {
             scale,
-            up: (-STEP_RANGE..=STEP_RANGE).map(|d| nats(d).exp()).collect(),
-            down: (-STEP_RANGE..=STEP_RANGE)
-                .map(|d| (-nats(d)).exp())
-                .collect(),
+            up: std::array::from_fn(|_| Cell::new(f64::NAN)),
+            down: std::array::from_fn(|_| Cell::new(f64::NAN)),
         }
     }
 
@@ -124,7 +141,7 @@ impl Steps {
     #[inline]
     fn up(&self, d: Score) -> f64 {
         match usize::try_from(d + STEP_RANGE) {
-            Ok(i) if i < self.up.len() => self.up[i],
+            Ok(i) if i < STEPS => tabulated(&self.up[i], || self.nats(d).exp()),
             _ => self.nats(d).exp(),
         }
     }
@@ -132,7 +149,7 @@ impl Steps {
     #[inline]
     fn down(&self, d: Score) -> f64 {
         match usize::try_from(d + STEP_RANGE) {
-            Ok(i) if i < self.down.len() => self.down[i],
+            Ok(i) if i < STEPS => tabulated(&self.down[i], || (-self.nats(d)).exp()),
             _ => (-self.nats(d)).exp(),
         }
     }
@@ -224,8 +241,9 @@ pub struct PosteriorScratch {
     suffix: Vec<f64>,
     work: Vec<f64>,
     tails: Vec<f64>,
-    /// Per Match column: query position, entry and exit prefix scores, and
-    /// the evidence (nats) before and through it.
+    /// Per Match column: query position, the gap run before it, its
+    /// substitution score ([`column_steps`]), and the evidence (nats) before and
+    /// through it.
     columns: Vec<(u32, Score, Score, f64, f64)>,
     /// Uncentred evidence at each usable entry / exit offset (NaN elsewhere).
     entry_nats: Vec<f64>,
@@ -329,8 +347,11 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
         s.scales.clear();
         s.forward.clear();
         s.backward.clear();
-        s.running.clear();
-        s.suffix.clear();
+        // `running` and `suffix` are not cleared: a slot's sums are written
+        // before any other slot reads them, `running` in `emit` for every
+        // kind that can follow it and `suffix` in `pull` for every kind that
+        // can precede it, by the predicates that record the edges reading
+        // them.
         let mut log_z: Vec<f64> = Vec::new();
         for e in 0..s.lattice.nodes.len() {
             self.gather(s, e);
@@ -397,15 +418,12 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
             // Evidence nats: a substitution column scoring s adds λ_r·s + μ_r,
             // an uninformative one (an N, s = 0) nothing; gaps keep λ.
             s.columns.clear();
-            let mut previous: Option<(Score, f64)> = None;
+            let mut previous: Option<f64> = None;
             let (mut in_lo, mut in_hi) = (f64::INFINITY, f64::NEG_INFINITY);
             let (mut out_lo, mut out_hi) = (f64::INFINITY, f64::NEG_INFINITY);
-            for (q, entry, exit) in p.clip.matches() {
-                let before = match previous {
-                    None => lambda0 * f64::from(entry),
-                    Some((exit_prefix, nats)) => nats + lambda0 * f64::from(entry - exit_prefix),
-                };
-                let column = exit - entry;
+            for (q, gap, column) in column_steps(p) {
+                let gap_nats = lambda0 * f64::from(gap);
+                let before = previous.map_or(gap_nats, |nats| nats + gap_nats);
                 let through = before
                     + if column == 0 {
                         0.0
@@ -418,8 +436,8 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
                 if exit_used(q + 1 - q_start) {
                     (out_lo, out_hi) = (out_lo.min(through), out_hi.max(through));
                 }
-                s.columns.push((q, entry, exit, before, through));
-                previous = Some((exit, through));
+                s.columns.push((q, gap, column, before, through));
+                previous = Some(through);
             }
             if in_hi - in_lo > MAX_SPREAD || out_hi - out_lo > MAX_SPREAD {
                 return false;
@@ -436,14 +454,13 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
                 (c, false) => steps.down(c),
             };
             let (mut before, mut inv) = (f64::NAN, f64::NAN);
-            let mut last: Option<(Score, Score)> = None;
-            for &(q, entry, exit, nats, through) in &s.columns {
-                if let Some((last_entry, last_exit)) = last {
-                    let (column, gap) = (last_exit - last_entry, entry - last_exit);
-                    before *= substitution(column, false) * self.w.of(-gap);
-                    inv *= substitution(column, true) * self.w.of(gap);
+            let mut last: Option<Score> = None;
+            for &(q, gap, column, nats, through) in &s.columns {
+                if let Some(previous) = last {
+                    before *= substitution(previous, false) * self.w.of(-gap);
+                    inv *= substitution(previous, true) * self.w.of(gap);
                 }
-                last = Some((entry, exit));
+                last = Some(column);
                 let o = q - q_start;
                 let usable = |v: f64| v.is_finite() && v > 0.0;
                 if entry_used(o) {
@@ -457,7 +474,7 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
                     if !usable(inv) {
                         inv = (nats - c_out).exp();
                     }
-                    s.exit_w[cuts + o as usize + 1] = inv * substitution(exit - entry, true);
+                    s.exit_w[cuts + o as usize + 1] = inv * substitution(column, true);
                     s.exit_nats[cuts + o as usize + 1] = through;
                 }
             }
@@ -516,8 +533,11 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
         let values = s.lattice.values();
         s.forward.resize(values, 0.0);
         s.backward.resize(values, 0.0);
-        s.running.resize(KINDS * values, 0.0);
-        s.suffix.resize(KINDS * values, 0.0);
+        // Grown, never cleared (see `run`).
+        if s.running.len() < KINDS * values {
+            s.running.resize(KINDS * values, 0.0);
+            s.suffix.resize(KINDS * values, 0.0);
+        }
 
         // A predecessor ending before this node reaches it across an N/P
         // gap; its weight joins the log scale, so a long, costly gap cannot
@@ -526,54 +546,51 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
             let iota = self.dag.model.junction_per_base(b.kind, node.kind);
             self.w.lambda * f64::from(iota * node.q_start.saturating_sub(b.q_end()) as Score)
         };
+        if s.tails.len() < KINDS * width {
+            s.tails.resize(KINDS * width, 0.0);
+        }
         for t in slots {
             let slot = s.lattice.slots[t];
             let starts_here = start == Some(slot.group);
             let scales = &s.scales;
-            let live = |u: usize| scales[u].exit > f64::NEG_INFINITY;
             let reference = s
                 .lattice
-                .incoming(e, grammar, slot.group, &live)
+                .incoming(t)
                 .map(|(b, u)| scales[u].exit + gap(&b))
                 .fold(if starts_here { 0.0 } else { f64::NEG_INFINITY }, f64::max);
 
             let mut tails = std::mem::take(&mut s.tails);
-            tails.clear();
-            tails.resize(KINDS * width, 0.0);
+            // Per predecessor kind, cleared when an edge first reaches it.
+            let mut touched = [false; KINDS];
             let mut f = std::mem::take(&mut s.work);
             f.clear();
             f.resize(width, 0.0);
             if starts_here {
                 f[0] = (-reference).exp();
             }
-            let entries = s.lattice.entries(&node);
-            for (b, u) in s.lattice.incoming(e, grammar, slot.group, &live) {
+            for (b, u) in s.lattice.incoming(t) {
                 let factor = (scales[u].exit + gap(&b) - reference).exp();
                 let r = &s.running[s.lattice.slots[u].per_kind(node.kind, b.width())];
-                // Entries inside b: exits up to the entry (none before b's
-                // start, which a predecessor of another kind may have).
-                for &o in entries {
-                    let y = node.q_start + o;
-                    if y >= b.q_end() {
-                        break;
-                    }
-                    let Some(z) = y.checked_sub(b.q_start) else {
-                        continue;
-                    };
-                    // r[z] already carries e^{λι(z − x)} for each exit x.
-                    f[o as usize] += factor * r[z as usize];
+                // Entries inside b: exits up to the entry. r[z] already
+                // carries e^{λι(z − x)} for each exit x.
+                for (o, z) in s.lattice.inside(&b, &node) {
+                    f[o] += factor * r[z];
                 }
                 // Entries at or beyond b's end: all exits, added once.
-                let beyond = b.q_end().saturating_sub(node.q_start) as usize;
-                if beyond < width {
-                    tails[b.kind.index() * width + beyond] += factor * r[b.len as usize];
+                if let Some(beyond) = b.beyond(&node) {
+                    let k = b.kind.index();
+                    let tail = &mut tails[k * width..(k + 1) * width];
+                    if !std::mem::replace(&mut touched[k], true) {
+                        tail.fill(0.0);
+                    }
+                    tail[beyond] += factor * r[b.len as usize];
                 }
             }
             for kind in SegmentKind::REARRANGED {
-                let tail = &tails[kind.index() * width..(kind.index() + 1) * width];
-                if tail.iter().all(|&v| v == 0.0) {
+                if !touched[kind.index()] {
                     continue;
                 }
+                let tail = &tails[kind.index() * width..(kind.index() + 1) * width];
                 // acc(o) = Σ_{o' ≤ o} tail(o') · e^{λι(o − o')}.
                 let step = self.w.of(self.dag.model.junction_per_base(kind, node.kind));
                 let mut acc = 0.0;
@@ -710,18 +727,10 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
                 let successor = s.lattice.slots[u];
                 let factor = (s.scales[u].backward + gap(&e) - reference).exp();
                 let backward = &s.backward[successor.values..successor.values + e.width()];
-                for &o in s.lattice.entries(&e) {
-                    let y = e.q_start + o;
-                    if y >= node.q_end() {
-                        break;
-                    }
-                    let Some(z) = y.checked_sub(node.q_start) else {
-                        continue;
-                    };
-                    tails[z as usize] += factor * backward[o as usize];
+                for (o, z) in s.lattice.inside(&node, &e) {
+                    tails[z] += factor * backward[o];
                 }
-                let beyond = node.q_end().saturating_sub(e.q_start) as usize;
-                if beyond < e.width() {
+                if let Some(beyond) = node.beyond(&e) {
                     let suffix = &s.suffix[successor.per_kind(node.kind, e.width())];
                     tails[width - 1] += factor * suffix[beyond];
                 }
@@ -1297,6 +1306,42 @@ mod tests {
             placement(SegmentKind::J, &query, &query[260..360], 260),
         ];
         check_fixed(&dag, &short, EvidenceScale::at_divergence(0.01, 2, -3));
+    }
+
+    /// The passes' buffers carry over between reads uncleared: a slot's
+    /// running maxima and sums are written before any slot reads them. A
+    /// large lattice, then a small one, then large ones again give, through
+    /// one scratch each, exactly what fresh buffers give.
+    #[test]
+    fn reused_scratch_gives_what_fresh_scratch_gives() {
+        let model = EngineeringObjective::priced([0.0, 4.5, 3.5]);
+        let big = PlacementDag::new(TANDEM_D, model, [4, 3, 4], Mode::Fixed);
+        let small = PlacementDag::new(VdjGrammar::VJ, model, [1, 1, 1], Mode::Fixed);
+        let (_, junction) = junction();
+        let (_, gapped) = gapped_junction();
+        let (_, over) = j_reaching_over_d();
+        let vj = [junction[0].clone(), junction[5].clone()];
+        let read = ReadModel::at(&EVIDENCE, 0.02, model.presence);
+        let nats = read.nats();
+        let (mut dag_scratch, mut scratch) = (DagScratch::default(), PosteriorScratch::default());
+        for (dag, placements) in [
+            (&big, &junction[..]),
+            (&small, &vj[..]),
+            (&big, &gapped[..]),
+            (&big, &over[..]),
+            (&big, &junction[..]),
+        ] {
+            let fresh = (
+                dag.viterbi(placements, &read, &mut DagScratch::default()),
+                dag.posterior(placements, &nats, &mut PosteriorScratch::default()),
+            );
+            let reused = (
+                dag.viterbi(placements, &read, &mut dag_scratch),
+                dag.posterior(placements, &nats, &mut scratch),
+            );
+            assert!(fresh.0.is_some() && fresh.1.is_some());
+            assert_eq!(fresh, reused);
+        }
     }
 
     /// A lattice without a D (a light chain, or a D-free database) has one

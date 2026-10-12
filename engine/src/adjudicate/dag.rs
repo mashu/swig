@@ -46,7 +46,9 @@
 //! the maximum over exits `x ≤ y'` another, read in O(1) per entry. On an edge
 //! `b → e`, every entry of `e` at or beyond `b`'s end sees the same best exit,
 //! so it is added once to a running maximum over `e`'s entries: an edge costs
-//! `O(overlap + 1)`, a read `O(Σ_nodes len + Σ_edges (overlap + 1))`.
+//! `O(overlap + 1)`, a read `O(Σ_nodes len + Σ_edges (overlap + 1))`, plus
+//! one scan of its predecessors' slots per node, which opens the node's
+//! slots and records their edges ([`super::lattice`]).
 //!
 //! Ties: final paths compare by [`PathScore`] (value, then fewer D, then
 //! germline support, the summed unclipped fixed scores), so a with-D path must
@@ -57,7 +59,7 @@
 //! the first predecessor in DAG order.
 
 use super::decode::{DAlleleDecoding, Topology, Within, max_marginal_d};
-use super::lattice::{Group, KINDS, Lattice};
+use super::lattice::{Group, KINDS, Lattice, column_steps};
 use super::model::{Grammar, PathModel, VdjGrammar};
 use super::posterior::{Marginals, PosteriorScratch};
 use super::units::{CallModel, EvidenceModel, PathNats, ReadModel, Units, divergence};
@@ -210,24 +212,21 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         s.exit.clear();
         s.exit.resize(s.lattice.cells(), None);
         for node in &s.lattice.nodes {
-            // (exit prefix score, exit prefix value) of the previous column.
-            let mut previous: Option<(Score, Units)> = None;
-            for (q, entry, exit) in placements[node.placement].clip.matches() {
-                let before = match previous {
-                    None => read.prior(entry),
-                    Some((score, value)) => value + read.prior(entry - score),
-                };
-                let through = before + read.column(node.kind, exit - entry);
+            let mut value: Units = 0;
+            for (q, gap, column) in column_steps(&placements[node.placement]) {
                 let o = (q - node.q_start) as usize;
-                s.entry[node.cuts + o] = Some(before);
-                s.exit[node.cuts + o + 1] = Some(through);
-                previous = Some((exit, through));
+                value += read.prior(gap);
+                s.entry[node.cuts + o] = Some(value);
+                value += read.column(node.kind, column);
+                s.exit[node.cuts + o + 1] = Some(value);
             }
         }
         s.open.clear();
         s.forward.clear();
         s.exits.clear();
-        s.running.clear();
+        // `running` is not cleared: `emit` writes a slot's running maxima
+        // for every kind that can follow it before `gather` reads them, by
+        // the same `can_follow`.
     }
 
     /// Open node `e`'s slots and fill their entry values from path starts
@@ -245,11 +244,14 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         s.open.resize(s.lattice.slots.len(), false);
         s.forward.resize(s.lattice.values(), None);
         s.exits.resize(s.lattice.values(), None);
-        s.running.resize(KINDS * s.lattice.values(), None);
+        // Grown, never cleared (see `layout`).
+        if s.running.len() < KINDS * s.lattice.values() {
+            s.running.resize(KINDS * s.lattice.values(), None);
+        }
+        if s.tails.len() < KINDS * width {
+            s.tails.resize(KINDS * width, None);
+        }
 
-        let entries = s.lattice.entries(&node);
-        let open = &s.open;
-        let live = |u: usize| open[u];
         for t in slots {
             let slot = s.lattice.slots[t];
             let forward = &mut s.forward[slot.values..slot.values + width];
@@ -263,34 +265,25 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
                     },
                 );
             }
-            s.tails.clear();
-            s.tails.resize(KINDS * width, None);
-            for (b, u) in s.lattice.incoming(e, grammar, slot.group, &live) {
+            // Per predecessor kind, the entries at or beyond its nodes' ends:
+            // cleared when an edge of that kind first reaches them.
+            let mut tails = [false; KINDS];
+            for (b, u) in s.lattice.incoming(t) {
                 let iota = read.prior(self.model.junction_per_base(b.kind, node.kind));
                 let running = &s.running[s.lattice.slots[u].per_kind(node.kind, b.width())];
-                // Entries inside b: the best exit at or before the entry. A
-                // predecessor of another kind may start after this node
-                // (its entries before b's start have no exit to follow).
-                for &o in entries {
-                    let y = node.q_start + o;
-                    if y >= b.q_end() {
-                        break;
-                    }
-                    let Some(z) = y.checked_sub(b.q_start) else {
-                        continue;
-                    };
-                    if let Some(cell) = running[z as usize] {
+                // Entries inside b: the best exit at or before the entry.
+                for (o, z) in s.lattice.inside(&b, &node) {
+                    if let Some(cell) = running[z] {
                         let candidate = Cell {
-                            key: (cell.key.0 + iota * Units::from(z), cell.key.1),
+                            key: (cell.key.0 + iota * z as Units, cell.key.1),
                             slot: u as u32,
                             at: cell.at,
                         };
-                        prefer(&mut forward[o as usize], candidate);
+                        prefer(&mut forward[o], candidate);
                     }
                 }
                 // Entries at or beyond b's end: b's best exit overall, once.
-                let beyond = b.q_end().saturating_sub(node.q_start) as usize;
-                if let (true, Some(cell)) = (beyond < width, running[b.len as usize]) {
+                if let (Some(beyond), Some(cell)) = (b.beyond(&node), running[b.len as usize]) {
                     let candidate = Cell {
                         key: (
                             cell.key.0
@@ -300,14 +293,19 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
                         slot: u as u32,
                         at: cell.at,
                     };
-                    prefer(&mut s.tails[b.kind.index() * width + beyond], candidate);
+                    let k = b.kind.index();
+                    let tail = &mut s.tails[k * width..(k + 1) * width];
+                    if !std::mem::replace(&mut tails[k], true) {
+                        tail.fill(None);
+                    }
+                    prefer(&mut tail[beyond], candidate);
                 }
             }
             for kind in SegmentKind::REARRANGED {
-                let tail = &s.tails[kind.index() * width..(kind.index() + 1) * width];
-                if tail.iter().all(Option::is_none) {
+                if !tails[kind.index()] {
                     continue;
                 }
+                let tail = &s.tails[kind.index() * width..(kind.index() + 1) * width];
                 let iota = read.prior(self.model.junction_per_base(kind, node.kind));
                 let mut best: Option<Cell> = None;
                 for (o, cell) in tail.iter().enumerate() {
