@@ -1,29 +1,31 @@
 //! Posterior decoding: forward–backward (sum-product) over the placement DAG.
 //!
-//! The path objective is a log-likelihood ratio in units of `1/λ` nats (see
-//! [`super::EngineeringObjective`]), so
+//! A read's model ([`PathNats`]) values every term of a path in nats, so
 //!
 //! ```text
-//! P(path, cuts | read) = exp(λ · score(path, cuts)) / Z
+//! P(path, cuts | read) = exp(nats(path, cuts)) / Z,     Z = Σ_{path, cuts} exp(nats)
 //! ```
 //!
 //! is a distribution over every grammatical path through the placements and
-//! every pair of cuts between neighbours. With the evidence read at the fixed
-//! λ, the Viterbi path of [`PlacementDag`] is its mode (both run over the same
-//! domain). Summing instead of maximising gives the marginal probability of
-//! each placement (an allele call) and of each D count (D presence).
+//! every pair of cuts between neighbours, the domain the Viterbi DAG of
+//! [`PlacementDag`] maximises over. Summing instead of maximising gives the
+//! marginal probability of each placement (an allele call) and of each D
+//! count (D presence).
 //!
-//! **Evidence at the read's own divergence.** `(2, −3)` scores are log-odds
-//! only at 11.2 % divergence, so one λ would make unmutated reads
-//! underconfident and heavily mutated ones overconfident. The alignment
-//! evidence is therefore read as log-odds at the read's divergence `p̂`, and
-//! the prior terms at the λ they were derived with ([`super::units`]). The
-//! weights come from a [`PathNats`]: the call's own [`ReadModel`] in nats
-//! under [`CallModel::PerRead`], whose Viterbi path is then a mode of this
-//! distribution; under [`CallModel::FixedScale`] the evidence unquantised and
-//! the presence costs `λ·P*_k` ([`super::EvidenceModel::nats`]), while the call stays
-//! on the fixed scores, so the reported probability is that of a call made
-//! under another model.
+//! **The read's model.** `(2, −3)` scores are log-odds only at 11.2 %
+//! divergence, so one λ would make unmutated reads underconfident and
+//! heavily mutated ones overconfident. A substitution column scoring
+//! `s ≠ 0` is therefore worth `λ_r·s + μ_r` nats ([`EvidenceScale`]), its
+//! log-odds at the read's divergence `p̂`, and an `N` column nothing; gap
+//! runs and the N/P cost stay at the prior λ0, and each segment pays its
+//! kind's presence cost ([`super::units`]). Under [`CallModel::PerRead`]
+//! these are the call's own integer units read as nats (`units/F`), so the
+//! Viterbi call is a mode of this distribution. Under
+//! [`CallModel::FixedScale`] they are the evidence unquantised and the
+//! presence costs `λ_k·P*_k` at the λ they were derived with
+//! ([`super::EvidenceModel::nats`]), while the call stays on the fixed
+//! scores: the reported probability is then that of a call made under
+//! another model.
 //!
 //! **Domain.** As in the Viterbi DAG, the first segment keeps its start and
 //! the last segment its end: V and J are extended to the read's ends on
@@ -34,25 +36,26 @@
 //! base, an exit cut right after the last.
 //!
 //! **Recursions.** For a node `b` in group `g = (D count, first kind)`, with
-//! `F(b, y)` the mass of path prefixes entering `b` at `y` and `ι` the
-//! per-base N/P score,
+//! `F(b, y)` the mass of path prefixes entering `b` at `y`, `entry(y)` and
+//! `exit(x)` the evidence of `b`'s columns before a cut, `c_b` the presence
+//! cost of `b`'s kind and `ι` the per-base N/P term, all in nats,
 //!
 //! ```text
-//! X(b, x)  = e^{λ(exit(x) + bonus)} · Σ_{y ≤ x − min} F(b, y) · e^{−λ entry(y)}
-//! F(e, y') = Σ_b Σ_{x ≤ y'} X(b, x) · e^{λι(y' − x)}            (+ 1 at a path start)
-//! Z        = Σ_b X(b, end of b) · e^{λ end(g, b)}
+//! X(b, x)  = e^{exit(x) − c_b} · Σ_{y ≤ x − min} F(b, y) · e^{−entry(y)}
+//! F(e, y') = Σ_b Σ_{x ≤ y'} X(b, x) · e^{ι(y' − x)}            (+ 1 at a path start)
+//! Z        = Σ_b X(b, end of b) · e^{end(g, b)}
 //! ```
 //!
 //! and the backward pass mirrors them. Every inner sum is a prefix or suffix
 //! sum, as the DAG's maxima are running maxima. On an edge `b → e`, every
 //! entry of `e` beyond `b`'s end sees the same exit mass `Σ_x X(b, x)`, so
-//! forward adds it once to a difference array and backward reads it from a
-//! suffix sum: an edge costs O(overlap), a read
-//! `O(Σ_nodes len + Σ_edges (overlap + 1))` multiply–adds.
+//! forward adds it once at the first such entry and carries it by a prefix
+//! sum, and backward reads it from a suffix sum: an edge costs O(overlap), a
+//! read `O(Σ_nodes len + Σ_edges (overlap + 1))` multiply–adds.
 //!
 //! **Arithmetic.** Values are linear, not logarithmic. Each `(node, group)`
 //! slot carries one log-scale (as in scaled HMM recursions) and is
-//! renormalised once complete. Prior weights `exp(λk)` come from a table and
+//! renormalised once complete. Prior weights `exp(λ0·k)` come from a table and
 //! cut weights from running products along the alignment, so no
 //! transcendental function is evaluated per cut. Within a placement, entry
 //! and exit weights are centred separately, each on the midpoint of the
@@ -71,7 +74,7 @@ use super::PlacementDag;
 use super::lattice::{Group, KINDS, Lattice, Node, column_steps};
 use super::model::{Grammar, PathModel};
 #[cfg(doc)]
-use super::units::{CallModel, ReadModel};
+use super::units::CallModel;
 use super::units::{EvidenceScale, PathNats};
 use crate::germline::SegmentKind;
 use crate::placement::Placement;
