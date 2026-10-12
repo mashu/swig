@@ -134,8 +134,8 @@ pub struct Assigner<
     pub d_window: W,
     pub adjudicator: Adj,
     /// Adjudicators for reads of one locus, where it differs from
-    /// `adjudicator`: a D database of several loci prices a D by its own
-    /// locus' D genes ([`crate::config::DPrior`]).
+    /// `adjudicator`: a D or J database of several loci prices a D and a J
+    /// by its own locus' genes ([`crate::config::DPrior`]).
     pub locus_adjudicators: Vec<(Locus, Adj)>,
     /// Constant-region assignment after adjudication; `None` without a C
     /// database ([`Assigner::with_constant`]).
@@ -243,14 +243,17 @@ impl<A, RV, RJ, RD, W, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj> {
         }
     }
 
-    /// The loci of `placements` together; [`Loci::ANY`] when there are none.
-    fn placed_loci(&self, placements: &[Placement]) -> Loci {
-        if placements.is_empty() {
-            return Loci::ANY;
-        }
+    /// The loci of the anchors among `placements` together; [`Loci::ANY`]
+    /// when none is an anchor. A chance hit does not choose the locus of
+    /// the next segment, as it does not bound the J window
+    /// ([`DownstreamWindow`]).
+    fn anchored_loci(&self, placements: &[Placement]) -> Loci {
         placements
             .iter()
-            .fold(Loci::NONE, |loci, p| loci.union(self.placement_loci(p)))
+            .filter(|p| p.anchor.is_some())
+            .map(|p| self.placement_loci(p))
+            .reduce(Loci::union)
+            .unwrap_or(Loci::ANY)
     }
 
     /// The adjudicator for reads of `locus` (`None`: unknown or several).
@@ -385,8 +388,8 @@ where
                 retrieval,
                 &mut state.j,
             );
-            // A J joins a V of its own locus.
-            let loci = self.placed_loci(placed);
+            // A J joins an anchoring V of its own locus.
+            let loci = self.anchored_loci(placed);
             state
                 .j
                 .retain(|c| set.allele(c.allele).loci.pairs_with(loci));
@@ -438,8 +441,8 @@ where
         let set = d.segment.set();
         for ((k, window), found) in windows.iter().zip(candidates.iter_mut()) {
             d.retrieve(&reads[*k].query, window.clone(), retrieval, found);
-            // A D joins the V and J of its own locus.
-            let loci = self.placed_loci(&placements[*k]);
+            // A D joins the anchoring V and J of its own locus.
+            let loci = self.anchored_loci(&placements[*k]);
             found.retain(|c| set.allele(c.allele).loci.pairs_with(loci));
         }
         let requests: Vec<SegmentRequest<'_>> = windows
