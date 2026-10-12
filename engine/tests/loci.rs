@@ -22,8 +22,11 @@ fn databases() -> (
 ) {
     let heavy = SyntheticDatabase::generate(&SyntheticSpec::default(), 1);
     let light = SyntheticDatabase::generate(&SyntheticSpec::default(), 2);
+    // The written `locus=IGH` would win over the new labels: drop it, so the
+    // loci are read from the labels.
     let rename = |set: &GermlineSet, kind, from: &str, to: &str| {
-        GermlineSet::from_fasta(kind, &fasta(set).replace(from, to)).unwrap()
+        let text = fasta(set).replace(from, to).replace(" locus=IGH", "");
+        GermlineSet::from_fasta(kind, &text).unwrap()
     };
     let light_v = rename(&light.v, SegmentKind::V, "IGHV", "IGKV");
     let light_j = rename(&light.j, SegmentKind::J, "IGHJ", "IGKJ");

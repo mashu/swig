@@ -14,8 +14,9 @@
 //!
 //! FWR3 ends after the Cys104 codon, so a V anchor is FWR3's end − 3. The
 //! values are *given*, like header keys: they win over every value the
-//! database annotation ([`crate::annotate`]) would derive, and fill only
-//! what an explicit `anchor=`, `fr1=`, … key leaves open.
+//! database annotation ([`crate::annotate`]) would derive, except an anchor
+//! the allele's own sequence confidently contradicts, and fill only what an
+//! explicit `anchor=`, `fr1=`, … key leaves open.
 
 /// The parsed `SWIGMETA=` field of one record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

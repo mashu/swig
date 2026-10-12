@@ -17,7 +17,7 @@ use crate::germline::{
     Allele, GermlineSet, IMGT_CONSERVED_CODONS, ImgtNumbering, RegionSlot, RegionStarts,
 };
 
-use super::AnchorSource;
+use super::{AnchorSource, Note};
 
 /// The conserved residues at [`IMGT_CONSERVED_CODONS`].
 const CONSERVED: [u8; 3] = *b"CWC";
@@ -79,10 +79,17 @@ impl ImgtGaps {
 #[derive(Clone, Debug)]
 pub struct Given {
     pub anchor: Option<u32>,
-    /// [`AnchorSource::Header`] or [`AnchorSource::ImgtGaps`] when the
-    /// anchor is given.
+    /// The source of a given anchor: [`AnchorSource::ImgtGaps`] for the
+    /// IMGT numbering's; for a header's, the source a prepared database
+    /// records for it ([`Allele::source`], `annotation=`), else
+    /// [`AnchorSource::Header`].
     pub source: Option<AnchorSource>,
+    /// The header anchor is `SWIGMETA`'s ([`Allele::anchor_from_meta`]).
+    pub from_meta: bool,
     pub regions: [RegionSlot; 5],
+    /// Header region starts a prepared database marks uncertain
+    /// ([`Allele::uncertain`]).
+    pub uncertain: [bool; 5],
     /// The IMGT numbering ends before Cys104: the allele holds no anchor,
     /// and none may be searched for or transferred.
     pub ends_before_cys104: bool,
@@ -91,14 +98,14 @@ pub struct Given {
 impl Given {
     /// Header keys, then (with `use_gaps`) the allele's IMGT numbering in
     /// the slots and anchor the header leaves open. Notes go to `notes`.
-    pub fn read(allele: &Allele, use_gaps: bool, notes: &mut Vec<String>) -> Self {
+    pub fn read(allele: &Allele, use_gaps: bool, notes: &mut Vec<Note>) -> Self {
+        let regions = allele.regions.values();
         let header = Self {
             anchor: allele.anchor,
-            source: allele.anchor.map(|_| AnchorSource::Header),
-            regions: allele
-                .regions
-                .values()
-                .map(|v| v.map_or(RegionSlot::Unknown, RegionSlot::Known)),
+            source: allele.anchor.map(|_| AnchorSource::given(allele)),
+            from_meta: allele.anchor_from_meta,
+            regions: regions.map(|v| v.map_or(RegionSlot::Unknown, RegionSlot::Known)),
+            uncertain: [0, 1, 2, 3, 4].map(|i| allele.uncertain[i] && regions[i].is_some()),
             ends_before_cys104: false,
         };
         let Some(imgt) = allele.imgt.as_deref().filter(|_| use_gaps) else {
@@ -116,18 +123,26 @@ impl Given {
             merged.ends_before_cys104 = imgt.ends_before_cys104;
         }
         if let Err(reason) = merged.known().check(merged.anchor, allele.codes.len()) {
-            notes.push(format!("IMGT gap numbering ignored: {reason}"));
+            notes.push(Note::ImgtGapsIgnored { reason });
             return header;
         }
         notes.extend(
             imgt.frameshift_markers
                 .iter()
-                .map(|column| format!("IMGT frameshift marker in codon {}", column / 3 + 1)),
+                .map(|column| Note::ImgtFrameshiftMarker {
+                    codon: column / 3 + 1,
+                }),
         );
         if merged.ends_before_cys104 {
-            notes.push("3′-partial: the IMGT numbering ends before Cys104".into());
+            notes.push(Note::ImgtEndsBeforeCys104);
         }
         merged
+    }
+
+    /// The given start of region `slot` (index into [`RegionStarts::KEYS`])
+    /// as evidence for other alleles: known, and not marked uncertain.
+    pub fn certain(&self, slot: usize) -> Option<u32> {
+        self.regions[slot].known().filter(|_| !self.uncertain[slot])
     }
 
     /// The known region starts.

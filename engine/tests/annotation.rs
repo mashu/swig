@@ -7,7 +7,9 @@
 //! W occur), random mutation of non-conserved framework residues, random
 //! synonymous codons, and optional 5′ truncation that shifts the frame.
 
-use swig::annotate::{AlleleAnnotation, AnchorSource, AnnotateOptions, ChainType, annotate};
+use swig::annotate::{
+    AlleleAnnotation, AnchorSource, AnnotateOptions, ChainType, Cys23Choice, Note, annotate,
+};
 use swig::germline::Allele;
 use swig::prelude::*;
 use swig::sim::Rng;
@@ -209,12 +211,7 @@ fn pseudogene_anchor_is_transferred_from_its_closest_sibling() {
             from: "V0*01".into()
         }
     );
-    assert!(
-        annotation
-            .notes
-            .iter()
-            .any(|n| n.contains("conserved residue is S"))
-    );
+    assert!(annotation.notes.contains(&Note::TransferredResidue(b'S')));
 }
 
 /// A 3′-partial allele (IMGT "partial in 3′") ends inside its Cys104 codon.
@@ -240,7 +237,7 @@ fn three_prime_partial_allele_gets_no_anchor() {
         annotation
             .notes
             .iter()
-            .any(|n| n.contains("past the 3′ end")),
+            .any(|n| matches!(n, Note::ThreePrimePartial { .. })),
         "{:?}",
         annotation.notes
     );
@@ -273,7 +270,10 @@ fn a_deletion_before_cys104_is_not_a_partial_allele() {
     let report = annotate(&mut v, Some(&mut j), AnnotateOptions::default());
     let annotation = report.v.last().unwrap();
     assert!(
-        !annotation.notes.iter().any(|n| n.contains("3′-partial")),
+        !annotation.notes.iter().any(|n| matches!(
+            n,
+            Note::ThreePrimePartial { .. } | Note::ImgtEndsBeforeCys104
+        )),
         "{annotation:?}"
     );
     let allele = v.alleles().last().unwrap();
@@ -373,9 +373,9 @@ fn ambiguous_cys23_of_a_truncated_allele_is_resolved_from_its_sibling() {
     assert_eq!(allele.regions.cdr1, Some(truth[0].starts[1] - 2));
     let notes = &report.v.last().unwrap().notes;
     assert!(
-        notes
-            .iter()
-            .any(|n| n == "ambiguous Cys23 resolved from V0*01"),
+        notes.contains(&Note::Cys23Resolved {
+            relative: "V0*01".into()
+        }),
         "{notes:?}"
     );
 }
@@ -599,7 +599,7 @@ fn imgt_gapped_input_numbers_every_region() {
         let (allele, annotation) = by_name("V0*02");
         assert_eq!(allele.anchor, Some(genes[0].anchor));
         assert!(
-            annotation.notes.iter().any(|n| n == "IMGT 104 codon is S"),
+            annotation.notes.contains(&Note::ImgtResidue(b'S')),
             "{annotation:?}"
         );
 
@@ -608,10 +608,7 @@ fn imgt_gapped_input_numbers_every_region() {
         assert_eq!(annotation.source, AnchorSource::Missing);
         assert_eq!(allele.regions.values(), genes[1].starts.map(Some));
         assert!(
-            annotation
-                .notes
-                .iter()
-                .any(|n| n == "3′-partial: the IMGT numbering ends before Cys104"),
+            annotation.notes.contains(&Note::ImgtEndsBeforeCys104),
             "{annotation:?}"
         );
 
@@ -635,8 +632,7 @@ fn imgt_gapped_input_numbers_every_region() {
         assert!(
             annotation
                 .notes
-                .iter()
-                .any(|n| n == "IMGT frameshift marker in codon 84"),
+                .contains(&Note::ImgtFrameshiftMarker { codon: 84 }),
             "{annotation:?}"
         );
 
@@ -881,10 +877,9 @@ fn fr3_start_follows_the_annotated_relative_across_a_cdr2_indel() {
         "{annotation:?}"
     );
     assert!(
-        annotation
-            .notes
-            .iter()
-            .any(|n| n == "FR3 start from TRBV1*01"),
+        annotation.notes.contains(&Note::Fr3FromRelative {
+            relative: "TRBV1*01".into()
+        }),
         "{annotation:?}"
     );
     assert!(!annotation.uncertain[4]);
@@ -964,7 +959,9 @@ fn appended_ungapped_alleles_take_fr3_from_gapped_relatives() {
         let (allele, annotation) = (&v.alleles()[id], &report.v[id]);
         assert_eq!(allele.anchor, Some(anchor), "{name}");
         assert_eq!(allele.regions.fr3, Some(fr3), "{name} {annotation:?}");
-        let note = format!("FR3 start from V{donor}*01");
+        let note = Note::Fr3FromRelative {
+            relative: format!("V{donor}*01"),
+        };
         assert!(annotation.notes.contains(&note), "{name} {annotation:?}");
         assert!(!annotation.uncertain[4], "{name}");
     }
@@ -1096,8 +1093,12 @@ fn cys23_model_learns_a_tr_context_and_resolves_a_truncated_allele() {
         "{annotation:?}"
     );
     assert!(
-        annotation.notes.iter().any(|n| n.starts_with(
-            "Cys23 ambiguous (1 other C in window); CDR1 start from the database model"
+        annotation.notes.iter().any(|n| matches!(
+            n,
+            Note::Cys23Ambiguous {
+                others: 1,
+                choice: Cys23Choice::Model { .. }
+            }
         )),
         "{annotation:?}"
     );
@@ -1124,9 +1125,10 @@ fn a_mutated_cys23_is_placed_at_the_database_offset() {
         "{annotation:?}"
     );
     assert!(
-        annotation.notes.iter().any(|n| n
-            .starts_with("no Cys23 (Y at its position); CDR1 start from the database model (n=")
-            && n.ends_with(", p=1.00)")),
+        annotation.notes.iter().any(|n| matches!(
+            n,
+            Note::NoCys23Model { residue: b'Y', p, .. } if *p >= 1.0
+        )),
         "{annotation:?}"
     );
     assert!(annotation.uncertain[1]);
@@ -1156,7 +1158,9 @@ fn a_five_prime_partial_allele_takes_cdr1_from_its_relative() {
         Some(gene.starts[1] - cut as u32),
         "{annotation:?}"
     );
-    let note = format!("no Cys23; CDR1 start from {}", v.alleles()[source].name);
+    let note = Note::NoCys23 {
+        relative: v.alleles()[source].name.clone(),
+    };
     assert!(annotation.notes.contains(&note), "{annotation:?}");
     assert!(annotation.uncertain[1]);
 }

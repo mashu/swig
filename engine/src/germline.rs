@@ -314,9 +314,18 @@ pub struct Allele {
     /// `SWIGMETA=`); a V or J anchor fixes the frame too.
     pub frame: Option<u8>,
     /// Where the anchor and region starts come from: the `SWIGMETA=`
-    /// provenance, else the database annotation's source
-    /// ([`crate::prepare`]).
+    /// provenance when its coordinates are used, else the database
+    /// annotation's source ([`crate::prepare`]).
     pub source: Option<String>,
+    /// Region starts (FR1, CDR1, FR2, CDR2, FR3) the header marks
+    /// `uncertain=`: given, but derived by the annotation of a prepared
+    /// database, which doubted them ([`crate::prepare`]).
+    pub uncertain: [bool; 5],
+    /// The anchor was read from `SWIGMETA=`, not from an `anchor=` key:
+    /// a coordinate Swig transferred from IMGT-annotated relatives, which
+    /// annotation drops when the allele's own motifs confidently contradict
+    /// it ([`crate::annotate`]).
+    pub anchor_from_meta: bool,
 }
 
 impl Allele {
@@ -326,22 +335,37 @@ impl Allele {
     }
 
     /// Take what this allele lacks from `copy`, an identical sequence: its
-    /// anchor when this allele's region starts fit it, its region starts
-    /// (only as a whole, and only when they fit this allele's anchor) and
-    /// its IMGT numbering. Values this allele has are kept, so the allele
+    /// anchor (with the frame it fixes) when this allele's region starts fit
+    /// it, its region starts (only as a whole, and only when they fit this
+    /// allele's anchor) and its IMGT numbering; its provenance only with
+    /// coordinates taken. Values this allele has are kept, so the allele
     /// stays consistent ([`RegionStarts::check`]).
     fn absorb(&mut self, copy: Allele) {
         let len = self.codes.len();
-        if self.anchor.is_none() && self.regions.check(copy.anchor, len).is_ok() {
+        let mut taken = false;
+        if self.anchor.is_none()
+            && copy.anchor.is_some()
+            && self.regions.check(copy.anchor, len).is_ok()
+        {
             self.anchor = copy.anchor;
+            self.anchor_from_meta = copy.anchor_from_meta;
+            self.frame = copy.frame.or(self.frame);
+            taken = true;
         }
-        if self.regions.is_empty() && copy.regions.check(self.anchor, len).is_ok() {
+        if self.regions.is_empty()
+            && !copy.regions.is_empty()
+            && copy.regions.check(self.anchor, len).is_ok()
+        {
             self.regions = copy.regions;
+            self.uncertain = copy.uncertain;
+            taken = true;
         }
         self.imgt = self.imgt.take().or(copy.imgt);
         self.loci = self.loci.union(copy.loci);
         self.frame = self.frame.or(copy.frame);
-        self.source = self.source.take().or(copy.source);
+        if taken {
+            self.source = self.source.take().or(copy.source);
+        }
     }
 }
 
@@ -534,16 +558,22 @@ impl GermlineSet {
             loci: Loci::infer(name, name),
             frame: None,
             source: None,
+            uncertain: [false; 5],
+            anchor_from_meta: false,
         });
         Ok(id)
     }
 
     /// Load from FASTA. Header: `>NAME [anchor=POS] [fr1= cdr1= fr2= cdr2= fr3=]
-    /// [frame=F] [aliases=A,B] [SWIGMETA=…]` (0-based positions; unknown keys
-    /// are ignored). Swig's `SWIGMETA=` field ([`crate::metadata`]) fills
-    /// what the keys leave open. A gapped V record keeps its IMGT numbering
-    /// in [`Allele::imgt`]; the loci come from the label, else the header
-    /// ([`Loci::infer`]).
+    /// [frame=F] [aliases=A,B] [locus=L,…] [annotation=SOURCE]
+    /// [uncertain=fr1,…] [SWIGMETA=…]` (0-based positions; unknown keys are
+    /// ignored). Swig's `SWIGMETA=` field ([`crate::metadata`]) fills what
+    /// the keys leave open. `annotation=` and `uncertain=`, as a prepared
+    /// database writes them, give the provenance of the header's values
+    /// ([`Allele::source`]) and the starts it doubts ([`Allele::uncertain`]).
+    /// A gapped V record keeps its IMGT numbering in [`Allele::imgt`]; the
+    /// loci come from `locus=` (as [`Self::write_fasta`] writes them), else
+    /// the label, else the header ([`Loci::infer`]).
     pub fn from_fasta(kind: SegmentKind, text: &str) -> Result<Self, GermlineError> {
         let mut set = Self::new(kind);
         for record in parse_fasta(text)? {
@@ -570,6 +600,20 @@ impl GermlineSet {
                 *slot = position(key)?;
             }
             let regions = RegionStarts::from_values(values);
+            let mut uncertain = [false; 5];
+            for key in record
+                .attribute("uncertain")
+                .into_iter()
+                .flat_map(|l| l.split(','))
+            {
+                let slot = RegionStarts::KEYS.iter().position(|&k| k == key);
+                let slot = slot.ok_or_else(|| GermlineError::BadAttribute {
+                    name: name.to_string(),
+                    key: "uncertain".to_string(),
+                    value: key.to_string(),
+                })?;
+                uncertain[slot] = true;
+            }
             let len = record.sequence.len();
             regions
                 .check(anchor, len)
@@ -579,10 +623,15 @@ impl GermlineSet {
                 })?;
             // SWIGMETA fills what the keys leave open, as long as the
             // result stays consistent; otherwise its coordinates are unused.
-            let (anchor, regions) = match &meta {
+            // Its provenance names the coordinates it supplies, so it is
+            // kept only when it supplies some.
+            let (filled_anchor, filled_regions) = match &meta {
                 Some(meta) => meta_fill(kind, meta, anchor, regions, len),
                 None => (anchor, regions),
             };
+            let anchor_from_meta = filled_anchor != anchor;
+            let meta_used = anchor_from_meta || filled_regions != regions;
+            let (anchor, regions) = (filled_anchor, filled_regions);
             let frame = match record.attribute("frame") {
                 Some(value) => {
                     Some(value.parse::<u8>().ok().filter(|f| *f < 3).ok_or_else(|| {
@@ -599,8 +648,23 @@ impl GermlineSet {
             let allele = &mut set.alleles[id as usize];
             allele.regions = regions;
             allele.frame = frame;
-            allele.source = meta.and_then(|m| m.source).map(str::to_string);
-            allele.loci = Loci::infer(name, &record.header);
+            allele.source = meta
+                .filter(|_| meta_used)
+                .and_then(|m| m.source)
+                .or(record.attribute("annotation"))
+                .map(str::to_string);
+            allele.uncertain = uncertain;
+            allele.anchor_from_meta = anchor_from_meta;
+            allele.loci = match record.attribute("locus") {
+                Some(list) => {
+                    Loci::parse_list(list).ok_or_else(|| GermlineError::BadAttribute {
+                        name: name.to_string(),
+                        key: "locus".to_string(),
+                        value: list.to_string(),
+                    })?
+                }
+                None => Loci::infer(name, &record.header),
+            };
             if kind == SegmentKind::V {
                 allele.imgt = ImgtNumbering::read(&record.gaps, &allele.codes).map(Box::new);
             }
@@ -687,13 +751,16 @@ impl GermlineSet {
             target.loci = allele.loci;
             target.frame = allele.frame;
             target.source = allele.source;
+            target.uncertain = allele.uncertain;
+            target.anchor_from_meta = allele.anchor_from_meta;
         }
         *self = rebuilt;
         Ok(merged)
     }
 
-    /// Write as FASTA with every known annotation in the header; `extra`
-    /// appends further `key=value` tokens per allele.
+    /// Write as FASTA with every known annotation in the header, the loci of
+    /// an allele of known locus included (`locus=`); `extra` appends further
+    /// `key=value` tokens per allele.
     pub fn write_fasta<W: Write>(
         &self,
         out: &mut W,
@@ -714,6 +781,9 @@ impl GermlineSet {
             }
             if !allele.aliases.is_empty() {
                 write!(out, " aliases={}", allele.aliases.join(","))?;
+            }
+            if allele.loci != Loci::ANY {
+                write!(out, " locus={}", allele.loci.list())?;
             }
             if let Some(tokens) = extra(id as AlleleId) {
                 write!(out, " {tokens}")?;
@@ -786,22 +856,29 @@ impl GermlineSet {
     /// The alleles for which `keep` holds, in order, as a set of their own,
     /// with their ids in this set.
     pub fn subset(&self, keep: impl Fn(&Allele) -> bool) -> (Self, Vec<AlleleId>) {
+        let ids: Vec<AlleleId> = (0..)
+            .zip(&self.alleles)
+            .filter(|(_, allele)| keep(allele))
+            .map(|(id, _)| id)
+            .collect();
+        (self.select(&ids), ids)
+    }
+
+    /// The alleles `ids`, in that order, as a set of their own.
+    pub fn select(&self, ids: &[AlleleId]) -> Self {
         let mut set = Self::new(self.kind);
-        let mut ids = Vec::new();
-        for (id, allele) in (0..).zip(&self.alleles) {
-            if keep(allele) {
-                let new = set
-                    .push_codes(&allele.name, allele.codes.clone(), allele.anchor)
-                    .expect("a copied allele is valid");
-                let gene = set.alleles[new as usize].gene;
-                set.alleles[new as usize] = Allele {
-                    gene,
-                    ..allele.clone()
-                };
-                ids.push(id);
-            }
+        for &id in ids {
+            let allele = &self.alleles[id as usize];
+            let new = set
+                .push_codes(&allele.name, allele.codes.clone(), allele.anchor)
+                .expect("a copied allele is valid");
+            let gene = set.alleles[new as usize].gene;
+            set.alleles[new as usize] = Allele {
+                gene,
+                ..allele.clone()
+            };
         }
-        (set, ids)
+        set
     }
 }
 
@@ -865,6 +942,49 @@ mod tests {
         assert_eq!(again.allele(0).anchor, Some(12));
         assert!(GermlineSet::from_fasta(SegmentKind::V, ">V anchor=2 fr2=5\nACGTACGT\n").is_err());
         assert!(GermlineSet::from_fasta(SegmentKind::V, ">V cdr1=x\nACGT\n").is_err());
+    }
+
+    /// A prepared header's `annotation=` and `uncertain=` are read back as
+    /// the provenance and the doubted starts of its values.
+    #[test]
+    fn prepared_headers_give_provenance_and_uncertain_starts() {
+        let text = ">V1*01 anchor=12 fr1=0 fr3=3 annotation=transfer:V2*01 uncertain=fr1,fr3\nACGTACGTACGTACG\n";
+        let set = GermlineSet::from_fasta(SegmentKind::V, text).unwrap();
+        let allele = set.allele(0);
+        assert_eq!(allele.source.as_deref(), Some("transfer:V2*01"));
+        assert_eq!(allele.uncertain, [true, false, false, false, true]);
+        assert!(matches!(
+            GermlineSet::from_fasta(SegmentKind::V, ">V1*01 uncertain=fr9\nACGT\n"),
+            Err(GermlineError::BadAttribute { key, .. }) if key == "uncertain"
+        ));
+    }
+
+    /// The written FASTA keeps every allele's loci, also those read from
+    /// the header or set by hand, so a reload pairs alleles as before.
+    #[test]
+    fn loci_survive_the_written_fasta() {
+        use crate::locus::Locus;
+        let text = ">V1*01 IGKV1-5*01 anchor=3\nACGTACGT\n>V2*01\nACGTTT\n>V3*01\nTTGCAT\n";
+        let mut set = GermlineSet::from_fasta(SegmentKind::V, text).unwrap();
+        assert_eq!(set.allele(0).loci, Loci::of(Locus::Igk));
+        assert_eq!(set.allele(1).loci, Loci::ANY);
+        let tra_trd = Loci::of(Locus::Tra).union(Loci::of(Locus::Trd));
+        set.alleles[2].loci = tra_trd;
+        let mut written = Vec::new();
+        set.write_fasta(&mut written, |_| None).unwrap();
+        let written = String::from_utf8(written).unwrap();
+        assert!(written.contains(">V1*01 anchor=3 locus=IGK\n"), "{written}");
+        assert!(written.contains(">V3*01 locus=TRA,TRD\n"), "{written}");
+        let again = GermlineSet::from_fasta(SegmentKind::V, &written).unwrap();
+        let loci = |set: &GermlineSet| set.alleles().iter().map(|a| a.loci).collect::<Vec<_>>();
+        assert_eq!(loci(&again), loci(&set));
+        // The key wins over the label.
+        let keyed = GermlineSet::from_fasta(SegmentKind::V, ">IGHV1*01 locus=igk\nACGT\n").unwrap();
+        assert_eq!(keyed.allele(0).loci, Loci::of(Locus::Igk));
+        assert!(matches!(
+            GermlineSet::from_fasta(SegmentKind::V, ">V1*01 locus=XYZ\nACGT\n"),
+            Err(GermlineError::BadAttribute { key, .. }) if key == "locus"
+        ));
     }
 
     #[test]
