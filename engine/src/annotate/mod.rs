@@ -639,7 +639,11 @@ fn annotate_j(
             if !matches!(residue, b'W' | b'F') {
                 notes.push(Note::HeaderResidue(residue));
             }
-            result.push(AlleleAnnotation::new(AnchorSource::given(allele), notes));
+            let annotation = AlleleAnnotation::new(AnchorSource::given(allele), notes);
+            if annotation.trusted() {
+                vote += 2 * i32::from(j_motif::residue_vote(residue));
+            }
+            result.push(annotation);
             anchors.push(Some(anchor));
             weak.push(None);
             continue;
@@ -1513,6 +1517,26 @@ mod tests {
     /// Human IGHV1/OR15-5*01, 5′-partial: its region starts lie in frame 2,
     /// and no Cys104 there has confident motifs.
     const IGHV1_OR15_5: &str = "AGAAGCCTGGGGCCTCAGTGAAGGTCTCCTGCAAGGCTTCTGGATACACCTTCACCAGCTACTGTATGCACTGGGTGCACCAGGTCCATGCACAAGGGCTTGAGTGGATGGGATTGGTGTGCCCTAGTGATGGCAGCACAAGCTATGCACAGAAGTTCCAGGCCAGAGTCACCATAACCAGGGACACATCCATGAGCACAGCCTACATGGAGCTAAGCAGTCTGAGATCTGAGGACACGGCCATGTATTACTGTGTGAGA";
+
+    /// Human IGHJ4*02: Trp118 at 14 starts `WGQG`.
+    const IGHJ4: &str = "ACTACTTTGACTACTGGGGCCAGGGAACCCTGGTCACCGTCTCCTCAG";
+
+    /// A J anchor given in the header votes the chain with its residue,
+    /// as the motif search's does: the chain no longer depends on whether a
+    /// database states its J anchors.
+    #[test]
+    fn given_j_anchors_vote_the_chain_as_motif_hits_do() {
+        for (allele, sequence, anchor, chain) in [
+            ("IGHJ4*02", IGHJ4, 14, ChainType::Heavy),
+            ("TRAJ48*01", TRAJ48, 29, ChainType::Light),
+        ] {
+            for keys in [String::new(), format!(" anchor={anchor}")] {
+                let (j, report) = annotate_j(&format!(">{allele}{keys}\n{sequence}\n"));
+                assert_eq!(j.allele(0).anchor, Some(anchor), "{allele}{keys}");
+                assert_eq!(report.chain, Some(chain), "{allele}{keys}");
+            }
+        }
+    }
 
     /// Human IGHV3-23*01, IGKV1-5*01 and IGLV2-14*01 (`swig` 0.7 reference).
     const IGHV3_23: &str = "GAGGTGCAGCTGTTGGAGTCTGGGGGAGGCTTGGTACAGCCTGGGGGGTCCCTGAGACTCTCCTGTGCAGCCTCTGGATTCACCTTTAGCAGCTATGCCATGAGCTGGGTCCGCCAGGCTCCAGGGAAGGGGCTGGAGTGGGTCTCAGCTATTAGTGGTAGTGGTGGTAGCACATACTACGCAGACTCCGTGAAGGGCCGGTTCACCATCTCCAGAGACAATTCCAAGAACACGCTGTATCTGCAAATGAACAGCCTGAGAGCCGAGGACACGGCCGTATATTACTGTGCGAAAGA";
