@@ -9,8 +9,10 @@
 //! column. An AIRR table is tab-separated, or comma-separated when its
 //! header line holds no tab, and is read from its `sequence`, `sequence_id`
 //! and `quality` columns: Swig re-annotates AIRR input from its sequences.
-//! Gzip input is recognised by its magic bytes and rejected with a hint to
-//! decompress on the fly (the crate has no dependencies).
+//! Lines end in `\n` or `\r\n`; a carriage return inside a line (CR-only
+//! line endings) is an error rather than one long line. Gzip input is
+//! recognised by its magic bytes and rejected with a hint to decompress on
+//! the fly (the crate has no dependencies).
 
 use std::fmt;
 use std::io::{self, BufRead};
@@ -80,6 +82,11 @@ pub enum ReadError {
     NoSequenceColumn {
         line: usize,
     },
+    /// A carriage return inside a line: CR-only (classic Mac) line endings,
+    /// which would otherwise read the whole input as one line.
+    CarriageReturn {
+        line: usize,
+    },
 }
 
 impl fmt::Display for ReadError {
@@ -119,6 +126,10 @@ impl fmt::Display for ReadError {
             } => write!(
                 f,
                 "FASTQ record '{header}': {quality} quality characters for {sequence} bases"
+            ),
+            Self::CarriageReturn { line } => write!(
+                f,
+                "line {line}: carriage return inside a line (CR-only line endings?); convert them, e.g. `tr '\\r' '\\n'`"
             ),
         }
     }
@@ -285,7 +296,10 @@ impl<R: BufRead> ReadReader<R> {
         Ok(None)
     }
 
-    /// Read one line into `self.buffer` without its line terminator.
+    /// Read one line into `self.buffer` without its line terminator (`\n`
+    /// or `\r\n`). A carriage return left inside the line is an error: no
+    /// FASTA/FASTQ line or unquoted table field holds one, and with CR-only
+    /// line endings the whole input would read as one line.
     fn next_line(&mut self) -> Result<bool, ReadError> {
         self.buffer.clear();
         if self.input.read_line(&mut self.buffer)? == 0 {
@@ -294,6 +308,9 @@ impl<R: BufRead> ReadReader<R> {
         self.line += 1;
         let trimmed = self.buffer.trim_end_matches(['\n', '\r']).len();
         self.buffer.truncate(trimmed);
+        if self.buffer.contains('\r') {
+            return Err(ReadError::CarriageReturn { line: self.line });
+        }
         Ok(true)
     }
 
@@ -475,6 +492,28 @@ mod tests {
         ));
         assert!(read_all(b"").unwrap().is_empty());
         assert!(read_all(b"\n  \n").unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejects_cr_only_line_endings() {
+        // Classic Mac line endings would read the whole file as one line:
+        // one FASTA read with an empty sequence, or no AIRR row at all.
+        for text in [
+            &b">r1\rACGT\r>r2\rTTTT\r"[..],
+            b"@r1\rACGT\r+\rIIII\r",
+            b"sequence_id\tsequence\tv_call\rq1\tACGT\t\r",
+            b"\r\r>r1\rACGT\r",
+        ] {
+            assert!(
+                matches!(read_all(text), Err(ReadError::CarriageReturn { line: 1 })),
+                "{:?}",
+                String::from_utf8_lossy(text)
+            );
+        }
+        assert!(matches!(
+            read_all(b">r1\nAC\rGT\n"),
+            Err(ReadError::CarriageReturn { line: 2 })
+        ));
     }
 
     #[test]
