@@ -130,17 +130,6 @@ fn interval(start: Option<i64>, end: Option<i64>, floor: i64, ceil: i64) -> Opti
 }
 
 impl ReadRegions {
-    /// AIRR names of the FR/CDR regions, in output column order.
-    pub const NAMES: [&'static str; 7] = ["fwr1", "cdr1", "fwr2", "cdr2", "fwr3", "fwr4", "cdr3"];
-
-    /// The FR/CDR intervals in [`ReadRegions::NAMES`] order.
-    pub fn intervals(&self) -> [Option<&Range<u32>>; 7] {
-        [
-            &self.fwr1, &self.cdr1, &self.fwr2, &self.cdr2, &self.fwr3, &self.fwr4, &self.cdr3,
-        ]
-        .map(Option::as_ref)
-    }
-
     pub fn from_call<C: AlleleCatalog>(call: &Call, catalog: &C) -> Self {
         let n = call.query.len() as i64;
         let v = called(call, catalog, SegmentKind::V);
