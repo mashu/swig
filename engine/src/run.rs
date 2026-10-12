@@ -543,13 +543,8 @@ fn assigned<T: VdjAssigner + AlleleCatalog + Sync>(
     assign_map(assigner, &encoded, threads, |i, call| {
         let sequence = String::from_utf8_lossy(sequences[i]);
         let mut record = AirrRecord::from_call("", &sequence, &call, assigner, support);
-        if let Some(gate) = c_prefix_identity
-            && record
-                .c
-                .as_ref()
-                .is_some_and(|c| c.prefix_identity.is_none_or(|p| p + 1e-9 < gate))
-        {
-            record.c = None;
+        if let Some(min) = c_prefix_identity {
+            record.gate_c_prefix(min);
         }
         let double_d = screen
             .zip(assigner.segment(SegmentKind::D))

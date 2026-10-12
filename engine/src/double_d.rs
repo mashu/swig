@@ -30,7 +30,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::alphabet::{N, decode};
 use crate::germline::{AlleleId, GermlineSet};
-use crate::locus::{Loci, Locus};
+use crate::locus::Loci;
 use crate::report::{AirrRecord, Row, fraction, push_run};
 use crate::scoring::Score;
 
@@ -360,9 +360,7 @@ impl DoubleDScreen {
             return None;
         }
         let [v, d, j] = [&record.v, &record.d, &record.j].map(Option::as_ref);
-        let locus = record
-            .locus
-            .and_then(|name| Locus::ALL.into_iter().find(|l| l.name() == name));
+        let locus = record.locus;
         if locus.is_some_and(|l| !l.has_d()) {
             return None;
         }

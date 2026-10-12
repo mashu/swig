@@ -75,6 +75,7 @@ use crate::alphabet::{N, decode_base};
 use crate::clip::ClipSpan;
 use crate::evidence::Evidence;
 use crate::germline::{GermlineSet, SegmentKind};
+use crate::locus::Locus;
 use crate::pipeline::{AlleleCatalog, Call};
 use crate::placement::Placement;
 use crate::read_regions::ReadRegions;
@@ -131,7 +132,7 @@ pub struct AirrRecord {
     pub quality: String,
     pub rev_comp: bool,
     /// The locus the path's alleles share; `None` when unknown.
-    pub locus: Option<&'static str>,
+    pub locus: Option<Locus>,
     pub v: Option<SegmentReport>,
     pub d: Option<SegmentReport>,
     pub j: Option<SegmentReport>,
@@ -952,8 +953,7 @@ impl AirrRecord {
         }
         record.locus = (loci != crate::locus::Loci::ANY)
             .then(|| loci.first())
-            .flatten()
-            .map(|l| l.name());
+            .flatten();
         let source = |kind: SegmentKind| {
             let segment = path
                 .segments
@@ -987,6 +987,18 @@ impl AirrRecord {
     /// The header line of [`Self::to_tsv`], without a line break.
     pub fn tsv_header() -> String {
         Self::COLUMNS.join("\t")
+    }
+
+    /// Empty the C columns unless `c_prefix_identity` reaches `min`
+    /// (`--c-prefix-identity`).
+    pub fn gate_c_prefix(&mut self, min: f64) {
+        if self
+            .c
+            .as_ref()
+            .is_some_and(|c| c.prefix_identity.is_none_or(|p| p < min))
+        {
+            self.c = None;
+        }
     }
 
     /// The oriented read's symbols, as `sequence` gives them: the text the
@@ -1029,7 +1041,7 @@ impl AirrRecord {
         row.flag(r.vj_in_frame);
         row.flag(r.stop_codon);
         row.flag(r.complete_vdj);
-        row.field(self.locus.unwrap_or(""));
+        row.field(self.locus.map_or("", Locus::name));
         let segments = [&self.v, &self.d, &self.j, &self.c];
         for s in segments {
             row.field(s.as_ref().map_or("", |s| &s.call));
@@ -1266,6 +1278,37 @@ mod tests {
                 assert!(row[column].contains(code), "{column} {}", row[column]);
             }
         }
+    }
+
+    /// The C gate keeps C where `c_prefix_identity` reaches it, and only
+    /// there.
+    #[test]
+    fn the_c_gate_keeps_c_from_its_prefix_identity_up() {
+        let assigner = synthetic_assigner();
+        let (v, _) = germline(&assigner, SegmentKind::V);
+        let (j, _) = germline(&assigner, SegmentKind::J);
+        let read = format!("{v}GGTCA{j}");
+        let call = assigner.assign(&encode(read.as_bytes()), &mut assigner.workspace());
+        let record = AirrRecord::from_call("q", &read, &call, &assigner, &[None, None, None]);
+        let with_c = |prefix_identity: Option<f64>| {
+            let c = record.v.clone().map(|v| SegmentReport {
+                prefix_identity,
+                ..v
+            });
+            AirrRecord {
+                c,
+                ..record.clone()
+            }
+        };
+        for (identity, kept) in [(Some(0.97), true), (Some(0.969), false), (None, false)] {
+            let mut gated = with_c(identity);
+            gated.gate_c_prefix(0.97);
+            assert_eq!(gated.c.is_some(), kept, "{identity:?}");
+        }
+        let mut without = with_c(None);
+        without.c = None;
+        without.gate_c_prefix(0.97);
+        assert_eq!(without, AirrRecord { c: None, ..record });
     }
 
     #[test]
