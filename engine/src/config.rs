@@ -652,9 +652,15 @@ impl Assigner {
         } else {
             Vec::new()
         };
-        // The D floor must not prune a D any locus would call.
+        // The D floor must not prune a D any locus would call; a locus
+        // without D genes calls none.
+        let has_d = |locus: Locus| {
+            d.as_ref()
+                .is_some_and(|d| d.alleles().iter().any(|a| a.loci.contains(locus)))
+        };
         let floor = locus_adjudicators
             .iter()
+            .filter(|(locus, _)| has_d(*locus))
             .map(|(_, a)| a.d_score_floor())
             .fold(adjudicator.d_score_floor(), Score::min);
         Ok(Assigner {
@@ -895,6 +901,55 @@ mod tests {
             .map(|(locus, dag)| (*locus, j_cost(dag)))
             .collect();
         assert_eq!(by_locus, [(Locus::Igh, cost(3)), (Locus::Igk, cost(2))]);
+    }
+
+    /// A locus without D genes calls no D, so its adjudicator's placeholder
+    /// D cost does not lower the D stage's floor: an IGH+IGK database prunes
+    /// D hits as an IGH one does.
+    #[test]
+    fn a_locus_without_d_leaves_the_d_floor_alone() {
+        let mut next = crate::testing::rng(5);
+        let mut fasta = |names: &[&str], len: usize| -> String {
+            names
+                .iter()
+                .map(|name| {
+                    let codes = crate::testing::random_codes(&mut next, len);
+                    format!(">{name}\n{}\n", crate::alphabet::decode(&codes))
+                })
+                .collect()
+        };
+        let v = fasta(&["IGHV1-1*01", "IGKV1-1*01"], 120);
+        let d: Vec<String> = (1..=20).map(|g| format!("IGHD{g}-1*01")).collect();
+        let d = fasta(&d.iter().map(String::as_str).collect::<Vec<_>>(), 20);
+        let j = fasta(&["IGHJ1*01", "IGHJ2*01", "IGKJ1*01"], 40);
+        let v = GermlineSet::from_fasta(SegmentKind::V, &v).unwrap();
+        let d = GermlineSet::from_fasta(SegmentKind::D, &d).unwrap();
+        let j = GermlineSet::from_fasta(SegmentKind::J, &j).unwrap();
+        let config = EngineConfig {
+            calls: CallModel::FixedScale,
+            posterior: false,
+            ..EngineConfig::default()
+        };
+        let assigner = Assigner::from_config(&config, v, Some(d), j).unwrap();
+        let floor = |locus| {
+            let (_, dag) = assigner
+                .locus_adjudicators
+                .iter()
+                .find(|(l, _)| *l == locus)
+                .unwrap();
+            dag.d_score_floor()
+        };
+        let heavy = assigner.adjudicator.d_score_floor();
+        assert_eq!(floor(Locus::Igh), heavy);
+        assert!(
+            floor(Locus::Igk) < heavy,
+            "the test needs a lower placeholder"
+        );
+        let stage = assigner.d.as_ref().unwrap();
+        assert_eq!(
+            stage.keep.min_score,
+            config.d.lossless_min_score().max(heavy)
+        );
     }
 
     /// The engine's DAG is the configuration's: its mode, and the D stage's
