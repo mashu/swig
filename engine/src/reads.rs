@@ -15,18 +15,20 @@
 //! aligned FASTA) are dropped, so a read and its coordinates are the
 //! sequence without them. FASTQ sequence lines and AIRR `sequence` values
 //! (the unaligned read) keep every symbol, because a quality counts each
-//! one: no-call symbols such as `.` and `-` read as N, whitespace and
-//! control characters are errors, and qualities (optional in a table) must
-//! match the sequence in length.
+//! one: no-call symbols such as `.` and `-` read as N. Their symbols and
+//! qualities are printable ASCII (`!` to `~`), one byte each, so whitespace,
+//! a control character or a non-ASCII character is an error; qualities
+//! (optional in a table) must match the sequence in length.
 //!
 //! Input is read as UTF-8, a byte that is no valid UTF-8 as U+FFFD (as the
 //! Swig app's `TextDecoder` reads it): a Latin-1 header description, which
 //! is dropped anyway, does not stop a run, and an identifier keeps its
-//! readable part. A leading UTF-8 byte-order mark is skipped. Lines end in
-//! `\n` or `\r\n`; a carriage return inside a line (CR-only line endings)
-//! is an error rather than one long line. Gzip input is recognised by its
-//! magic bytes and rejected with a hint to decompress on the fly (the crate
-//! has no dependencies). An error ends the input.
+//! readable part, while in a sequence the symbol is dropped (FASTA) or an
+//! error (FASTQ, AIRR). A leading UTF-8 byte-order mark is skipped. Lines
+//! end in `\n` or `\r\n`; a carriage return inside a line (CR-only line
+//! endings) is an error rather than one long line. Gzip input is recognised
+//! by its magic bytes and rejected with a hint to decompress on the fly (the
+//! crate has no dependencies). An error ends the input.
 
 use std::fmt;
 use std::io::{self, BufRead};
@@ -61,13 +63,29 @@ fn header_id(header: &str) -> String {
     header.split_whitespace().next().unwrap_or("").to_string()
 }
 
+/// The first symbol of `text` that is not printable ASCII (`!` to `~`).
+/// FASTQ and AIRR sequences and qualities hold only those, so that one
+/// symbol is one byte and a quality counts one base.
+fn unprintable(text: &str) -> Option<char> {
+    text.chars().find(|c| !c.is_ascii_graphic())
+}
+
 /// The symbols of a FASTQ sequence line or an AIRR `sequence` value at
 /// `line`, every one kept: their qualities count them, so nothing can be
 /// dropped. No-call symbols such as `.` and `-` read as N.
-fn kept_symbols(text: &str, line: usize) -> Result<&[u8], ReadError> {
-    match text.chars().find(|c| c.is_whitespace() || c.is_control()) {
+fn sequence_symbols(text: &str, line: usize) -> Result<&[u8], ReadError> {
+    match unprintable(text) {
         Some(found) => Err(ReadError::InvalidSymbol { line, found }),
         None => Ok(text.as_bytes()),
+    }
+}
+
+/// The qualities of a FASTQ quality line or an AIRR `quality` value at
+/// `line`.
+fn quality_symbols(text: &str, line: usize) -> Result<&str, ReadError> {
+    match unprintable(text) {
+        Some(found) => Err(ReadError::InvalidQuality { line, found }),
+        None => Ok(text),
     }
 }
 
@@ -97,9 +115,16 @@ pub enum ReadError {
     MissingSeparator {
         header: String,
     },
-    /// A FASTQ sequence line or an AIRR `sequence` value holds whitespace
-    /// or a control character, which would split an output column.
+    /// A FASTQ sequence line or an AIRR `sequence` value holds a symbol
+    /// that is not printable ASCII: whitespace or a control character, or a
+    /// non-ASCII character, whose bytes would each count as a base.
     InvalidSymbol {
+        line: usize,
+        found: char,
+    },
+    /// A FASTQ quality line or an AIRR `quality` value holds a symbol that
+    /// is not printable ASCII (`!` to `~`, the Phred+33 range).
+    InvalidQuality {
         line: usize,
         found: char,
     },
@@ -149,9 +174,14 @@ impl fmt::Display for ReadError {
             Self::MissingSeparator { header } => {
                 write!(f, "FASTQ record '{header}' has no '+' separator line")
             }
-            Self::InvalidSymbol { line, found } => {
-                write!(f, "line {line}: {found:?} in a sequence")
-            }
+            Self::InvalidSymbol { line, found } => write!(
+                f,
+                "line {line}: {found:?} in a sequence (FASTQ and AIRR sequences are printable ASCII)"
+            ),
+            Self::InvalidQuality { line, found } => write!(
+                f,
+                "line {line}: {found:?} in a quality (qualities are printable ASCII, '!' to '~')"
+            ),
             Self::QualityLength {
                 line,
                 header,
@@ -332,8 +362,8 @@ impl<R: BufRead> ReadReader<R> {
             if sequence.is_empty() {
                 continue;
             }
-            let sequence = kept_symbols(sequence, self.line)?;
-            let quality = value(columns.quality);
+            let sequence = sequence_symbols(sequence, self.line)?;
+            let quality = quality_symbols(value(columns.quality), self.line)?;
             if !quality.is_empty() && quality.len() != sequence.len() {
                 return Err(ReadError::QualityLength {
                     line: self.line,
@@ -424,14 +454,14 @@ impl<R: BufRead> ReadReader<R> {
             if self.buffer.starts_with('+') {
                 break;
             }
-            sequence.extend_from_slice(kept_symbols(self.buffer.trim(), self.line)?);
+            sequence.extend_from_slice(sequence_symbols(self.buffer.trim(), self.line)?);
         }
         let mut quality = String::new();
         while quality.len() < sequence.len() {
             if !self.next_line()? {
                 break;
             }
-            quality.push_str(self.buffer.trim());
+            quality.push_str(quality_symbols(self.buffer.trim(), self.line)?);
         }
         if quality.len() != sequence.len() {
             return Err(ReadError::QualityLength {
@@ -628,6 +658,62 @@ mod tests {
             Some(Err(ReadError::UnknownFormat { .. }))
         ));
         assert!(reader.next().is_none());
+    }
+
+    #[test]
+    fn sequence_symbols_are_printable_ascii() {
+        // One symbol is one byte is one quality: a non-ASCII symbol, or a
+        // byte that is no UTF-8 (read as U+FFFD), would count as 2 or 3
+        // bases and read as as many Ns.
+        assert!(matches!(
+            read_all(b"sequence_id\tsequence\nq\tAC\xe9GT\n"),
+            Err(ReadError::InvalidSymbol {
+                line: 2,
+                found: '\u{fffd}'
+            })
+        ));
+        assert!(matches!(
+            read_all("@q\nAC\u{e9}GT\n+\nIIIII\n".as_bytes()),
+            Err(ReadError::InvalidSymbol {
+                line: 2,
+                found: '\u{e9}'
+            })
+        ));
+        // FASTA keeps letters only, and so drops them.
+        assert_eq!(
+            read_all(b">r\nAC\xe9G\xc3\xa9T\n").unwrap(),
+            [record("r", "ACGT")]
+        );
+    }
+
+    #[test]
+    fn qualities_are_printable_ascii() {
+        // "I\u{fffd}" is 4 bytes for 4 bases, but 2 qualities.
+        assert!(matches!(
+            read_all(b"@q\nACGT\n+\nI\xe9\n"),
+            Err(ReadError::InvalidQuality {
+                line: 4,
+                found: '\u{fffd}'
+            })
+        ));
+        assert!(matches!(
+            read_all("sequence,quality\nACG,I\u{e9}\n".as_bytes()),
+            Err(ReadError::InvalidQuality {
+                line: 2,
+                found: '\u{e9}'
+            })
+        ));
+        assert!(matches!(
+            read_all(b"@q\nACGTA\n+\nII II\n"),
+            Err(ReadError::InvalidQuality {
+                line: 4,
+                found: ' '
+            })
+        ));
+        assert_eq!(
+            read_all(b"@q\nACGT\n+\n!~?I\n").unwrap(),
+            [fastq("q", "ACGT", "!~?I")]
+        );
     }
 
     #[test]
