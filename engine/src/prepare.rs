@@ -444,6 +444,51 @@ mod tests {
         assert_eq!(parts(&again), [Some(Locus::Igh), Some(Locus::Igk)]);
     }
 
+    /// An allele reports a `SWIGMETA` provenance only for coordinates the
+    /// field supplied: a field with none (`unclassified`, all −1) or one
+    /// the keys override leaves the annotation's source, and a merged copy
+    /// passes its provenance on with its anchor.
+    #[test]
+    fn the_swigmeta_provenance_names_the_coordinates_it_supplied() {
+        let mut next = rng(13);
+        let none = |provenance: u32| format!("SWIGMETA=-1{},{provenance}", ",-1".repeat(11));
+        let v = format!(
+            ">V1*01 {}\n{}\n",
+            none(1),
+            decode(&random_codes(&mut next, 300))
+        );
+        let traj16 = "GGTTTTCAGATGGCCAGAAGCTGCTCTTTGCAAGGGGAACCATGTTAAAGGTGGATCTTA";
+        let iglj2 = "TGTGGTATTCGGCGGAGGGACCAAGCTGACCGTCCTAG";
+        let given = "SWIGMETA=1,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,4";
+        let j = [
+            format!(">TRAJ16*01 SWIGMETA=2{},0\n{traj16}\n", ",-1".repeat(11)),
+            format!(">J2*01 anchor=7 {}\n{iglj2}CC\n", none(4)),
+            format!(">IGLJ2A*02 SWIGMETA=0{},0\n{iglj2}\n", ",-1".repeat(11)),
+            format!(">IGLJ2B*01 {given}\n{iglj2}A\n"),
+            format!(">IGLJ2B*02 {given}\n{iglj2}\n"),
+        ]
+        .concat();
+        let texts = GermlineTexts {
+            v: &v,
+            d: None,
+            j: &j,
+            c: None,
+        };
+        let db = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+        let label = |annotations: &[AlleleAnnotation], id: usize| annotations[id].source.label();
+        assert_eq!(db.v.allele(0).source, Some(label(&db.annotation.v, 0)));
+        let traj16 = db.j.allele(0);
+        assert_eq!(traj16.frame, Some(2));
+        assert_eq!(traj16.source, Some(label(&db.annotation.j, 0)));
+        assert_eq!(db.j.allele(1).source.as_deref(), Some("header"));
+        // IGLJ2B*02 merges into IGLJ2A*02 and gives it anchor and provenance.
+        let merged = db.j.allele(2);
+        assert_eq!(merged.aliases, ["IGLJ2B*02"]);
+        assert_eq!((merged.anchor, merged.frame), (Some(7), Some(1)));
+        assert_eq!(merged.source.as_deref(), Some("validated-J-motif"));
+        assert_eq!(db.j.allele(3).source.as_deref(), Some("validated-J-motif"));
+    }
+
     #[test]
     fn constant_warnings_name_each_convention_that_blocks_c() {
         let mut next = rng(11);

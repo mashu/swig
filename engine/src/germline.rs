@@ -314,8 +314,8 @@ pub struct Allele {
     /// `SWIGMETA=`); a V or J anchor fixes the frame too.
     pub frame: Option<u8>,
     /// Where the anchor and region starts come from: the `SWIGMETA=`
-    /// provenance, else the database annotation's source
-    /// ([`crate::prepare`]).
+    /// provenance when its coordinates are used, else the database
+    /// annotation's source ([`crate::prepare`]).
     pub source: Option<String>,
     /// The anchor was read from `SWIGMETA=`, not from an `anchor=` key:
     /// a coordinate Swig transferred from IMGT-annotated relatives, which
@@ -331,23 +331,36 @@ impl Allele {
     }
 
     /// Take what this allele lacks from `copy`, an identical sequence: its
-    /// anchor when this allele's region starts fit it, its region starts
-    /// (only as a whole, and only when they fit this allele's anchor) and
-    /// its IMGT numbering. Values this allele has are kept, so the allele
+    /// anchor (with the frame it fixes) when this allele's region starts fit
+    /// it, its region starts (only as a whole, and only when they fit this
+    /// allele's anchor) and its IMGT numbering; its provenance only with
+    /// coordinates taken. Values this allele has are kept, so the allele
     /// stays consistent ([`RegionStarts::check`]).
     fn absorb(&mut self, copy: Allele) {
         let len = self.codes.len();
-        if self.anchor.is_none() && self.regions.check(copy.anchor, len).is_ok() {
+        let mut taken = false;
+        if self.anchor.is_none()
+            && copy.anchor.is_some()
+            && self.regions.check(copy.anchor, len).is_ok()
+        {
             self.anchor = copy.anchor;
             self.anchor_from_meta = copy.anchor_from_meta;
+            self.frame = copy.frame.or(self.frame);
+            taken = true;
         }
-        if self.regions.is_empty() && copy.regions.check(self.anchor, len).is_ok() {
+        if self.regions.is_empty()
+            && !copy.regions.is_empty()
+            && copy.regions.check(self.anchor, len).is_ok()
+        {
             self.regions = copy.regions;
+            taken = true;
         }
         self.imgt = self.imgt.take().or(copy.imgt);
         self.loci = self.loci.union(copy.loci);
         self.frame = self.frame.or(copy.frame);
-        self.source = self.source.take().or(copy.source);
+        if taken {
+            self.source = self.source.take().or(copy.source);
+        }
     }
 }
 
@@ -573,7 +586,6 @@ impl GermlineSet {
                 })
                 .transpose()?;
             let anchor = position("anchor")?;
-            let keyed_anchor = anchor.is_some();
             let mut values = [None; 5];
             for (slot, key) in values.iter_mut().zip(RegionStarts::KEYS) {
                 *slot = position(key)?;
@@ -588,10 +600,15 @@ impl GermlineSet {
                 })?;
             // SWIGMETA fills what the keys leave open, as long as the
             // result stays consistent; otherwise its coordinates are unused.
-            let (anchor, regions) = match &meta {
+            // Its provenance names the coordinates it supplies, so it is
+            // kept only when it supplies some.
+            let (filled_anchor, filled_regions) = match &meta {
                 Some(meta) => meta_fill(kind, meta, anchor, regions, len),
                 None => (anchor, regions),
             };
+            let anchor_from_meta = filled_anchor != anchor;
+            let meta_used = anchor_from_meta || filled_regions != regions;
+            let (anchor, regions) = (filled_anchor, filled_regions);
             let frame = match record.attribute("frame") {
                 Some(value) => {
                     Some(value.parse::<u8>().ok().filter(|f| *f < 3).ok_or_else(|| {
@@ -608,8 +625,11 @@ impl GermlineSet {
             let allele = &mut set.alleles[id as usize];
             allele.regions = regions;
             allele.frame = frame;
-            allele.source = meta.and_then(|m| m.source).map(str::to_string);
-            allele.anchor_from_meta = allele.anchor.is_some() && !keyed_anchor;
+            allele.source = meta
+                .filter(|_| meta_used)
+                .and_then(|m| m.source)
+                .map(str::to_string);
+            allele.anchor_from_meta = anchor_from_meta;
             allele.loci = match record.attribute("locus") {
                 Some(list) => {
                     Loci::parse_list(list).ok_or_else(|| GermlineError::BadAttribute {
