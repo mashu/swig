@@ -71,7 +71,7 @@ use crate::placement::Placement;
 use crate::read_regions::ReadRegions;
 use crate::scoring::Score;
 use crate::stats::KarlinAltschul;
-use crate::translate::{UNKNOWN, codon};
+use crate::translate::codon;
 
 /// An allele near-tied with a call (see the module documentation).
 #[derive(Clone, Debug, PartialEq)]
@@ -104,6 +104,9 @@ pub struct SegmentReport {
     pub germline_end: u32,
     pub sequence_alignment: String,
     pub germline_alignment: String,
+    /// The primary allele's coding frame: the offset (0–2) of a codon start
+    /// on the germline, from its anchor or given frame, when it has one.
+    pub germline_frame: Option<u32>,
     /// Near-tied alleles the call does not list, best first.
     pub alternatives: Vec<Alternative>,
     /// C only: identity of the germline from its first base.
@@ -379,24 +382,56 @@ fn normalized(sequence: &str) -> String {
         .collect()
 }
 
-/// Translate the ASCII `bases` from offset `frame`; with `gaps`, a codon
-/// holding `-` reads `-`. Unknown codons read `X`.
-fn translate_text(bases: &str, frame: usize, gaps: bool) -> String {
-    let bytes = bases.as_bytes();
-    let code = |b: u8| crate::alphabet::encode_base(b);
-    bytes
+/// Translate the ASCII `bases` from offset `frame`; unknown codons read `X`.
+fn translate_text(bases: &str, frame: usize) -> String {
+    let code = crate::alphabet::encode_base;
+    bases
+        .as_bytes()
         .get(frame..)
         .unwrap_or_default()
         .chunks_exact(3)
-        .map(|c| {
-            if gaps && c.contains(&b'-') {
-                '-'
-            } else {
-                let aa = codon(code(c[0]), code(c[1]), code(c[2]));
-                char::from(if aa == 0 { UNKNOWN } else { aa })
-            }
-        })
+        .map(|c| char::from(codon(code(c[0]), code(c[1]), code(c[2]))))
         .collect()
+}
+
+/// Translate the gapped alignment row `text` in the frame of its own bases:
+/// skip `skip` bases, then every three bases make a codon, whatever gap
+/// columns lie between them, so an indel that is not a multiple of 3 never
+/// shifts the row out of its register. Every run of three gap columns
+/// reads `-`, so an in-frame indel keeps both rows aligned. Also returns
+/// the number of residues before column `anchor`.
+fn translate_row(text: &str, skip: usize, anchor: usize) -> (String, usize) {
+    let code = crate::alphabet::encode_base;
+    let mut protein = String::with_capacity(text.len() / 3 + 1);
+    let mut at_anchor = None;
+    let (mut skip, mut codon_bases, mut filled, mut gaps) = (skip, [0u8; 3], 0, 0);
+    for (column, b) in text.bytes().enumerate() {
+        if column == anchor {
+            at_anchor = Some(protein.len());
+        }
+        if b == b'-' {
+            gaps += 1;
+            if gaps == 3 {
+                protein.push('-');
+                gaps = 0;
+            }
+            continue;
+        }
+        gaps = 0;
+        if skip > 0 {
+            skip -= 1;
+            continue;
+        }
+        codon_bases[filled] = code(b);
+        filled += 1;
+        if filled == 3 {
+            let [a, b, c] = codon_bases;
+            protein.push(char::from(codon(a, b, c)));
+            filled = 0;
+        }
+    }
+    let residues = at_anchor.unwrap_or(protein.len());
+    (protein, residues)
 }
 
 /// `S_alt ≥ S − max(2, |S|/100)`: the alternatives' score floor.
@@ -463,9 +498,9 @@ fn called_report(
         .clip
         .span(called.entry, called.exit)
         .expect("primary tied placement clips to the called interval");
-    let reference = &set.allele(placement.primary_allele()).codes;
+    let allele = set.allele(placement.primary_allele());
     let (cigar, sequence_alignment, germline_alignment, evidence) =
-        aligned(query, placement, &span, reference);
+        aligned(query, placement, &span, &allele.codes);
     let names = co.names(set);
     SegmentReport {
         alternatives: alternatives(placements, query, set, called, &names),
@@ -481,6 +516,7 @@ fn called_report(
         germline_end: span.r_hi,
         sequence_alignment,
         germline_alignment,
+        germline_frame: allele.anchor.map(|a| a % 3).or(allele.frame.map(u32::from)),
         prefix_identity: None,
     }
 }
@@ -899,6 +935,20 @@ impl AirrRecord {
         Self::COLUMNS.join("\t")
     }
 
+    /// The column of `sequence_alignment`, which starts at read base
+    /// `start`, that holds read base `position`.
+    fn alignment_column(&self, start: u32, position: u32) -> Option<usize> {
+        let mut at = start;
+        self.sequence_alignment
+            .bytes()
+            .enumerate()
+            .filter(|&(_, b)| b != b'-')
+            .find_map(|(column, _)| {
+                at += 1;
+                (at - 1 == position).then_some(column)
+            })
+    }
+
     /// The `[start, end)` slice of the oriented read.
     fn slice(&self, range: &Range<u32>) -> &str {
         &self.oriented[range.start as usize..range.end as usize]
@@ -913,7 +963,7 @@ impl AirrRecord {
         row.text(&self.sequence_id);
         row.field(&self.sequence);
         row.text(&self.quality);
-        row.some(frame, |f| translate_text(&self.oriented, f, false));
+        row.some(frame, |f| translate_text(&self.oriented, f));
         row.flag(Some(self.rev_comp));
         row.flag(r.productive);
         row.flag(r.vj_in_frame);
@@ -924,39 +974,34 @@ impl AirrRecord {
         for s in segments {
             row.field(s.as_ref().map_or("", |s| &s.call));
         }
-        // The stitched alignment translates from the Cys104 column (or the
-        // first in-frame column without a junction).
-        let alignment_frame = frame.and_then(|f| {
-            let start = self.v.as_ref().map(|v| v.sequence_start - 1)?;
-            let target = r.junction.as_ref().map(|j| j.start);
-            let mut position = start;
-            self.sequence_alignment
-                .bytes()
-                .enumerate()
-                .find_map(|(column, b)| {
-                    if b == b'-' {
-                        return None;
-                    }
-                    let hit = match target {
-                        Some(cys) => position == cys,
-                        None => position as usize % 3 == f,
-                    };
-                    position += 1;
-                    hit.then_some(column % 3)
-                })
+        // Each stitched row translates in its own frame, the read's
+        // (`sequence_frame`) and the called V germline's coding frame, and
+        // the shorter is padded with `-` so the residues at the Cys104
+        // column (the first column without a junction) line up.
+        let translated = self.v.as_ref().zip(frame).map(|(v, f)| {
+            let phase = |frame: usize, start: u32| (frame + 3 - start as usize % 3) % 3;
+            let read_skip = phase(f, v.sequence_start - 1);
+            let germline_skip = phase(v.germline_frame.unwrap_or(0) as usize, v.germline_start - 1);
+            let anchor = r
+                .junction
+                .as_ref()
+                .and_then(|j| self.alignment_column(v.sequence_start - 1, j.start))
+                .unwrap_or(0);
+            let (read, read_at) = translate_row(&self.sequence_alignment, read_skip, anchor);
+            let (germline, germline_at) =
+                translate_row(&self.germline_alignment, germline_skip, anchor);
+            let at = read_at.max(germline_at);
+            (
+                "-".repeat(at - read_at) + &read,
+                "-".repeat(at - germline_at) + &germline,
+            )
         });
         row.field(&self.sequence_alignment);
-        row.some(alignment_frame, |f| {
-            translate_text(&self.sequence_alignment, f, true)
-        });
+        row.field(translated.as_ref().map_or("", |t| &t.0));
         row.field(&self.germline_alignment);
-        row.some(alignment_frame, |f| {
-            translate_text(&self.germline_alignment, f, true)
-        });
+        row.field(translated.as_ref().map_or("", |t| &t.1));
         row.some(r.junction.as_ref(), |j| self.slice(j).to_string());
-        row.some(r.junction.as_ref(), |j| {
-            translate_text(self.slice(j), 0, false)
-        });
+        row.some(r.junction.as_ref(), |j| translate_text(self.slice(j), 0));
         row.field(self.np1.as_deref().unwrap_or(""));
         row.field(self.np2.as_deref().unwrap_or(""));
         // A V region translates in the read's frame; CDR3 and FWR4 from
@@ -968,7 +1013,7 @@ impl AirrRecord {
                     (true, Some(f)) => (f + 3 - x.start as usize % 3) % 3,
                     _ => 0,
                 };
-                translate_text(self.slice(x), offset, false)
+                translate_text(self.slice(x), offset)
             });
         };
         region(&mut row, r.cdr1.as_ref(), true);
@@ -1046,7 +1091,76 @@ impl AirrRecord {
 
 #[cfg(test)]
 mod tests {
-    use super::probability;
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::alphabet::encode;
+    use crate::annotate::AnnotateOptions;
+    use crate::config::DefaultAssigner;
+    use crate::pipeline::VdjAssigner;
+    use crate::prepare::prepare;
+    use crate::profiles::CallingProfile;
+    use crate::sim::{SyntheticDatabase, SyntheticSpec};
+    use crate::translate::translate;
+
+    /// The default assigner over the synthetic database.
+    fn synthetic_assigner() -> DefaultAssigner {
+        let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 5);
+        let database = prepare(db.v, Some(db.d), db.j, AnnotateOptions::default()).unwrap();
+        let config = CallingProfile::ROptimized.config();
+        DefaultAssigner::from_config(&config, database.v, database.d, database.j).unwrap()
+    }
+
+    /// The bases of the first allele of `kind`, and its anchor.
+    fn germline(assigner: &DefaultAssigner, kind: SegmentKind) -> (String, Option<u32>) {
+        let allele = assigner.segment(kind).unwrap().set().allele(0);
+        (decode(&allele.codes), allele.anchor)
+    }
+
+    /// The row of `read`, by column name.
+    fn row(assigner: &DefaultAssigner, read: &str) -> HashMap<&'static str, String> {
+        let call = assigner.assign(&encode(read.as_bytes()), &mut assigner.workspace());
+        let record = AirrRecord::from_call("q", read, &call, assigner, &[None, None, None]);
+        AirrRecord::COLUMNS
+            .into_iter()
+            .zip(record.to_tsv().split('\t').map(str::to_string))
+            .collect()
+    }
+
+    /// An indel that is not a multiple of 3 shifts neither translated
+    /// alignment row out of its own frame: `germline_alignment_aa` reads the
+    /// germline's protein and `sequence_alignment_aa` the read's, as
+    /// `sequence_aa` does.
+    #[test]
+    fn translated_alignment_rows_keep_their_own_frames() {
+        let assigner = synthetic_assigner();
+        let (v, anchor) = germline(&assigner, SegmentKind::V);
+        let (d, _) = germline(&assigner, SegmentKind::D);
+        let (j, _) = germline(&assigner, SegmentKind::J);
+        let anchor = anchor.expect("an annotated V") as usize;
+        let protein = |bases: &str, frame: usize| {
+            String::from_utf8(translate(&encode(bases.as_bytes()), frame)).unwrap()
+        };
+        let germline_v = protein(&v[..anchor], anchor % 3);
+        let inserted = format!("{}T{}", &v[..120], &v[120..]);
+        let deleted_and_inserted = format!("{}{}A{}", &v[..100], &v[101..200], &v[200..]);
+        for edited in [inserted, deleted_and_inserted] {
+            let read = format!("{edited}GGTCA{d}CCATG{j}");
+            let row = row(&assigner, &read);
+            assert!(row["v_cigar"].contains('I'), "{}", row["v_cigar"]);
+            let germline_aa = row["germline_alignment_aa"].trim_start_matches('-');
+            assert!(
+                germline_aa.starts_with(&germline_v),
+                "germline_alignment_aa {germline_aa} against the germline {germline_v}"
+            );
+            let read_aa = row["sequence_alignment_aa"].replace('-', "");
+            assert!(
+                row["sequence_aa"].contains(&read_aa),
+                "sequence_alignment_aa {read_aa} not in sequence_aa {}",
+                row["sequence_aa"]
+            );
+        }
+    }
 
     #[test]
     fn probabilities_show_their_tail_but_not_rounding_noise() {
