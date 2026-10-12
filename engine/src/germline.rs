@@ -317,6 +317,11 @@ pub struct Allele {
     /// provenance, else the database annotation's source
     /// ([`crate::prepare`]).
     pub source: Option<String>,
+    /// The anchor was read from `SWIGMETA=`, not from an `anchor=` key:
+    /// a coordinate Swig transferred from IMGT-annotated relatives, which
+    /// annotation drops when the allele's own motifs confidently contradict
+    /// it ([`crate::annotate`]).
+    pub anchor_from_meta: bool,
 }
 
 impl Allele {
@@ -334,6 +339,7 @@ impl Allele {
         let len = self.codes.len();
         if self.anchor.is_none() && self.regions.check(copy.anchor, len).is_ok() {
             self.anchor = copy.anchor;
+            self.anchor_from_meta = copy.anchor_from_meta;
         }
         if self.regions.is_empty() && copy.regions.check(self.anchor, len).is_ok() {
             self.regions = copy.regions;
@@ -534,6 +540,7 @@ impl GermlineSet {
             loci: Loci::infer(name, name),
             frame: None,
             source: None,
+            anchor_from_meta: false,
         });
         Ok(id)
     }
@@ -565,6 +572,7 @@ impl GermlineSet {
                 })
                 .transpose()?;
             let anchor = position("anchor")?;
+            let keyed_anchor = anchor.is_some();
             let mut values = [None; 5];
             for (slot, key) in values.iter_mut().zip(RegionStarts::KEYS) {
                 *slot = position(key)?;
@@ -600,6 +608,7 @@ impl GermlineSet {
             allele.regions = regions;
             allele.frame = frame;
             allele.source = meta.and_then(|m| m.source).map(str::to_string);
+            allele.anchor_from_meta = allele.anchor.is_some() && !keyed_anchor;
             allele.loci = Loci::infer(name, &record.header);
             if kind == SegmentKind::V {
                 allele.imgt = ImgtNumbering::read(&record.gaps, &allele.codes).map(Box::new);
@@ -687,6 +696,7 @@ impl GermlineSet {
             target.loci = allele.loci;
             target.frame = allele.frame;
             target.source = allele.source;
+            target.anchor_from_meta = allele.anchor_from_meta;
         }
         *self = rebuilt;
         Ok(merged)

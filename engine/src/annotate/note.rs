@@ -26,11 +26,47 @@ pub enum Cys23Choice {
     Model { labels: u32, p: f64 },
 }
 
+/// How the allele's own sequence contradicts a header anchor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Conflict {
+    /// J: the anchor codon does not start a `[WF]G.G` motif, while the motif
+    /// search confidently places one elsewhere in the same reading frame.
+    NotJMotif,
+    /// V: the anchor's motifs are weak and its codon lies in another reading
+    /// frame than every given CDR1, FR2, CDR2 and FR3 start.
+    OutOfFrame,
+}
+
+impl fmt::Display for Conflict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NotJMotif => "is not on [WF]G.G",
+            Self::OutOfFrame => "is out of frame with its region starts",
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Note {
     /// A header (key or `SWIGMETA`) anchor on a codon that is not the
     /// conserved residue (V `C`, J `W`/`F`); the codon's residue.
     HeaderResidue(u8),
+    /// A header anchor its allele's sequence contradicts, kept: the anchor
+    /// is not trusted ([`super::AlleleAnnotation::trusted`]). `motif` is the
+    /// anchor the confident motif search gives, if any.
+    AnchorContradicted {
+        anchor: u32,
+        conflict: Conflict,
+        motif: Option<u32>,
+    },
+    /// A `SWIGMETA` anchor its allele's sequence contradicts while the
+    /// motif search confidently places the anchor at `motif`: dropped, and
+    /// the allele annotated as one without a given anchor.
+    MetaAnchorDropped {
+        anchor: u32,
+        conflict: Conflict,
+        motif: u32,
+    },
     /// IMGT codon 104 of a gapped record is not `C`.
     ImgtResidue(u8),
     /// A transferred anchor on a codon that is not the conserved residue.
@@ -83,6 +119,25 @@ impl fmt::Display for Note {
         let residue = |r: &u8| char::from(*r);
         match self {
             Self::HeaderResidue(r) => write!(f, "header anchor codon is {}", residue(r)),
+            Self::AnchorContradicted {
+                anchor,
+                conflict,
+                motif,
+            } => {
+                write!(f, "header anchor {anchor} {conflict}")?;
+                match motif {
+                    Some(motif) => write!(f, "; the motif places it at {motif}"),
+                    None => Ok(()),
+                }
+            }
+            Self::MetaAnchorDropped {
+                anchor,
+                conflict,
+                motif,
+            } => write!(
+                f,
+                "SWIGMETA anchor {anchor} {conflict}; motif anchor {motif} used"
+            ),
             Self::ImgtResidue(r) => write!(f, "IMGT 104 codon is {}", residue(r)),
             Self::TransferredResidue(r) => write!(f, "conserved residue is {}", residue(r)),
             Self::PartialJ { relative } => write!(

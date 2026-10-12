@@ -13,7 +13,9 @@ use std::fmt;
 use std::io;
 use std::path::Path;
 
-use crate::annotate::{AlleleAnnotation, AnnotateOptions, DatabaseAnnotation, annotate_by_locus};
+use crate::annotate::{
+    AlleleAnnotation, AnnotateOptions, DatabaseAnnotation, Note, annotate_by_locus,
+};
 use crate::germline::{GermlineError, GermlineSet, MergedDuplicate, SegmentKind};
 use crate::retrieve::GeneFrames;
 use crate::seed::SeedShape;
@@ -143,7 +145,8 @@ pub enum DatabaseWarning {
     /// No V allele gives its FR3 start in a locus whose FR3 length varies by
     /// family, so every FR3 start rests on one chain default.
     Fr3Default,
-    /// Alleles whose anchors were transferred, are low-confidence or missing.
+    /// Alleles whose anchors were transferred, are low-confidence, missing
+    /// or contradicted by their sequence.
     Uncertain(usize),
     /// A convention that keeps C from being called.
     Constant(ConstantWarning),
@@ -158,7 +161,7 @@ impl fmt::Display for DatabaseWarning {
             ),
             Self::Uncertain(count) => write!(
                 f,
-                "{count} alleles have transferred, low-confidence or missing anchors; review them in the prepared annotation.tsv"
+                "{count} alleles have transferred, low-confidence, missing or contradicted anchors; review them in the prepared annotation.tsv"
             ),
             Self::Constant(warning) => write!(f, "{warning}"),
         }
@@ -192,12 +195,17 @@ pub fn prepare(
         deduplicate(set, &mut merged)?;
     }
     let annotation = annotate_by_locus(&mut v, Some(&mut j), options);
-    // An allele without a given provenance (`SWIGMETA=`) reports the
-    // annotation's source.
+    // An allele reports the provenance of its given coordinates
+    // (`SWIGMETA=`), unless it has none or annotation dropped its given
+    // anchor: then the annotation's source.
     for (set, annotations) in [(&mut v, &annotation.v), (&mut j, &annotation.j)] {
         for (id, annotation) in (0..).zip(annotations) {
             let source = set.annotation_mut(id).2;
-            if source.is_none() {
+            let dropped = annotation
+                .notes
+                .iter()
+                .any(|n| matches!(n, Note::MetaAnchorDropped { .. }));
+            if source.is_none() || dropped {
                 *source = Some(annotation.source.label());
             }
         }

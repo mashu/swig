@@ -82,6 +82,8 @@ pub struct Given {
     /// [`AnchorSource::Header`] or [`AnchorSource::ImgtGaps`] when the
     /// anchor is given.
     pub source: Option<AnchorSource>,
+    /// The header anchor is `SWIGMETA`'s ([`Allele::anchor_from_meta`]).
+    pub from_meta: bool,
     pub regions: [RegionSlot; 5],
     /// The IMGT numbering ends before Cys104: the allele holds no anchor,
     /// and none may be searched for or transferred.
@@ -95,6 +97,7 @@ impl Given {
         let header = Self {
             anchor: allele.anchor,
             source: allele.anchor.map(|_| AnchorSource::Header),
+            from_meta: allele.anchor_from_meta,
             regions: allele
                 .regions
                 .values()

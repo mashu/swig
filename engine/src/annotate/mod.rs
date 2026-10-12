@@ -22,12 +22,19 @@
 //! Every start that may be wrong is marked in
 //! [`AlleleAnnotation::uncertain`].
 //!
-//! Sources, in order of trust (a given value is never overridden):
+//! Sources, in order of trust (a given value is never overridden, except a
+//! `SWIGMETA` anchor its allele's own sequence confidently contradicts):
 //!
 //! 1. `anchor=` / `fr1=` … `fr3=` in the FASTA header, then the IMGT
 //!    numbering of an IMGT-gapped V set ([`ImgtGaps`]). A region the
 //!    numbering places before a 5′-partial sequence stays empty, and an
-//!    allele whose numbering ends before Cys104 gets no anchor.
+//!    allele whose numbering ends before Cys104 gets no anchor. A header
+//!    anchor is contradicted ([`Conflict`]) when a J anchor is off
+//!    `[WF]G.G` while a confident motif lies elsewhere in its frame, or a V
+//!    anchor with weak motifs lies in another frame than all of its given
+//!    CDR1–FR3 starts. A `SWIGMETA` anchor (coordinates Swig transferred,
+//!    with known misplacements) then gives way to a confident motif hit;
+//!    any other is kept, noted and not trusted.
 //! 2. Motif search on a one-pass three-frame translation ([`find_v`], [`find_j`]).
 //! 3. The same search with a database-consensus prior on the anchor's
 //!    distance from the 3′ end, for alleles whose motifs were weak.
@@ -58,7 +65,7 @@ pub use cys23::Cys23Model;
 pub use fr3::Fr3Model;
 pub use given::ImgtGaps;
 pub use j_motif::{JHit, find_j};
-pub use note::{Cys23Choice, Note};
+pub use note::{Conflict, Cys23Choice, Note};
 pub use transfer::{
     MIN_SHARED_FRACTION, MIN_SHARED_KMERS, RelativeIndex, kmers, shared, transfer, transfer_aligned,
 };
@@ -162,6 +169,17 @@ impl AlleleAnnotation {
             notes,
             uncertain: [false; 5],
         }
+    }
+
+    /// The anchor is reliable enough to serve as a transfer donor and to
+    /// inform the database's consensus: from a header (unless the allele's
+    /// sequence contradicts it), IMGT gaps, a motif or the consensus.
+    pub fn trusted(&self) -> bool {
+        self.source.trusted()
+            && !self
+                .notes
+                .iter()
+                .any(|n| matches!(n, Note::AnchorContradicted { .. }))
     }
 
     /// The notes, then `uncertain=` and the keys of the uncertain starts
@@ -559,7 +577,27 @@ fn annotate_j(
     let mut vote = 0i32;
     for allele in j.alleles() {
         let mut notes = Vec::new();
-        if let Some(anchor) = allele.anchor {
+        let mut given = allele.anchor;
+        if let Some(anchor) = given
+            && let Some(motif) = j_motif_against(&allele.codes, anchor, frames)
+        {
+            let (conflict, motif) = (Conflict::NotJMotif, motif.anchor());
+            if allele.anchor_from_meta {
+                notes.push(Note::MetaAnchorDropped {
+                    anchor,
+                    conflict,
+                    motif,
+                });
+                given = None;
+            } else {
+                notes.push(Note::AnchorContradicted {
+                    anchor,
+                    conflict,
+                    motif: Some(motif),
+                });
+            }
+        }
+        if let Some(anchor) = given {
             let residue = residue_at(&allele.codes, anchor);
             if !matches!(residue, b'W' | b'F') {
                 notes.push(Note::HeaderResidue(residue));
@@ -588,7 +626,9 @@ fn annotate_j(
         j.alleles()
             .iter()
             .zip(&anchors)
-            .filter_map(|(a, &x)| x.map(|x| a.codes.len() as u32 - x)),
+            .zip(&result)
+            .filter(|(_, r)| r.trusted())
+            .filter_map(|((a, &x), _)| x.map(|x| a.codes.len() as u32 - x)),
     );
     // Consensus prior for weak alleles.
     for (index, allele) in j.alleles().iter().enumerate() {
@@ -603,7 +643,7 @@ fn annotate_j(
     }
     // Sibling transfer, then low-confidence motif hits. K-mer profiles are
     // built only if some allele needs a relative.
-    let trusted: Vec<bool> = result.iter().map(|r| r.source.trusted()).collect();
+    let trusted: Vec<bool> = result.iter().map(AlleleAnnotation::trusted).collect();
     let mut relative_index = None;
     let any_donor = trusted.iter().any(|&t| t);
     for index in 0..j.len() {
@@ -660,9 +700,73 @@ fn annotate_j(
         }
     }
     for ((_, anchor, _), found) in j.annotate_mut().zip(anchors) {
-        *anchor = anchor.or(found);
+        *anchor = found;
     }
     (result, tail, vote)
+}
+
+/// The confident `[WF]G.G` motif that contradicts the given J anchor
+/// `anchor`: one in the anchor's reading frame at another codon, while the
+/// anchor codon does not start `[WF]G.G` itself.
+fn j_motif_against(codes: &[u8], anchor: u32, frames: &mut [Vec<u8>; 3]) -> Option<JHit> {
+    let on_motif = matches!(residue_at(codes, anchor), b'W' | b'F')
+        && residue_at(codes, anchor + 3) == b'G'
+        && residue_at(codes, anchor + 9) == b'G';
+    if on_motif {
+        return None;
+    }
+    find_j(codes, None, frames)
+        .filter(|h| h.confident && h.anchor() != anchor && h.frame == anchor as usize % 3)
+}
+
+/// A header anchor whose own motifs are weak (`fixed`, the motif search at
+/// it) and whose codon lies in another reading frame than every given
+/// CDR1, FR2, CDR2 and FR3 start contradicts them. FR1 is left out: Swig's
+/// preprocessor starts a 5′-partial allele's FR1 at 0 whatever its frame.
+/// A `SWIGMETA` anchor is dropped, with a note, when the free motif search
+/// confidently places Cys104 in the starts' frame: `given` then holds no
+/// anchor, and that motif hit is returned. Any other contradicted anchor is
+/// kept with a note that makes it untrusted.
+fn check_given_v_anchor(
+    codes: &[u8],
+    given: &mut Given,
+    fixed: Option<VHit>,
+    notes: &mut Vec<Note>,
+    frames: &mut [Vec<u8>; 3],
+) -> Option<VHit> {
+    let anchor = given
+        .anchor
+        .filter(|_| given.source == Some(AnchorSource::Header))?;
+    if fixed.is_some_and(|h| h.confident) {
+        return None;
+    }
+    let mut starts = given.regions[1..].iter().filter_map(|slot| slot.known());
+    let frame = starts.next()? % 3;
+    if frame == anchor % 3 || !starts.all(|start| start % 3 == frame) {
+        return None;
+    }
+    let conflict = Conflict::OutOfFrame;
+    let motif = find_v(codes, VSearch::default(), frames)
+        .filter(|h| h.confident && h.anchor() % 3 == frame);
+    match motif {
+        Some(hit) if given.from_meta => {
+            notes.push(Note::MetaAnchorDropped {
+                anchor,
+                conflict,
+                motif: hit.anchor(),
+            });
+            (given.anchor, given.source, given.from_meta) = (None, None, false);
+            Some(hit)
+        }
+        _ => {
+            notes.push(Note::AnchorContradicted {
+                anchor,
+                conflict,
+                motif: motif.map(|h| h.anchor()),
+            });
+            None
+        }
+    }
 }
 
 /// The locus an allele is annotated with: its first, `None` if unknown.
@@ -742,7 +846,7 @@ pub fn annotate(
     // database's gaps follow the IMGT numbering.
     let imgt_gaps = ImgtGaps::check(v);
     let mut result: Vec<AlleleAnnotation> = Vec::with_capacity(v.len());
-    let given: Vec<Given> = v
+    let mut given: Vec<Given> = v
         .alleles()
         .iter()
         .map(|allele| {
@@ -753,10 +857,11 @@ pub fn annotate(
         })
         .collect();
 
-    // V pass 1: given anchors fix the frame; otherwise free motif search. An
-    // allele whose IMGT numbering ends before Cys104 is not searched.
+    // V pass 1: given anchors fix the frame, unless the allele's sequence
+    // contradicts a SWIGMETA one; otherwise free motif search. An allele
+    // whose IMGT numbering ends before Cys104 is not searched.
     let mut hits: Vec<Option<VHit>> = Vec::with_capacity(v.len());
-    for ((allele, given), annotation) in v.alleles().iter().zip(&given).zip(&mut result) {
+    for ((allele, given), annotation) in v.alleles().iter().zip(&mut given).zip(&mut result) {
         let hit = if given.ends_before_cys104 {
             None
         } else {
@@ -764,7 +869,15 @@ pub fn annotate(
                 fixed_anchor: given.anchor,
                 ..VSearch::default()
             };
-            find_v(&allele.codes, search, &mut frames)
+            let fixed = find_v(&allele.codes, search, &mut frames);
+            check_given_v_anchor(
+                &allele.codes,
+                given,
+                fixed,
+                &mut annotation.notes,
+                &mut frames,
+            )
+            .or(fixed)
         };
         annotation.source = match (&given.source, hit) {
             (Some(source), _) => source.clone(),
@@ -780,7 +893,7 @@ pub fn annotate(
                 });
             }
         }
-        if annotation.source.trusted() {
+        if annotation.trusted() {
             vote += hit.map_or(0, |h| i32::from(h.chain_vote));
         }
         hits.push(hit);
@@ -800,7 +913,7 @@ pub fn annotate(
         > v.len();
     let fr3_model = Fr3Model::learn((0..v.len()).filter_map(|i| {
         let fr3 = given[i].regions[4].known()?;
-        let hit = hits[i].filter(|_| result[i].source.trusted());
+        let hit = hits[i].filter(|_| result[i].trusted());
         let anchor = given[i].anchor.or(hit.map(|h| h.anchor()))?;
         let codons = anchor.checked_sub(fr3).filter(|d| d.is_multiple_of(3))? / 3 + 1;
         let cdr2 = given[i].regions[3]
@@ -825,12 +938,12 @@ pub fn annotate(
     // Database consensus from pass 1: the 3′ tail after Cys104, the frame of
     // full-length alleles and the codon index of their Cys23.
     let trusted: Vec<VHit> = (0..v.len())
-        .filter(|&i| result[i].source.trusted())
+        .filter(|&i| result[i].trusted())
         .filter_map(|i| hits[i])
         .collect();
     let (tail, tail_share) = mode_with_share(
         (0..v.len())
-            .filter(|&i| result[i].source.trusted())
+            .filter(|&i| result[i].trusted())
             .filter_map(|i| {
                 given[i]
                     .anchor
@@ -857,7 +970,7 @@ pub fn annotate(
         if given[index].ends_before_cys104 {
             continue;
         }
-        let was_confident = result[index].source.trusted();
+        let was_confident = result[index].trusted();
         let search = VSearch {
             fixed_anchor: given[index].anchor,
             tail_prior: tail.filter(|_| !was_confident || tail_share >= 0.5),
@@ -882,7 +995,7 @@ pub fn annotate(
     // Final anchors and regions for trusted alleles.
     let len_of = |set: &GermlineSet, i: usize| set.alleles()[i].codes.len();
     let trusted_hits: Vec<Option<VHit>> = (0..v.len())
-        .map(|i| hits[i].filter(|_| result[i].source.trusted()))
+        .map(|i| hits[i].filter(|_| result[i].trusted()))
         .collect();
     let mut anchors: Vec<Option<u32>> = given
         .iter()
@@ -1069,7 +1182,7 @@ pub fn annotate(
     let trusted: Vec<bool> = result
         .iter()
         .zip(&anchors)
-        .map(|(r, a)| r.source.trusted() && a.is_some())
+        .map(|(r, a)| r.trusted() && a.is_some())
         .collect();
     let any_donor = trusted.iter().any(|&t| t);
     for index in 0..v.len() {
@@ -1164,8 +1277,7 @@ pub fn annotate(
     }
     // Every derived start of an allele without a trusted anchor is uncertain.
     for ((annotation, given), regions) in result.iter_mut().zip(&given).zip(&regions) {
-        if annotation.source.trusted() || matches!(annotation.source, AnchorSource::Transfer { .. })
-        {
+        if annotation.trusted() || matches!(annotation.source, AnchorSource::Transfer { .. }) {
             continue;
         }
         let derived = given.regions.iter().zip(regions.values());
@@ -1176,7 +1288,7 @@ pub fn annotate(
     for ((_, anchor, slot), (found, merged)) in
         v.annotate_mut().zip(anchors.into_iter().zip(regions))
     {
-        *anchor = anchor.or(found);
+        *anchor = found;
         *slot = merged;
     }
     DatabaseAnnotation {
@@ -1257,12 +1369,14 @@ impl DatabaseAnnotation {
         self.fr3_model.is_none() && self.fr3_varies && self.chain.is_some()
     }
 
-    /// Alleles whose anchor is not from a header, IMGT gaps, motif or consensus.
+    /// Alleles whose anchor is not trusted ([`AlleleAnnotation::trusted`]):
+    /// transferred, low-confidence, missing, or a header anchor the
+    /// allele's sequence contradicts.
     pub fn uncertain(&self) -> usize {
         self.v
             .iter()
             .chain(&self.j)
-            .filter(|a| !a.source.trusted())
+            .filter(|a| !a.trusted())
             .count()
     }
 
@@ -1310,5 +1424,128 @@ impl DatabaseAnnotation {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::germline::SegmentKind;
+
+    /// Human TRAJ48*01: `F` at 8 starts `FGNE`; `FGTG` starts at 29.
+    const TRAJ48: &str = "TATCTAACTTTGGAAATGAGAAATTAACCTTTGGGACTGGAACAAGACTCACCATCATACCCA";
+    /// Human TRAJ51*01: its Phe118 at 29 starts `FGKE`, no `[WF]G.G`.
+    const TRAJ51: &str = "AGATGCGTGACAGCTATGAGAAGCTGATATTTGGAAAGGAGACATGACTAACTGTGAAGCCAA";
+    /// Human IGLV2-11*03, 5′-partial: Cys104 at 244 (frame 1).
+    const IGLV2_11: &str = "CTCAGTGTCCGGGTCTCCTGGACAGTCAGTCACCATCTCCTGCACTGGAACCAGCAGTGATGTTGGTGGTTATAACTATGTCTCCTGGTACCAACAACACCCAGGCAAAGCCCCCAAACTCATGATTTATGATGTCAGTAAGCGGCCCTCAGGGGTCCCTGATCGCTTCTCTGGCTCCAAGTCTGGCAACACGGCCTCCCTGACCATCTCTGGGCTCCAGGCTGAGGATGAGGCTGATTATTACTGCTGCTCATATGCAGGCAGCTACACTTTC";
+    /// Human IGHV1/OR15-5*01, 5′-partial: its region starts lie in frame 2,
+    /// and no Cys104 there has confident motifs.
+    const IGHV1_OR15_5: &str = "AGAAGCCTGGGGCCTCAGTGAAGGTCTCCTGCAAGGCTTCTGGATACACCTTCACCAGCTACTGTATGCACTGGGTGCACCAGGTCCATGCACAAGGGCTTGAGTGGATGGGATTGGTGTGCCCTAGTGATGGCAGCACAAGCTATGCACAGAAGTTCCAGGCCAGAGTCACCATAACCAGGGACACATCCATGAGCACAGCCTACATGGAGCTAAGCAGTCTGAGATCTGAGGACACGGCCATGTATTACTGTGTGAGA";
+
+    fn annotate_j(text: &str) -> (GermlineSet, DatabaseAnnotation) {
+        let mut j = GermlineSet::from_fasta(SegmentKind::J, text).unwrap();
+        let mut v = GermlineSet::new(SegmentKind::V);
+        let report = annotate(&mut v, Some(&mut j), AnnotateOptions::default());
+        (j, report)
+    }
+
+    fn annotate_v(text: &str, chain: ChainType) -> (GermlineSet, DatabaseAnnotation) {
+        let mut v = GermlineSet::from_fasta(SegmentKind::V, text).unwrap();
+        let options = AnnotateOptions { chain: Some(chain) };
+        let report = annotate(&mut v, None, options);
+        (v, report)
+    }
+
+    /// Swig's shipped human TRAJ48*01 carries a SWIGMETA anchor on `FGNE`:
+    /// the confident `FGTG` in its frame replaces it. An explicit `anchor=`
+    /// key is kept, but noted and not trusted. TRAJ51*01's anchor is off
+    /// `[WF]G.G` too, but nothing confident contradicts it.
+    #[test]
+    fn a_j_anchor_off_its_motif_is_contradicted_by_the_motif_search() {
+        let meta = |stop: u32| format!("SWIGMETA=2,{stop},-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,4");
+        let text = format!(
+            ">TRAJ48*01 {}\n{TRAJ48}\n>TRAJ51*01 {}\n{TRAJ51}\n",
+            meta(7),
+            meta(28)
+        );
+        let (j, report) = annotate_j(&text);
+        assert_eq!(j.allele(0).anchor, Some(29));
+        assert_eq!(report.j[0].source, AnchorSource::Motif);
+        let dropped = Note::MetaAnchorDropped {
+            anchor: 8,
+            conflict: Conflict::NotJMotif,
+            motif: 29,
+        };
+        assert_eq!(report.j[0].notes, [dropped]);
+        assert_eq!(j.allele(1).anchor, Some(29));
+        assert_eq!(report.j[1].source, AnchorSource::Header);
+        assert!(report.j[1].notes.is_empty());
+        assert_eq!(report.uncertain(), 0);
+
+        let (j, report) = annotate_j(&format!(">TRAJ48*01 anchor=8\n{TRAJ48}\n"));
+        assert_eq!(j.allele(0).anchor, Some(8));
+        assert_eq!(report.j[0].source, AnchorSource::Header);
+        let contradicted = Note::AnchorContradicted {
+            anchor: 8,
+            conflict: Conflict::NotJMotif,
+            motif: Some(29),
+        };
+        assert_eq!(report.j[0].notes, [contradicted]);
+        assert!(!report.j[0].trusted());
+        assert_eq!(report.uncertain(), 1);
+    }
+
+    /// Swig's shipped IGLV2-11*03 gives its region starts in frame 1 but its
+    /// anchor in frame 0, where the V has stop codons: the confident Cys104
+    /// at 244 replaces it, and the given starts stay. IGHV1/OR15-5*01's
+    /// anchor is as contradicted, with no confident Cys104 to take its
+    /// place: kept, noted and not trusted.
+    #[test]
+    fn a_v_anchor_out_of_frame_with_its_region_starts_is_contradicted() {
+        let text =
+            format!(">IGLV2-11*03 SWIGMETA=0,-1,0,52,52,79,79,130,130,139,139,258,1\n{IGLV2_11}\n");
+        let (v, report) = annotate_v(&text, ChainType::Light);
+        let allele = v.allele(0);
+        assert_eq!(allele.anchor, Some(244));
+        assert_eq!(
+            allele.regions.values(),
+            [Some(0), Some(52), Some(79), Some(130), Some(139)]
+        );
+        assert_eq!(report.v[0].source, AnchorSource::Motif);
+        let dropped = Note::MetaAnchorDropped {
+            anchor: 255,
+            conflict: Conflict::OutOfFrame,
+            motif: 244,
+        };
+        assert!(report.v[0].notes.contains(&dropped), "{report:?}");
+        assert_eq!(report.uncertain(), 0);
+
+        let keys = "anchor=255 fr1=0 cdr1=52 fr2=79 cdr2=130 fr3=139";
+        let (v, report) = annotate_v(
+            &format!(">IGLV2-11*03 {keys}\n{IGLV2_11}\n"),
+            ChainType::Light,
+        );
+        assert_eq!(v.allele(0).anchor, Some(255));
+        let contradicted = Note::AnchorContradicted {
+            anchor: 255,
+            conflict: Conflict::OutOfFrame,
+            motif: Some(244),
+        };
+        assert!(report.v[0].notes.contains(&contradicted), "{report:?}");
+        assert_eq!(report.uncertain(), 1);
+
+        let text = format!(
+            ">IGHV1/OR15-5*01 SWIGMETA=0,-1,0,41,41,65,65,116,116,140,140,246,1\n{IGHV1_OR15_5}\n"
+        );
+        let (v, report) = annotate_v(&text, ChainType::Heavy);
+        assert_eq!(v.allele(0).anchor, Some(243));
+        assert_eq!(report.v[0].source, AnchorSource::Header);
+        let contradicted = Note::AnchorContradicted {
+            anchor: 243,
+            conflict: Conflict::OutOfFrame,
+            motif: None,
+        };
+        assert!(report.v[0].notes.contains(&contradicted), "{report:?}");
+        assert_eq!(report.uncertain(), 1);
     }
 }
