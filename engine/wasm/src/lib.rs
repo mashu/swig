@@ -31,6 +31,7 @@ use std::alloc::{Layout, alloc, dealloc};
 use std::cell::RefCell;
 use std::sync::Once;
 
+use swig::align::Backend;
 use swig::prelude::*;
 
 /// An instance's engine and buffers.
@@ -237,17 +238,6 @@ pub unsafe extern "C" fn swig_set_option(
     })
 }
 
-/// Restore every option's default; the run is rebuilt on the next
-/// annotation.
-#[unsafe(no_mangle)]
-pub extern "C" fn swig_reset_options() {
-    with_state(|state| {
-        state.options = RunOptions::default();
-        state.run = None;
-        Ok(0)
-    });
-}
-
 /// Load the germline databases (V and J required, D and C empty when
 /// absent) and prepare them under the current options. Returns the number
 /// of records read, or −1; the result buffer then holds
@@ -371,14 +361,19 @@ pub extern "C" fn swig_panic_message() {
 }
 
 /// Leave `{"version", "backend"}` in the result buffer: the engine version
-/// and the alignment kernel it runs.
+/// and the alignment kernel the run uses (before the run is built, the one
+/// the options select).
 #[unsafe(no_mangle)]
 pub extern "C" fn swig_version() {
     with_state(|state| {
+        let backend = state.run.as_ref().map_or_else(
+            || state.options.simd.unwrap_or_else(Backend::detect),
+            Run::backend,
+        );
         state.result = format!(
             "{{\"version\":{},\"backend\":{}}}",
             json_string(env!("CARGO_PKG_VERSION")),
-            json_string(swig::align::Backend::detect().name())
+            json_string(backend.name())
         )
         .into_bytes();
         Ok(0)
@@ -503,12 +498,19 @@ mod tests {
         let posterior = header.split('\t').position(|c| c == "v_posterior").unwrap();
         let row = result().lines().nth(1).unwrap().to_string();
         assert_eq!(row.split('\t').nth(posterior), Some(""));
-        swig_reset_options();
-        assert_eq!(annotate(&text), 20);
-        assert_eq!(result(), rows);
 
         swig_version();
         assert!(result().contains(env!("CARGO_PKG_VERSION")));
+        // The kernel reported is the one the options select, then the one
+        // the run uses.
+        assert_eq!(set("simd", "scalar"), 0);
+        swig_version();
+        assert!(result().contains("\"backend\":\"scalar\""), "{}", result());
+        assert_eq!(annotate(&text), 20);
+        let backend = STATE.with_borrow(|state| state.run.as_ref().map(|run| run.backend()));
+        assert_eq!(backend, Some(Backend::Scalar));
+        swig_version();
+        assert!(result().contains("\"backend\":\"scalar\""), "{}", result());
     }
 
     /// A panic inside a call keeps its message and stops the instance: the
