@@ -40,8 +40,9 @@ simulate writes PREFIX.fasta and PREFIX.truth.tsv: reads from the IgSim model
 (presets as in IgSim.jl; --rc reverse-complements that fraction, default 0.5;
 --shm fixes the SHM rate of every read; --dd sets the tandem-DD fraction) with
 their true alleles, the germline-equivalent alleles, segment intervals and
-junctions; each read's V, D and C come from its J's locus. evaluate scores an
-AIRR Rearrangement TSV from any tool against that truth
+junctions; each read's V, D and C come from its J's locus, and V and J records
+without a trusted anchor and the C records prepare warns about are not drawn.
+evaluate scores an AIRR Rearrangement TSV from any tool against that truth
 (germline-equivalence-aware allele, gene, boundary, D-presence and junction
 accuracy). Given a second calls file, evaluate also compares the two read by
 read: accuracy difference with its 95 % confidence interval and an exact
@@ -463,9 +464,20 @@ fn run_simulate(args: &Args) -> Result<(), Box<dyn Error>> {
     if params.include_dd > 0.0 && database.d.as_ref().map_or(0, GermlineSet::len) < 2 {
         eprintln!("swig: warning: --dd has no effect without at least two D alleles");
     }
-    let mut sim = Simulator::new(&database.v, database.d.as_ref(), &database.j, params)?;
-    if let Some(c) = &database.c {
-        sim = sim.with_constant(c)?;
+    let sim = Simulator::from_database(&database, params)?;
+    let sets = [
+        (SegmentKind::V, Some(&database.v)),
+        (SegmentKind::J, Some(&database.j)),
+        (SegmentKind::C, database.c.as_ref()),
+    ];
+    for (kind, set) in sets {
+        let (all, drawn) = (set.map_or(0, GermlineSet::len), sim.drawn(kind));
+        if drawn < all {
+            eprintln!(
+                "swig: drawing {} alleles from {drawn} of {all}: the others lack a trusted anchor or a complete coding region",
+                kind.label()
+            );
+        }
     }
     let mut reads = BufWriter::new(File::create(format!("{out}.fasta"))?);
     let mut truth = BufWriter::new(File::create(format!("{out}.truth.tsv"))?);

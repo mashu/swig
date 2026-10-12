@@ -11,6 +11,8 @@
 //!    alleles of the V loci, then D and V among those of the J's locus (and
 //!    the D's), so a database of several loci gives no cross-locus reads
 //!    ([`crate::locus`]); in a single-locus database that is every allele.
+//!    Over a prepared database ([`Simulator::from_database`]) alleles no
+//!    rearranged transcript carries are left out.
 //! 2. **Assembly**: `flank5 + V + N1 + [D + [N3 + D2] + N2] + J + flank3`,
 //!    flanks being random DNA. Reads outside `[min_length, max_length]` are
 //!    redrawn.
@@ -37,8 +39,11 @@ use std::ops::Range;
 use super::params::SimParams;
 use super::random::{Count, Rng};
 use crate::alphabet::decode_base;
+use crate::annotate::{AlleleAnnotation, AnchorSource};
+use crate::config::CSegmentConfig;
 use crate::germline::{GermlineSet, SegmentKind};
 use crate::locus::Loci;
+use crate::prepare::{ConstantWarning, PreparedDatabase};
 use crate::translate::open_frames;
 
 /// The C stream's seed is the read stream's seed XOR this
@@ -149,7 +154,7 @@ pub enum SimError {
     },
     /// No read met the length constraints within `max_retries` attempts.
     Retries(usize),
-    /// No J allele shares a locus with a V allele.
+    /// No J allele to draw shares a locus with a V allele to draw.
     Unpaired,
     /// A parameter outside its domain ([`SimParams::validate`]).
     Parameter(String),
@@ -163,7 +168,7 @@ impl fmt::Display for SimError {
                 write!(f, "expected a {} germline set", expected.label())
             }
             Self::Retries(n) => write!(f, "no read met the length limits after {n} attempts"),
-            Self::Unpaired => write!(f, "no J allele shares a locus with a V allele"),
+            Self::Unpaired => write!(f, "no J allele to draw shares a locus with a V allele"),
             Self::Parameter(problem) => write!(f, "simulation parameter {problem}"),
         }
     }
@@ -179,7 +184,8 @@ pub struct Simulator<'a> {
     c: Vec<Vec<u8>>,
     /// Stop-free reading frame of each C allele.
     c_frames: Vec<Option<usize>>,
-    /// The loci of each allele, by [`SegmentKind::index`].
+    /// The loci each allele is drawn for, by [`SegmentKind::index`]: its
+    /// own, or none for an allele left out ([`Simulator::from_database`]).
     loci: [Vec<Loci>; 4],
     /// The loci of the V alleles together: a J outside them is never drawn.
     v_loci: Loci,
@@ -249,11 +255,7 @@ impl<'a> Simulator<'a> {
         }
         check(j, SegmentKind::J)?;
         params.validate()?;
-        let v_loci = v.alleles().iter().fold(Loci::NONE, |u, a| u.union(a.loci));
-        if !j.alleles().iter().any(|a| a.loci.pairs_with(v_loci)) {
-            return Err(SimError::Unpaired);
-        }
-        Ok(Self {
+        let mut sim = Self {
             v: ascii(v),
             d: d.map(ascii).unwrap_or_default(),
             j: ascii(j),
@@ -265,10 +267,83 @@ impl<'a> Simulator<'a> {
                 loci(j),
                 Vec::new(),
             ],
-            v_loci,
+            v_loci: Loci::NONE,
             sets: [Some(v), d, Some(j), None],
             params,
-        })
+        };
+        sim.pair()?;
+        Ok(sim)
+    }
+
+    /// A simulator over a prepared database (and its C, if any) that draws
+    /// only the alleles a rearranged, spliced transcript carries: no V or J
+    /// allele whose anchor was not found (a 3′-partial V record) or is a
+    /// low-confidence guess, since a junction truth built on it would rest
+    /// on the annotation it is meant to test; and no C allele the C stage
+    /// cannot call (5′-truncated or genomic records,
+    /// [`PreparedDatabase::constant_warnings`]).
+    pub fn from_database(
+        database: &'a PreparedDatabase,
+        params: SimParams,
+    ) -> Result<Self, SimError> {
+        let mut sim = Self::new(&database.v, database.d.as_ref(), &database.j, params)?;
+        let guessed = |annotations: &'a [AlleleAnnotation]| {
+            move |allele: usize| {
+                annotations.get(allele).is_some_and(|a| {
+                    matches!(
+                        a.source,
+                        AnchorSource::Missing | AnchorSource::LowConfidence
+                    )
+                })
+            }
+        };
+        sim.leave_out(SegmentKind::V, guessed(&database.annotation.v));
+        sim.leave_out(SegmentKind::J, guessed(&database.annotation.j));
+        if let Some(c) = &database.c {
+            sim = sim.with_constant(c)?;
+            let refused: Vec<String> = database
+                .constant_warnings(CSegmentConfig::default().spread)
+                .into_iter()
+                .filter_map(|warning| match warning {
+                    ConstantWarning::Truncated { allele, .. }
+                    | ConstantWarning::NotCoding { allele, .. } => Some(allele),
+                    ConstantWarning::JEnd { .. } => None,
+                })
+                .collect();
+            sim.leave_out(SegmentKind::C, |allele| {
+                refused.contains(&c.alleles()[allele].name)
+            });
+        }
+        sim.pair()?;
+        Ok(sim)
+    }
+
+    /// Never draw the alleles of `kind` that `left_out` names by index.
+    fn leave_out(&mut self, kind: SegmentKind, left_out: impl Fn(usize) -> bool) {
+        for (allele, loci) in self.loci[kind.index()].iter_mut().enumerate() {
+            if left_out(allele) {
+                *loci = Loci::NONE;
+            }
+        }
+    }
+
+    /// Collect the loci of the V alleles to draw, and check that some J
+    /// allele to draw pairs with them.
+    fn pair(&mut self) -> Result<(), SimError> {
+        let [v, _, j, _] = &self.loci;
+        self.v_loci = v.iter().fold(Loci::NONE, |u, &l| u.union(l));
+        match j.iter().any(|l| l.pairs_with(self.v_loci)) {
+            true => Ok(()),
+            false => Err(SimError::Unpaired),
+        }
+    }
+
+    /// How many alleles of `kind` reads are drawn from.
+    pub fn drawn(&self, kind: SegmentKind) -> usize {
+        self.loci[kind.index()]
+            .iter()
+            .filter(|l| !l.is_empty())
+            .count()
     }
 
     /// Read into the constant regions of `c` ([`Self::append_constant`]).
@@ -796,5 +871,68 @@ mod tests {
             }
             assert!((200..280).contains(&constant), "{constant}");
         }
+    }
+
+    /// From a prepared database, a 3′-partial V record (no Cys104) and a
+    /// 5′-truncated C record are never drawn: every read's V has an anchor
+    /// for its junction truth.
+    #[test]
+    fn a_prepared_database_draws_only_complete_alleles() {
+        use crate::annotate::AnnotateOptions;
+        use crate::prepare::GermlineTexts;
+        use crate::sim::{SyntheticDatabase, SyntheticSpec};
+        let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 4);
+        let fasta = |set: &GermlineSet| {
+            let mut text = Vec::new();
+            set.write_fasta(&mut text, |_| None).unwrap();
+            String::from_utf8(text).unwrap()
+        };
+        let record = |name: &str, codes: &[u8]| {
+            let bases: String = codes.iter().map(|&c| char::from(decode_base(c))).collect();
+            format!(">{name}\n{bases}\n")
+        };
+        let (v1, c1) = (db.v.allele(0), db.c.allele(0));
+        let cut = v1.anchor.unwrap() as usize - 30;
+        let v = fasta(&db.v) + &record("IGHV9-9*01", &v1.codes[..cut]);
+        let c = fasta(&db.c) + &record("IGHC1-1*09", &c1.codes[300..]);
+        let (d, j) = (fasta(&db.d), fasta(&db.j));
+        let texts = GermlineTexts {
+            v: &v,
+            d: Some(&d),
+            j: &j,
+            c: Some(&c),
+        };
+        let database = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+        let (v_set, c_set) = (&database.v, database.c.as_ref().unwrap());
+        let id = |set: &GermlineSet, name| set.alleles().iter().position(|a| a.name == name);
+        let left_out = (
+            id(v_set, "IGHV9-9*01").unwrap(),
+            id(c_set, "IGHC1-1*09").unwrap(),
+        );
+        // How often each record is drawn, and whether every V has an anchor.
+        let draws = |sim: &Simulator<'_>| {
+            let reads = sim.reads(3000, 2).unwrap();
+            let v = reads.iter().filter(|r| r.v == left_out.0).count();
+            let c = reads.iter().filter(|r| r.c == Some(left_out.1)).count();
+            let anchored = reads
+                .iter()
+                .all(|r| v_set.allele(r.v as u32).anchor.is_some());
+            (v, c, anchored)
+        };
+        let params = SimParams::easy();
+        let all = Simulator::new(v_set, database.d.as_ref(), &database.j, params)
+            .unwrap()
+            .with_constant(c_set)
+            .unwrap();
+        let (v, c, anchored) = draws(&all);
+        assert!(
+            v > 0 && c > 0 && !anchored,
+            "uniform draws reach both records"
+        );
+        let sim = Simulator::from_database(&database, params).unwrap();
+        assert_eq!(draws(&sim), (0, 0, true));
+        assert_eq!(sim.drawn(SegmentKind::V), v_set.len() - 1);
+        assert_eq!(sim.drawn(SegmentKind::J), database.j.len());
+        assert_eq!(sim.drawn(SegmentKind::C), c_set.len() - 1);
     }
 }
