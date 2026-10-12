@@ -77,3 +77,69 @@ fn junctions_end_at_the_j_motif_a_swigmeta_anchor_misplaces() {
         assert_eq!(row["v_annotation_source"], "IMGT-gapped");
     }
 }
+
+/// Kappa V alleles labelled without their locus code (`KV…`) in a heavy +
+/// kappa database, whose headers read "human kappa light chain": `LIGHT`
+/// holds `IGH` but names no locus. The kappa reads keep kappa J calls and
+/// get no D, as with the IMGT names.
+#[test]
+fn header_words_name_no_locus() {
+    use swig::germline::GermlineSet;
+    use swig::locus::{Loci, Locus};
+    use swig::sim::{SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
+    let heavy = SyntheticDatabase::generate(&SyntheticSpec::default(), 1);
+    let light = SyntheticDatabase::generate(&SyntheticSpec::default(), 2);
+    let fasta = |set: &GermlineSet, rename: &dyn Fn(&str) -> String| {
+        set.alleles()
+            .iter()
+            .map(|a| format!(">{}\n{}\n", rename(&a.name), decode(&a.codes)))
+            .collect::<String>()
+    };
+    let same = |name: &str| name.to_string();
+    let light_v = fasta(&light.v, &|name| {
+        format!("{} human kappa light chain", name.replace("IGHV", "KV"))
+    });
+    let light_j = fasta(&light.j, &|name| name.replace("IGHJ", "IGKJ"));
+    let v = fasta(&heavy.v, &same) + &light_v;
+    let j = fasta(&heavy.j, &same) + &light_j;
+    let d = fasta(&heavy.d, &same);
+    let texts = GermlineTexts {
+        v: &v,
+        d: Some(&d),
+        j: &j,
+        c: None,
+    };
+    let database = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+    let kappa_v = database
+        .v
+        .alleles()
+        .iter()
+        .filter(|a| a.name.starts_with("KV"));
+    assert!(kappa_v.clone().count() > 0);
+    assert!(kappa_v.into_iter().all(|a| a.loci == Loci::ANY));
+    let reads_v = GermlineSet::from_fasta(SegmentKind::V, &light_v).unwrap();
+    let reads_j = GermlineSet::from_fasta(SegmentKind::J, &light_j).unwrap();
+    let reads = Simulator::new(&reads_v, None, &reads_j, SimParams::mid())
+        .unwrap()
+        .reads(150, 12)
+        .unwrap();
+    let config = CallingProfile::ROptimized.config();
+    let assigner =
+        DefaultAssigner::from_config(&config, database.v, database.d, database.j).unwrap();
+    let mut ws = assigner.workspace();
+    let (mut kappa_j, mut d_calls) = (0, 0);
+    for read in &reads {
+        let call = assigner.assign(&encode(&read.sequence), &mut ws);
+        let Some(path) = &call.path else { continue };
+        for segment in &path.segments {
+            let placement = &call.placements[segment.placement];
+            let set = assigner.segment(placement.kind).unwrap().set();
+            let loci = set.allele(placement.alleles[0]).loci;
+            kappa_j +=
+                usize::from(placement.kind == SegmentKind::J && loci == Loci::of(Locus::Igk));
+            d_calls += usize::from(placement.kind == SegmentKind::D);
+        }
+    }
+    assert_eq!(d_calls, 0);
+    assert!(kappa_j >= 145, "{kappa_j} of 150 reads called a kappa J");
+}

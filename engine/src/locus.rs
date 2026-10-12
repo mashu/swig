@@ -8,11 +8,14 @@
 //! and C candidates and every adjudicated path within one locus
 //! ([`crate::pipeline`]).
 //!
-//! A locus is read from the allele label (`IGHV1-2*02`, `TRBJ2-7*01`), or,
-//! when the label names none, from the whole FASTA header. Shared TRA/TRD
-//! V genes (`TRAV14/DV4`) belong to both loci and pair with either. An
-//! allele whose locus cannot be read belongs to every locus, so a database
-//! of unrecognised names is assigned as a single locus.
+//! A locus is read from a `locus=` header key (as `swig prepare` writes it),
+//! else from the gene name in the allele label (`IGHV1-2*02`, `TRBJ2-7*01`),
+//! or, when the label names none, from a gene name in the FASTA header's
+//! free text ([`Loci::infer`]). A locus code counts only as the start of a
+//! gene name, so words such as `light` or `strain` name no locus. Shared
+//! TRA/TRD V genes (`TRAV14/DV4`) belong to both loci and pair with either.
+//! An allele whose locus cannot be read belongs to every locus, so a
+//! database of unrecognised names is assigned as a single locus.
 
 use std::fmt;
 
@@ -140,30 +143,51 @@ impl Loci {
         self.iter().map(Locus::name).collect::<Vec<_>>().join(",")
     }
 
-    /// The loci named in `text`: the locus whose code (`IGH`, …, `TRG`)
-    /// occurs first, case-insensitively, and TRD as well for a shared
-    /// `TRAV…/DV…` gene. Empty when no code occurs.
+    /// The loci named in `text`: the locus of its first gene name, and TRD
+    /// as well for a shared `TRAV…/DV…` gene. A gene name is a locus code
+    /// (`IGH`, …, `TRG`, case-insensitively) that starts the text or follows
+    /// a character other than a letter or digit, followed by a segment
+    /// letter (`V`, `D`, `J`, `C`) or, for IGH, an isotype letter (`A`,
+    /// `E`, `G`, `M`: `IGHG1`, `IGHEP1`). Empty when no gene name occurs: a
+    /// code inside a word (`LIGHT`, `STRAIN`) or before another letter
+    /// (`TRANSFER`) names none.
     pub fn named_in(text: &str) -> Self {
         let upper = text.to_ascii_uppercase();
-        let first = Locus::ALL
-            .iter()
-            .filter_map(|&locus| upper.find(locus.name()).map(|at| (at, locus)))
-            .min();
-        match first {
+        let bytes = upper.as_bytes();
+        let gene_at = |at: usize| {
+            if at > 0 && bytes[at - 1].is_ascii_alphanumeric() {
+                return None;
+            }
+            let locus = Locus::ALL
+                .into_iter()
+                .find(|locus| bytes[at..].starts_with(locus.name().as_bytes()))?;
+            let next = *bytes.get(at + locus.name().len())?;
+            let isotype = locus == Locus::Igh && matches!(next, b'A' | b'E' | b'G' | b'M');
+            (matches!(next, b'V' | b'D' | b'J' | b'C') || isotype).then_some(locus)
+        };
+        match (0..bytes.len()).find_map(gene_at) {
             None => Self::NONE,
-            Some((_, Locus::Tra)) if upper.contains("/DV") => {
+            Some(Locus::Tra) if upper.contains("/DV") => {
                 Self::of(Locus::Tra).union(Self::of(Locus::Trd))
             }
-            Some((_, locus)) => Self::of(locus),
+            Some(locus) => Self::of(locus),
         }
     }
 
     /// The loci of an allele labelled `label` in a record with FASTA header
-    /// `header`: those its label names, else those the header names, else
-    /// [`Loci::ANY`].
+    /// `header`: those its label names ([`Self::named_in`]), else those
+    /// the header's free text names, else [`Loci::ANY`]. Free text is the
+    /// whitespace-separated tokens that hold a digit, as gene names do
+    /// (`IGKV1-5`, `M99641|IGKV1-5*01|Homo_sapiens`), and are no `key=value`
+    /// attribute (`annotation=transfer:IGHV1-2*01` names a relative's gene).
     pub fn infer(label: &str, header: &str) -> Self {
-        [label, header]
-            .into_iter()
+        let named = Self::named_in(label);
+        if !named.is_empty() {
+            return named;
+        }
+        header
+            .split_whitespace()
+            .filter(|token| !token.contains('=') && token.bytes().any(|b| b.is_ascii_digit()))
             .map(Self::named_in)
             .find(|loci| !loci.is_empty())
             .unwrap_or(Self::ANY)
@@ -209,6 +233,53 @@ mod tests {
         );
         assert_eq!(Loci::infer("V1", "V1 Homo sapiens IGKV1-5"), of(Locus::Igk));
         assert_eq!(Loci::infer("V1", "V1 synthetic"), Loci::ANY);
+        assert_eq!(
+            Loci::infer("V1", "V1|IGLVI-20*01|Homo sapiens"),
+            of(Locus::Igl)
+        );
+        assert_eq!(
+            Loci::infer("V1", "V1 (TRAV14/DV4*01)"),
+            of(Locus::Tra).union(of(Locus::Trd))
+        );
+        assert_eq!(
+            Loci::infer("KV1-5*01", "KV1-5*01 Mus musculus strain BALB/c IGKV1-5"),
+            of(Locus::Igk)
+        );
+        assert_eq!(Loci::infer("Homo_sapiens_IGHV1-2*02", ""), of(Locus::Igh));
+    }
+
+    /// Gene names of every segment and IGH isotype name their locus; a code
+    /// inside a word, before another letter, in a `key=value` attribute or
+    /// in a header word without a digit names none.
+    #[test]
+    fn only_gene_names_name_a_locus() {
+        let of = Loci::of;
+        for (label, locus) in [
+            ("IGHG1*01", Locus::Igh),
+            ("IGHM*01", Locus::Igh),
+            ("IGHEP1*01", Locus::Igh),
+            ("IGHA2*01", Locus::Igh),
+            ("IGKC*01", Locus::Igk),
+            ("IGLV(I)-20*01", Locus::Igl),
+            ("TRBC1*01", Locus::Trb),
+            ("TRDD1*01", Locus::Trd),
+            ("TRGJP1*01", Locus::Trg),
+        ] {
+            assert_eq!(Loci::infer(label, ""), of(locus), "{label}");
+        }
+        for header in [
+            "VH1-18*01 Homo sapiens germline, donor strain unknown",
+            "VK1 human kappa light chain",
+            "V1 full-length transcript, Australia",
+            "ACC1.1 Homo sapiens kappa light chain, extra high weight",
+            "V1*01 anchor=285 annotation=transfer:IGHV1-2*01",
+            "V1*01 trace amounts; track 2",
+            "V1 strain=BALB_c",
+        ] {
+            let label = header.split_whitespace().next().unwrap();
+            assert_eq!(Loci::infer(label, header), Loci::ANY, "{header}");
+        }
+        assert_eq!(Loci::named_in("LIGHT STRAIN TRANSFER"), Loci::NONE);
     }
 
     #[test]
