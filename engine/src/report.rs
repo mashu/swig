@@ -66,7 +66,7 @@
 //! exact run, most matches, lowest allele id); read the isotype from the
 //! whole list.
 
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::ops::Range;
 
 use crate::adjudicate::{CallModel, CallPath, CalledSegment, CoOptimal, Marginals, co_optimal};
@@ -567,6 +567,12 @@ impl Row {
         self.fields += 1;
     }
 
+    /// A field `write` writes into the line.
+    pub(crate) fn write(&mut self, write: impl FnOnce(&mut String)) {
+        self.separate();
+        write(&mut self.line);
+    }
+
     pub(crate) fn field(&mut self, value: &str) {
         self.separate();
         self.line.push_str(value);
@@ -599,8 +605,12 @@ impl Row {
         });
     }
 
-    pub(crate) fn number(&mut self, value: Option<u32>) {
-        self.some(value, |v| v.to_string());
+    /// A field holding `value`, written in place; empty for `None`.
+    pub(crate) fn number(&mut self, value: Option<impl fmt::Display>) {
+        self.separate();
+        if let Some(value) = value {
+            let _ = write!(self.line, "{value}");
+        }
     }
 }
 
@@ -948,14 +958,14 @@ impl AirrRecord {
         row.field(translated.as_ref().map_or("", |t| &t.0));
         row.field(&self.germline_alignment);
         row.field(translated.as_ref().map_or("", |t| &t.1));
-        row.some(r.junction.as_ref(), |j| self.slice(j).to_string());
+        row.field(r.junction.as_ref().map_or("", |j| self.slice(j)));
         row.some(r.junction.as_ref(), |j| translate_text(self.slice(j), 0));
         row.field(self.np1.as_deref().unwrap_or(""));
         row.field(self.np2.as_deref().unwrap_or(""));
         // A V region translates in the read's frame; CDR3 and FWR4 from
         // their first base, which the junction puts in frame.
         let region = |row: &mut Row, range: Option<&Range<u32>>, in_frame: bool| {
-            row.some(range, |x| self.slice(x).to_string());
+            row.field(range.map_or("", |x| self.slice(x)));
             row.some(range, |x| {
                 let offset = match (in_frame, frame) {
                     (true, Some(f)) => (f + 3 - x.start as usize % 3) % 3,
@@ -972,7 +982,7 @@ impl AirrRecord {
         region(&mut row, r.fwr3.as_ref(), true);
         region(&mut row, r.fwr4.as_ref(), false);
         for (s, kind) in segments.into_iter().zip(SegmentKind::ALL) {
-            row.some(s.as_ref(), |s| s.score.to_string());
+            row.number(s.as_ref().map(|s| s.score));
             row.some(s.as_ref(), |s| fraction(s.identity));
             if kind == SegmentKind::C {
                 row.some(s.as_ref().and_then(|s| s.prefix_identity), fraction);
@@ -1000,8 +1010,8 @@ impl AirrRecord {
         }
         row.number(r.junction.as_ref().map(|j| j.end - j.start));
         row.number(r.junction.as_ref().map(|j| (j.end - j.start) / 3));
-        row.some(self.np1.as_ref(), |np| np.len().to_string());
-        row.some(self.np2.as_ref(), |np| np.len().to_string());
+        row.number(self.np1.as_ref().map(String::len));
+        row.number(self.np2.as_ref().map(String::len));
         row.flag(r.v_frameshift);
         row.flag(r.j_frameshift);
         row.number(r.d_frame.map(|f| f + 1));
@@ -1010,24 +1020,24 @@ impl AirrRecord {
         row.field(self.v_annotation_source.as_deref().unwrap_or(""));
         row.field(self.j_annotation_source.as_deref().unwrap_or(""));
         for s in segments {
-            let mut text = String::new();
-            for (i, a) in s.iter().flat_map(|s| &s.alternatives).enumerate() {
-                if i > 0 {
-                    text.push(';');
+            row.write(|text| {
+                for (i, a) in s.iter().flat_map(|s| &s.alternatives).enumerate() {
+                    if i > 0 {
+                        text.push(';');
+                    }
+                    let _ = write!(
+                        text,
+                        "{}|{}|{}|{}|{}|{}|{}",
+                        a.name,
+                        a.score,
+                        fraction(a.identity),
+                        a.sequence_start,
+                        a.sequence_end,
+                        a.germline_start,
+                        a.germline_end
+                    );
                 }
-                let _ = write!(
-                    text,
-                    "{}|{}|{}|{}|{}|{}|{}",
-                    a.name,
-                    a.score,
-                    fraction(a.identity),
-                    a.sequence_start,
-                    a.sequence_end,
-                    a.germline_start,
-                    a.germline_end
-                );
-            }
-            row.field(&text);
+            });
         }
         for s in segments {
             row.some(s.as_ref().and_then(|s| s.posterior), probability);

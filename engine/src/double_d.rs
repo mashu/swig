@@ -528,13 +528,13 @@ impl DoubleDScreen {
         row.field(&j.call);
         for hit in [d1, d2] {
             let reference = &d_set.allele(hit.allele).codes;
-            row.field(&hit.score.to_string());
+            row.number(Some(hit.score));
             row.field(&fraction(f64::from(hit.matches) / f64::from(hit.len())));
             row.field(&cigar(hit, query, reference));
         }
         for hit in [d1, d2] {
             for value in [hit.q_lo + 1, hit.q_hi, hit.r_lo + 1, hit.r_hi] {
-                row.field(&value.to_string());
+                row.number(Some(value));
             }
         }
         for hit in [d1, d2] {
@@ -544,8 +544,8 @@ impl DoubleDScreen {
         }
         row.field(np2);
         row.field(np3);
-        row.field(&np2.len().to_string());
-        row.field(&np3.len().to_string());
+        row.number(Some(np2.len()));
+        row.number(Some(np3.len()));
         for value in [
             Score::try_from(vj_span).unwrap_or(Score::MAX),
             Score::try_from(options.seed_length).unwrap_or(Score::MAX),
@@ -553,9 +553,9 @@ impl DoubleDScreen {
             best_single,
             selected.gain,
         ] {
-            row.field(&value.to_string());
+            row.number(Some(value));
         }
-        row.some(selected.pseudo, |p| p.to_string());
+        row.number(selected.pseudo);
         row.field(options.mode.name());
         row.field(&alternatives.join(";"));
         Some(row.line)
