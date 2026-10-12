@@ -26,7 +26,7 @@
 //! `\n` or `\r\n`; a carriage return inside a line (CR-only line endings)
 //! is an error rather than one long line. Gzip input is recognised by its
 //! magic bytes and rejected with a hint to decompress on the fly (the crate
-//! has no dependencies).
+//! has no dependencies). An error ends the input.
 
 use std::fmt;
 use std::io::{self, BufRead};
@@ -188,6 +188,8 @@ pub struct ReadReader<R> {
     input: R,
     format: Option<ReadFormat>,
     started: bool,
+    /// An error ended the input: where the next record starts is unknown.
+    failed: bool,
     line: usize,
     buffer: String,
     /// FASTA header already read while finishing the previous record.
@@ -202,6 +204,7 @@ impl<R: BufRead> ReadReader<R> {
             input,
             format: None,
             started: false,
+            failed: false,
             line: 0,
             buffer: String::new(),
             pending_header: None,
@@ -215,7 +218,8 @@ impl<R: BufRead> ReadReader<R> {
         &self.input
     }
 
-    /// Detected format, `None` for empty input.
+    /// Detected format, `None` for empty input (or after an error on
+    /// detection).
     pub fn format(&mut self) -> Result<Option<ReadFormat>, ReadError> {
         if !self.started {
             self.started = true;
@@ -225,7 +229,8 @@ impl<R: BufRead> ReadReader<R> {
     }
 
     /// Append up to `max` records to `out`; returns how many were appended
-    /// (0 at end of input).
+    /// (0 at end of input). On an error, the records read before it stay in
+    /// `out`.
     pub fn read_batch(
         &mut self,
         max: usize,
@@ -244,7 +249,19 @@ impl<R: BufRead> ReadReader<R> {
         Ok(count)
     }
 
+    /// The next record, `None` at the end of the input. An error ends the
+    /// input: later calls return `None`, since where the next record starts
+    /// is unknown (a FASTQ quality line may start with `@`).
     pub fn next_record(&mut self) -> Result<Option<ReadRecord>, ReadError> {
+        if self.failed {
+            return Ok(None);
+        }
+        let next = self.read_record();
+        self.failed = next.is_err();
+        next
+    }
+
+    fn read_record(&mut self) -> Result<Option<ReadRecord>, ReadError> {
         match self.format()? {
             None => Ok(None),
             Some(ReadFormat::Fasta) => self.next_fasta(),
@@ -446,6 +463,9 @@ impl<R: BufRead> Iterator for ReadReader<R> {
     }
 }
 
+/// After the end of the input or an error, every call returns `None`.
+impl<R: BufRead> std::iter::FusedIterator for ReadReader<R> {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,6 +611,29 @@ mod tests {
             read_all(b"@r1 \xe9\nAC\n+\nII\n").unwrap(),
             [fastq("r1", "AC", "II")]
         );
+    }
+
+    #[test]
+    fn an_error_ends_the_input() {
+        // Where the next record starts is unknown after an error: read on,
+        // the FASTQ quality line "@IIII" would become a read named IIII.
+        let text = b"@r1\nAC GT\n+\n@IIII\n+\nIIIII\n@r2\nACGT\n+\nIIII\n";
+        let mut reader = ReadReader::new(&text[..]);
+        assert!(matches!(
+            reader.next(),
+            Some(Err(ReadError::InvalidSymbol { line: 2, .. }))
+        ));
+        assert!(reader.next().is_none());
+        let mut out = Vec::new();
+        assert_eq!(reader.read_batch(10, &mut out).unwrap(), 0);
+        assert_eq!(ReadReader::new(&text[..]).flatten().count(), 0);
+        // So does one found on detection.
+        let mut reader = ReadReader::new(&b"\x01>r\nACGT\n"[..]);
+        assert!(matches!(
+            reader.next(),
+            Some(Err(ReadError::UnknownFormat { .. }))
+        ));
+        assert!(reader.next().is_none());
     }
 
     #[test]
