@@ -4,7 +4,7 @@
 use swig::germline::GermlineSet;
 use swig::placement::Placement;
 use swig::prelude::*;
-use swig::sim::{Region, SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
+use swig::sim::{Region, SimParams, SimulatedRead, Simulator, SyntheticDatabase, SyntheticSpec};
 
 fn database() -> SyntheticDatabase {
     SyntheticDatabase::generate(&SyntheticSpec::default(), 11)
@@ -37,6 +37,16 @@ fn names(assigner: &DefaultAssigner, call: &Call, kind: SegmentKind) -> Vec<Stri
 
 fn gene(name: &str) -> &str {
     name.split('*').next().unwrap_or(name)
+}
+
+/// `read`'s germline-sense bases from `start`, emitted on the read's strand.
+fn cut(read: &SimulatedRead, start: usize) -> Vec<u8> {
+    let forward = &read.forward[start..];
+    if read.reverse_complemented {
+        swig::sim::reverse_complement(forward)
+    } else {
+        forward.to_vec()
+    }
 }
 
 /// An indel of 9 to 30 bases in V puts the seeds on its two sides on
@@ -86,4 +96,55 @@ fn long_indels_in_v_keep_the_call() {
     }
     println!("V gene and end right on {right} of {total} reads with a long indel");
     assert!(right * 100 >= total * 98, "{right} of {total}");
+}
+
+/// A read that starts inside CDR3 holds no V, but a chance V hit in its
+/// 3′ flank or C region can sit downstream of the real J. The J must still
+/// be found as often as by a search of the whole read.
+#[test]
+fn reads_starting_in_cdr3_keep_their_j() {
+    let db = database();
+    let sim = Simulator::new(
+        &db.v,
+        Some(&db.d),
+        &db.j,
+        SimParams::mid().with_reverse_complement(0.0),
+    )
+    .expect("simulator")
+    .with_constant(&db.c)
+    .expect("C simulator");
+    let reads = sim.reads(1500, 5).expect("reads");
+    let queries: Vec<Vec<u8>> = reads
+        .iter()
+        .map(|read| encode(&cut(read, read.span(Region::V).expect("V").end + 3)))
+        .collect();
+    let truth: Vec<&str> = reads
+        .iter()
+        .map(|read| gene(&db.j.allele(read.j as u32).name))
+        .collect();
+    let right = |config: &EngineConfig| {
+        let assigner = assigner(&db.v, &db, config);
+        let calls = assign_all(&assigner, &queries, 0);
+        calls
+            .iter()
+            .zip(&truth)
+            .filter(|(call, truth)| {
+                names(&assigner, call, SegmentKind::J)
+                    .first()
+                    .is_some_and(|n| gene(n) == **truth)
+            })
+            .count()
+    };
+    let default = right(&EngineConfig::default());
+    let mut whole = EngineConfig::default();
+    whole.j.window.reclaim = u32::MAX;
+    let whole = right(&whole);
+    println!(
+        "J gene right: {default} (whole-read J search {whole}) of {}",
+        reads.len()
+    );
+    assert!(
+        default + reads.len() / 200 >= whole,
+        "J gene right {default}, whole-read search {whole}"
+    );
 }
