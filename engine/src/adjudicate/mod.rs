@@ -25,6 +25,7 @@ mod lattice;
 mod model;
 mod posterior;
 mod residual;
+mod ties;
 mod units;
 
 pub use dag::{DagScratch, PlacementDag};
@@ -32,6 +33,7 @@ pub use decode::{DAlleleDecoding, Topology, Within};
 pub use model::{EngineeringObjective, Grammar, PathModel, VdjGrammar};
 pub use posterior::{MAX_SPREAD, Marginals, OVERLAP_SPREAD, PosteriorScratch};
 pub use residual::{ResidualAdjudicator, ResidualScratch};
+pub(crate) use ties::{CoOptimal, co_optimal};
 pub use units::{
     CallModel, EvidenceModel, EvidenceScale, PathNats, ReadModel, UNITS_PER_NAT, Units, divergence,
 };
