@@ -53,6 +53,13 @@ impl Locus {
         }
     }
 
+    /// The locus of an AIRR `locus` value, case-insensitively.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|locus| locus.name().eq_ignore_ascii_case(name))
+    }
+
     /// Whether the locus has D genes (IGH, TRB, TRD).
     pub const fn has_d(self) -> bool {
         matches!(self, Self::Igh | Self::Trb | Self::Trd)
@@ -116,6 +123,21 @@ impl Loci {
     /// The first locus of the set in [`Locus::ALL`] order.
     pub fn first(self) -> Option<Locus> {
         self.iter().next()
+    }
+
+    /// The loci of a `,`-separated list of locus names (`IGH`, `TRA,TRD`),
+    /// as [`Self::list`] writes it; `None` if a name is no locus or the
+    /// list is empty.
+    pub fn parse_list(text: &str) -> Option<Self> {
+        let loci = text.split(',').try_fold(Self::NONE, |loci, name| {
+            Locus::from_name(name).map(|locus| loci.union(Self::of(locus)))
+        })?;
+        (!loci.is_empty()).then_some(loci)
+    }
+
+    /// The names of the loci in the set, `,`-separated.
+    pub fn list(self) -> String {
+        self.iter().map(Locus::name).collect::<Vec<_>>().join(",")
     }
 
     /// The loci named in `text`: the locus whose code (`IGH`, …, `TRG`)
@@ -200,5 +222,17 @@ mod tests {
         assert_eq!(Loci::of(Locus::Igl).single(), Some(Locus::Igl));
         assert_eq!(Loci::ANY.iter().count(), 7);
         assert!(Locus::Trd.has_d() && !Locus::Igk.has_d());
+    }
+
+    #[test]
+    fn lists_of_loci_round_trip() {
+        let tra_trd = Loci::of(Locus::Tra).union(Loci::of(Locus::Trd));
+        assert_eq!(tra_trd.list(), "TRA,TRD");
+        assert_eq!(Loci::parse_list("TRA,TRD"), Some(tra_trd));
+        assert_eq!(Loci::parse_list("igk"), Some(Loci::of(Locus::Igk)));
+        assert_eq!(Loci::parse_list(&Loci::ANY.list()), Some(Loci::ANY));
+        for bad in ["", "IGH,", "XYZ", "IGH,TRX"] {
+            assert_eq!(Loci::parse_list(bad), None, "{bad}");
+        }
     }
 }

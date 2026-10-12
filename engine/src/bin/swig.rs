@@ -50,10 +50,11 @@ with a paired t.
 Germline databases are FASTA and may hold several loci (IGH, IGK and IGL;
 or the TR loci): each allele's locus is read from its name, and every
 rearrangement, D and C call stays within one locus. Headers may carry
-0-based positions:
+0-based positions and the loci:
   anchor=POS            first base of the V Cys104 / J Trp-Phe118 codon (fixes the frame)
   fr1= cdr1= fr2= cdr2= fr3=   V region starts (IMGT definitions)
   frame=F               offset of the first complete codon (D: d_frame)
+  locus=L[,L]           the allele's loci (IGH, IGK, IGL, TRA, TRB, TRD, TRG)
   SWIGMETA=...          Swig's prepared coordinates (filling what the keys leave open)
 Missing values are detected on every start, per locus (motifs, database
 consensus, transfer from the closest sibling allele; milliseconds).

@@ -385,6 +385,7 @@ impl PreparedDatabase {
 mod tests {
     use super::*;
     use crate::alphabet::decode;
+    use crate::locus::{Loci, Locus};
     use crate::testing::{random_codes, rng};
 
     /// `codons` random sense codons and a stop: open in frame 0.
@@ -397,6 +398,50 @@ mod tests {
             }
         }
         (text + "TGA").into_bytes()
+    }
+
+    /// Labels without a locus code (the code only in the header text, which
+    /// the written FASTA drops) keep their loci through `prepare` → reload:
+    /// the database is still annotated, and paired, per locus.
+    #[test]
+    fn a_prepared_database_keeps_the_loci_of_its_alleles() {
+        let mut next = rng(12);
+        let mut record = |label: &str, gene: &str, len: usize| {
+            format!(
+                ">{label} {gene}\n{}\n",
+                decode(&random_codes(&mut next, len))
+            )
+        };
+        let v = record("h1*01", "IGHV1-2*01", 290) + &record("k1*01", "IGKV1-5*01", 280);
+        let j = record("hj1*01", "IGHJ4*02", 48) + &record("kj1*01", "IGKJ1*01", 38);
+        let texts = GermlineTexts {
+            v: &v,
+            d: None,
+            j: &j,
+            c: None,
+        };
+        let first = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+        let files: HashMap<&str, String> = first.files().into_iter().collect();
+        let texts = GermlineTexts {
+            v: &files["V.fasta"],
+            d: None,
+            j: &files["J.fasta"],
+            c: None,
+        };
+        let again = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+        let loci = |set: &GermlineSet| set.alleles().iter().map(|a| a.loci).collect::<Vec<_>>();
+        for (before, after) in [(&first.v, &again.v), (&first.j, &again.j)] {
+            assert_eq!(loci(after), loci(before));
+            assert!(!loci(after).contains(&Loci::ANY));
+        }
+        let parts = |db: &PreparedDatabase| -> Vec<Option<Locus>> {
+            db.annotation
+                .parts
+                .iter()
+                .map(|(locus, _)| *locus)
+                .collect()
+        };
+        assert_eq!(parts(&again), [Some(Locus::Igh), Some(Locus::Igk)]);
     }
 
     #[test]

@@ -546,11 +546,12 @@ impl GermlineSet {
     }
 
     /// Load from FASTA. Header: `>NAME [anchor=POS] [fr1= cdr1= fr2= cdr2= fr3=]
-    /// [frame=F] [aliases=A,B] [SWIGMETA=…]` (0-based positions; unknown keys
-    /// are ignored). Swig's `SWIGMETA=` field ([`crate::metadata`]) fills
-    /// what the keys leave open. A gapped V record keeps its IMGT numbering
-    /// in [`Allele::imgt`]; the loci come from the label, else the header
-    /// ([`Loci::infer`]).
+    /// [frame=F] [aliases=A,B] [locus=L,…] [SWIGMETA=…]` (0-based positions;
+    /// unknown keys are ignored). Swig's `SWIGMETA=` field
+    /// ([`crate::metadata`]) fills what the keys leave open. A gapped V
+    /// record keeps its IMGT numbering in [`Allele::imgt`]; the loci come
+    /// from `locus=` (as [`Self::write_fasta`] writes them), else the label,
+    /// else the header ([`Loci::infer`]).
     pub fn from_fasta(kind: SegmentKind, text: &str) -> Result<Self, GermlineError> {
         let mut set = Self::new(kind);
         for record in parse_fasta(text)? {
@@ -609,7 +610,16 @@ impl GermlineSet {
             allele.frame = frame;
             allele.source = meta.and_then(|m| m.source).map(str::to_string);
             allele.anchor_from_meta = allele.anchor.is_some() && !keyed_anchor;
-            allele.loci = Loci::infer(name, &record.header);
+            allele.loci = match record.attribute("locus") {
+                Some(list) => {
+                    Loci::parse_list(list).ok_or_else(|| GermlineError::BadAttribute {
+                        name: name.to_string(),
+                        key: "locus".to_string(),
+                        value: list.to_string(),
+                    })?
+                }
+                None => Loci::infer(name, &record.header),
+            };
             if kind == SegmentKind::V {
                 allele.imgt = ImgtNumbering::read(&record.gaps, &allele.codes).map(Box::new);
             }
@@ -702,8 +712,9 @@ impl GermlineSet {
         Ok(merged)
     }
 
-    /// Write as FASTA with every known annotation in the header; `extra`
-    /// appends further `key=value` tokens per allele.
+    /// Write as FASTA with every known annotation in the header, the loci of
+    /// an allele of known locus included (`locus=`); `extra` appends further
+    /// `key=value` tokens per allele.
     pub fn write_fasta<W: Write>(
         &self,
         out: &mut W,
@@ -724,6 +735,9 @@ impl GermlineSet {
             }
             if !allele.aliases.is_empty() {
                 write!(out, " aliases={}", allele.aliases.join(","))?;
+            }
+            if allele.loci != Loci::ANY {
+                write!(out, " locus={}", allele.loci.list())?;
             }
             if let Some(tokens) = extra(id as AlleleId) {
                 write!(out, " {tokens}")?;
@@ -875,6 +889,34 @@ mod tests {
         assert_eq!(again.allele(0).anchor, Some(12));
         assert!(GermlineSet::from_fasta(SegmentKind::V, ">V anchor=2 fr2=5\nACGTACGT\n").is_err());
         assert!(GermlineSet::from_fasta(SegmentKind::V, ">V cdr1=x\nACGT\n").is_err());
+    }
+
+    /// The written FASTA keeps every allele's loci, also those read from
+    /// the header or set by hand, so a reload pairs alleles as before.
+    #[test]
+    fn loci_survive_the_written_fasta() {
+        use crate::locus::Locus;
+        let text = ">V1*01 IGKV1-5*01 anchor=3\nACGTACGT\n>V2*01\nACGTTT\n>V3*01\nTTGCAT\n";
+        let mut set = GermlineSet::from_fasta(SegmentKind::V, text).unwrap();
+        assert_eq!(set.allele(0).loci, Loci::of(Locus::Igk));
+        assert_eq!(set.allele(1).loci, Loci::ANY);
+        let tra_trd = Loci::of(Locus::Tra).union(Loci::of(Locus::Trd));
+        set.alleles[2].loci = tra_trd;
+        let mut written = Vec::new();
+        set.write_fasta(&mut written, |_| None).unwrap();
+        let written = String::from_utf8(written).unwrap();
+        assert!(written.contains(">V1*01 anchor=3 locus=IGK\n"), "{written}");
+        assert!(written.contains(">V3*01 locus=TRA,TRD\n"), "{written}");
+        let again = GermlineSet::from_fasta(SegmentKind::V, &written).unwrap();
+        let loci = |set: &GermlineSet| set.alleles().iter().map(|a| a.loci).collect::<Vec<_>>();
+        assert_eq!(loci(&again), loci(&set));
+        // The key wins over the label.
+        let keyed = GermlineSet::from_fasta(SegmentKind::V, ">IGHV1*01 locus=igk\nACGT\n").unwrap();
+        assert_eq!(keyed.allele(0).loci, Loci::of(Locus::Igk));
+        assert!(matches!(
+            GermlineSet::from_fasta(SegmentKind::V, ">V1*01 locus=XYZ\nACGT\n"),
+            Err(GermlineError::BadAttribute { key, .. }) if key == "locus"
+        ));
     }
 
     #[test]
