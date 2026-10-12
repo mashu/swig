@@ -387,6 +387,10 @@ fn alternatives(
         let reference = &set.allele(p.primary_allele()).codes;
         let identity = Evidence::from_columns(p.clip.columns(&span), query, reference).identity();
         for &allele in &p.alleles {
+            // A merged allele shares the primary's columns and scores, so
+            // its identity; its germline coordinates are shifted.
+            let shift = i64::from(p.germline_shift(allele));
+            let germline = |r: u32| (i64::from(r) + shift) as u32;
             for name in set.allele(allele).names() {
                 if names.contains(&name) || found.iter().any(|a| a.name == name) {
                     continue;
@@ -397,8 +401,8 @@ fn alternatives(
                     identity,
                     sequence_start: span.q_lo + 1,
                     sequence_end: span.q_hi,
-                    germline_start: span.r_lo + 1,
-                    germline_end: span.r_hi,
+                    germline_start: germline(span.r_lo) + 1,
+                    germline_end: germline(span.r_hi),
                 });
             }
         }
@@ -1117,6 +1121,41 @@ mod tests {
             .into_iter()
             .zip(record.to_tsv().split('\t').map(str::to_string))
             .collect()
+    }
+
+    /// Every allele merged into a placement is listed among the
+    /// alternatives at its own germline coordinates, as a called allele is
+    /// ([`Placement::germline_shift`]): `IGHD9-2*02` is `IGHD9-2*01` behind
+    /// three more bases.
+    #[test]
+    fn alternatives_place_each_merged_allele_on_its_own_germline() {
+        let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 5);
+        let core = "GTATTACTATGGTTCA";
+        let d = GermlineSet::from_fasta(
+            SegmentKind::D,
+            &format!(
+                ">IGHD9-1*01\n{core}\n>IGHD9-2*01\n{near}G\n>IGHD9-2*02\nTTT{near}G\n",
+                near = &core[..15]
+            ),
+        )
+        .unwrap();
+        let database = prepare(db.v, Some(d), db.j, AnnotateOptions::default()).unwrap();
+        let config = CallingProfile::ROptimized.config();
+        let assigner =
+            DefaultAssigner::from_config(&config, database.v, database.d, database.j).unwrap();
+        let (v, _) = germline(&assigner, SegmentKind::V);
+        let (j, _) = germline(&assigner, SegmentKind::J);
+        let row = row(&assigner, &format!("{v}GG{core}TC{j}"));
+        assert_eq!(row["d_call"], "IGHD9-1*01");
+        let span = |name: &str| {
+            row["d_alternatives"]
+                .split(';')
+                .map(|a| a.split('|').collect::<Vec<_>>())
+                .find(|a| a[0] == name)
+                .map(|a| (a[5].to_string(), a[6].to_string()))
+        };
+        assert_eq!(span("IGHD9-2*01"), Some(("1".into(), "15".into())));
+        assert_eq!(span("IGHD9-2*02"), Some(("4".into(), "18".into())));
     }
 
     /// An indel that is not a multiple of 3 shifts neither translated
