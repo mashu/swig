@@ -31,7 +31,7 @@ use std::collections::{HashMap, HashSet};
 use crate::alphabet::{N, decode};
 use crate::germline::{AlleleId, GermlineSet};
 use crate::locus::{Loci, Locus};
-use crate::report::{Row, SegmentReport, fraction, push_run};
+use crate::report::{AirrRecord, Row, fraction, push_run};
 use crate::scoring::Score;
 
 /// When the screen runs.
@@ -348,21 +348,18 @@ impl DoubleDScreen {
 
     /// The sidecar fields, from `locus` on (without
     /// `swig_batch_record_index` and `sequence_id`), of the read `query`
-    /// (codes, oriented as called) whose main row reports `v`, `d` and `j`
-    /// with the D alleles of `d_set`, if the screen finds a VDDJ pair. The
-    /// line has no line break.
-    pub fn screen(
-        &self,
-        d_set: &GermlineSet,
-        query: &[u8],
-        locus: Option<&str>,
-        [v, d, j]: [Option<&SegmentReport>; 3],
-    ) -> Option<String> {
+    /// (codes, oriented as called) whose main row is `record`, with the D
+    /// alleles of `d_set`, if the screen finds a VDDJ pair. The line has no
+    /// line break.
+    pub fn screen(&self, d_set: &GermlineSet, query: &[u8], record: &AirrRecord) -> Option<String> {
         let options = &self.options;
         if options.mode == DoubleDMode::Off {
             return None;
         }
-        let locus = locus.and_then(|name| Locus::ALL.into_iter().find(|l| l.name() == name));
+        let [v, d, j] = [&record.v, &record.d, &record.j].map(Option::as_ref);
+        let locus = record
+            .locus
+            .and_then(|name| Locus::ALL.into_iter().find(|l| l.name() == name));
         if locus.is_some_and(|l| !l.has_d()) {
             return None;
         }
@@ -501,7 +498,9 @@ impl DoubleDScreen {
             names.join(",")
         };
         let (d1, d2) = (&hits[selected.first], &hits[selected.second]);
-        let between = |from: u32, to: u32| decode(&query[from as usize..to.max(from) as usize]);
+        // Read bases as the main row quotes them, IUPAC codes included.
+        let text = record.oriented();
+        let between = |from: u32, to: u32| &text[from as usize..to.max(from) as usize];
         let np2 = between(d1.q_hi, d2.q_lo);
         let np3 = between(d2.q_hi, end);
         let alternatives: Vec<String> = pairs[1..]
@@ -539,11 +538,11 @@ impl DoubleDScreen {
         }
         for hit in [d1, d2] {
             let reference = &d_set.allele(hit.allele).codes;
-            row.field(&decode(&query[hit.q_lo as usize..hit.q_hi as usize]));
+            row.field(&text[hit.q_lo as usize..hit.q_hi as usize]);
             row.field(&decode(&reference[hit.r_lo as usize..hit.r_hi as usize]));
         }
-        row.field(&np2);
-        row.field(&np3);
+        row.field(np2);
+        row.field(np3);
         row.field(&np2.len().to_string());
         row.field(&np3.len().to_string());
         for value in [

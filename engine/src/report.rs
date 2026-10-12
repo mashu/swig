@@ -30,6 +30,15 @@
 //! the read's allele up to germline equivalence. `d_presence_posterior` is
 //! the probability that the read has a D.
 //!
+//! `sequence_aa` translates the oriented read in `sequence_frame`, and
+//! `stop_codon` is a stop codon in that translation (the Cys104 codon's
+//! frame) between `v_sequence_start` and `j_sequence_end`.
+//! `sequence_alignment_aa` and `germline_alignment_aa` translate each
+//! alignment row in its own frame, the read's and the called V germline's
+//! coding frame, a run of three gap columns as `-`; the shorter is padded
+//! with `-` so the residues at the Cys104 column line up. Their stops can
+//! differ from `stop_codon`, which reads the read without indel correction.
+//!
 //! `*_alternatives` lists the alleles the call does not name whose
 //! placement, clipped to the called interval, scores within
 //! `max(2, |S|/100)` of the call's `S`, as `name|score|identity|start|end|
@@ -62,7 +71,7 @@ use std::ops::Range;
 
 use crate::adjudicate::{CallModel, CallPath, CalledSegment, Marginals};
 use crate::align::Op;
-use crate::alphabet::{N, decode, decode_base};
+use crate::alphabet::{N, decode_base};
 use crate::clip::ClipSpan;
 use crate::evidence::Evidence;
 use crate::germline::{GermlineSet, SegmentKind};
@@ -142,7 +151,8 @@ pub struct AirrRecord {
     /// Where the called V's and J's coordinates come from.
     pub v_annotation_source: Option<String>,
     pub j_annotation_source: Option<String>,
-    /// Oriented query as ASCII (region sequences are slices of it).
+    /// The oriented read's symbols, as `sequence` gives them (region
+    /// sequences are slices of it).
     oriented: String,
 }
 
@@ -295,9 +305,11 @@ pub(crate) fn co_optimal<'a>(
 }
 
 /// The CIGAR, the sequence and germline alignment strings, and the evidence
-/// of `placement`'s columns on `span` (`reference` its primary allele).
+/// of `placement`'s columns on `span` (`reference` its primary allele); the
+/// sequence alignment quotes the oriented read's symbols `text`.
 fn aligned(
     query: &[u8],
+    text: &[u8],
     placement: &Placement,
     span: &ClipSpan,
     reference: &[u8],
@@ -315,11 +327,11 @@ fn aligned(
                 let symbol = if a < N && a == b { '=' } else { 'X' };
                 (
                     symbol,
-                    char::from(decode_base(a)),
+                    char::from(text[q as usize]),
                     char::from(decode_base(b)),
                 )
             }
-            Op::Ins => ('I', char::from(decode_base(query[q as usize])), '-'),
+            Op::Ins => ('I', char::from(text[q as usize]), '-'),
             Op::Del => ('D', '-', char::from(decode_base(reference[r as usize]))),
         };
         sequence_alignment.push(qs);
@@ -369,7 +381,8 @@ fn evalue(value: f64) -> String {
 }
 
 /// The read as given, upper-cased, `U` as `T`, and every symbol that is no
-/// IUPAC nucleotide as `N`.
+/// IUPAC nucleotide as `N`: one symbol per byte, as
+/// [`crate::alphabet::encode`] reads it.
 fn normalized(sequence: &str) -> String {
     sequence
         .bytes()
@@ -378,6 +391,32 @@ fn normalized(sequence: &str) -> String {
             c @ (b'A' | b'C' | b'G' | b'T' | b'R' | b'Y' | b'S' | b'W' | b'K' | b'M' | b'B'
             | b'D' | b'H' | b'V' | b'N') => char::from(c),
             _ => 'N',
+        })
+        .collect()
+}
+
+/// The reverse complement of [`normalized`] `bases`, IUPAC codes included.
+fn reverse_complement_text(bases: &str) -> String {
+    bases
+        .bytes()
+        .rev()
+        .map(|b| {
+            char::from(match b {
+                b'A' => b'T',
+                b'C' => b'G',
+                b'G' => b'C',
+                b'T' => b'A',
+                b'R' => b'Y',
+                b'Y' => b'R',
+                b'K' => b'M',
+                b'M' => b'K',
+                b'B' => b'V',
+                b'V' => b'B',
+                b'D' => b'H',
+                b'H' => b'D',
+                // S, W and N are their own complements.
+                other => other,
+            })
         })
         .collect()
 }
@@ -482,15 +521,15 @@ fn alternatives(
 }
 
 /// The report of `called`: the co-optimal names, the primary's clipped
-/// alignment and coordinates, and the near-tied alternatives.
+/// alignment and coordinates, and the near-tied alternatives; no support or
+/// posterior yet.
 fn called_report(
     call: &Call,
+    text: &[u8],
     placements: &[Placement],
     set: &GermlineSet,
     co: &CoOptimal<'_>,
     called: &CalledSegment,
-    support: Option<f64>,
-    posterior: Option<f64>,
 ) -> SegmentReport {
     let query = &call.query;
     let placement = co.tied[0];
@@ -500,15 +539,15 @@ fn called_report(
         .expect("primary tied placement clips to the called interval");
     let allele = set.allele(placement.primary_allele());
     let (cigar, sequence_alignment, germline_alignment, evidence) =
-        aligned(query, placement, &span, &allele.codes);
+        aligned(query, text, placement, &span, &allele.codes);
     let names = co.names(set);
     SegmentReport {
         alternatives: alternatives(placements, query, set, called, &names),
         call: names.join(","),
         score: span.score,
         identity: evidence.identity(),
-        support,
-        posterior,
+        support: None,
+        posterior: None,
         cigar,
         sequence_start: span.q_lo + 1,
         sequence_end: span.q_hi,
@@ -522,9 +561,11 @@ fn called_report(
 }
 
 /// The report of `called`, a segment of `path` (the call's, or another
-/// reading of the same placements) with posterior `marginals`.
-pub(crate) fn segment_report<C: AlleleCatalog>(
+/// reading of the same placements) with posterior `marginals`; `text` is
+/// the oriented read.
+fn segment_report<C: AlleleCatalog>(
     call: &Call,
+    text: &[u8],
     path: &CallPath,
     marginals: Option<&Marginals>,
     called: &CalledSegment,
@@ -567,15 +608,11 @@ pub(crate) fn segment_report<C: AlleleCatalog>(
             set.len(),
         )
     });
-    Some(called_report(
-        call,
-        &call.placements,
-        set,
-        &co,
-        called,
-        evalue,
+    Some(SegmentReport {
+        support: evalue,
         posterior,
-    ))
+        ..called_report(call, text, &call.placements, set, &co, called)
+    })
 }
 
 /// Identity of `allele` from its first germline base on `span`: the
@@ -600,9 +637,13 @@ fn prefix_identity(
     (columns > 0).then(|| f64::from(leading + evidence.matches) / f64::from(columns))
 }
 
-/// The report of the read's C call: support is its anchored E-value
-/// ([`crate::constant`]), not a K·m·n E-value.
-fn constant_report<C: AlleleCatalog>(call: &Call, catalog: &C) -> Option<SegmentReport> {
+/// The report of the read's C call (`text` the oriented read): support is
+/// its anchored E-value ([`crate::constant`]), not a K·m·n E-value.
+fn constant_report<C: AlleleCatalog>(
+    call: &Call,
+    text: &[u8],
+    catalog: &C,
+) -> Option<SegmentReport> {
     let c = call.c.as_ref()?;
     let set = catalog.segment(SegmentKind::C)?.set();
     let called = &c.segment;
@@ -614,15 +655,11 @@ fn constant_report<C: AlleleCatalog>(call: &Call, catalog: &C) -> Option<Segment
         false,
         called.entry..called.exit,
     );
-    let mut report = called_report(
-        call,
-        &call.constant,
-        set,
-        &co,
-        called,
-        Some(c.evalue),
-        Some(c.posterior),
-    );
+    let mut report = SegmentReport {
+        support: Some(c.evalue),
+        posterior: Some(c.posterior),
+        ..called_report(call, text, &call.constant, set, &co, called)
+    };
     let span = co.tied[0]
         .clip
         .span(called.entry, called.exit)
@@ -807,7 +844,13 @@ impl AirrRecord {
     ];
 
     /// The record of `call` for the read `sequence_id` with symbols
-    /// `sequence` (as given); `quality` is empty until set.
+    /// `sequence` (as given, the text `call.query` was encoded from: the
+    /// alignments, regions and junction quote its symbols, IUPAC codes
+    /// included); `quality` is empty until set.
+    ///
+    /// # Panics
+    ///
+    /// If `sequence` is not as long as `call.query`.
     pub fn from_call<C: AlleleCatalog>(
         sequence_id: &str,
         sequence: &str,
@@ -815,17 +858,27 @@ impl AirrRecord {
         catalog: &C,
         support: &SupportModels,
     ) -> Self {
-        let oriented = decode(&call.query);
+        assert_eq!(
+            sequence.len(),
+            call.query.len(),
+            "the read's symbols are those the call's query was encoded from"
+        );
+        let sequence = normalized(sequence);
+        let oriented = if call.orientation.is_reverse() {
+            reverse_complement_text(&sequence)
+        } else {
+            sequence.clone()
+        };
         let mut record = AirrRecord {
             sequence_id: sequence_id.to_string(),
-            sequence: normalized(sequence),
+            sequence,
             quality: String::new(),
             rev_comp: call.orientation.is_reverse(),
             locus: None,
             v: None,
             d: None,
             j: None,
-            c: constant_report(call, catalog),
+            c: constant_report(call, oriented.as_bytes(), catalog),
             np1: None,
             np2: None,
             sequence_alignment: String::new(),
@@ -875,6 +928,7 @@ impl AirrRecord {
             }
             let report = segment_report(
                 call,
+                record.oriented.as_bytes(),
                 path,
                 call.marginals.as_ref(),
                 called,
@@ -933,6 +987,12 @@ impl AirrRecord {
     /// The header line of [`Self::to_tsv`], without a line break.
     pub fn tsv_header() -> String {
         Self::COLUMNS.join("\t")
+    }
+
+    /// The oriented read's symbols, as `sequence` gives them: the text the
+    /// coordinates refer to.
+    pub(crate) fn oriented(&self) -> &str {
+        &self.oriented
     }
 
     /// The column of `sequence_alignment`, which starts at read base
@@ -1094,7 +1154,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::alphabet::encode;
+    use crate::alphabet::{decode, encode};
     use crate::annotate::AnnotateOptions;
     use crate::config::DefaultAssigner;
     use crate::pipeline::VdjAssigner;
@@ -1159,6 +1219,52 @@ mod tests {
                 "sequence_alignment_aa {read_aa} not in sequence_aa {}",
                 row["sequence_aa"]
             );
+        }
+    }
+
+    /// IUPAC codes in a read reach every column that quotes its bases, on
+    /// either strand: each such column, gaps removed, is a slice of the
+    /// oriented read.
+    #[test]
+    fn iupac_codes_reach_alignments_regions_and_junction() {
+        let assigner = synthetic_assigner();
+        let (v, anchor) = germline(&assigner, SegmentKind::V);
+        let (d, _) = germline(&assigner, SegmentKind::D);
+        let (j, _) = germline(&assigner, SegmentKind::J);
+        let anchor = anchor.expect("an annotated V") as usize;
+        let mut read = format!("{v}GGTCA{d}CCATG{j}").into_bytes();
+        let n = read.len();
+        for (at, code) in [(20, b'Y'), (anchor - 15, b'K'), (n - 6, b'M')] {
+            read[at] = code;
+        }
+        let forward = String::from_utf8(read).unwrap();
+        for (given, reverse) in [
+            (forward.clone(), false),
+            (reverse_complement_text(&forward), true),
+        ] {
+            let row = row(&assigner, &given);
+            assert_eq!(row["rev_comp"], if reverse { "T" } else { "F" });
+            assert_eq!(row["sequence"], given);
+            for column in [
+                "sequence_alignment",
+                "v_sequence_alignment",
+                "j_sequence_alignment",
+                "junction",
+                "cdr3",
+                "fwr1",
+                "fwr3",
+                "fwr4",
+            ] {
+                let bases = row[column].replace('-', "");
+                assert!(!bases.is_empty(), "{column} is empty");
+                assert!(
+                    forward.contains(&bases),
+                    "{column} {bases} is not read from {forward}"
+                );
+            }
+            for (column, code) in [("fwr1", 'Y'), ("fwr3", 'K'), ("sequence_alignment", 'M')] {
+                assert!(row[column].contains(code), "{column} {}", row[column]);
+            }
         }
     }
 

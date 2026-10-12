@@ -72,7 +72,9 @@ impl Setup {
         let calls = assign_all(&assigner, &queries, 0);
         let mut evaluation = Evaluation::default();
         for (read, call) in simulated.iter().zip(&calls) {
-            let record = AirrRecord::from_call("r", "", call, &assigner, &[None, None, None]);
+            let sequence = String::from_utf8_lossy(&read.sequence);
+            let record =
+                AirrRecord::from_call("r", &sequence, call, &assigner, &[None, None, None]);
             let truth = Truth::from_read(&sim, read, "r");
             evaluation.add(&truth, &Assignment::from_record(&record));
         }

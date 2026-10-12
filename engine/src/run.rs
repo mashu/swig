@@ -536,14 +536,7 @@ fn assigned<T: VdjAssigner + AlleleCatalog + Sync>(
         }
         let double_d = screen
             .zip(assigner.segment(SegmentKind::D))
-            .and_then(|(screen, d)| {
-                screen.screen(
-                    d.set(),
-                    &call.query,
-                    record.locus,
-                    [record.v.as_ref(), record.d.as_ref(), record.j.as_ref()],
-                )
-            });
+            .and_then(|(screen, d)| screen.screen(d.set(), &call.query, &record));
         Assigned {
             // `sequence_id`, `sequence` and `quality` are the read's own.
             airr: tail(&record.to_tsv(), 3).to_string(),
@@ -982,6 +975,57 @@ mod tests {
             assert!(d_end < d2_start);
             assert!(at("swig_double_d_score_gain").parse::<i32>().unwrap() >= 8);
         }
+    }
+
+    /// The sidecar quotes the read's own symbols, as the AIRR row does: an
+    /// IUPAC code between the two Ds stays in `np2`.
+    #[test]
+    fn the_double_d_sidecar_quotes_the_read() {
+        let params = SimParams {
+            include_dd: 0.5,
+            reverse_complement: 0.0,
+            ..SimParams::preset("easy").unwrap()
+        };
+        let ([v, d, j, _], reads) = texts_and_simulated(120, params);
+        let texts = GermlineTexts {
+            v: &v,
+            d: Some(&d),
+            j: &j,
+            c: None,
+        };
+        let mut records: Vec<ReadRecord> = ReadReader::new(reads.as_bytes())
+            .map(Result::unwrap)
+            .collect();
+        let mut options = RunOptions::default();
+        options.set("double-d", Some("all")).unwrap();
+        options.set("double-d-seed-length", Some("6")).unwrap();
+        let screen = |records: &[ReadRecord]| {
+            let database = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+            Run::new(&options, database)
+                .unwrap()
+                .assign(records)
+                .double_d
+        };
+        let at = |name: &str| double_d::COLUMNS.iter().position(|c| *c == name).unwrap();
+        // The first base between the two Ds becomes K (G or T).
+        for row in screen(&records).lines() {
+            let fields: Vec<&str> = row.split('\t').collect();
+            let d_end: usize = fields[at("d_sequence_end")].parse().unwrap();
+            if !fields[at("np2")].is_empty() {
+                let index: usize = fields[0].parse().unwrap();
+                records[index].sequence[d_end] = b'K';
+            }
+        }
+        let mut quoted = 0;
+        for row in screen(&records).lines() {
+            let fields: Vec<&str> = row.split('\t').collect();
+            let read = &records[fields[0].parse::<usize>().unwrap()].sequence;
+            let d_end: usize = fields[at("d_sequence_end")].parse().unwrap();
+            let np2 = fields[at("np2")];
+            assert_eq!(np2.as_bytes(), &read[d_end..d_end + np2.len()]);
+            quoted += usize::from(np2.starts_with('K'));
+        }
+        assert!(quoted >= 3, "{quoted} sidecar rows quote the code");
     }
 
     #[test]

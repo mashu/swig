@@ -166,7 +166,9 @@ impl ReadRegions {
             out.cdr3 = interval(Some(c + 3), Some(w), 0, n);
             out.vj_in_frame = Some((w + 3 - c) % 3 == 0);
         }
-        // Stop codons in the V reading frame from the V alignment start to the J end.
+        // Stop codons in the read, as a ribosome reads it (no indel
+        // correction), in the frame of the Cys104 codon (sequence_frame
+        // with a junction) from the V alignment start to the J end.
         if let (Some(v), Some(c)) = (&v, cys104) {
             let end = j
                 .as_ref()
