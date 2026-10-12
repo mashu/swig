@@ -17,8 +17,12 @@
 //! * **Boundaries** — absolute error of the called segment ends against the
 //!   labelled read positions (only for reads whose reported orientation,
 //!   `rev_comp`, is the true one).
-//! * **D presence**, stratified by the length of the simulated D remnant:
-//!   a 2-nt remnant is not identifiable, a 20-nt one must be found.
+//! * **Tandem D** — on a read with two simulated Ds, a single D call (most
+//!   callers report one D) is scored against the true D it covers, and the
+//!   other true D is the missed second D.
+//! * **D presence**, stratified by the length of the simulated D remnant
+//!   (the longer one of a tandem DD): a 2-nt remnant is not identifiable, a
+//!   20-nt one must be found.
 //! * **Junction** — the called junction sequence equals the true one
 //!   (Cys104 … Trp/Phe118 inclusive), when both anchor codons are templated
 //!   in the read.
@@ -157,6 +161,46 @@ impl Assignment {
     pub fn oriented(&self, truth: &Truth) -> bool {
         self.rev_comp == Some(truth.reverse_complemented)
     }
+}
+
+/// The true segment each slot of `call` is scored against, by
+/// [`Slot::index`]: the read's own, except on a read with two true Ds and a
+/// single D call. That call answers the true D it covers: the one its span
+/// overlaps more (when the read positions are comparable), else the one its
+/// primary name is equivalent to, the 5′ D first. The other true D is then
+/// the missed second D.
+fn scored_against<'a>(truth: &'a Truth, call: &Assignment) -> [Option<&'a TrueSegment>; 5] {
+    let mut segments = Slot::ALL.map(|slot| truth.segment(slot));
+    let (Some(first), Some(second), Some(d), None) = (
+        truth.segment(Slot::D),
+        truth.segment(Slot::D2),
+        call.segment(Slot::D),
+        call.segment(Slot::D2),
+    ) else {
+        return segments;
+    };
+    let overlap = |t: &TrueSegment| {
+        let span = d.span.as_ref().filter(|_| call.oriented(truth))?;
+        Some(
+            span.end
+                .min(t.span.end)
+                .saturating_sub(span.start.max(t.span.start)),
+        )
+    };
+    let covers_second = match (overlap(first), overlap(second)) {
+        (Some(a), Some(b)) if a != b => b > a,
+        _ => !primary_equivalent(first, d) && primary_equivalent(second, d),
+    };
+    if covers_second {
+        segments.swap(Slot::D.index(), Slot::D2.index());
+    }
+    segments
+}
+
+/// The length of the longest simulated D remnant (0 without D).
+fn d_remnant(truth: &Truth) -> usize {
+    let d2 = truth.segment(Slot::D2).map_or(0, |d| d.span.len());
+    truth.d_length.max(d2)
 }
 
 /// Whether the primary allele of `call` is germline-equivalent to `truth`.
@@ -409,7 +453,8 @@ pub struct DPresence {
     pub reads: usize,
     /// Reads with any D call.
     pub called: usize,
-    /// Reads whose primary D call is germline-equivalent to the first true D.
+    /// Reads whose primary D call is germline-equivalent to the true D it
+    /// is scored against (on a tandem DD, the one it covers).
     pub correct: usize,
 }
 
@@ -438,24 +483,25 @@ impl Evaluation {
         let oriented = call.oriented(truth);
         self.oriented += usize::from(oriented);
         self.unassigned += usize::from(!call.assigned());
+        let scored = scored_against(truth, call);
         for (slot, stats) in [
             (Slot::V, &mut self.v),
             (Slot::D, &mut self.d),
             (Slot::D2, &mut self.d2),
             (Slot::J, &mut self.j),
         ] {
-            stats.add(truth.segment(slot), call.segment(slot), oriented);
+            stats.add(scored[slot.index()], call.segment(slot), oriented);
         }
 
         let bin = D_LENGTH_BINS
             .iter()
-            .position(|&(lo, hi)| (lo..=hi).contains(&truth.d_length))
+            .position(|&(lo, hi)| (lo..=hi).contains(&d_remnant(truth)))
             .expect("bins cover every length");
         let presence = &mut self.d_presence[bin];
         presence.reads += 1;
         let called_d = call.segment(Slot::D);
         presence.called += usize::from(called_d.is_some());
-        if let (Some(called), Some(true_d)) = (called_d, truth.segment(Slot::D)) {
+        if let (Some(called), Some(true_d)) = (called_d, scored[Slot::D.index()]) {
             presence.correct += usize::from(primary_equivalent(true_d, called));
         }
 
@@ -483,8 +529,7 @@ impl Evaluation {
                 continue;
             };
             if let Some(posterior) = segment.posterior {
-                let correct = truth
-                    .segment(slot)
+                let correct = scored[slot.index()]
                     .is_some_and(|t| segment.names.iter().any(|n| t.equivalent.contains(n)));
                 calibration.add(posterior, correct);
             }
@@ -851,9 +896,14 @@ pub struct Paired {
 
 impl Paired {
     pub fn add(&mut self, truth: &Truth, first: &Assignment, second: &Assignment) {
-        let correct = |call: &Assignment, slot: Slot, truth_segment: &TrueSegment| {
-            call.segment(slot)
-                .is_some_and(|c| primary_equivalent(truth_segment, c))
+        // Each caller's D answers the true D it covers ([`scored_against`]).
+        let callers = [first, second];
+        let scored = callers.map(|call| scored_against(truth, call));
+        let correct = |caller: usize, slot: Slot| {
+            let call = callers[caller].segment(slot);
+            scored[caller][slot.index()]
+                .zip(call)
+                .is_some_and(|(t, c)| primary_equivalent(t, c))
         };
         for (slot, outcome) in [
             (Slot::V, &mut self.v),
@@ -861,22 +911,16 @@ impl Paired {
             (Slot::J, &mut self.j),
             (Slot::C, &mut self.c),
         ] {
-            if let Some(segment) = truth.segment(slot) {
-                outcome.add(
-                    correct(first, slot, segment),
-                    correct(second, slot, segment),
-                );
+            if truth.segment(slot).is_some() {
+                outcome.add(correct(0, slot), correct(1, slot));
             }
         }
-        if let Some(segment) = truth.segment(Slot::D)
+        if truth.segment(Slot::D).is_some()
             && let Some(stratum) = D_REMNANT_STRATA
                 .iter()
-                .position(|&(lo, hi)| (lo..=hi).contains(&truth.d_length))
+                .position(|&(lo, hi)| (lo..=hi).contains(&d_remnant(truth)))
         {
-            self.d_by_remnant[stratum].add(
-                correct(first, Slot::D, segment),
-                correct(second, Slot::D, segment),
-            );
+            self.d_by_remnant[stratum].add(correct(0, Slot::D), correct(1, Slot::D));
         }
         let silent = |call: &Assignment, slot: Slot| call.segment(slot).is_none();
         if truth.segment(Slot::D).is_none() {
@@ -889,14 +933,13 @@ impl Paired {
         }
         // The calibration events of [`Evaluation`]: some reported D name is
         // equivalent to the truth; the read has a D.
-        let d_posterior = |call: &Assignment| {
-            let segment = call.segment(Slot::D)?;
-            let listed = truth
-                .segment(Slot::D)
+        let d_posterior = |caller: usize| {
+            let segment = callers[caller].segment(Slot::D)?;
+            let listed = scored[caller][Slot::D.index()]
                 .is_some_and(|t| segment.names.iter().any(|n| t.equivalent.contains(n)));
             Some((segment.posterior?, listed))
         };
-        if let (Some(a), Some(b)) = (d_posterior(first), d_posterior(second)) {
+        if let (Some(a), Some(b)) = (d_posterior(0), d_posterior(1)) {
             self.d_brier.add(a, b);
         }
         let has_d = truth.segment(Slot::D).is_some();
@@ -1081,6 +1124,90 @@ mod tests {
             paired.add(&truth, &call, &call);
             assert_eq!((paired.v.both, paired.junction.both), (1, 1));
         }
+    }
+
+    /// A read with V, a 10-nt 5′ D, a 12-nt 3′ D and J, in germline sense.
+    fn tandem_truth() -> Truth {
+        Truth {
+            id: "r".into(),
+            reverse_complemented: false,
+            segments: [
+                Some(segment("V1*01", 0..9)),
+                Some(segment("D1*01", 10..20)),
+                Some(segment("D2*01", 25..37)),
+                Some(segment("J1*01", 40..60)),
+                None,
+            ],
+            constant: false,
+            junction: None,
+            d_length: 10,
+            shm_rate: 0.0,
+        }
+    }
+
+    /// A forward call of `calls` (slot, primary name, span), posterior 0.9.
+    fn call(calls: &[(Slot, &str, Option<Range<usize>>)]) -> Assignment {
+        let mut call = Assignment {
+            rev_comp: Some(false),
+            ..Assignment::default()
+        };
+        for (slot, name, span) in calls {
+            call.segments[slot.index()] = Some(SegmentCall {
+                names: vec![name.to_string()],
+                span: span.clone(),
+                posterior: Some(0.9),
+            });
+        }
+        call
+    }
+
+    /// A single D call on a tandem-DD read answers the true D it covers,
+    /// whichever of the two that is; the other is the missed second D.
+    #[test]
+    fn a_single_d_call_is_scored_against_the_true_d_it_covers() {
+        let truth = tandem_truth();
+        let d = |name, span: Option<Range<usize>>| call(&[(Slot::D, name, span)]);
+        let evaluate = |call: &Assignment| {
+            let mut e = Evaluation::default();
+            e.add(&truth, call);
+            e
+        };
+        // The 3′ D, by its span and without one (by its name).
+        for call in [d("D2*01", Some(25..37)), d("D2*01", None)] {
+            let e = evaluate(&call);
+            assert_eq!((e.d.reads, e.d.equivalent, e.d.exact), (1, 1, 1));
+            assert_eq!((e.d2.reads, e.d2.called), (1, 0));
+            // Binned by the longer remnant (12 nt).
+            let presence = DPresence {
+                reads: 1,
+                called: 1,
+                correct: 1,
+            };
+            assert_eq!(e.d_presence[4], presence);
+            assert_eq!(e.calibration.d.bins[3].correct, 1, "0.9 is in [0.9, 0.95)");
+        }
+        let e = evaluate(&d("D2*01", Some(25..37)));
+        let boundaries = (e.d.boundary_reads, e.d.start_error, e.d.end_error);
+        assert_eq!(boundaries, (1, 0, 0));
+        // The 5′ D is still right.
+        let e = evaluate(&d("D1*01", Some(10..20)));
+        assert_eq!((e.d.equivalent, e.d.start_error, e.d.end_error), (1, 0, 0));
+        // A wrong allele over the 3′ D is wrong, with exact boundaries.
+        let e = evaluate(&d("D3*01", Some(25..37)));
+        assert_eq!((e.d.equivalent, e.d.start_error, e.d.end_error), (0, 0, 0));
+        // Two D calls are scored in read order.
+        let both = call(&[
+            (Slot::D, "D2*01", Some(25..37)),
+            (Slot::D2, "D1*01", Some(10..20)),
+        ]);
+        let e = evaluate(&both);
+        assert_eq!((e.d.equivalent, e.d2.equivalent, e.d2.called), (0, 0, 1));
+        // Paired: each caller's D is matched on its own.
+        let mut paired = Paired::default();
+        paired.add(&truth, &d("D2*01", Some(25..37)), &d("D1*01", Some(10..20)));
+        assert_eq!((paired.d.both, paired.d_by_remnant[2].both), (1, 1));
+        assert_eq!(paired.d_brier.reads, 1);
+        assert!(paired.d_brier.difference.abs() < 1e-12 && paired.d_brier.first < 0.011);
     }
 
     #[test]
