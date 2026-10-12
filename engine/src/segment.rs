@@ -363,11 +363,11 @@ impl Significance {
         })
     }
 
-    /// Smallest local score with E-value ≤ `evalue` for a window of `query_len`.
+    /// Smallest local score with E-value ≤ `evalue` for a window of
+    /// `query_len` ([`KarlinAltschul::min_score`]).
     pub fn min_score(&self, query_len: usize, evalue: f64) -> Score {
-        let KarlinAltschul { lambda, k, .. } = self.statistics;
-        let space = k * query_len.max(1) as f64 * self.database_len.max(1) as f64;
-        ((space.ln() - evalue.ln()) / lambda).ceil().max(0.0) as Score
+        self.statistics
+            .min_score(query_len, self.database_len, evalue)
     }
 }
 
@@ -2012,14 +2012,10 @@ mod tests {
         assert!(significance.min_score(600, 1e-3) > significance.min_score(60, 1e-3));
         let gap = significance.min_score(300, 1e-3) - significance.min_score(300, 1.0);
         assert!((gap - (1e3f64.ln() / significance.statistics.lambda) as Score).abs() <= 1);
+        // The gate reads the formula of the reported support.
         let strict = significance;
         let floor = strict.min_score(300, 1e-3);
-        let evalue = |s: Score| {
-            strict.statistics.k
-                * 300.0
-                * strict.database_len as f64
-                * (-strict.statistics.lambda * f64::from(s)).exp()
-        };
+        let evalue = |s: Score| strict.statistics.evalue(s, 300, strict.database_len);
         assert!(evalue(floor) <= 1e-3 && evalue(floor - 1) > 1e-3);
     }
 

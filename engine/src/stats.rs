@@ -2,8 +2,12 @@
 //! ([`crate::segment::Significance`]), the λ that turns scores into nats for
 //! the D prior and the posteriors, and the reported `*_support` E-values.
 //!
-//! `E = K m′ n′ e^{−λS}` with the BLAST length adjustment
-//! `ℓ = ln(K m n) / H`, `m′ = m − ℓ`, `n′ = n − N ℓ`.
+//! Gates and support read one formula, `E = K·m·n·e^{−λS}` for `m` query
+//! positions against `n` database residues ([`KarlinAltschul::evalue`];
+//! [`KarlinAltschul::min_score`] is its inverse). There is no BLAST length
+//! adjustment (`m − ℓ`, `n − N·ℓ` with `ℓ = ln(K·m·n)/H`): D alleles are
+//! shorter than `ℓ`, where `n − N·ℓ` collapses and the E-value would no
+//! longer grow with the database.
 //!
 //! [`KarlinAltschul::ungapped`] computes λ, H and K exactly for a match /
 //! mismatch tuple under uniform base composition: λ by bisection on
@@ -170,14 +174,23 @@ impl KarlinAltschul {
         Some(Self { lambda, k, h })
     }
 
-    /// Expectation of chance local alignments scoring at least `score` between a
-    /// query of `query_len` and a database of `db_len` residues in `db_seqs` sequences.
-    pub fn evalue(&self, score: Score, query_len: usize, db_len: usize, db_seqs: usize) -> f64 {
-        let (m, n) = (query_len as f64, db_len as f64);
-        let ell = ((self.k * m * n).ln() / self.h).max(0.0);
-        let m_eff = (m - ell).max(1.0);
-        let n_eff = (n - db_seqs as f64 * ell).max(1.0);
-        self.k * m_eff * n_eff * (-self.lambda * f64::from(score)).exp()
+    /// `K·m·n`: the search space of `query_len` positions against `db_len`
+    /// database residues.
+    fn space(&self, query_len: usize, db_len: usize) -> f64 {
+        self.k * query_len.max(1) as f64 * db_len.max(1) as f64
+    }
+
+    /// Expectation `K·m·n·e^{−λS}` of chance local alignments scoring at
+    /// least `score` between `query_len` query positions and a database of
+    /// `db_len` residues.
+    pub fn evalue(&self, score: Score, query_len: usize, db_len: usize) -> f64 {
+        self.space(query_len, db_len) * (-self.lambda * f64::from(score)).exp()
+    }
+
+    /// Smallest score whose [`Self::evalue`] is at most `evalue`.
+    pub fn min_score(&self, query_len: usize, db_len: usize, evalue: f64) -> Score {
+        let space = self.space(query_len, db_len);
+        ((space.ln() - evalue.ln()) / self.lambda).ceil().max(0.0) as Score
     }
 
     /// Normalised bit score.
@@ -287,6 +300,26 @@ mod tests {
     #[test]
     fn evalue_decreases_with_score() {
         let ka = KarlinAltschul::ungapped(&AffineScoring::new(2, -3, -5, -1)).unwrap();
-        assert!(ka.evalue(60, 400, 100_000, 300) < ka.evalue(40, 400, 100_000, 300));
+        assert!(ka.evalue(60, 400, 100_000) < ka.evalue(40, 400, 100_000));
+    }
+
+    /// `min_score` inverts `evalue`, and the E-value counts every residue of
+    /// the database: a D set of 8–13 base alleles, shorter than BLAST's
+    /// length correction, still doubles its E-value when it doubles.
+    #[test]
+    fn min_score_inverts_the_evalue_of_the_whole_search_space() {
+        let ka = KarlinAltschul::ungapped(&AffineScoring::new(2, -3, -13, -1)).unwrap();
+        for (m, n) in [(20, 30), (60, 805), (600, 30), (450, 120_000)] {
+            for e in [1e-3, 0.1, 1.0, 10.0] {
+                let floor = ka.min_score(m, n, e);
+                assert!(ka.evalue(floor, m, n) <= e * (1.0 + 1e-12), "{m} {n} {e}");
+                assert!(floor == 0 || ka.evalue(floor - 1, m, n) > e, "{m} {n} {e}");
+            }
+            assert!(close(
+                ka.evalue(12, m, 2 * n),
+                2.0 * ka.evalue(12, m, n),
+                1e-12
+            ));
+        }
     }
 }

@@ -523,14 +523,8 @@ pub(crate) fn segment_report<C: AlleleCatalog>(
             // D placements, so the sum is then an upper bound.
             .min(1.0)
     });
-    let evalue = support[kind.index()].map(|ka| {
-        ka.evalue(
-            called.span.score,
-            call.query.len(),
-            set.total_len(),
-            set.len(),
-        )
-    });
+    let evalue = support[kind.index()]
+        .map(|ka| ka.evalue(called.span.score, call.query.len(), set.total_len()));
     Some(called_report(
         call,
         &call.placements,
