@@ -63,6 +63,16 @@ impl Locus {
             .find(|locus| locus.name().eq_ignore_ascii_case(name))
     }
 
+    /// Whether IMGT's FR3 length varies by gene family in the locus (lambda
+    /// and every TR locus), so that one chain default is wrong for some
+    /// families ([`crate::annotate`]).
+    pub const fn fr3_varies_by_family(self) -> bool {
+        matches!(
+            self,
+            Self::Igl | Self::Tra | Self::Trb | Self::Trd | Self::Trg
+        )
+    }
+
     /// Whether the locus has D genes (IGH, TRB, TRD).
     pub const fn has_d(self) -> bool {
         matches!(self, Self::Igh | Self::Trb | Self::Trd)

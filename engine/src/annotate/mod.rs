@@ -249,8 +249,9 @@ pub struct DatabaseAnnotation {
     pub imgt_gaps: ImgtGaps,
     /// FR3 lengths learned from the alleles whose FR3 start is given.
     pub fr3_model: Option<Fr3Model>,
-    /// Most V allele names are TR or IGL ones: loci whose FR3 length IMGT
-    /// varies by gene family, so one chain default is wrong for some.
+    /// Most V alleles of known locus belong to one whose FR3 length IMGT
+    /// varies by gene family ([`Locus::fr3_varies_by_family`]), so one
+    /// chain default is wrong for some.
     pub fr3_varies: bool,
     /// For a database of several loci, each locus annotated on its own
     /// ([`annotate_by_locus`]): an allele of unknown locus with the locus of
@@ -973,12 +974,17 @@ pub fn annotate(
 
     // FR3 and CDR2 lengths of the trusted alleles whose FR3 start is given
     // and certain.
-    let fr3_varies = 2 * v
-        .alleles()
-        .iter()
-        .filter(|a| a.name.starts_with("TR") || a.name.starts_with("IGL"))
-        .count()
-        > v.len();
+    let (varying, named) =
+        v.alleles()
+            .iter()
+            .filter_map(annotation_locus)
+            .fold((0, 0), |(varying, named), locus| {
+                (
+                    varying + usize::from(locus.fr3_varies_by_family()),
+                    named + 1,
+                )
+            });
+    let fr3_varies = 2 * varying > named;
     let fr3_model = Fr3Model::learn((0..v.len()).filter(|&i| result[i].trusted()).filter_map(
         |i| {
             let fr3 = given[i].certain(4)?;
@@ -1434,10 +1440,10 @@ impl DatabaseAnnotation {
         text
     }
 
-    /// No V allele has a given FR3 start, and the names are those of a
-    /// locus (TR, IGL) whose FR3 length varies by gene family: one chain
-    /// default places some FR3 starts wrong, and every such start is
-    /// marked uncertain.
+    /// No V allele has a given FR3 start, and the alleles belong to a locus
+    /// (TR, IGL) whose FR3 length varies by gene family: one chain default
+    /// places some FR3 starts wrong, and every such start is marked
+    /// uncertain.
     pub fn fr3_warning(&self) -> bool {
         if !self.parts.is_empty() {
             return self.parts.iter().any(|(_, part)| part.fr3_warning());
@@ -1517,6 +1523,24 @@ mod tests {
     /// Human IGHV1/OR15-5*01, 5′-partial: its region starts lie in frame 2,
     /// and no Cys104 there has confident motifs.
     const IGHV1_OR15_5: &str = "AGAAGCCTGGGGCCTCAGTGAAGGTCTCCTGCAAGGCTTCTGGATACACCTTCACCAGCTACTGTATGCACTGGGTGCACCAGGTCCATGCACAAGGGCTTGAGTGGATGGGATTGGTGTGCCCTAGTGATGGCAGCACAAGCTATGCACAGAAGTTCCAGGCCAGAGTCACCATAACCAGGGACACATCCATGAGCACAGCCTACATGGAGCTAAGCAGTCTGAGATCTGAGGACACGGCCATGTATTACTGTGTGAGA";
+
+    /// Human TRAV1-2*01: Cys104 at 261.
+    const TRAV1_2: &str = "GGACAAAACATTGACCAGCCCACTGAGATGACAGCTACGGAAGGTGCCATTGTCCAGATCAACTGCACGTACCAGACATCTGGGTTCAACGGGCTGTTCTGGTACCAGCAACATGCTGGCGAAGCACCCACATTTCTGTCTTACAATGTTCTGGATGGTTTGGAGGAGAAAGGTCGTTTTTCTTCATTCCTTAGTCGGTCTAAAGGGTACAGTTACCTCCTTTTGAAGGAGCTCCAGATGAAAGACTCTGCCTCTTACCTCTGTGCTGTGAGAGA";
+
+    /// Whether a locus varies its FR3 length by family comes from the
+    /// alleles' loci, so a lowercase label or a locus named only in the
+    /// header raises the warning and flags the chain-default FR3 start as
+    /// the IMGT name does.
+    #[test]
+    fn the_fr3_default_is_doubted_by_locus_not_by_label_case() {
+        for header in ["TRAV1-2*01", "trav1-2*01", "V1 TRAV1-2*01"] {
+            let (_, report) = annotate_v(&format!(">{header}\n{TRAV1_2}\n"), ChainType::Light);
+            assert!(report.fr3_varies && report.fr3_warning(), "{header}");
+            assert!(report.v[0].uncertain[4], "{header}: {:?}", report.v[0]);
+        }
+        let (_, report) = annotate_v(&format!(">V1\n{TRAV1_2}\n"), ChainType::Light);
+        assert!(!report.fr3_varies && !report.v[0].uncertain[4]);
+    }
 
     /// Human IGHJ4*02: Trp118 at 14 starts `WGQG`.
     const IGHJ4: &str = "ACTACTTTGACTACTGGGGCCAGGGAACCCTGGTCACCGTCTCCTCAG";
