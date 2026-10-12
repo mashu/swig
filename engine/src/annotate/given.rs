@@ -17,7 +17,7 @@ use crate::germline::{
     Allele, GermlineSet, IMGT_CONSERVED_CODONS, ImgtNumbering, RegionSlot, RegionStarts,
 };
 
-use super::AnchorSource;
+use super::{AnchorSource, Note};
 
 /// The conserved residues at [`IMGT_CONSERVED_CODONS`].
 const CONSERVED: [u8; 3] = *b"CWC";
@@ -91,7 +91,7 @@ pub struct Given {
 impl Given {
     /// Header keys, then (with `use_gaps`) the allele's IMGT numbering in
     /// the slots and anchor the header leaves open. Notes go to `notes`.
-    pub fn read(allele: &Allele, use_gaps: bool, notes: &mut Vec<String>) -> Self {
+    pub fn read(allele: &Allele, use_gaps: bool, notes: &mut Vec<Note>) -> Self {
         let header = Self {
             anchor: allele.anchor,
             source: allele.anchor.map(|_| AnchorSource::Header),
@@ -116,16 +116,18 @@ impl Given {
             merged.ends_before_cys104 = imgt.ends_before_cys104;
         }
         if let Err(reason) = merged.known().check(merged.anchor, allele.codes.len()) {
-            notes.push(format!("IMGT gap numbering ignored: {reason}"));
+            notes.push(Note::ImgtGapsIgnored { reason });
             return header;
         }
         notes.extend(
             imgt.frameshift_markers
                 .iter()
-                .map(|column| format!("IMGT frameshift marker in codon {}", column / 3 + 1)),
+                .map(|column| Note::ImgtFrameshiftMarker {
+                    codon: column / 3 + 1,
+                }),
         );
         if merged.ends_before_cys104 {
-            notes.push("3′-partial: the IMGT numbering ends before Cys104".into());
+            notes.push(Note::ImgtEndsBeforeCys104);
         }
         merged
     }

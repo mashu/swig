@@ -47,6 +47,7 @@ mod cys23;
 mod fr3;
 mod given;
 mod j_motif;
+mod note;
 mod transfer;
 mod v_motif;
 
@@ -57,6 +58,7 @@ pub use cys23::Cys23Model;
 pub use fr3::Fr3Model;
 pub use given::ImgtGaps;
 pub use j_motif::{JHit, find_j};
+pub use note::{Cys23Choice, Note};
 pub use transfer::{
     MIN_SHARED_FRACTION, MIN_SHARED_KMERS, RelativeIndex, kmers, shared, transfer, transfer_aligned,
 };
@@ -140,7 +142,7 @@ impl AnchorSource {
 #[derive(Clone, Debug)]
 pub struct AlleleAnnotation {
     pub source: AnchorSource,
-    pub notes: Vec<String>,
+    pub notes: Vec<Note>,
     /// Region starts (FR1, CDR1, FR2, CDR2, FR3) that may be wrong: derived
     /// for an allele whose anchor is low-confidence or missing; a CDR1
     /// start placed without a Cys23 codon, or from an ambiguous Cys23 that
@@ -154,7 +156,7 @@ pub struct AlleleAnnotation {
 }
 
 impl AlleleAnnotation {
-    fn new(source: AnchorSource, notes: Vec<String>) -> Self {
+    fn new(source: AnchorSource, notes: Vec<Note>) -> Self {
         Self {
             source,
             notes,
@@ -170,7 +172,7 @@ impl AlleleAnnotation {
             .zip(self.uncertain)
             .filter_map(|(&key, uncertain)| uncertain.then_some(key))
             .collect();
-        let mut fields = self.notes.clone();
+        let mut fields: Vec<String> = self.notes.iter().map(Note::to_string).collect();
         if !keys.is_empty() {
             fields.push(format!("uncertain={}", keys.join(",")));
         }
@@ -224,12 +226,6 @@ fn mode_with_share(values: impl Iterator<Item = u32>) -> (Option<u32>, f64) {
         .map_or((None, 0.0), |(value, count)| {
             (Some(value), count as f64 / total as f64)
         })
-}
-
-/// A probability for a note, rounded down to two decimals so that only a
-/// certain choice reads `1.00`.
-fn probability(p: f64) -> String {
-    format!("{:.2}", (p * 100.0).floor() / 100.0)
 }
 
 fn residue_at(codes: &[u8], anchor: u32) -> u8 {
@@ -355,19 +351,19 @@ fn merge_regions(
             .rev()
             .find(|&i| merged.values()[i].is_some() && given[i].known().is_none())
         else {
-            notes.push(format!("header regions inconsistent: {reason}"));
+            notes.push(Note::HeaderRegionsInconsistent { reason });
             break;
         };
-        notes.push(format!(
-            "dropped derived {}: {reason}",
-            RegionStarts::KEYS[index]
-        ));
+        notes.push(Note::DroppedDerived {
+            region: index,
+            reason,
+        });
         let mut values = merged.values();
         values[index] = None;
         merged = RegionStarts::from_values(values);
     }
     let values = merged.values();
-    for (region, [start, end], usual) in [("CDR1", [1, 2], 4..=14), ("CDR2", [3, 4], 0..=12)] {
+    for (cdr, [start, end], usual) in [(1, [1, 2], 4..=14), (2, [3, 4], 0..=12)] {
         let Some(codons) = values[start]
             .zip(values[end])
             .map(|(a, b)| (i64::from(b) - i64::from(a)) / 3)
@@ -375,7 +371,7 @@ fn merge_regions(
             continue;
         };
         if !usual.contains(&codons) {
-            notes.push(format!("unusual {region} length {codons} codons"));
+            notes.push(Note::UnusualCdrLength { cdr, codons });
             for bound in [start, end] {
                 annotation.uncertain[bound] |= given[bound].known().is_none();
             }
@@ -469,21 +465,20 @@ impl Fr3Notes<'_> {
         let Some(choice) = choice else { return };
         let (note, uncertain) = match choice {
             Fr3Choice::Relative(donor) => (
-                Some(format!("FR3 start from {}", self.set.alleles()[donor].name)),
+                Some(Note::Fr3FromRelative {
+                    relative: self.set.alleles()[donor].name.clone(),
+                }),
                 false,
             ),
             Fr3Choice::Model { codons, p } => (
-                Some(format!(
-                    "FR3 length {codons} codons from the database model (n={}, p={})",
-                    self.model.map_or(0, Fr3Model::labels),
-                    probability(p)
-                )),
+                Some(Note::Fr3FromModel {
+                    codons,
+                    labels: self.model.map_or(0, Fr3Model::labels),
+                    p,
+                }),
                 p < FR3_CONFIDENT,
             ),
-            Fr3Choice::OutsideModel => (
-                Some("FR3 length outside the database model; chain default".into()),
-                true,
-            ),
+            Fr3Choice::OutsideModel => (Some(Note::Fr3OutsideModel), true),
             Fr3Choice::ChainDefault => (None, self.default_doubtful),
         };
         annotation.notes.extend(note);
@@ -567,7 +562,7 @@ fn annotate_j(
         if let Some(anchor) = allele.anchor {
             let residue = residue_at(&allele.codes, anchor);
             if !matches!(residue, b'W' | b'F') {
-                notes.push(format!("header anchor codon is {}", char::from(residue)));
+                notes.push(Note::HeaderResidue(residue));
             }
             result.push(AlleleAnnotation::new(AnchorSource::Header, notes));
             anchors.push(Some(anchor));
@@ -639,9 +634,7 @@ fn annotate_j(
                 let anchor = mapped[0].expect("checked above");
                 let residue = residue_at(&j.alleles()[index].codes, anchor);
                 if !matches!(residue, b'W' | b'F') {
-                    result[index]
-                        .notes
-                        .push(format!("conserved residue is {}", char::from(residue)));
+                    result[index].notes.push(Note::TransferredResidue(residue));
                 }
                 result[index].source = AnchorSource::Transfer {
                     from: j.alleles()[donor].name.clone(),
@@ -651,17 +644,16 @@ fn annotate_j(
             // A partial allele: the relative's anchor codon maps outside it,
             // and the allele ends while still aligned to the relative.
             Some(r) if !fits(&r) && partial(&r) => {
-                result[index].notes.push(format!(
-                    "partial: the anchor codon of {} maps outside the sequence",
-                    j.alleles()[r.donor].name
-                ));
+                result[index].notes.push(Note::PartialJ {
+                    relative: j.alleles()[r.donor].name.clone(),
+                });
             }
             _ => {
                 if let Some(h) = weak[index] {
                     result[index].source = AnchorSource::LowConfidence;
                     result[index]
                         .notes
-                        .push(format!("weak motif {}G.G", char::from(h.residue)));
+                        .push(Note::WeakJMotif { residue: h.residue });
                     anchors[index] = Some(h.anchor());
                 }
             }
@@ -780,11 +772,11 @@ pub fn annotate(
             _ => AnchorSource::Missing,
         };
         if let (Some(anchor), Some(source)) = (given.anchor, &given.source) {
-            let residue = char::from(residue_at(&allele.codes, anchor));
-            if residue != 'C' {
+            let residue = residue_at(&allele.codes, anchor);
+            if residue != b'C' {
                 annotation.notes.push(match source {
-                    AnchorSource::ImgtGaps => format!("IMGT 104 codon is {residue}"),
-                    _ => format!("header anchor codon is {residue}"),
+                    AnchorSource::ImgtGaps => Note::ImgtResidue(residue),
+                    _ => Note::HeaderResidue(residue),
                 });
             }
         }
@@ -882,9 +874,7 @@ pub fn annotate(
             }
             (AnchorSource::Motif, _) => {
                 result[index].source = AnchorSource::Missing;
-                result[index]
-                    .notes
-                    .push("motifs inconsistent with the database consensus".into());
+                result[index].notes.push(Note::InconsistentMotifs);
             }
             _ => {}
         }
@@ -921,10 +911,10 @@ pub fn annotate(
             (Some(anchor), Some(hit)) => {
                 let annotation = &mut result[index];
                 if hit.cys23_alternatives > 0 && given.regions[1] == RegionSlot::Unknown {
-                    annotation.notes.push(format!(
-                        "Cys23 ambiguous ({} other C in window); CDR1 start from the best-scoring one",
-                        hit.cys23_alternatives
-                    ));
+                    annotation.notes.push(Note::Cys23Ambiguous {
+                        others: hit.cys23_alternatives,
+                        choice: Cys23Choice::BestScoring,
+                    });
                     annotation.uncertain[1] = true;
                 }
                 let (merged, choice) = merge_hit(
@@ -1018,20 +1008,16 @@ pub fn annotate(
                 if let Some(cdr1) = lands
                     && set_cdr1(&mut regions[index], cdr1)
                 {
-                    let name = &v.alleles()[donor].name;
+                    let relative = v.alleles()[donor].name.clone();
                     let annotation = &mut result[index];
                     if missing {
-                        annotation
-                            .notes
-                            .push(format!("no Cys23; CDR1 start from {name}"));
+                        annotation.notes.push(Note::NoCys23 { relative });
                         annotation.uncertain[1] = true;
                     } else {
                         annotation
                             .notes
-                            .retain(|n| !n.starts_with("Cys23 ambiguous"));
-                        annotation
-                            .notes
-                            .push(format!("ambiguous Cys23 resolved from {name}"));
+                            .retain(|n| !matches!(n, Note::Cys23Ambiguous { .. }));
+                        annotation.notes.push(Note::Cys23Resolved { relative });
                         annotation.uncertain[1] = false;
                     }
                     continue;
@@ -1059,25 +1045,21 @@ pub fn annotate(
             }
             let annotation = &mut result[index];
             annotation.uncertain[1] = true;
+            let from_model = Cys23Choice::Model {
+                labels: model.labels(),
+                p,
+            };
             if missing {
-                annotation.notes.push(format!(
-                    "no Cys23 ({} at its position); CDR1 start from the database model (n={}, p={})",
-                    char::from(aa[k]),
-                    model.labels(),
-                    probability(p)
-                ));
+                annotation.notes.push(Note::NoCys23Model {
+                    residue: aa[k],
+                    labels: model.labels(),
+                    p,
+                });
             } else {
-                for note in annotation
-                    .notes
-                    .iter_mut()
-                    .filter(|n| n.starts_with("Cys23 ambiguous"))
-                {
-                    *note = format!(
-                        "Cys23 ambiguous ({} other C in window); CDR1 start from the database model (n={}, p={})",
-                        hit.cys23_alternatives,
-                        model.labels(),
-                        probability(p)
-                    );
+                for note in &mut annotation.notes {
+                    if let Note::Cys23Ambiguous { choice, .. } = note {
+                        *choice = from_model.clone();
+                    }
                 }
             }
         }
@@ -1119,9 +1101,7 @@ pub fn annotate(
                 let annotation = &mut result[index];
                 let residue = residue_at(&v.alleles()[index].codes, anchor);
                 if residue != b'C' {
-                    annotation
-                        .notes
-                        .push(format!("conserved residue is {}", char::from(residue)));
+                    annotation.notes.push(Note::TransferredResidue(residue));
                 }
                 regions[index] = merge_regions(
                     &given[index].regions,
@@ -1151,10 +1131,9 @@ pub fn annotate(
                 ]);
                 let donor_uncertain = result[r.donor].uncertain;
                 let annotation = &mut result[index];
-                annotation.notes.push(format!(
-                    "3′-partial: the anchor codon of {} maps past the 3′ end",
-                    v.alleles()[r.donor].name
-                ));
+                annotation.notes.push(Note::ThreePrimePartial {
+                    relative: v.alleles()[r.donor].name.clone(),
+                });
                 regions[index] =
                     merge_regions(&given[index].regions, derived, None, len, annotation);
                 inherit_uncertain(annotation, &given[index].regions, donor_uncertain);
@@ -1162,12 +1141,8 @@ pub fn annotate(
             relative => {
                 if let Some(hit) = hits[index] {
                     let annotation = &mut result[index];
-                    annotation.notes.push(match relative {
-                        Some(r) => format!(
-                            "weak motifs; the anchor of {} does not fit and their alignment stops short",
-                            v.alleles()[r.donor].name
-                        ),
-                        None => "weak motifs; no similar annotated allele".into(),
+                    annotation.notes.push(Note::WeakMotifs {
+                        relative: relative.map(|r| v.alleles()[r.donor].name.clone()),
                     });
                     let (merged, choice) = merge_hit(
                         &given[index].regions,
