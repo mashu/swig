@@ -129,6 +129,28 @@ pub enum Count {
 }
 
 impl Count {
+    /// Why the distribution is not well defined, if it is not: an inverted
+    /// range, or a success probability outside `(0, 1]`.
+    pub fn problem(&self) -> Option<String> {
+        let inverted = |(lo, hi): (u32, u32)| (lo > hi).then(|| format!("range {lo}..={hi}"));
+        let success = |p: f64| {
+            (!(p > 0.0 && p <= 1.0)).then(|| format!("success probability {p} outside (0, 1]"))
+        };
+        match *self {
+            Count::Fixed(_) => None,
+            Count::Uniform { lo, hi } => inverted((lo, hi)),
+            Count::Geometric { p } | Count::NegativeBinomial { p, .. } => success(p),
+            Count::Mixture {
+                short,
+                long,
+                p_short,
+            } => inverted(short).or_else(|| inverted(long)).or_else(|| {
+                (!(0.0..=1.0).contains(&p_short))
+                    .then(|| format!("p_short {p_short} outside [0, 1]"))
+            }),
+        }
+    }
+
     pub fn sample(&self, rng: &mut Rng) -> u32 {
         match *self {
             Count::Fixed(n) => n,
@@ -165,6 +187,19 @@ pub enum Rate {
 }
 
 impl Rate {
+    /// Why the distribution is not a rate distribution, if it is not: a
+    /// fixed rate or a uniform range outside `[0, 1]`, or log-normal
+    /// parameters that are not finite (σ ≥ 0).
+    pub fn problem(&self) -> Option<String> {
+        let unit = |x: f64| (0.0..=1.0).contains(&x);
+        let ok = match *self {
+            Rate::Fixed(x) => unit(x),
+            Rate::Uniform { lo, hi } => unit(lo) && unit(hi) && lo <= hi,
+            Rate::LogNormal { mu, sigma } => mu.is_finite() && sigma.is_finite() && sigma >= 0.0,
+        };
+        (!ok).then(|| format!("{self:?}"))
+    }
+
     pub fn sample(&self, rng: &mut Rng) -> f64 {
         let x = match *self {
             Rate::Fixed(x) => x,

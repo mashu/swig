@@ -12,9 +12,11 @@
 //!
 //! # Conventions
 //!
-//! - Text crosses the boundary as UTF-8 in buffers from [`swig_alloc`]. A
-//!   function borrows the buffers it is given; the host frees them with
-//!   [`swig_free`].
+//! - Text crosses the boundary as UTF-8 in buffers from [`swig_alloc`]
+//!   (null when memory is exhausted). A function borrows the buffers it is
+//!   given; the host frees them with [`swig_free`].
+//! - Pointers and lengths are `usize`, an `i32` to the host: JavaScript
+//!   reads them as unsigned (`>>> 0`), since memory may exceed 2 GiB.
 //! - Results stay readable until the next call: the AIRR TSV (or other
 //!   text) through [`swig_result_ptr`]/[`swig_result_len`], the double-D
 //!   sidecar through [`swig_double_d_result_ptr`]/[`swig_double_d_result_len`],
@@ -23,11 +25,13 @@
 //!   buffer.
 //! - A panic traps the instance (this target aborts on panic). Its message
 //!   stays readable after [`swig_panic_message`], and the host must then
-//!   discard the instance.
+//!   discard the instance: every later call returns −1.
 
+use std::alloc::{Layout, alloc, dealloc};
 use std::cell::RefCell;
 use std::sync::Once;
 
+use swig::align::Backend;
 use swig::prelude::*;
 
 /// An instance's engine and buffers.
@@ -43,6 +47,10 @@ struct State {
     double_d_count: i32,
     error: String,
     panic: String,
+    /// Set on the stand-in [`STATE`] holds while a call runs
+    /// ([`with_state`]): a call that traps never puts the state back, and
+    /// the stand-in stays.
+    interrupted: bool,
 }
 
 thread_local! {
@@ -51,33 +59,56 @@ thread_local! {
 
 static PANIC_HOOK: Once = Once::new();
 
-/// Keep a panic's message for [`swig_panic_message`].
+/// Keep a panic's message for [`swig_panic_message`], then report it as
+/// before (natively; this target has nowhere to print it).
 fn install_panic_hook() {
     PANIC_HOOK.call_once(|| {
-        std::panic::set_hook(Box::new(|info| {
+        let report = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
             let message = info.to_string();
             STATE.with(|state| {
                 if let Ok(mut state) = state.try_borrow_mut() {
                     state.panic = message;
                 }
             });
+            report(info);
         }));
     });
 }
 
 /// Run `f` on the instance state; on `Err`, keep the message and return −1.
+///
+/// `f` runs on the state taken out of [`STATE`], which holds an interrupted
+/// stand-in meanwhile. This target traps on a panic (it aborts without
+/// unwinding) and on an invalid memory access, so a borrow held across `f`
+/// would never be released: the panic hook could not keep its message and
+/// every later call would trap. Instead a trapped call leaves the stand-in,
+/// with the panic's message, and every later call refuses.
 fn with_state(f: impl FnOnce(&mut State) -> Result<i32, String>) -> i32 {
     install_panic_hook();
-    STATE.with_borrow_mut(|state| {
-        state.error.clear();
-        match f(state) {
-            Ok(value) => value,
-            Err(message) => {
-                state.error = message;
-                -1
-            }
+    let stand_in = State {
+        interrupted: true,
+        ..State::default()
+    };
+    let mut state = STATE.replace(stand_in);
+    if state.interrupted {
+        state.error = match state.panic.as_str() {
+            "" => "the aligner stopped at an earlier trap; start a new instance".into(),
+            panic => format!("the aligner stopped at an earlier panic: {panic}"),
+        };
+        STATE.set(state);
+        return -1;
+    }
+    state.error.clear();
+    let value = match f(&mut state) {
+        Ok(value) => value,
+        Err(message) => {
+            state.error = message;
+            -1
         }
-    })
+    };
+    STATE.set(state);
+    value
 }
 
 /// The UTF-8 text in `len` bytes at `ptr`.
@@ -146,30 +177,44 @@ impl State {
     }
 }
 
-/// `len` bytes for the host to fill; free with [`swig_free`].
-#[unsafe(no_mangle)]
-pub extern "C" fn swig_alloc(len: usize) -> *mut u8 {
-    let mut buffer = Vec::<u8>::with_capacity(len.max(1));
-    let ptr = buffer.as_mut_ptr();
-    std::mem::forget(buffer);
-    ptr
+/// The layout of a [`swig_alloc`] buffer of `len` bytes; `None` above
+/// `isize::MAX`.
+fn buffer(len: usize) -> Option<Layout> {
+    Layout::array::<u8>(len.max(1)).ok()
 }
 
-/// Free a buffer from [`swig_alloc`].
+/// `len` bytes for the host to fill, or null when memory is exhausted (or
+/// `len` exceeds `isize::MAX`); free with [`swig_free`]. The first export a
+/// host calls, so it installs the panic hook.
+#[unsafe(no_mangle)]
+pub extern "C" fn swig_alloc(len: usize) -> *mut u8 {
+    install_panic_hook();
+    match buffer(len) {
+        // SAFETY: the layout's size is nonzero. `alloc` returns null when it
+        // cannot allocate, where a `Vec` would abort.
+        Some(layout) => unsafe { alloc(layout) },
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Free a buffer from [`swig_alloc`] (nothing for null).
 ///
 /// # Safety
 ///
 /// `ptr` and `len` must come from one [`swig_alloc`] call, not freed before.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn swig_free(ptr: *mut u8, len: usize) {
-    // SAFETY: the buffer was allocated as a `Vec<u8>` of capacity `len.max(1)`.
-    drop(unsafe { Vec::from_raw_parts(ptr, 0, len.max(1)) });
+    if let (false, Some(layout)) = (ptr.is_null(), buffer(len)) {
+        // SAFETY: `swig_alloc` allocated `ptr` with this layout.
+        unsafe { dealloc(ptr, layout) };
+    }
 }
 
 /// Set run option `name` (as on the command line, without `--`) to the
-/// value, or set flag `name` (`value_len` 0). The run is rebuilt from the
-/// loaded germlines on the next annotation. 0, or −1 for an unknown option
-/// or a bad value.
+/// value, or set flag `name`, whose value must be empty (`value_len` 0).
+/// The run is rebuilt from the loaded germlines on the next annotation. 0,
+/// or −1 for an unknown option, a missing or bad value, or a flag given
+/// one.
 ///
 /// # Safety
 ///
@@ -184,22 +229,13 @@ pub unsafe extern "C" fn swig_set_option(
     with_state(|state| {
         // SAFETY: forwarded from the caller.
         let (name, value) = unsafe { (text(name, name_len)?, text(value, value_len)?) };
-        let value = (RunOptions::takes_value(name) == Some(true)).then_some(value);
+        // An empty value is none: `set` refuses it for an option that needs
+        // one, and refuses any other for a flag.
+        let value = (!value.is_empty()).then_some(value);
         state.options.set(name, value).map_err(|e| e.to_string())?;
         state.run = None;
         Ok(0)
     })
-}
-
-/// Restore every option's default; the run is rebuilt on the next
-/// annotation.
-#[unsafe(no_mangle)]
-pub extern "C" fn swig_reset_options() {
-    with_state(|state| {
-        state.options = RunOptions::default();
-        state.run = None;
-        Ok(0)
-    });
 }
 
 /// Load the germline databases (V and J required, D and C empty when
@@ -321,22 +357,23 @@ pub extern "C" fn swig_error_len() -> usize {
 /// Leave the last panic's message in the error buffer (empty if none).
 #[unsafe(no_mangle)]
 pub extern "C" fn swig_panic_message() {
-    STATE.with(|state| {
-        if let Ok(mut state) = state.try_borrow_mut() {
-            state.error = state.panic.clone();
-        }
-    });
+    STATE.with_borrow_mut(|state| state.error = state.panic.clone());
 }
 
 /// Leave `{"version", "backend"}` in the result buffer: the engine version
-/// and the alignment kernel it runs.
+/// and the alignment kernel the run uses (before the run is built, the one
+/// the options select).
 #[unsafe(no_mangle)]
 pub extern "C" fn swig_version() {
     with_state(|state| {
+        let backend = state.run.as_ref().map_or_else(
+            || state.options.simd.unwrap_or_else(Backend::detect),
+            Run::backend,
+        );
         state.result = format!(
             "{{\"version\":{},\"backend\":{}}}",
             json_string(env!("CARGO_PKG_VERSION")),
-            json_string(swig::align::Backend::detect().name())
+            json_string(backend.name())
         )
         .into_bytes();
         Ok(0)
@@ -445,17 +482,69 @@ mod tests {
 
         assert_eq!(set("strand", "sideways"), -1);
         assert!(error().contains("--strand"), "{}", error());
+        // A flag takes no value: "false" or "no" is refused, not read as
+        // the flag; an option that needs a value refuses an empty one.
+        assert_eq!(set("no-posterior", "false"), -1);
+        assert!(error().contains("takes no value"), "{}", error());
+        assert_eq!(set("residual", "no"), -1);
+        assert_eq!(set("no-anchor-window", "0"), -1);
+        assert_eq!(set("profile", ""), -1);
+        assert!(error().contains("needs a value"), "{}", error());
+        assert_eq!(annotate(&text), 20);
+        assert_eq!(result(), rows, "refused options change nothing");
         assert_eq!(set("no-posterior", ""), 0);
         assert_eq!(annotate(&text), 20);
         let header = rows.lines().next().unwrap();
         let posterior = header.split('\t').position(|c| c == "v_posterior").unwrap();
         let row = result().lines().nth(1).unwrap().to_string();
         assert_eq!(row.split('\t').nth(posterior), Some(""));
-        swig_reset_options();
-        assert_eq!(annotate(&text), 20);
-        assert_eq!(result(), rows);
 
         swig_version();
         assert!(result().contains(env!("CARGO_PKG_VERSION")));
+        // The kernel reported is the one the options select, then the one
+        // the run uses.
+        assert_eq!(set("simd", "scalar"), 0);
+        swig_version();
+        assert!(result().contains("\"backend\":\"scalar\""), "{}", result());
+        assert_eq!(annotate(&text), 20);
+        let backend = STATE.with_borrow(|state| state.run.as_ref().map(|run| run.backend()));
+        assert_eq!(backend, Some(Backend::Scalar));
+        swig_version();
+        assert!(result().contains("\"backend\":\"scalar\""), "{}", result());
+    }
+
+    /// A panic inside a call keeps its message and stops the instance: the
+    /// state is not borrowed while the call runs (on WebAssembly a panic
+    /// traps without unwinding), and later calls refuse instead of trapping.
+    #[test]
+    fn a_panic_inside_a_call_keeps_its_message() {
+        with_state(|_| {
+            assert!(STATE.with(|state| state.try_borrow_mut().is_ok()));
+            Ok(0)
+        });
+        let caught = std::panic::catch_unwind(|| with_state(|_| panic!("boom")));
+        assert!(caught.is_err());
+        swig_panic_message();
+        assert!(error().contains("boom"), "{:?}", error());
+        assert_eq!(annotate(">r\nACGT\n"), -1);
+        assert!(error().contains("earlier panic"), "{:?}", error());
+        assert!(error().contains("boom"), "{:?}", error());
+        assert_eq!(swig_error_len(), error().len());
+    }
+
+    /// The allocator returns null when it cannot allocate, instead of
+    /// trapping, and frees what it allocated.
+    #[test]
+    fn allocation_failure_is_null() {
+        assert!(swig_alloc(usize::MAX).is_null());
+        assert!(swig_alloc(isize::MAX as usize + 1).is_null());
+        let ptr = swig_alloc(16);
+        assert!(!ptr.is_null());
+        // SAFETY: 16 bytes from swig_alloc, freed once; null frees nothing.
+        unsafe {
+            ptr.write_bytes(7, 16);
+            swig_free(ptr, 16);
+            swig_free(std::ptr::null_mut(), 16);
+        }
     }
 }

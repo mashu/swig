@@ -7,7 +7,12 @@
 //!    trimmed away entirely means no D. With probability `include_dd` a
 //!    second, different D joins that DJ on its 5′ side, separated by N3
 //!    (DJ → DDJ). Finally sample V, trim it and add N1. Alleles are sampled
-//!    uniformly.
+//!    uniformly among those that can join one rearrangement: J among the J
+//!    alleles of the V loci, then D and V among those of the J's locus (and
+//!    the D's), so a database of several loci gives no cross-locus reads
+//!    ([`crate::locus`]); in a single-locus database that is every allele.
+//!    Over a prepared database ([`Simulator::from_database`]) alleles no
+//!    rearranged transcript carries are left out.
 //! 2. **Assembly**: `flank5 + V + N1 + [D + [N3 + D2] + N2] + J + flank3`,
 //!    flanks being random DNA. Reads outside `[min_length, max_length]` are
 //!    redrawn.
@@ -18,10 +23,10 @@
 //! 5. Optionally (not in IgSim) the emitted read is reverse-complemented.
 //!
 //! With a C database (not in IgSim), [`Simulator::append_constant`] then
-//! reads through the J–C splice: the start of the 3′ flank becomes the C
-//! allele's germline, from the base that follows the J's last base in the
-//! reading frame. It draws from a stream of its own, so the V(D)J part of
-//! every read is the same with and without C.
+//! reads through the J–C splice: the start of the 3′ flank becomes the
+//! germline of a C allele of the J's locus, from the base that follows the
+//! J's last base in the reading frame. It draws from a stream of its own, so
+//! the V(D)J part of every read is the same with and without C.
 //!
 //! Unlike IgSim, which labels bases by region only, every base here also
 //! carries its germline **origin** (position in its allele, or none for N,
@@ -34,7 +39,11 @@ use std::ops::Range;
 use super::params::SimParams;
 use super::random::{Count, Rng};
 use crate::alphabet::decode_base;
+use crate::annotate::{AlleleAnnotation, AnchorSource};
+use crate::config::CSegmentConfig;
 use crate::germline::{GermlineSet, SegmentKind};
+use crate::locus::Loci;
+use crate::prepare::{ConstantWarning, PreparedDatabase};
 use crate::translate::open_frames;
 
 /// The C stream's seed is the read stream's seed XOR this
@@ -127,6 +136,43 @@ impl SimulatedRead {
         Some(first..last + 1)
     }
 
+    /// The read cut to its last `n` bases, as a short read covering part of
+    /// the V (a germline-sense read only). A segment cut into keeps the
+    /// germline that remains: its 5′ trim grows to its first surviving
+    /// germline base. A segment cut away has no span, so its truth goes
+    /// ([`super::Truth::from_read`]).
+    pub fn tail(&self, n: usize) -> SimulatedRead {
+        assert!(
+            !self.reverse_complemented,
+            "the tail of a germline-sense read"
+        );
+        let cut = self.forward.len().saturating_sub(n);
+        let mut read = self.clone();
+        read.forward.drain(..cut);
+        read.regions.drain(..cut);
+        read.origins.drain(..cut);
+        read.sequence = read.forward.clone();
+        read.flank_5p = read.flank_5p.saturating_sub(cut as u32);
+        // The germline start of each segment cut into: its first surviving
+        // templated base, or past its end when none survives.
+        let start = |region: Region| {
+            self.regions[..cut].contains(&region).then(|| {
+                let mut kept = read.regions.iter().zip(&read.origins);
+                kept.find(|&(&r, &o)| r == region && o != NO_ORIGIN)
+                    .map_or(u32::MAX, |(_, &o)| o)
+            })
+        };
+        let starts = [Region::V, Region::D, Region::D2, Region::J].map(start);
+        let t = &mut read.trims;
+        let trims = [&mut t.v_5p, &mut t.d_5p, &mut t.d2_5p, &mut t.j_5p];
+        for (trim, start) in trims.into_iter().zip(starts) {
+            if let Some(start) = start {
+                *trim = start;
+            }
+        }
+        read
+    }
+
     /// Forward-read index of the base templated from germline position `at`
     /// of `region`'s allele, if it survived trimming and indels.
     pub fn locate(&self, region: Region, at: u32) -> Option<usize> {
@@ -145,6 +191,10 @@ pub enum SimError {
     },
     /// No read met the length constraints within `max_retries` attempts.
     Retries(usize),
+    /// No J allele to draw shares a locus with a V allele to draw.
+    Unpaired,
+    /// A parameter outside its domain ([`SimParams::validate`]).
+    Parameter(String),
 }
 
 impl fmt::Display for SimError {
@@ -155,6 +205,8 @@ impl fmt::Display for SimError {
                 write!(f, "expected a {} germline set", expected.label())
             }
             Self::Retries(n) => write!(f, "no read met the length limits after {n} attempts"),
+            Self::Unpaired => write!(f, "no J allele to draw shares a locus with a V allele"),
+            Self::Parameter(problem) => write!(f, "simulation parameter {problem}"),
         }
     }
 }
@@ -169,8 +221,13 @@ pub struct Simulator<'a> {
     c: Vec<Vec<u8>>,
     /// Stop-free reading frame of each C allele.
     c_frames: Vec<Option<usize>>,
+    /// The loci each allele is drawn for, by [`SegmentKind::index`]: its
+    /// own, or none for an allele left out ([`Simulator::from_database`]).
+    loci: [Vec<Loci>; 4],
+    /// The loci of the V alleles together: a J outside them is never drawn.
+    v_loci: Loci,
     sets: [Option<&'a GermlineSet>; 4],
-    pub params: SimParams,
+    params: SimParams,
 }
 
 #[derive(Clone, Copy)]
@@ -197,6 +254,23 @@ fn check(set: &GermlineSet, kind: SegmentKind) -> Result<(), SimError> {
     Ok(())
 }
 
+fn loci(set: &GermlineSet) -> Vec<Loci> {
+    set.alleles().iter().map(|a| a.loci).collect()
+}
+
+/// The alleles of loci `of` that pair with `loci`, `except` excluded.
+fn pool(of: &[Loci], loci: Loci, except: Option<usize>) -> impl Iterator<Item = usize> + '_ {
+    (0..of.len()).filter(move |&i| Some(i) != except && of[i].pairs_with(loci))
+}
+
+/// A uniform draw from [`pool`], `None` when it is empty. When every allele
+/// pairs (a single-locus database) this is IgSim's `below(len)`, with
+/// `except` skipped.
+fn draw(rng: &mut Rng, of: &[Loci], loci: Loci, except: Option<usize>) -> Option<usize> {
+    let n = pool(of, loci, except).count();
+    (n > 0).then(|| pool(of, loci, except).nth(rng.below(n)).expect("k < n"))
+}
+
 /// `sequence[t5 .. len − t3]` with positions, empty when the trims meet.
 fn trimmed(sequence: &[u8], t5: u32, t3: u32) -> Range<usize> {
     let len = sequence.len();
@@ -217,15 +291,96 @@ impl<'a> Simulator<'a> {
             check(d, SegmentKind::D)?;
         }
         check(j, SegmentKind::J)?;
-        Ok(Self {
+        params.validate()?;
+        let mut sim = Self {
             v: ascii(v),
             d: d.map(ascii).unwrap_or_default(),
             j: ascii(j),
             c: Vec::new(),
             c_frames: Vec::new(),
+            loci: [
+                loci(v),
+                d.map(loci).unwrap_or_default(),
+                loci(j),
+                Vec::new(),
+            ],
+            v_loci: Loci::NONE,
             sets: [Some(v), d, Some(j), None],
             params,
-        })
+        };
+        sim.pair()?;
+        Ok(sim)
+    }
+
+    /// A simulator over a prepared database (and its C, if any) that draws
+    /// only the alleles a rearranged, spliced transcript carries: no V or J
+    /// allele whose anchor was not found (a 3′-partial V record) or is a
+    /// low-confidence guess, since a junction truth built on it would rest
+    /// on the annotation it is meant to test; and no C allele the C stage
+    /// cannot call (5′-truncated or genomic records,
+    /// [`PreparedDatabase::constant_warnings`]).
+    pub fn from_database(
+        database: &'a PreparedDatabase,
+        params: SimParams,
+    ) -> Result<Self, SimError> {
+        let mut sim = Self::new(&database.v, database.d.as_ref(), &database.j, params)?;
+        let guessed = |annotations: &'a [AlleleAnnotation]| {
+            move |allele: usize| {
+                annotations.get(allele).is_some_and(|a| {
+                    matches!(
+                        a.source,
+                        AnchorSource::Missing | AnchorSource::LowConfidence
+                    )
+                })
+            }
+        };
+        sim.leave_out(SegmentKind::V, guessed(&database.annotation.v));
+        sim.leave_out(SegmentKind::J, guessed(&database.annotation.j));
+        if let Some(c) = &database.c {
+            sim = sim.with_constant(c)?;
+            let refused: Vec<String> = database
+                .constant_warnings(CSegmentConfig::default().spread)
+                .into_iter()
+                .filter_map(|warning| match warning {
+                    ConstantWarning::Truncated { allele, .. }
+                    | ConstantWarning::NotCoding { allele, .. } => Some(allele),
+                    ConstantWarning::JEnd { .. } => None,
+                })
+                .collect();
+            sim.leave_out(SegmentKind::C, |allele| {
+                refused.contains(&c.alleles()[allele].name)
+            });
+        }
+        sim.pair()?;
+        Ok(sim)
+    }
+
+    /// Never draw the alleles of `kind` that `left_out` names by index.
+    fn leave_out(&mut self, kind: SegmentKind, left_out: impl Fn(usize) -> bool) {
+        for (allele, loci) in self.loci[kind.index()].iter_mut().enumerate() {
+            if left_out(allele) {
+                *loci = Loci::NONE;
+            }
+        }
+    }
+
+    /// Collect the loci of the V alleles to draw, and check that some J
+    /// allele to draw pairs with them.
+    fn pair(&mut self) -> Result<(), SimError> {
+        let [v, _, j, _] = &self.loci;
+        self.v_loci = v.iter().fold(Loci::NONE, |u, &l| u.union(l));
+        match j.iter().any(|l| l.pairs_with(self.v_loci)) {
+            true => Ok(()),
+            false => Err(SimError::Unpaired),
+        }
+    }
+
+    /// How many alleles of `kind` reads are drawn from.
+    pub fn drawn(&self, kind: SegmentKind) -> usize {
+        self.loci[kind.index()]
+            .iter()
+            .filter(|l| !l.is_empty())
+            .count()
     }
 
     /// Read into the constant regions of `c` ([`Self::append_constant`]).
@@ -237,6 +392,7 @@ impl<'a> Simulator<'a> {
             .iter()
             .map(|a| open_frames(&a.codes).next())
             .collect();
+        self.loci[SegmentKind::C.index()] = loci(c);
         self.sets[SegmentKind::C.index()] = Some(c);
         Ok(self)
     }
@@ -291,18 +447,22 @@ impl<'a> Simulator<'a> {
     }
 
     /// With probability `include_c`, read through the J–C splice: a C
-    /// allele drawn uniformly overwrites the start of the 3′ flank from
-    /// germline position `o` ([`Self::constant_offset`]), for the whole
-    /// flank with probability `c_whole_flank`, else for a length uniform in
-    /// `0..=flank`, and never past the allele's end; then instrument errors
-    /// at the 3′ rate. Draws only from `rng`, so call it with a stream of
-    /// its own; without a C database it does nothing.
+    /// allele of the J's locus, drawn uniformly, overwrites the start of the
+    /// 3′ flank from germline position `o` ([`Self::constant_offset`]), for
+    /// the whole flank with probability `c_whole_flank`, else for a length
+    /// uniform in `0..=flank`, and never past the allele's end; then
+    /// instrument errors at the 3′ rate. Draws only from `rng`, so call it with a stream of
+    /// its own; without a C allele of the J's locus it does nothing.
     pub fn append_constant(&self, read: &mut SimulatedRead, rng: &mut Rng) {
         let p = &self.params;
-        if self.c.is_empty() || !rng.bernoulli(p.include_c) {
+        let (c_loci, j_loci) = (
+            &self.loci[SegmentKind::C.index()],
+            self.loci[SegmentKind::J.index()][read.j],
+        );
+        if pool(c_loci, j_loci, None).next().is_none() || !rng.bernoulli(p.include_c) {
             return;
         }
-        let allele = rng.below(self.c.len());
+        let allele = draw(rng, c_loci, j_loci, None).expect("a C of the J's locus");
         let offset = self.constant_offset(allele, read.j);
         let Some(flank) = read.span(Region::Flank3) else {
             return;
@@ -350,24 +510,27 @@ impl<'a> Simulator<'a> {
         let p = &self.params;
         let mut trims = Trims::default();
 
-        // 1. DJ, optional DDJ, then V (IgSim's order of draws).
-        let j = rng.below(self.j.len());
+        // 1. DJ, optional DDJ, then V (IgSim's order of draws), each allele
+        // among those of the loci drawn so far: `loci` keeps every V pool
+        // non-empty, as it stays within the V loci.
+        let [v_loci, d_loci, j_loci, _] = &self.loci;
+        let j = draw(rng, j_loci, self.v_loci, None).expect("a J pairs with a V");
+        let mut loci = j_loci[j].intersection(self.v_loci);
         trims.j_5p = p.j_trim_5p.sample(rng);
         let j_body = trimmed(&self.j[j], trims.j_5p, 0);
         let (mut d, mut d2) = (None, None);
         let (mut n2, mut n3) = (Vec::new(), Vec::new());
-        if !self.d.is_empty() && rng.bernoulli(p.include_d) {
-            let first = rng.below(self.d.len());
+        if pool(d_loci, loci, None).next().is_some() && rng.bernoulli(p.include_d) {
+            let first = draw(rng, d_loci, loci, None).expect("a D of the J's locus");
             let (t5, t3) = (p.d_trim_5p.sample(rng), p.d_trim_3p.sample(rng));
             if !trimmed(&self.d[first], t5, t3).is_empty() {
                 n2 = random_n(rng, &p.n2_length);
                 d = Some(first);
                 (trims.d_5p, trims.d_3p) = (t5, t3);
-                if self.d.len() >= 2 && rng.bernoulli(p.include_dd) {
-                    let mut other = rng.below(self.d.len() - 1);
-                    if other >= first {
-                        other += 1;
-                    }
+                loci = loci.intersection(d_loci[first]);
+                let another = pool(d_loci, loci, Some(first)).next().is_some();
+                if another && rng.bernoulli(p.include_dd) {
+                    let other = draw(rng, d_loci, loci, Some(first)).expect("another D");
                     let (u5, u3) = (p.d_trim_5p.sample(rng), p.d_trim_3p.sample(rng));
                     if !trimmed(&self.d[other], u5, u3).is_empty() {
                         // D + DJ → DDJ: the new D is 5′ of the original one.
@@ -376,11 +539,12 @@ impl<'a> Simulator<'a> {
                         (trims.d2_5p, trims.d2_3p) = (t5, t3);
                         d = Some(other);
                         (trims.d_5p, trims.d_3p) = (u5, u3);
+                        loci = loci.intersection(d_loci[other]);
                     }
                 }
             }
         }
-        let v = rng.below(self.v.len());
+        let v = draw(rng, v_loci, loci, None).expect("a V of the read's locus");
         trims.v_5p = p.v_trim_5p.sample(rng);
         trims.v_3p = p.v_trim_3p.sample(rng);
         let v_body = trimmed(&self.v[v], trims.v_5p, trims.v_3p);
@@ -598,6 +762,54 @@ mod tests {
         assert!(tandem > 30, "tandem DD should occur at include_dd = 0.3");
     }
 
+    /// Parameters outside their domain are refused, not clamped or wrapped
+    /// at sampling time; every preset is valid.
+    #[test]
+    fn invalid_parameters_are_refused() {
+        use crate::sim::random::Rate;
+        let (v, d, j) = sets();
+        let new = |params: SimParams| Simulator::new(&v, Some(&d), &j, params).err();
+        for name in ["easy", "mid", "train", "hard"] {
+            assert_eq!(new(SimParams::preset(name).unwrap()), None, "{name}");
+        }
+        let mid = SimParams::mid();
+        let invalid = [
+            SimParams {
+                include_dd: 7.0,
+                ..mid
+            },
+            mid.with_reverse_complement(1.5),
+            mid.with_reverse_complement(-1.0),
+            mid.with_shm(f64::NAN),
+            mid.with_shm(3.0),
+            SimParams {
+                indel_rate: GatedRate {
+                    p: 0.1,
+                    rate: Rate::Uniform { lo: 0.2, hi: 0.1 },
+                },
+                ..mid
+            },
+            SimParams {
+                n1_length: Count::Uniform { lo: 5, hi: 2 },
+                ..mid
+            },
+            SimParams {
+                d_trim_5p: Count::Geometric { p: 0.0 },
+                ..mid
+            },
+            SimParams {
+                min_length: 1000,
+                ..mid
+            },
+        ];
+        for params in invalid {
+            assert!(
+                matches!(new(params), Some(SimError::Parameter(_))),
+                "{params:?}"
+            );
+        }
+    }
+
     #[test]
     fn noise_is_confined_to_the_body_and_origins_survive_indels() {
         let (v, d, j) = sets();
@@ -696,5 +908,120 @@ mod tests {
             }
             assert!((200..280).contains(&constant), "{constant}");
         }
+    }
+
+    /// From a prepared database, a 3′-partial V record (no Cys104) and a
+    /// 5′-truncated C record are never drawn: every read's V has an anchor
+    /// for its junction truth.
+    #[test]
+    fn a_prepared_database_draws_only_complete_alleles() {
+        use crate::annotate::AnnotateOptions;
+        use crate::prepare::GermlineTexts;
+        use crate::sim::{SyntheticDatabase, SyntheticSpec};
+        let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 4);
+        let fasta = |set: &GermlineSet| {
+            let mut text = Vec::new();
+            set.write_fasta(&mut text, |_| None).unwrap();
+            String::from_utf8(text).unwrap()
+        };
+        let record = |name: &str, codes: &[u8]| {
+            let bases: String = codes.iter().map(|&c| char::from(decode_base(c))).collect();
+            format!(">{name}\n{bases}\n")
+        };
+        let (v1, c1) = (db.v.allele(0), db.c.allele(0));
+        let cut = v1.anchor.unwrap() as usize - 30;
+        let v = fasta(&db.v) + &record("IGHV9-9*01", &v1.codes[..cut]);
+        let c = fasta(&db.c) + &record("IGHC1-1*09", &c1.codes[300..]);
+        let (d, j) = (fasta(&db.d), fasta(&db.j));
+        let texts = GermlineTexts {
+            v: &v,
+            d: Some(&d),
+            j: &j,
+            c: Some(&c),
+        };
+        let database = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+        let (v_set, c_set) = (&database.v, database.c.as_ref().unwrap());
+        let id = |set: &GermlineSet, name| set.alleles().iter().position(|a| a.name == name);
+        let left_out = (
+            id(v_set, "IGHV9-9*01").unwrap(),
+            id(c_set, "IGHC1-1*09").unwrap(),
+        );
+        // How often each record is drawn, and whether every V has an anchor.
+        let draws = |sim: &Simulator<'_>| {
+            let reads = sim.reads(3000, 2).unwrap();
+            let v = reads.iter().filter(|r| r.v == left_out.0).count();
+            let c = reads.iter().filter(|r| r.c == Some(left_out.1)).count();
+            let anchored = reads
+                .iter()
+                .all(|r| v_set.allele(r.v as u32).anchor.is_some());
+            (v, c, anchored)
+        };
+        let params = SimParams::easy();
+        let all = Simulator::new(v_set, database.d.as_ref(), &database.j, params)
+            .unwrap()
+            .with_constant(c_set)
+            .unwrap();
+        let (v, c, anchored) = draws(&all);
+        assert!(
+            v > 0 && c > 0 && !anchored,
+            "uniform draws reach both records"
+        );
+        let sim = Simulator::from_database(&database, params).unwrap();
+        assert_eq!(draws(&sim), (0, 0, true));
+        assert_eq!(sim.drawn(SegmentKind::V), v_set.len() - 1);
+        assert_eq!(sim.drawn(SegmentKind::J), database.j.len());
+        assert_eq!(sim.drawn(SegmentKind::C), c_set.len() - 1);
+    }
+
+    /// A read's tail is scored against the germline it keeps: spans on the
+    /// tail, the V's remaining body (so more alleles are equivalent), the
+    /// junction while the V anchor remains, and no V once the V is cut away.
+    #[test]
+    fn a_tail_keeps_the_truth_of_what_remains() {
+        use crate::sim::truth::{Slot, Truth};
+        use crate::sim::{IlluminaError, SyntheticDatabase, SyntheticSpec};
+        let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 3);
+        let params = SimParams {
+            body_error_rate: GatedRate::NONE,
+            indel_rate: GatedRate::NONE,
+            illumina_error: IlluminaError::NONE,
+            ..SimParams::mid()
+        };
+        let sim = Simulator::new(&db.v, Some(&db.d), &db.j, params).unwrap();
+        let mut wider = 0;
+        for (i, read) in sim.reads(200, 4).unwrap().iter().enumerate() {
+            let full = Truth::from_read(&sim, read, "r");
+            let len = read.forward.len();
+            // The last 40 V bases and what follows, or what follows the V.
+            let n = len - read.span(Region::V).unwrap().end + [40, 0][i % 2];
+            let tail = read.tail(n);
+            assert_eq!(tail.sequence, read.forward[len - n..]);
+            let truth = Truth::from_read(&sim, &tail, "r");
+            let j = truth.segment(Slot::J).unwrap();
+            let whole_j = full.segment(Slot::J).unwrap();
+            assert_eq!(
+                j.span,
+                whole_j.span.start - (len - n)..whole_j.span.end - (len - n)
+            );
+            assert_eq!(
+                (&j.allele, &j.equivalent),
+                (&whole_j.allele, &whole_j.equivalent)
+            );
+            let Some(v) = truth.segment(Slot::V) else {
+                assert_eq!(i % 2, 1);
+                assert_eq!(truth.junction, None);
+                continue;
+            };
+            assert_eq!(v.span, 0..40);
+            assert_eq!(
+                &tail.forward[..40],
+                sim.germline_body(&tail, Region::V).unwrap()
+            );
+            let whole = full.segment(Slot::V).unwrap();
+            assert!(whole.equivalent.iter().all(|a| v.equivalent.contains(a)));
+            wider += usize::from(v.equivalent.len() > whole.equivalent.len());
+            assert_eq!(truth.junction, full.junction);
+        }
+        assert!(wider >= 20, "{wider} of 100 tails widen the V");
     }
 }

@@ -4,6 +4,9 @@
 //! across tools: a call is an [`Assignment`], built from this crate's
 //! [`AirrRecord`] or from any AIRR Rearrangement TSV row.
 //!
+//! Allele identity, D presence and the junction do not depend on how the
+//! caller oriented the read; read positions do.
+//!
 //! * **Exact** — the primary (first) called allele is the simulated allele.
 //! * **Equivalent** — the primary allele is *germline-equivalent* on this
 //!   read: its sequence contains the trimmed, pre-mutation germline body that
@@ -12,9 +15,14 @@
 //! * **Truth listed** — the simulated allele is among the reported names.
 //! * **Gene** — the primary allele's gene is the gene of an equivalent allele.
 //! * **Boundaries** — absolute error of the called segment ends against the
-//!   labelled read positions (only for correctly oriented reads).
-//! * **D presence**, stratified by the length of the simulated D remnant:
-//!   a 2-nt remnant is not identifiable, a 20-nt one must be found.
+//!   labelled read positions (only for reads whose reported orientation,
+//!   `rev_comp`, is the true one).
+//! * **Tandem D** — on a read with two simulated Ds, a single D call (most
+//!   callers report one D) is scored against the true D it covers, and the
+//!   other true D is the missed second D.
+//! * **D presence**, stratified by the length of the simulated D remnant
+//!   (the longer one of a tandem DD): a 2-nt remnant is not identifiable, a
+//!   20-nt one must be found.
 //! * **Junction** — the called junction sequence equals the true one
 //!   (Cys104 … Trp/Phe118 inclusive), when both anchor codons are templated
 //!   in the read.
@@ -39,8 +47,10 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::ops::Range;
 
+use super::simulate::{SimulatedRead, Simulator};
 use super::truth::{Slot, TrueSegment, Truth};
 use crate::germline::GermlineSet;
+use crate::pipeline::{AlleleCatalog, Call};
 use crate::report::{AirrRecord, SegmentReport};
 
 fn gene(name: &str) -> &str {
@@ -65,7 +75,8 @@ pub struct SegmentCall {
 /// A caller's answer for one read, from any tool.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Assignment {
-    pub rev_comp: bool,
+    /// The reported orientation; `None` when the caller does not report one.
+    pub rev_comp: Option<bool>,
     /// Indexed by [`Slot::index`].
     pub segments: [Option<SegmentCall>; 5],
     pub junction: Option<String>,
@@ -83,7 +94,7 @@ impl Assignment {
             })
         };
         Self {
-            rev_comp: record.rev_comp,
+            rev_comp: Some(record.rev_comp),
             segments: [
                 segment(&record.v),
                 segment(&record.d),
@@ -97,7 +108,8 @@ impl Assignment {
     }
 
     /// Parse one AIRR Rearrangement TSV row; returns `(sequence_id, assignment)`.
-    /// Only `sequence_id` is required. `{v,d,d2,j,c}_call` may list several
+    /// Only `sequence_id` is required; without a `rev_comp` value the
+    /// orientation is unknown. `{v,d,d2,j,c}_call` may list several
     /// comma-separated names (primary first); coordinates are AIRR 1-based closed.
     pub fn from_airr(header: &[&str], line: &str) -> Result<(String, Self), String> {
         let fields: Vec<&str> = line.split('\t').collect();
@@ -111,7 +123,11 @@ impl Assignment {
         let id = get("sequence_id").ok_or("AIRR row without sequence_id")?;
         let probability = |name: &str| get(name).and_then(|v| v.parse::<f64>().ok());
         let mut assignment = Self {
-            rev_comp: matches!(get("rev_comp"), Some("T" | "TRUE" | "true" | "True")),
+            rev_comp: get("rev_comp").and_then(|v| match v {
+                "T" | "TRUE" | "true" | "True" => Some(true),
+                "F" | "FALSE" | "false" | "False" => Some(false),
+                _ => None,
+            }),
             junction: get("junction").map(|j| j.to_ascii_uppercase()),
             d_presence: probability("d_presence_posterior"),
             ..Self::default()
@@ -141,6 +157,52 @@ impl Assignment {
     pub fn assigned(&self) -> bool {
         self.segment(Slot::V).is_some() || self.segment(Slot::J).is_some()
     }
+
+    /// Whether the reported orientation is `truth`'s, so that read
+    /// positions are comparable.
+    pub fn oriented(&self, truth: &Truth) -> bool {
+        self.rev_comp == Some(truth.reverse_complemented)
+    }
+}
+
+/// The true segment each slot of `call` is scored against, by
+/// [`Slot::index`]: the read's own, except on a read with two true Ds and a
+/// single D call. That call answers the true D it covers: the one its span
+/// overlaps more (when the read positions are comparable), else the one its
+/// primary name is equivalent to, the 5′ D first. The other true D is then
+/// the missed second D.
+fn scored_against<'a>(truth: &'a Truth, call: &Assignment) -> [Option<&'a TrueSegment>; 5] {
+    let mut segments = Slot::ALL.map(|slot| truth.segment(slot));
+    let (Some(first), Some(second), Some(d), None) = (
+        truth.segment(Slot::D),
+        truth.segment(Slot::D2),
+        call.segment(Slot::D),
+        call.segment(Slot::D2),
+    ) else {
+        return segments;
+    };
+    let overlap = |t: &TrueSegment| {
+        let span = d.span.as_ref().filter(|_| call.oriented(truth))?;
+        Some(
+            span.end
+                .min(t.span.end)
+                .saturating_sub(span.start.max(t.span.start)),
+        )
+    };
+    let covers_second = match (overlap(first), overlap(second)) {
+        (Some(a), Some(b)) if a != b => b > a,
+        _ => !primary_equivalent(first, d) && primary_equivalent(second, d),
+    };
+    if covers_second {
+        segments.swap(Slot::D.index(), Slot::D2.index());
+    }
+    segments
+}
+
+/// The length of the longest simulated D remnant (0 without D).
+fn d_remnant(truth: &Truth) -> usize {
+    let d2 = truth.segment(Slot::D2).map_or(0, |d| d.span.len());
+    truth.d_length.max(d2)
 }
 
 /// Whether the primary allele of `call` is germline-equivalent to `truth`.
@@ -165,7 +227,8 @@ pub struct SegmentStats {
     pub names: usize,
     /// Calls on reads whose truth lacks the segment.
     pub spurious: usize,
-    /// Boundary errors over called, correctly oriented reads.
+    /// Boundary errors over called reads whose reported orientation is the
+    /// true one.
     pub start_error: usize,
     pub end_error: usize,
     pub start_exact: usize,
@@ -211,14 +274,11 @@ impl SegmentStats {
         let Some(primary) = call.names.first() else {
             return;
         };
-        if !oriented {
-            return;
-        }
         self.exact += usize::from(*primary == truth.allele);
         self.equivalent += usize::from(primary_equivalent(truth, call));
         self.truth_listed += usize::from(call.names.contains(&truth.allele));
         self.gene += usize::from(truth.equivalent.iter().any(|e| gene(e) == gene(primary)));
-        if let Some(span) = &call.span {
+        if let Some(span) = call.span.as_ref().filter(|_| oriented) {
             self.boundary_reads += 1;
             self.start_error += span.start.abs_diff(truth.span.start);
             self.end_error += span.end.abs_diff(truth.span.end);
@@ -263,7 +323,7 @@ pub struct ConstantStats {
 }
 
 impl ConstantStats {
-    fn add(&mut self, truth: Option<&TrueSegment>, call: Option<&SegmentCall>, oriented: bool) {
+    fn add(&mut self, truth: Option<&TrueSegment>, call: Option<&SegmentCall>) {
         self.reads += 1;
         if let Some(truth) = truth {
             self.genes_equivalent += genes(&truth.equivalent).len();
@@ -275,24 +335,10 @@ impl ConstantStats {
             return;
         };
         let listed_equivalent = call.names.iter().all(|n| truth.equivalent.contains(n));
-        self.over_call += usize::from(!oriented || !listed_equivalent);
-        if !oriented {
-            return;
-        }
+        self.over_call += usize::from(!listed_equivalent);
         self.equivalent += usize::from(primary_equivalent(truth, call));
         self.first_gene += usize::from(gene(primary) == gene(&truth.allele));
         self.gene_set += usize::from(genes(&call.names) == genes(&truth.equivalent));
-    }
-
-    fn merge(&mut self, other: &ConstantStats) {
-        self.reads += other.reads;
-        self.called += other.called;
-        self.equivalent += other.equivalent;
-        self.first_gene += other.first_gene;
-        self.gene_set += other.gene_set;
-        self.over_call += other.over_call;
-        self.genes_listed += other.genes_listed;
-        self.genes_equivalent += other.genes_equivalent;
     }
 }
 
@@ -336,15 +382,6 @@ impl Calibration {
 
     pub fn count(&self) -> usize {
         self.bins.iter().map(|b| b.count).sum()
-    }
-
-    pub fn merge(&mut self, other: &Calibration) {
-        for (a, b) in self.bins.iter_mut().zip(&other.bins) {
-            a.count += b.count;
-            a.posterior += b.posterior;
-            a.correct += b.correct;
-        }
-        self.squared_error += other.squared_error;
     }
 
     /// Expected calibration error: `Σ_bins n_b · |mean posterior − frequency| / n`.
@@ -398,7 +435,8 @@ pub struct DPresence {
     pub reads: usize,
     /// Reads with any D call.
     pub called: usize,
-    /// Reads whose primary D call is germline-equivalent to the first true D.
+    /// Reads whose primary D call is germline-equivalent to the true D it
+    /// is scored against (on a tandem DD, the one it covers).
     pub correct: usize,
 }
 
@@ -422,36 +460,54 @@ pub struct Evaluation {
 }
 
 impl Evaluation {
+    /// The evaluation of `calls`, one per read of `reads` (simulated by
+    /// `sim`), as `catalog` reports them in its AIRR records.
+    pub fn of_calls<C: AlleleCatalog>(
+        sim: &Simulator<'_>,
+        reads: &[SimulatedRead],
+        calls: &[Call],
+        catalog: &C,
+    ) -> Self {
+        let mut evaluation = Self::default();
+        for (read, call) in reads.iter().zip(calls) {
+            let sequence = String::from_utf8_lossy(&read.sequence);
+            let record = AirrRecord::from_call("r", &sequence, call, catalog, &[None, None, None]);
+            let truth = Truth::from_read(sim, read, "r");
+            evaluation.add(&truth, &Assignment::from_record(&record));
+        }
+        evaluation
+    }
+
     pub fn add(&mut self, truth: &Truth, call: &Assignment) {
         self.reads += 1;
-        let oriented = call.rev_comp == truth.reverse_complemented;
+        let oriented = call.oriented(truth);
         self.oriented += usize::from(oriented);
         self.unassigned += usize::from(!call.assigned());
+        let scored = scored_against(truth, call);
         for (slot, stats) in [
             (Slot::V, &mut self.v),
             (Slot::D, &mut self.d),
             (Slot::D2, &mut self.d2),
             (Slot::J, &mut self.j),
         ] {
-            stats.add(truth.segment(slot), call.segment(slot), oriented);
+            stats.add(scored[slot.index()], call.segment(slot), oriented);
         }
 
         let bin = D_LENGTH_BINS
             .iter()
-            .position(|&(lo, hi)| (lo..=hi).contains(&truth.d_length))
+            .position(|&(lo, hi)| (lo..=hi).contains(&d_remnant(truth)))
             .expect("bins cover every length");
         let presence = &mut self.d_presence[bin];
         presence.reads += 1;
         let called_d = call.segment(Slot::D);
         presence.called += usize::from(called_d.is_some());
-        if let (Some(called), Some(true_d)) = (called_d, truth.segment(Slot::D)) {
-            presence.correct += usize::from(oriented && primary_equivalent(true_d, called));
+        if let (Some(called), Some(true_d)) = (called_d, scored[Slot::D.index()]) {
+            presence.correct += usize::from(primary_equivalent(true_d, called));
         }
 
         if let Some(junction) = &truth.junction {
             self.junction_reads += 1;
-            self.junction_exact +=
-                usize::from(oriented && call.junction.as_deref() == Some(junction.as_str()));
+            self.junction_exact += usize::from(call.junction.as_deref() == Some(junction.as_str()));
         }
 
         if truth.constant {
@@ -460,7 +516,7 @@ impl Evaluation {
                 .iter()
                 .position(|&(lo, hi)| (lo..=hi).contains(&length))
                 .expect("bins cover every length");
-            self.c[bin].add(truth.segment(Slot::C), call.segment(Slot::C), oriented);
+            self.c[bin].add(truth.segment(Slot::C), call.segment(Slot::C));
         }
 
         for (slot, calibration) in [
@@ -473,10 +529,8 @@ impl Evaluation {
                 continue;
             };
             if let Some(posterior) = segment.posterior {
-                let correct = oriented
-                    && truth
-                        .segment(slot)
-                        .is_some_and(|t| segment.names.iter().any(|n| t.equivalent.contains(n)));
+                let correct = scored[slot.index()]
+                    .is_some_and(|t| segment.names.iter().any(|n| t.equivalent.contains(n)));
                 calibration.add(posterior, correct);
             }
         }
@@ -485,49 +539,6 @@ impl Evaluation {
                 .d_presence
                 .add(posterior, truth.segment(Slot::D).is_some());
         }
-    }
-
-    /// Merge another evaluation (e.g. from another thread or stratum).
-    pub fn merge(&mut self, other: &Evaluation) {
-        fn segment(a: &mut SegmentStats, b: &SegmentStats) {
-            a.reads += b.reads;
-            a.called += b.called;
-            a.exact += b.exact;
-            a.equivalent += b.equivalent;
-            a.truth_listed += b.truth_listed;
-            a.gene += b.gene;
-            a.names += b.names;
-            a.spurious += b.spurious;
-            a.start_error += b.start_error;
-            a.end_error += b.end_error;
-            a.start_exact += b.start_exact;
-            a.end_exact += b.end_exact;
-            a.boundary_reads += b.boundary_reads;
-        }
-        self.reads += other.reads;
-        self.oriented += other.oriented;
-        self.unassigned += other.unassigned;
-        segment(&mut self.v, &other.v);
-        segment(&mut self.d, &other.d);
-        segment(&mut self.d2, &other.d2);
-        segment(&mut self.j, &other.j);
-        for (a, b) in self.d_presence.iter_mut().zip(&other.d_presence) {
-            a.reads += b.reads;
-            a.called += b.called;
-            a.correct += b.correct;
-        }
-        self.junction_reads += other.junction_reads;
-        self.junction_exact += other.junction_exact;
-        for (a, b) in self.c.iter_mut().zip(&other.c) {
-            a.merge(b);
-        }
-        self.calibration.v.merge(&other.calibration.v);
-        self.calibration.d.merge(&other.calibration.d);
-        self.calibration.j.merge(&other.calibration.j);
-        self.calibration
-            .d_presence
-            .merge(&other.calibration.d_presence);
-        self.calibration.c.merge(&other.calibration.c);
     }
 
     pub fn junction_rate(&self) -> f64 {
@@ -842,11 +853,14 @@ pub struct Paired {
 
 impl Paired {
     pub fn add(&mut self, truth: &Truth, first: &Assignment, second: &Assignment) {
-        let correct = |call: &Assignment, slot: Slot, truth_segment: &TrueSegment| {
-            call.rev_comp == truth.reverse_complemented
-                && call
-                    .segment(slot)
-                    .is_some_and(|c| primary_equivalent(truth_segment, c))
+        // Each caller's D answers the true D it covers ([`scored_against`]).
+        let callers = [first, second];
+        let scored = callers.map(|call| scored_against(truth, call));
+        let correct = |caller: usize, slot: Slot| {
+            let call = callers[caller].segment(slot);
+            scored[caller][slot.index()]
+                .zip(call)
+                .is_some_and(|(t, c)| primary_equivalent(t, c))
         };
         for (slot, outcome) in [
             (Slot::V, &mut self.v),
@@ -854,22 +868,16 @@ impl Paired {
             (Slot::J, &mut self.j),
             (Slot::C, &mut self.c),
         ] {
-            if let Some(segment) = truth.segment(slot) {
-                outcome.add(
-                    correct(first, slot, segment),
-                    correct(second, slot, segment),
-                );
+            if truth.segment(slot).is_some() {
+                outcome.add(correct(0, slot), correct(1, slot));
             }
         }
-        if let Some(segment) = truth.segment(Slot::D)
+        if truth.segment(Slot::D).is_some()
             && let Some(stratum) = D_REMNANT_STRATA
                 .iter()
-                .position(|&(lo, hi)| (lo..=hi).contains(&truth.d_length))
+                .position(|&(lo, hi)| (lo..=hi).contains(&d_remnant(truth)))
         {
-            self.d_by_remnant[stratum].add(
-                correct(first, Slot::D, segment),
-                correct(second, Slot::D, segment),
-            );
+            self.d_by_remnant[stratum].add(correct(0, Slot::D), correct(1, Slot::D));
         }
         let silent = |call: &Assignment, slot: Slot| call.segment(slot).is_none();
         if truth.segment(Slot::D).is_none() {
@@ -882,15 +890,13 @@ impl Paired {
         }
         // The calibration events of [`Evaluation`]: some reported D name is
         // equivalent to the truth; the read has a D.
-        let d_posterior = |call: &Assignment| {
-            let segment = call.segment(Slot::D)?;
-            let listed = call.rev_comp == truth.reverse_complemented
-                && truth
-                    .segment(Slot::D)
-                    .is_some_and(|t| segment.names.iter().any(|n| t.equivalent.contains(n)));
+        let d_posterior = |caller: usize| {
+            let segment = callers[caller].segment(Slot::D)?;
+            let listed = scored[caller][Slot::D.index()]
+                .is_some_and(|t| segment.names.iter().any(|n| t.equivalent.contains(n)));
             Some((segment.posterior?, listed))
         };
-        if let (Some(a), Some(b)) = (d_posterior(first), d_posterior(second)) {
+        if let (Some(a), Some(b)) = (d_posterior(0), d_posterior(1)) {
             self.d_brier.add(a, b);
         }
         let has_d = truth.segment(Slot::D).is_some();
@@ -898,10 +904,7 @@ impl Paired {
             self.d_presence_brier.add((a, has_d), (b, has_d));
         }
         if let Some(junction) = &truth.junction {
-            let exact = |call: &Assignment| {
-                call.rev_comp == truth.reverse_complemented
-                    && call.junction.as_deref() == Some(junction.as_str())
-            };
+            let exact = |call: &Assignment| call.junction.as_deref() == Some(junction.as_str());
             self.junction.add(exact(first), exact(second));
         }
     }
@@ -1015,6 +1018,155 @@ mod tests {
         assert!((o.half_width() - 1.2334).abs() < 1e-3, "{}", o.half_width());
     }
 
+    fn segment(allele: &str, span: Range<usize>) -> TrueSegment {
+        TrueSegment {
+            allele: allele.into(),
+            equivalent: vec![allele.into()],
+            span,
+        }
+    }
+
+    /// A read with V, J and a templated junction, emitted reverse
+    /// complemented.
+    fn reversed_truth() -> Truth {
+        Truth {
+            id: "r".into(),
+            reverse_complemented: true,
+            segments: [
+                Some(segment("V1*01", 0..9)),
+                None,
+                None,
+                Some(segment("J1*01", 40..60)),
+                None,
+            ],
+            constant: false,
+            junction: Some("TGTGCG".into()),
+            d_length: 0,
+            shm_rate: 0.0,
+        }
+    }
+
+    /// Allele identity and the junction do not depend on the reported
+    /// orientation; boundaries need it, and a calls file without `rev_comp`
+    /// reports none: a perfect caller without the column is perfect.
+    #[test]
+    fn orientation_gates_boundaries_only() {
+        let truth = reversed_truth();
+        let header = [
+            "sequence_id",
+            "v_call",
+            "v_sequence_start",
+            "v_sequence_end",
+            "j_call",
+            "junction",
+        ];
+        let row = "r\tV1*01\t1\t9\tJ1*01\ttgtgcg";
+        let (_, unknown) = Assignment::from_airr(&header, row).unwrap();
+        assert_eq!(unknown.rev_comp, None);
+        let with_column = [&header[..], &["rev_comp"]].concat();
+        let (_, reported) = Assignment::from_airr(&with_column, &format!("{row}\tT")).unwrap();
+        assert_eq!(reported.rev_comp, Some(true));
+        let (_, wrong) = Assignment::from_airr(&with_column, &format!("{row}\tF")).unwrap();
+        assert_eq!(wrong.rev_comp, Some(false));
+        for (call, oriented) in [(unknown, false), (wrong, false), (reported, true)] {
+            let mut e = Evaluation::default();
+            e.add(&truth, &call);
+            assert_eq!(e.oriented, usize::from(oriented));
+            assert_eq!(
+                (e.v.equivalent, e.j.equivalent, e.junction_exact),
+                (1, 1, 1)
+            );
+            assert_eq!(e.v.boundary_reads, usize::from(oriented));
+            let mut paired = Paired::default();
+            paired.add(&truth, &call, &call);
+            assert_eq!((paired.v.both, paired.junction.both), (1, 1));
+        }
+    }
+
+    /// A read with V, a 10-nt 5′ D, a 12-nt 3′ D and J, in germline sense.
+    fn tandem_truth() -> Truth {
+        Truth {
+            id: "r".into(),
+            reverse_complemented: false,
+            segments: [
+                Some(segment("V1*01", 0..9)),
+                Some(segment("D1*01", 10..20)),
+                Some(segment("D2*01", 25..37)),
+                Some(segment("J1*01", 40..60)),
+                None,
+            ],
+            constant: false,
+            junction: None,
+            d_length: 10,
+            shm_rate: 0.0,
+        }
+    }
+
+    /// A forward call of `calls` (slot, primary name, span), posterior 0.9.
+    fn call(calls: &[(Slot, &str, Option<Range<usize>>)]) -> Assignment {
+        let mut call = Assignment {
+            rev_comp: Some(false),
+            ..Assignment::default()
+        };
+        for (slot, name, span) in calls {
+            call.segments[slot.index()] = Some(SegmentCall {
+                names: vec![name.to_string()],
+                span: span.clone(),
+                posterior: Some(0.9),
+            });
+        }
+        call
+    }
+
+    /// A single D call on a tandem-DD read answers the true D it covers,
+    /// whichever of the two that is; the other is the missed second D.
+    #[test]
+    fn a_single_d_call_is_scored_against_the_true_d_it_covers() {
+        let truth = tandem_truth();
+        let d = |name, span: Option<Range<usize>>| call(&[(Slot::D, name, span)]);
+        let evaluate = |call: &Assignment| {
+            let mut e = Evaluation::default();
+            e.add(&truth, call);
+            e
+        };
+        // The 3′ D, by its span and without one (by its name).
+        for call in [d("D2*01", Some(25..37)), d("D2*01", None)] {
+            let e = evaluate(&call);
+            assert_eq!((e.d.reads, e.d.equivalent, e.d.exact), (1, 1, 1));
+            assert_eq!((e.d2.reads, e.d2.called), (1, 0));
+            // Binned by the longer remnant (12 nt).
+            let presence = DPresence {
+                reads: 1,
+                called: 1,
+                correct: 1,
+            };
+            assert_eq!(e.d_presence[4], presence);
+            assert_eq!(e.calibration.d.bins[3].correct, 1, "0.9 is in [0.9, 0.95)");
+        }
+        let e = evaluate(&d("D2*01", Some(25..37)));
+        let boundaries = (e.d.boundary_reads, e.d.start_error, e.d.end_error);
+        assert_eq!(boundaries, (1, 0, 0));
+        // The 5′ D is still right.
+        let e = evaluate(&d("D1*01", Some(10..20)));
+        assert_eq!((e.d.equivalent, e.d.start_error, e.d.end_error), (1, 0, 0));
+        // A wrong allele over the 3′ D is wrong, with exact boundaries.
+        let e = evaluate(&d("D3*01", Some(25..37)));
+        assert_eq!((e.d.equivalent, e.d.start_error, e.d.end_error), (0, 0, 0));
+        // Two D calls are scored in read order.
+        let both = call(&[
+            (Slot::D, "D2*01", Some(25..37)),
+            (Slot::D2, "D1*01", Some(10..20)),
+        ]);
+        let e = evaluate(&both);
+        assert_eq!((e.d.equivalent, e.d2.equivalent, e.d2.called), (0, 0, 1));
+        // Paired: each caller's D is matched on its own.
+        let mut paired = Paired::default();
+        paired.add(&truth, &d("D2*01", Some(25..37)), &d("D1*01", Some(10..20)));
+        assert_eq!((paired.d.both, paired.d_by_remnant[2].both), (1, 1));
+        assert_eq!(paired.d_brier.reads, 1);
+        assert!(paired.d_brier.difference.abs() < 1e-12 && paired.d_brier.first < 0.011);
+    }
+
     #[test]
     fn constant_calls_are_scored_by_gene_set_and_first_name() {
         let names = |list: &[&str]| list.iter().map(|n| n.to_string()).collect::<Vec<_>>();
@@ -1030,27 +1182,22 @@ mod tests {
         };
         let mut stats = ConstantStats::default();
         // Equivalent, but the first name is the other gene.
-        stats.add(Some(&truth), Some(&call(&["G2*01", "G1*01"])), true);
+        stats.add(Some(&truth), Some(&call(&["G2*01", "G1*01"])));
         // Right gene first; a gene missing from the list.
-        stats.add(Some(&truth), Some(&call(&["G1*02"])), true);
+        stats.add(Some(&truth), Some(&call(&["G1*02"])));
         // An over-call: G3 is not equivalent.
-        stats.add(
-            Some(&truth),
-            Some(&call(&["G1*01", "G2*01", "G3*01"])),
-            true,
-        );
-        // Misoriented calls are wrong; no call is not an over-call.
-        stats.add(Some(&truth), Some(&call(&["G1*01", "G2*01"])), false);
-        stats.add(Some(&truth), None, true);
+        stats.add(Some(&truth), Some(&call(&["G1*01", "G2*01", "G3*01"])));
+        // No call is not an over-call.
+        stats.add(Some(&truth), None);
         let expected = ConstantStats {
-            reads: 5,
-            called: 4,
+            reads: 4,
+            called: 3,
             equivalent: 3,
             first_gene: 2,
             gene_set: 1,
-            over_call: 2,
-            genes_listed: 2 + 1 + 3 + 2,
-            genes_equivalent: 5 * 2,
+            over_call: 1,
+            genes_listed: 2 + 1 + 3,
+            genes_equivalent: 4 * 2,
         };
         assert_eq!(stats, expected);
     }

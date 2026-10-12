@@ -25,8 +25,9 @@ use swig::sim::{Assignment, C_STREAM, Evaluation, Paired, Rng, SimParams, Simula
 const USAGE: &str = "\
 usage: swig --v V.fasta --j J.fasta [--d D.fasta] [--c C.fasta] [options] <reads|->
        swig prepare --v V.fasta --j J.fasta [--d D.fasta] [--c C.fasta] [--chain heavy|light] --out DIR
-       swig simulate --v V.fasta --j J.fasta [--d D.fasta] [--c C.fasta] --out PREFIX
-                  [--preset easy|mid|hard] [--reads N] [--seed S] [--rc P] [--shm RATE] [--dd P]
+       swig simulate --v V.fasta --j J.fasta [--d D.fasta] [--c C.fasta] [--chain heavy|light]
+                  --out PREFIX [--preset easy|mid|train|hard] [--reads N] [--seed S]
+                  [--rc P] [--shm RATE] [--dd P]
        swig evaluate --truth PREFIX.truth.tsv <calls.tsv> [other.tsv]
 
 Assigns V(D)J (and C) germline alleles to reads and writes Swig's AIRR
@@ -37,15 +38,16 @@ zcat reads.fastq.gz | swig ... -
 
 simulate writes PREFIX.fasta and PREFIX.truth.tsv: reads from the IgSim model
 (presets as in IgSim.jl; --rc reverse-complements that fraction, default 0.5;
---shm fixes the SHM rate of every read; --dd sets the tandem-DD fraction)
-with their true alleles, the germline-equivalent alleles, segment intervals
-and junctions. evaluate scores an AIRR Rearrangement TSV from any tool
-against that truth (germline-equivalence-aware allele, gene, boundary,
-D-presence and junction accuracy). Given a second calls file, evaluate also
-compares the two read by read: accuracy difference with its 95 % confidence
-interval and an exact McNemar test on the reads only one of them gets right
-(D also by remnant length), and the D allele and D-presence Brier scores
-with a paired t.
+--shm fixes the SHM rate of every read; --dd sets the tandem-DD fraction) with
+their true alleles, the germline-equivalent alleles, segment intervals and
+junctions; each read's V, D and C come from its J's locus, and V and J records
+without a trusted anchor and the C records prepare warns about are not drawn.
+evaluate scores an AIRR Rearrangement TSV from any tool against that truth
+(germline-equivalence-aware allele, gene, boundary, D-presence and junction
+accuracy). Given a second calls file, evaluate also compares the two read by
+read: accuracy difference with its 95 % confidence interval and an exact
+McNemar test on the reads only one of them gets right (D also by remnant
+length), and the D allele and D-presence Brier scores with a paired t.
 
 Germline databases are FASTA and may hold several loci (IGH, IGK and IGL;
 or the TR loci): each allele's locus is read from its name, and every
@@ -275,15 +277,52 @@ fn parse_args() -> Result<Command, String> {
         };
         *slot = value;
     }
+    args.check()?;
     Ok(Command::Run(Box::new(args)))
+}
+
+impl Args {
+    /// Refuse a command line that lacks an input its mode needs, or gives
+    /// the double-D screen without its sidecar (or the reverse): a usage
+    /// error like any other bad command line.
+    fn check(&self) -> Result<(), String> {
+        let mode = self.mode;
+        let germline = matches!(mode, Mode::Assign | Mode::Prepare | Mode::Simulate);
+        let missing = [
+            (germline && self.files.v.is_none(), "--v V.fasta"),
+            (germline && self.files.j.is_none(), "--j J.fasta"),
+            (mode == Mode::Prepare && self.out.is_none(), "--out DIR"),
+            (mode == Mode::Simulate && self.out.is_none(), "--out PREFIX"),
+            (
+                mode == Mode::Evaluate && self.truth.is_none(),
+                "--truth PREFIX.truth.tsv",
+            ),
+            (
+                mode == Mode::Evaluate && self.input.is_none(),
+                "an AIRR TSV of calls",
+            ),
+            (
+                mode == Mode::Assign && self.input.is_none(),
+                "a reads file (FASTA, FASTQ, AIRR TSV or '-')",
+            ),
+        ];
+        if let Some((_, what)) = missing.iter().find(|(missing, _)| *missing) {
+            return Err(format!("{} needs {what}", mode.name()));
+        }
+        let screening = self.run.double_d.mode != DoubleDMode::Off;
+        if screening != self.double_d_out.is_some() {
+            return Err("--double-d and --double-d-out go together".into());
+        }
+        Ok(())
+    }
 }
 
 /// Read the germline FASTA files and prepare the database, logging its
 /// summary and warnings.
 fn load_database(files: &Files, options: &RunOptions) -> Result<PreparedDatabase, Box<dyn Error>> {
     let read = |path: &str| fs::read_to_string(path).map_err(|e| format!("{path}: {e}"));
-    let v = read(files.v.as_deref().ok_or("--v is required")?)?;
-    let j = read(files.j.as_deref().ok_or("--j is required")?)?;
+    let v = read(files.v.as_deref().expect("checked by Args::check"))?;
+    let j = read(files.j.as_deref().expect("checked by Args::check"))?;
     let d = files.d.as_deref().map(read).transpose()?;
     let c = files.c.as_deref().map(read).transpose()?;
     let texts = GermlineTexts {
@@ -314,7 +353,7 @@ fn load_database(files: &Files, options: &RunOptions) -> Result<PreparedDatabase
 }
 
 fn run_prepare(args: &Args) -> Result<(), Box<dyn Error>> {
-    let out = args.out.as_deref().ok_or("prepare needs --out DIR")?;
+    let out = args.out.as_deref().expect("checked by Args::check");
     let database = load_database(&args.files, &args.run)?;
     database.write(Path::new(out))?;
     let names: Vec<&str> = database.files().iter().map(|&(name, _)| name).collect();
@@ -328,14 +367,8 @@ fn run_assign(args: &Args) -> Result<(), Box<dyn Error>> {
             "swig: warning: debug build, typically 10-50x slower; build with `cargo build --release`"
         );
     }
-    let reads = args
-        .input
-        .as_deref()
-        .ok_or("a reads file (FASTA, FASTQ, AIRR TSV or '-') is required")?;
+    let reads = args.input.as_deref().expect("checked by Args::check");
     let screening = args.run.double_d.mode != DoubleDMode::Off;
-    if screening != args.double_d_out.is_some() {
-        return Err("--double-d and --double-d-out go together".into());
-    }
     let database = load_database(&args.files, &args.run)?;
     let mut run = Run::new(&args.run, database)?;
     let mut sidecar = args
@@ -397,24 +430,54 @@ fn number<T: std::str::FromStr>(
     }
 }
 
+/// Parse an optional probability or per-base rate, which must lie in
+/// `[0, 1]` (not NaN).
+fn probability(value: &Option<String>, option: &str, default: f64) -> Result<f64, String> {
+    let p = number(value, option, default)?;
+    match (0.0..=1.0).contains(&p) {
+        true => Ok(p),
+        false => Err(format!(
+            "{option} expects a value in [0, 1], got '{}'",
+            value.as_deref().unwrap_or_default()
+        )),
+    }
+}
+
 fn run_simulate(args: &Args) -> Result<(), Box<dyn Error>> {
-    let out = args.out.as_deref().ok_or("simulate needs --out PREFIX")?;
+    let out = args.out.as_deref().expect("checked by Args::check");
     let preset = args.preset.as_deref().unwrap_or("mid");
     let mut params = SimParams::preset(preset)
         .ok_or_else(|| format!("unknown preset '{preset}' (easy, mid, train, hard)"))?
-        .with_reverse_complement(number(&args.rc, "--rc", 0.5)?);
+        .with_reverse_complement(probability(&args.rc, "--rc", 0.5)?);
     if args.shm.is_some() {
-        params = params.with_shm(number(&args.shm, "--shm", 0.0)?);
+        params = params.with_shm(probability(&args.shm, "--shm", 0.0)?);
     }
     if args.dd.is_some() {
-        params.include_dd = number(&args.dd, "--dd", 0.0)?;
+        params.include_dd = probability(&args.dd, "--dd", 0.0)?;
     }
     let count: usize = number(&args.count, "--reads", 10_000)?;
+    if count == 0 {
+        return Err("--reads expects a positive count, got '0'".into());
+    }
     let seed: u64 = number(&args.seed, "--seed", 1)?;
     let database = load_database(&args.files, &args.run)?;
-    let mut sim = Simulator::new(&database.v, database.d.as_ref(), &database.j, params)?;
-    if let Some(c) = &database.c {
-        sim = sim.with_constant(c)?;
+    if params.include_dd > 0.0 && database.d.as_ref().map_or(0, GermlineSet::len) < 2 {
+        eprintln!("swig: warning: --dd has no effect without at least two D alleles");
+    }
+    let sim = Simulator::from_database(&database, params)?;
+    let sets = [
+        (SegmentKind::V, Some(&database.v)),
+        (SegmentKind::J, Some(&database.j)),
+        (SegmentKind::C, database.c.as_ref()),
+    ];
+    for (kind, set) in sets {
+        let (all, drawn) = (set.map_or(0, GermlineSet::len), sim.drawn(kind));
+        if drawn < all {
+            eprintln!(
+                "swig: drawing {} alleles from {drawn} of {all}: the others lack a trusted anchor or a complete coding region",
+                kind.label()
+            );
+        }
     }
     let mut reads = BufWriter::new(File::create(format!("{out}.fasta"))?);
     let mut truth = BufWriter::new(File::create(format!("{out}.truth.tsv"))?);
@@ -451,14 +514,8 @@ fn read_calls(path: &str) -> Result<HashMap<String, Assignment>, Box<dyn Error>>
 }
 
 fn run_evaluate(args: &Args) -> Result<(), Box<dyn Error>> {
-    let truth_path = args
-        .truth
-        .as_deref()
-        .ok_or("evaluate needs --truth PREFIX.truth.tsv")?;
-    let calls_path = args
-        .input
-        .as_deref()
-        .ok_or("evaluate needs an AIRR TSV of calls")?;
+    let truth_path = args.truth.as_deref().expect("checked by Args::check");
+    let calls_path = args.input.as_deref().expect("checked by Args::check");
     let calls = read_calls(calls_path)?;
     let other = args.other.as_deref().map(read_calls).transpose()?;
     let truth_text = fs::read_to_string(truth_path).map_err(|e| format!("{truth_path}: {e}"))?;
@@ -496,21 +553,25 @@ fn run_evaluate(args: &Args) -> Result<(), Box<dyn Error>> {
             );
         }
     }
-    println!("{evaluation}");
+    // Written, not printed: a closed or full stdout is an error, not a panic.
+    let mut out = io::stdout().lock();
+    writeln!(out, "{evaluation}")?;
     if let Some(other_path) = &args.other {
-        println!("\nfirst: {calls_path}\nsecond: {other_path}\n{paired}");
+        writeln!(out, "\nfirst: {calls_path}\nsecond: {other_path}\n{paired}")?;
     }
+    out.flush()?;
     Ok(())
 }
 
 fn main() -> ExitCode {
     match parse_args() {
+        // A closed stdout leaves no one to tell: neither is an error.
         Ok(Command::Help) => {
-            println!("{USAGE}");
+            let _ = writeln!(io::stdout(), "{USAGE}");
             ExitCode::SUCCESS
         }
         Ok(Command::Version) => {
-            println!("swig {}", env!("CARGO_PKG_VERSION"));
+            let _ = writeln!(io::stdout(), "swig {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
         Ok(Command::Run(args)) => {
