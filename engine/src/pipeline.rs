@@ -5,7 +5,7 @@
 //!                 ─► V stage over the whole chunk     score batch + traceback waves
 //!                 ─► per read: J window right of V; J stage over the whole chunk
 //!                 ─► per read: D windows from V/J geometry, D candidates
-//!                 ─► D stage over the whole chunk ─► per read: admission gates
+//!                 ─► D stage over the whole chunk (admission gates as acceptance)
 //!                 ─► per read: adjudicator (placement DAG) ─► Call
 //!                 ─► C stage over the whole chunk (optional; reads finished
 //!                    calls only, see [`crate::constant`])
@@ -122,15 +122,15 @@ pub struct Assigner<
 > {
     pub v: SegmentStage<RV>,
     pub j: SegmentStage<RJ>,
-    /// `None` for loci without D (light chains).
-    pub d: Option<SegmentStage<RD>>,
+    /// `None` for loci without D (light chains). Its acceptance predicate
+    /// is the D admission gate, so an inadmissible hit takes no slot.
+    pub d: Option<SegmentStage<RD, Adm>>,
     /// Germline k-mer presence for orientation.
     pub strand: StrandIndex,
     /// Where J is searched relative to V.
     pub j_window: DownstreamWindow,
     pub aligner: A,
     pub d_window: W,
-    pub d_admission: Adm,
     pub adjudicator: Adj,
     /// Adjudicators for reads of one locus, where it differs from
     /// `adjudicator`: a D database of several loci prices a D by its own
@@ -204,18 +204,20 @@ macro_rules! replace {
 /// monomorphises again around it.
 impl<A, RV, RJ, RD, W, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj> {
     pub fn with_aligner<A2>(self, aligner: A2) -> Assigner<A2, RV, RJ, RD, W, Adm, Adj> {
-        replace!(self { v, j, d, strand, j_window, d_window, d_admission, adjudicator, locus_adjudicators, c, options } aligner: aligner)
+        replace!(self { v, j, d, strand, j_window, d_window, adjudicator, locus_adjudicators, c, options } aligner: aligner)
     }
 
     pub fn with_d_window<W2>(self, d_window: W2) -> Assigner<A, RV, RJ, RD, W2, Adm, Adj> {
-        replace!(self { v, j, d, strand, j_window, aligner, d_admission, adjudicator, locus_adjudicators, c, options } d_window: d_window)
+        replace!(self { v, j, d, strand, j_window, aligner, adjudicator, locus_adjudicators, c, options } d_window: d_window)
     }
 
+    /// Swap the D stage's admission gate (its acceptance predicate).
     pub fn with_d_admission<Adm2>(
         self,
         d_admission: Adm2,
     ) -> Assigner<A, RV, RJ, RD, W, Adm2, Adj> {
-        replace!(self { v, j, d, strand, j_window, aligner, d_window, adjudicator, locus_adjudicators, c, options } d_admission: d_admission)
+        let d = self.d.map(|stage| stage.with_accept(d_admission));
+        replace!(self { v, j, strand, j_window, aligner, d_window, adjudicator, locus_adjudicators, c, options } d: d)
     }
 
     /// Swap the adjudicator, for reads of every locus. The D stage keeps
@@ -238,7 +240,6 @@ impl<A, RV, RJ, RD, W, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj> {
             j_window: assigner.j_window,
             aligner: assigner.aligner,
             d_window: assigner.d_window,
-            d_admission: assigner.d_admission,
             c: assigner.c,
             options: assigner.options,
         }
@@ -428,12 +429,13 @@ where
         }
     }
 
-    /// Stage 4: D windows from V/J geometry and their candidates per read, D
-    /// placements over the whole chunk, then the admission gates per read.
+    /// Stage 4: D windows from V/J geometry and their candidates per read,
+    /// then D placements over the whole chunk (the stage applies the
+    /// admission gates).
     #[allow(clippy::too_many_arguments)]
     fn stage_d(
         &self,
-        d: &SegmentStage<RD>,
+        d: &SegmentStage<RD, Adm>,
         reads: &[ReadState],
         placements: &mut [Vec<Placement>],
         scratch: &mut DScratch,
@@ -482,11 +484,7 @@ where
         start.clear();
         start.extend(placements.iter().map(Vec::len));
         d.place_many(&self.aligner, &requests, dp, batch, placements);
-        for ((state, placed), &first) in reads.iter().zip(placements.iter_mut()).zip(start.iter()) {
-            retain_from(placed, first, |p| {
-                self.d_admission
-                    .admit(p, &state.query, d.segment.reference(p.primary_allele()))
-            });
+        for (placed, &first) in placements.iter_mut().zip(start.iter()) {
             self.drop_dissimilar(placed, first);
         }
     }

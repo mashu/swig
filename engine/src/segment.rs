@@ -23,6 +23,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::admission::Admission;
 use crate::align::{AlignJob, Aligner, Alignment, ScoreHit};
 use crate::clip::ClipIndex;
 use crate::evidence::Evidence;
@@ -34,7 +35,9 @@ use crate::retrieve::{Candidate, RetrievalScratch, Retriever};
 use crate::scoring::{AffineScoring, GapCosts, Score, SubstitutionModel, SubstitutionProfile};
 use crate::stats::KarlinAltschul;
 
-/// Length and identity floor applied to a local alignment before outer extension.
+/// Length and identity floor applied to a local alignment before outer
+/// extension: the acceptance predicate ([`Admission`]) of the V, J and C
+/// stages.
 ///
 /// A hit needs at least `min_subst` substitution columns (matches plus
 /// mismatches) and an identity of at least `min_identity`. `min_identity` of
@@ -64,6 +67,16 @@ impl HitAcceptance {
         subst >= self.min_subst
             && (columns == 0
                 || f64::from(evidence.matches) + 1e-9 >= self.min_identity * f64::from(columns))
+    }
+}
+
+impl Admission for HitAcceptance {
+    fn admit(&self, placement: &Placement, _: &[u8], _: &[u8]) -> bool {
+        self.allows(&placement.evidence)
+    }
+
+    fn admits_all(&self) -> bool {
+        self.is_permissive()
     }
 }
 
@@ -116,8 +129,8 @@ impl PreparedSegment {
 ///
 /// The stage keeps the `top` best *accepted* alignments by extended score
 /// (the local score when the stage extends no flank) and every alignment
-/// tied with the last of them. A high score that fails [`HitAcceptance`]
-/// does not take a slot, so traceback proceeds in waves down the
+/// tied with the last of them. A high score that the stage's acceptance
+/// predicate rejects does not take a slot, so traceback proceeds in waves down the
 /// local-score ranking until `top` alignments are accepted and the next
 /// local score is below the `top`-th extended score, the list is exhausted,
 /// or `cap` candidates were traced.
@@ -358,11 +371,14 @@ impl Significance {
     }
 }
 
-pub struct SegmentStage<R> {
+pub struct SegmentStage<R, Acc = HitAcceptance> {
     pub segment: Arc<PreparedSegment>,
     pub retriever: R,
     pub keep: KeepPolicy,
-    pub accept: HitAcceptance,
+    /// Which traced alignments take a slot, judged before the outer flank
+    /// is stitched on: [`HitAcceptance`] for V, J and C, the admission
+    /// gates for D. A rejected alignment frees its slot for the next one.
+    pub accept: Acc,
     /// `None` accepts hits of any significance, and none anchors a call.
     pub significance: Option<Significance>,
     /// Stitch the co-linear V prefix or J suffix onto every accepted
@@ -406,7 +422,25 @@ impl<R: Retriever> SegmentStage<R> {
             family_delta: None,
         }
     }
+}
 
+impl<R, Acc> SegmentStage<R, Acc> {
+    /// The stage with acceptance predicate `accept`.
+    pub fn with_accept<Acc2>(self, accept: Acc2) -> SegmentStage<R, Acc2> {
+        SegmentStage {
+            segment: self.segment,
+            retriever: self.retriever,
+            keep: self.keep,
+            accept,
+            significance: self.significance,
+            outer: self.outer,
+            ties: self.ties,
+            family_delta: self.family_delta,
+        }
+    }
+}
+
+impl<R: Retriever, Acc: Admission> SegmentStage<R, Acc> {
     pub fn kind(&self) -> SegmentKind {
         self.segment.kind()
     }
@@ -649,7 +683,7 @@ impl<R: Retriever> SegmentStage<R> {
     ///    full scoring, positions included (so `cap` binds alike).
     ///
     /// Aligning representatives, the cutoff and early tracing apply only
-    /// under permissive acceptance ([`HitAcceptance::is_permissive`]).
+    /// under permissive acceptance ([`Admission::admits_all`]).
     /// Otherwise a rejected alignment makes the traceback waves refill from
     /// below `T`, where a deferred sibling may lie, so siblings are pruned
     /// only below the floor.
@@ -663,7 +697,7 @@ impl<R: Retriever> SegmentStage<R> {
         dp: &mut A::Workspace,
         batch: &mut BatchScratch,
     ) {
-        let cut = self.accept.is_permissive() && self.keep.top > 0;
+        let cut = self.accept.admits_all() && self.keep.top > 0;
         batch.owners.clear();
         for (index, request) in requests.iter().enumerate() {
             if self.needs_scores(request) {
@@ -1078,7 +1112,8 @@ impl<R: Retriever> SegmentStage<R> {
         placement.anchor = self
             .significance
             .is_some_and(|s| local >= s.min_score(request.window.len(), s.gates.anchor));
-        if self.accept.allows(&placement.evidence) {
+        let reference = self.segment.reference(placement.primary_allele());
+        if self.accept.admit(&placement, request.query, reference) {
             self.extend_outer(&mut placement, request.query);
             let key = placement.score();
             debug_assert!(key <= local, "the outer flank lies in the searched window");
@@ -1245,8 +1280,8 @@ mod tests {
     }
 
     /// `(alleles, score)` of the placements `stage` keeps for `candidates`.
-    fn placed<R: Retriever>(
-        stage: &SegmentStage<R>,
+    fn placed<R: Retriever, Acc: Admission>(
+        stage: &SegmentStage<R, Acc>,
         candidates: &[Candidate],
         query: &[u8],
     ) -> Vec<(Vec<AlleleId>, Score)> {
@@ -1309,6 +1344,69 @@ mod tests {
             // Two candidates are traced unranked.
             assert_eq!(placed(&stage, &candidates[..2], &query)[0], (vec![1], 96));
         }
+    }
+
+    /// The D stage's acceptance predicate is its admission gate: a hit
+    /// without an exact run of `min_d_match` bases takes no slot, so the
+    /// admissible hit ranked behind it is kept. The default D policy traces
+    /// beyond its `top` for that.
+    #[test]
+    fn inadmissible_hits_free_their_slots() {
+        use crate::admission::{AnyOf, DistributedEvidence, ExactRunFloor};
+        let scoring = AffineScoring::new(2, -3, -13, -1);
+        let mut next = crate::testing::rng(41);
+        let (long, short) = (
+            crate::testing::random_codes(&mut next, 32),
+            crate::testing::random_codes(&mut next, 10),
+        );
+        let mut set = GermlineSet::new(SegmentKind::D);
+        set.push("IGHD1-1*01", decode(&long).as_bytes(), None)
+            .unwrap();
+        set.push("IGHD2-2*01", decode(&short).as_bytes(), None)
+            .unwrap();
+        let segment = Arc::new(PreparedSegment::new(set, &scoring, scoring.gaps));
+        // The long allele with every 4th base mutated (runs of 3, score
+        // about 3 per 4 columns), then the short allele exact (run 10,
+        // score 20).
+        let mut query = crate::testing::random_codes(&mut next, 6);
+        query.extend(
+            (0..)
+                .zip(&long)
+                .map(|(i, &c)| if i % 4 == 3 { (c + 1) % 4 } else { c }),
+        );
+        query.extend(crate::testing::random_codes(&mut next, 6));
+        query.extend(&short);
+        query.extend(crate::testing::random_codes(&mut next, 6));
+        let keep = KeepPolicy {
+            top: 1,
+            min_score: 1,
+            cap: 2,
+        };
+        let gate = AnyOf(ExactRunFloor { min_run: 4 }, None::<DistributedEvidence>);
+        let stage = SegmentStage::new(Arc::clone(&segment), EmptyRetriever, keep).with_accept(gate);
+        let candidates = [0, 1].map(|allele| Candidate {
+            allele,
+            band: Band::Full,
+            votes: 0,
+        });
+        let traced = |stage: &SegmentStage<EmptyRetriever, _>| {
+            let score = |allele| {
+                BandedGotoh
+                    .score(
+                        &query,
+                        segment.profile(allele),
+                        scoring.gaps,
+                        Band::Full,
+                        &mut Default::default(),
+                    )
+                    .map_or(0, |hit| hit.score)
+            };
+            assert!(score(0) > score(1), "the inadmissible hit ranks first");
+            placed(stage, &candidates, &query)
+        };
+        assert_eq!(traced(&stage), vec![(vec![1], 20)]);
+        let d = crate::config::DSegmentConfig::default();
+        assert!(d.keep.cap > d.keep.top);
     }
 
     /// A request of `top + 1` candidates is ranked by score when `cap` binds

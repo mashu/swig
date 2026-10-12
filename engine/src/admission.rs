@@ -1,9 +1,14 @@
-//! D admission gates: which D placements may enter adjudication.
+//! Acceptance predicates: which traced alignments a segment stage keeps
+//! ([`crate::segment::SegmentStage::accept`]), and so which may enter
+//! adjudication.
 //!
-//! The method note's hard gates are expressed as small composable values:
+//! The V, J and C stages take a length and identity floor
+//! ([`crate::segment::HitAcceptance`]); the D stage takes the method note's
+//! hard D gates, expressed as small composable values:
 //! `AnyOf<ExactRunFloor, Option<DistributedEvidence>>` is "exact-run floor, or
-//! distributed-D evidence when enabled". Turning a gate into a soft prior later
-//! means moving it into [`crate::adjudicate::PathModel`] and admitting all.
+//! distributed-D evidence when enabled". A rejected alignment takes no slot of
+//! the stage's keep policy. Turning a gate into a soft prior later means
+//! moving it into [`crate::adjudicate::PathModel`] and admitting all.
 
 use crate::evidence::rescore;
 use crate::placement::Placement;
@@ -15,6 +20,13 @@ pub type DefaultAdmission = AnyOf<ExactRunFloor, Option<DistributedEvidence>>;
 pub trait Admission: Send + Sync {
     /// `query` is the oriented query, `reference` the primary allele's codes.
     fn admit(&self, placement: &Placement, query: &[u8], reference: &[u8]) -> bool;
+
+    /// Whether every placement is admitted. Only then is the `top`-th best
+    /// local score also the `top`-th best admitted one, which the stage's
+    /// cutoff pruning relies on.
+    fn admits_all(&self) -> bool {
+        false
+    }
 }
 
 /// Admit every placement.
@@ -23,6 +35,10 @@ pub struct AdmitAll;
 
 impl Admission for AdmitAll {
     fn admit(&self, _: &Placement, _: &[u8], _: &[u8]) -> bool {
+        true
+    }
+
+    fn admits_all(&self) -> bool {
         true
     }
 }
@@ -83,6 +99,10 @@ impl<A: Admission> Admission for Option<A> {
         self.as_ref()
             .is_some_and(|gate| gate.admit(placement, query, reference))
     }
+
+    fn admits_all(&self) -> bool {
+        self.as_ref().is_some_and(A::admits_all)
+    }
 }
 
 /// Admit if either gate admits.
@@ -93,6 +113,10 @@ impl<A: Admission, B: Admission> Admission for AnyOf<A, B> {
     fn admit(&self, placement: &Placement, query: &[u8], reference: &[u8]) -> bool {
         self.0.admit(placement, query, reference) || self.1.admit(placement, query, reference)
     }
+
+    fn admits_all(&self) -> bool {
+        self.0.admits_all() || self.1.admits_all()
+    }
 }
 
 /// Admit only if both gates admit.
@@ -102,5 +126,9 @@ pub struct AllOf<A, B>(pub A, pub B);
 impl<A: Admission, B: Admission> Admission for AllOf<A, B> {
     fn admit(&self, placement: &Placement, query: &[u8], reference: &[u8]) -> bool {
         self.0.admit(placement, query, reference) && self.1.admit(placement, query, reference)
+    }
+
+    fn admits_all(&self) -> bool {
+        self.0.admits_all() && self.1.admits_all()
     }
 }
