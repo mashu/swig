@@ -12,9 +12,11 @@
 //!
 //! # Conventions
 //!
-//! - Text crosses the boundary as UTF-8 in buffers from [`swig_alloc`]. A
-//!   function borrows the buffers it is given; the host frees them with
-//!   [`swig_free`].
+//! - Text crosses the boundary as UTF-8 in buffers from [`swig_alloc`]
+//!   (null when memory is exhausted). A function borrows the buffers it is
+//!   given; the host frees them with [`swig_free`].
+//! - Pointers and lengths are `usize`, an `i32` to the host: JavaScript
+//!   reads them as unsigned (`>>> 0`), since memory may exceed 2 GiB.
 //! - Results stay readable until the next call: the AIRR TSV (or other
 //!   text) through [`swig_result_ptr`]/[`swig_result_len`], the double-D
 //!   sidecar through [`swig_double_d_result_ptr`]/[`swig_double_d_result_len`],
@@ -25,6 +27,7 @@
 //!   stays readable after [`swig_panic_message`], and the host must then
 //!   discard the instance: every later call returns −1.
 
+use std::alloc::{Layout, alloc, dealloc};
 use std::cell::RefCell;
 use std::sync::Once;
 
@@ -173,26 +176,37 @@ impl State {
     }
 }
 
-/// `len` bytes for the host to fill; free with [`swig_free`]. The first
-/// export a host calls, so it installs the panic hook.
+/// The layout of a [`swig_alloc`] buffer of `len` bytes; `None` above
+/// `isize::MAX`.
+fn buffer(len: usize) -> Option<Layout> {
+    Layout::array::<u8>(len.max(1)).ok()
+}
+
+/// `len` bytes for the host to fill, or null when memory is exhausted (or
+/// `len` exceeds `isize::MAX`); free with [`swig_free`]. The first export a
+/// host calls, so it installs the panic hook.
 #[unsafe(no_mangle)]
 pub extern "C" fn swig_alloc(len: usize) -> *mut u8 {
     install_panic_hook();
-    let mut buffer = Vec::<u8>::with_capacity(len.max(1));
-    let ptr = buffer.as_mut_ptr();
-    std::mem::forget(buffer);
-    ptr
+    match buffer(len) {
+        // SAFETY: the layout's size is nonzero. `alloc` returns null when it
+        // cannot allocate, where a `Vec` would abort.
+        Some(layout) => unsafe { alloc(layout) },
+        None => std::ptr::null_mut(),
+    }
 }
 
-/// Free a buffer from [`swig_alloc`].
+/// Free a buffer from [`swig_alloc`] (nothing for null).
 ///
 /// # Safety
 ///
 /// `ptr` and `len` must come from one [`swig_alloc`] call, not freed before.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn swig_free(ptr: *mut u8, len: usize) {
-    // SAFETY: the buffer was allocated as a `Vec<u8>` of capacity `len.max(1)`.
-    drop(unsafe { Vec::from_raw_parts(ptr, 0, len.max(1)) });
+    if let (false, Some(layout)) = (ptr.is_null(), buffer(len)) {
+        // SAFETY: `swig_alloc` allocated `ptr` with this layout.
+        unsafe { dealloc(ptr, layout) };
+    }
 }
 
 /// Set run option `name` (as on the command line, without `--`) to the
@@ -514,5 +528,21 @@ mod tests {
         assert!(error().contains("earlier panic"), "{:?}", error());
         assert!(error().contains("boom"), "{:?}", error());
         assert_eq!(swig_error_len(), error().len());
+    }
+
+    /// The allocator returns null when it cannot allocate, instead of
+    /// trapping, and frees what it allocated.
+    #[test]
+    fn allocation_failure_is_null() {
+        assert!(swig_alloc(usize::MAX).is_null());
+        assert!(swig_alloc(isize::MAX as usize + 1).is_null());
+        let ptr = swig_alloc(16);
+        assert!(!ptr.is_null());
+        // SAFETY: 16 bytes from swig_alloc, freed once; null frees nothing.
+        unsafe {
+            ptr.write_bytes(7, 16);
+            swig_free(ptr, 16);
+            swig_free(std::ptr::null_mut(), 16);
+        }
     }
 }

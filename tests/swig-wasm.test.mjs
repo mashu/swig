@@ -3,6 +3,7 @@ import fs from "node:fs";
 import test from "node:test";
 import zlib from "node:zlib";
 
+import { AlignerEngine } from "../src/aligner-engine.ts";
 import { preprocessGermlineFasta } from "../src/germline-preprocess.ts";
 import { inferLineageGermline, lineageInputFasta } from "../src/lineage-alignment.ts";
 import {
@@ -198,6 +199,20 @@ function preprocessTiered(text, speciesName, segment) {
   assert.equal(report.annotated, report.count, `${speciesName} ${segment}`);
   return report.fasta;
 }
+
+test("the aligner wrapper reads module pointers from 2 GiB on as unsigned", () => {
+  // A wasm32 pointer is an i32: from 2 GiB on it reaches JavaScript negative.
+  const memory = { buffer: new ArrayBuffer(2 ** 31 + 4096) };
+  const high = (2 ** 31) | 0;
+  const exports = { memory, swig_alloc: () => high, swig_free() {} };
+  const [pointer, length] = AlignerEngine["put"](exports, encoder.encode("ACGT"));
+  assert.equal(pointer, 2 ** 31);
+  assert.equal(AlignerEngine["read"](exports, high, length), "ACGT");
+  assert.throws(
+    () => AlignerEngine["put"]({ memory, swig_alloc: () => 0 }, encoder.encode("ACGT")),
+    /ran out of WebAssembly memory/,
+  );
+});
 
 test("reference pack covers complete IG and TR loci", () => {
   assert.equal(pack.license?.id, "CC-BY-4.0");

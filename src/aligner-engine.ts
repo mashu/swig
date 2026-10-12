@@ -214,11 +214,11 @@ export class AlignerEngine {
     if (returned !== count) {
       throw new Error(`The Swig aligner returned ${returned} records for a ${count}-record input batch.`);
     }
-    const table = new Uint8Array(exports.memory.buffer, exports.swig_result_ptr(), exports.swig_result_len());
+    const table = AlignerEngine.view(exports, exports.swig_result_ptr(), exports.swig_result_len());
     const batch: AnnotatedBatch = { ...splitTable(table, "AIRR table"), count };
     if (doubleD) {
-      const sidecar = new Uint8Array(
-        exports.memory.buffer,
+      const sidecar = AlignerEngine.view(
+        exports,
         exports.swig_double_d_result_ptr(),
         exports.swig_double_d_result_len(),
       );
@@ -230,15 +230,24 @@ export class AlignerEngine {
     return batch;
   }
 
+  /**
+   * The module's `length` bytes at `pointer`. Pointers and lengths are wasm
+   * `i32`s, which JavaScript reads as signed: from 2 GiB on they arrive
+   * negative, so they are read back as unsigned.
+   */
+  private static view(exports: AlignerExports, pointer: number, length: number): Uint8Array {
+    return new Uint8Array(exports.memory.buffer, pointer >>> 0, length >>> 0);
+  }
+
   private static put(exports: AlignerExports, bytes: Uint8Array): [number, number] {
-    const pointer = exports.swig_alloc(bytes.byteLength);
-    if (!pointer) throw new Error("The Swig aligner ran out of WebAssembly memory.");
-    new Uint8Array(exports.memory.buffer, pointer, bytes.byteLength).set(bytes);
+    const pointer = exports.swig_alloc(bytes.byteLength) >>> 0;
+    if (pointer === 0) throw new Error("The Swig aligner ran out of WebAssembly memory.");
+    AlignerEngine.view(exports, pointer, bytes.byteLength).set(bytes);
     return [pointer, bytes.byteLength];
   }
 
   private static read(exports: AlignerExports, pointer: number, length: number): string {
-    return decoder.decode(new Uint8Array(exports.memory.buffer, pointer, length));
+    return decoder.decode(AlignerEngine.view(exports, pointer, length));
   }
 
   private static error(exports: AlignerExports): string {
