@@ -23,7 +23,7 @@
 //!   buffer.
 //! - A panic traps the instance (this target aborts on panic). Its message
 //!   stays readable after [`swig_panic_message`], and the host must then
-//!   discard the instance.
+//!   discard the instance: every later call returns −1.
 
 use std::cell::RefCell;
 use std::sync::Once;
@@ -43,6 +43,10 @@ struct State {
     double_d_count: i32,
     error: String,
     panic: String,
+    /// Set on the stand-in [`STATE`] holds while a call runs
+    /// ([`with_state`]): a call that traps never puts the state back, and
+    /// the stand-in stays.
+    interrupted: bool,
 }
 
 thread_local! {
@@ -51,33 +55,56 @@ thread_local! {
 
 static PANIC_HOOK: Once = Once::new();
 
-/// Keep a panic's message for [`swig_panic_message`].
+/// Keep a panic's message for [`swig_panic_message`], then report it as
+/// before (natively; this target has nowhere to print it).
 fn install_panic_hook() {
     PANIC_HOOK.call_once(|| {
-        std::panic::set_hook(Box::new(|info| {
+        let report = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
             let message = info.to_string();
             STATE.with(|state| {
                 if let Ok(mut state) = state.try_borrow_mut() {
                     state.panic = message;
                 }
             });
+            report(info);
         }));
     });
 }
 
 /// Run `f` on the instance state; on `Err`, keep the message and return −1.
+///
+/// `f` runs on the state taken out of [`STATE`], which holds an interrupted
+/// stand-in meanwhile. This target traps on a panic (it aborts without
+/// unwinding) and on an invalid memory access, so a borrow held across `f`
+/// would never be released: the panic hook could not keep its message and
+/// every later call would trap. Instead a trapped call leaves the stand-in,
+/// with the panic's message, and every later call refuses.
 fn with_state(f: impl FnOnce(&mut State) -> Result<i32, String>) -> i32 {
     install_panic_hook();
-    STATE.with_borrow_mut(|state| {
-        state.error.clear();
-        match f(state) {
-            Ok(value) => value,
-            Err(message) => {
-                state.error = message;
-                -1
-            }
+    let stand_in = State {
+        interrupted: true,
+        ..State::default()
+    };
+    let mut state = STATE.replace(stand_in);
+    if state.interrupted {
+        state.error = match state.panic.as_str() {
+            "" => "the aligner stopped at an earlier trap; start a new instance".into(),
+            panic => format!("the aligner stopped at an earlier panic: {panic}"),
+        };
+        STATE.set(state);
+        return -1;
+    }
+    state.error.clear();
+    let value = match f(&mut state) {
+        Ok(value) => value,
+        Err(message) => {
+            state.error = message;
+            -1
         }
-    })
+    };
+    STATE.set(state);
+    value
 }
 
 /// The UTF-8 text in `len` bytes at `ptr`.
@@ -146,9 +173,11 @@ impl State {
     }
 }
 
-/// `len` bytes for the host to fill; free with [`swig_free`].
+/// `len` bytes for the host to fill; free with [`swig_free`]. The first
+/// export a host calls, so it installs the panic hook.
 #[unsafe(no_mangle)]
 pub extern "C" fn swig_alloc(len: usize) -> *mut u8 {
+    install_panic_hook();
     let mut buffer = Vec::<u8>::with_capacity(len.max(1));
     let ptr = buffer.as_mut_ptr();
     std::mem::forget(buffer);
@@ -321,11 +350,7 @@ pub extern "C" fn swig_error_len() -> usize {
 /// Leave the last panic's message in the error buffer (empty if none).
 #[unsafe(no_mangle)]
 pub extern "C" fn swig_panic_message() {
-    STATE.with(|state| {
-        if let Ok(mut state) = state.try_borrow_mut() {
-            state.error = state.panic.clone();
-        }
-    });
+    STATE.with_borrow_mut(|state| state.error = state.panic.clone());
 }
 
 /// Leave `{"version", "backend"}` in the result buffer: the engine version
@@ -457,5 +482,24 @@ mod tests {
 
         swig_version();
         assert!(result().contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    /// A panic inside a call keeps its message and stops the instance: the
+    /// state is not borrowed while the call runs (on WebAssembly a panic
+    /// traps without unwinding), and later calls refuse instead of trapping.
+    #[test]
+    fn a_panic_inside_a_call_keeps_its_message() {
+        with_state(|_| {
+            assert!(STATE.with(|state| state.try_borrow_mut().is_ok()));
+            Ok(0)
+        });
+        let caught = std::panic::catch_unwind(|| with_state(|_| panic!("boom")));
+        assert!(caught.is_err());
+        swig_panic_message();
+        assert!(error().contains("boom"), "{:?}", error());
+        assert_eq!(annotate(">r\nACGT\n"), -1);
+        assert!(error().contains("earlier panic"), "{:?}", error());
+        assert!(error().contains("boom"), "{:?}", error());
+        assert_eq!(swig_error_len(), error().len());
     }
 }
