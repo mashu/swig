@@ -636,12 +636,7 @@ impl<'a, G: Grammar> Brute<'a, G> {
 
     /// The cut-independent terms of `p` as a segment with `d_used` D so far.
     fn bonus(&self, p: &Placement, d_used: u8) -> Units {
-        let presence = if p.kind == SegmentKind::D {
-            self.read.d_cost()
-        } else {
-            0
-        };
-        self.read.prior(self.dag.model.segment_bonus(p, d_used)) - presence
+        self.read.prior(self.dag.model.segment_bonus(p, d_used)) - self.read.presence(p.kind)
     }
 
     /// Best rest of a path whose current segment is `b`, entered at `entry`.
@@ -754,7 +749,7 @@ impl<'a, G: Grammar> Brute<'a, G> {
 
 /// The fixed scale of `dag`'s model: scores are units.
 fn fixed(dag: &PlacementDag) -> ReadModel {
-    ReadModel::fixed(1.0, dag.model.d_presence)
+    ReadModel::fixed(1.0, dag.model.presence)
 }
 
 /// The DAG's best key and the exhaustive one on `placements` under `read`;
@@ -785,7 +780,9 @@ fn dag_equals_brute_force_on_hypermutated_igsim_reads() {
     let assigner =
         DefaultAssigner::from_config(&config, db.v.clone(), Some(db.d.clone()), db.j.clone())
             .unwrap();
-    let base = config.objective.resolve(Some(&db.d), &config.d);
+    let base = config
+        .objective
+        .resolve(Some(&db.d), &config.d, &db.j, &config.j.scoring);
     let sim = Simulator::new(&db.v, Some(&db.d), &db.j, SimParams::hard()).unwrap();
     let mut ws = assigner.workspace();
     let mut scratch = DagScratch::default();
@@ -838,7 +835,9 @@ fn per_read_dag_equals_exhaustive_enumeration() {
     let assigner =
         DefaultAssigner::from_config(&config, db.v.clone(), Some(db.d.clone()), db.j.clone())
             .unwrap();
-    let base = config.objective.resolve(Some(&db.d), &config.d);
+    let base = config
+        .objective
+        .resolve(Some(&db.d), &config.d, &db.j, &config.j.scoring);
     let lambda = KarlinAltschul::ungapped(&config.v.scoring).unwrap().lambda;
     let substitution = |s: &AffineScoring| (s.matched, s.mismatch);
     let evidence = EvidenceModel {
@@ -869,7 +868,7 @@ fn per_read_dag_equals_exhaustive_enumeration() {
                 };
                 let own = divergence(&placements);
                 for p in [own, 1e-3, 0.02, 0.3] {
-                    let model = ReadModel::at(&evidence, p, objective.d_presence);
+                    let model = ReadModel::at(&evidence, p, objective.presence);
                     let (fast, exhaustive) = dag_and_brute(&dag, &placements, model, &mut scratch);
                     assert_eq!(fast, exhaustive, "p {p}, iota {iota}");
                     let (_, path) = dag.viterbi(&placements, &model, &mut scratch).unwrap();
@@ -880,12 +879,12 @@ fn per_read_dag_equals_exhaustive_enumeration() {
                 let integer = PlacementDag::new(
                     VdjGrammar::TANDEM_D,
                     EngineeringObjective {
-                        d_presence: objective.d_presence.floor(),
+                        presence: objective.presence.map(f64::floor),
                         ..objective
                     },
                     config.min_retained,
                 );
-                let model = ReadModel::at(&evidence, delta0, integer.model.d_presence);
+                let model = ReadModel::at(&evidence, delta0, integer.model.presence);
                 let (fast, exhaustive) = dag_and_brute(&integer, &placements, model, &mut scratch);
                 assert_eq!(fast, exhaustive, "δ0, iota {iota}");
                 let (key, path) = integer.viterbi(&placements, &model, &mut scratch).unwrap();
@@ -923,7 +922,9 @@ fn conditioned_dag_equals_exhaustive_enumeration() {
     let assigner =
         DefaultAssigner::from_config(&config, db.v.clone(), Some(db.d.clone()), db.j.clone())
             .unwrap();
-    let objective = config.objective.resolve(Some(&db.d), &config.d);
+    let objective = config
+        .objective
+        .resolve(Some(&db.d), &config.d, &db.j, &config.j.scoring);
     let lambda = KarlinAltschul::ungapped(&config.v.scoring).unwrap().lambda;
     let evidence = EvidenceModel {
         lambda,
@@ -939,7 +940,7 @@ fn conditioned_dag_equals_exhaustive_enumeration() {
         let mut placements = top_by_kind(&call.placements, SegmentKind::V, 3);
         placements.extend(top_by_kind(&call.placements, SegmentKind::D, 6));
         placements.extend(top_by_kind(&call.placements, SegmentKind::J, 3));
-        let model = ReadModel::at(&evidence, divergence(&placements), objective.d_presence);
+        let model = ReadModel::at(&evidence, divergence(&placements), objective.presence);
         let Some((key, path)) = dag.viterbi(&placements, &model, &mut scratch) else {
             continue;
         };
@@ -1058,9 +1059,12 @@ fn dag_equals_brute_force_over_all_paths_and_cuts() {
     let config = EngineConfig::default();
     let model = EngineeringObjective {
         insertion_per_base: -1,
-        ..config
-            .objective
-            .resolve(Some(&Db::set(SegmentKind::D, &db.d, None)), &config.d)
+        ..config.objective.resolve(
+            Some(&Db::set(SegmentKind::D, &db.d, None)),
+            &config.d,
+            &Db::set(SegmentKind::J, &db.j, None),
+            &config.j.scoring,
+        )
     };
     let dag = PlacementDag::new(VdjGrammar::TANDEM_D, model, [10, 3, 6]);
     let mut rng = Rng::new(23);

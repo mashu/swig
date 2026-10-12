@@ -21,7 +21,7 @@
 //! weights come from a [`PathNats`]: the call's own [`ReadModel`] in nats
 //! under [`CallModel::PerRead`], whose Viterbi path is then a mode of this
 //! distribution; under [`CallModel::FixedScale`] the evidence unquantised and
-//! the D cost `λ·P*_D` ([`super::EvidenceModel::nats`]), while the call stays
+//! the presence costs `λ·P*_k` ([`super::EvidenceModel::nats`]), while the call stays
 //! on the fixed scores, so the reported probability is that of a call made
 //! under another model.
 //!
@@ -295,7 +295,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
             dag: self,
             placements,
             w: &weights,
-            d_presence: (-nats.d_cost).exp(),
+            presence: nats.presence.map(|cost| (-cost).exp()),
             steps: nats.evidence.map(Steps::new),
         }
         .run(scratch);
@@ -310,23 +310,19 @@ struct Pass<'a, G, M> {
     placements: &'a [Placement],
     /// Prior weights.
     w: &'a Weights,
-    /// `e^{−c_D}`, the weight of a D's presence cost.
-    d_presence: f64,
+    /// `e^{−c_k}`, the weight of a segment's presence cost, per kind.
+    presence: [f64; 3],
     /// Evidence steps per rearranged segment kind.
     steps: [Steps; 3],
 }
 
 impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
-    /// Weight of `node`'s cut-independent terms: its bonus and, for a D,
-    /// the presence cost.
+    /// Weight of `node`'s cut-independent terms: its bonus and its kind's
+    /// presence cost.
     fn segment_bonus(&self, node: Node, d_used: u8) -> f64 {
         let placement = &self.placements[node.placement];
-        let bonus = self.w.of(self.dag.model.segment_bonus(placement, d_used));
-        if node.kind == SegmentKind::D {
-            bonus * self.d_presence
-        } else {
-            bonus
-        }
+        self.w.of(self.dag.model.segment_bonus(placement, d_used))
+            * self.presence[node.kind.index()]
     }
 
     fn run(&self, s: &mut PosteriorScratch) -> Option<Marginals> {
@@ -892,13 +888,10 @@ mod tests {
         /// `b`'s cut-independent terms as the `d_used`-th D (if a D).
         fn bonus(&self, b: &Placement, d_used: u8) -> (f64, Units) {
             let bonus = self.dag.model.segment_bonus(b, d_used);
-            let (mut nats, mut units) =
-                (self.nats.lambda * f64::from(bonus), self.read.prior(bonus));
-            if b.kind == SegmentKind::D {
-                nats -= self.nats.d_cost;
-                units -= self.read.d_cost();
-            }
-            (nats, units)
+            (
+                self.nats.lambda * f64::from(bonus) - self.nats.presence[b.kind.index()],
+                self.read.prior(bonus) - self.read.presence(b.kind),
+            )
         }
 
         /// A prior term scoring `k`.
@@ -1041,21 +1034,22 @@ mod tests {
     }
 
     /// The fixed-scale call with the posterior on `evidence` (the
-    /// [`CallModel::FixedScale`] pair): the D costs `⌊P*_D⌋` and `λ·P*_D`.
+    /// [`CallModel::FixedScale`] pair): a segment costs `⌊P*_k⌋` and
+    /// `λ·P*_k`.
     fn check_fixed(dag: &PlacementDag, placements: &[Placement], evidence: EvidenceScale) {
-        let d_presence = dag.model.d_presence();
+        let presence = dag.model.presence;
         let nats = PathNats {
             lambda: LAMBDA,
             evidence: [evidence; 3],
-            d_cost: LAMBDA * d_presence,
+            presence: presence.map(|cost| LAMBDA * cost),
         };
-        check(dag, placements, nats, ReadModel::fixed(LAMBDA, d_presence));
+        check(dag, placements, nats, ReadModel::fixed(LAMBDA, presence));
     }
 
     /// One read model at divergence `p` for both passes: the Viterbi path is
     /// a mode of the posterior (the brute-force maximum of `e^{units/F}`).
     fn check_per_read(dag: &PlacementDag, placements: &[Placement], p: f64) {
-        let read = ReadModel::at(&EVIDENCE, p, dag.model.d_presence());
+        let read = ReadModel::at(&EVIDENCE, p, dag.model.presence);
         check(dag, placements, read.nats(), read);
     }
 
@@ -1150,9 +1144,10 @@ mod tests {
     #[test]
     fn marginals_equal_exhaustive_summation() {
         let (_, placements) = junction();
-        // An unrounded D prior: the posterior uses 4.5, the Viterbi call 4.
+        // Unrounded presence priors: the posterior uses 4.5 for a D and 3.5
+        // for a J, the Viterbi call 4 and 3.
         let model = EngineeringObjective {
-            d_presence: 4.5,
+            presence: [0.0, 4.5, 3.5],
             ..EngineeringObjective::default()
         };
         let fixed = EvidenceScale::fixed(LAMBDA);
@@ -1194,7 +1189,7 @@ mod tests {
     #[test]
     fn per_read_call_is_a_mode_of_the_posterior() {
         let model = EngineeringObjective {
-            d_presence: 4.5,
+            presence: [0.0, 4.5, 3.5],
             ..EngineeringObjective::default()
         };
         let per_base = EngineeringObjective {
@@ -1286,7 +1281,7 @@ mod tests {
             placement(SegmentKind::J, &query, &query[60..], 60),
         ];
         let dag = PlacementDag::new(VdjGrammar::VDJ, EngineeringObjective::default(), [4, 3, 4]);
-        let nats = EVIDENCE.nats(0.01, dag.model.d_presence);
+        let nats = EVIDENCE.nats(0.01, dag.model.presence);
         let m = dag.posterior(&placements, &nats, &mut PosteriorScratch::default());
         assert!(m.is_none(), "{m:?}");
         // A junction-sized overlap is fine.
@@ -1306,7 +1301,7 @@ mod tests {
         let nats = PathNats {
             lambda: LAMBDA,
             evidence: [EvidenceScale::fixed(LAMBDA); 3],
-            d_cost: LAMBDA * dag.model.d_presence,
+            presence: dag.model.presence.map(|cost| LAMBDA * cost),
         };
         let m = dag
             .posterior(&placements, &nats, &mut PosteriorScratch::default())
@@ -1323,7 +1318,7 @@ mod tests {
         let nats = PathNats {
             lambda: LAMBDA,
             evidence: [EvidenceScale::fixed(LAMBDA); 3],
-            d_cost: LAMBDA * dag.model.d_presence,
+            presence: dag.model.presence.map(|cost| LAMBDA * cost),
         };
         let m = dag
             .posterior(&placements, &nats, &mut PosteriorScratch::default())

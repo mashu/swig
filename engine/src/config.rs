@@ -154,6 +154,7 @@ impl DSearchSpace {
 }
 
 /// Prior cost of including a D, in score units (see [`EngineeringObjective`]).
+/// The same rules price a J over the J database ([`ObjectiveConfig::j_prior`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DPrior {
     /// A fixed cost (0 = D only has to beat the no-D path).
@@ -226,12 +227,17 @@ impl DPrior {
     }
 }
 
-/// Declarative form of [`EngineeringObjective`]; `d_prior` is resolved
-/// against the D database when the assigner is built.
+/// Declarative form of [`EngineeringObjective`]; `d_prior` and `j_prior` are
+/// resolved against the D and J databases when the assigner is built.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ObjectiveConfig {
     pub pair_bonus: Score,
     pub d_prior: DPrior,
+    /// Prior cost of including a J, by [`DPrior`]'s rules over the J genes
+    /// (with every J offset a search offset). Without it any J clip of
+    /// positive value completes a path for free, so a read that stops
+    /// before its J gets one from a few chance bases.
+    pub j_prior: DPrior,
     pub tandem_d_penalty: Score,
     pub insertion_per_base: Score,
 }
@@ -241,6 +247,7 @@ impl Default for ObjectiveConfig {
         Self {
             pair_bonus: 0,
             d_prior: DPrior::DERIVED,
+            j_prior: DPrior::DERIVED,
             tandem_d_penalty: 12,
             insertion_per_base: 0,
         }
@@ -248,10 +255,14 @@ impl Default for ObjectiveConfig {
 }
 
 impl ObjectiveConfig {
+    /// The objective for the D database `d` (none: no D) and the J database
+    /// `j` scored with `j_scoring`.
     pub fn resolve(
         &self,
         d: Option<&GermlineSet>,
         d_config: &DSegmentConfig,
+        j: &GermlineSet,
+        j_scoring: &AffineScoring,
     ) -> EngineeringObjective {
         let space = d.map_or(
             DSearchSpace {
@@ -262,7 +273,11 @@ impl ObjectiveConfig {
         );
         EngineeringObjective {
             pair_bonus: self.pair_bonus,
-            d_presence: self.d_prior.cost(space, &d_config.scoring),
+            presence: [
+                0.0,
+                self.d_prior.cost(space, &d_config.scoring),
+                self.j_prior.cost(DSearchSpace::of(j, 1), j_scoring),
+            ],
             tandem_d_penalty: self.tandem_d_penalty,
             insertion_per_base: self.insertion_per_base,
         }
@@ -597,7 +612,9 @@ impl Assigner {
             }
         };
         let strand = StrandIndex::build([&v, &j], StrandIndex::K);
-        let objective = config.objective.resolve(d.as_ref(), &config.d);
+        let objective = config
+            .objective
+            .resolve(d.as_ref(), &config.d, &j, &config.j.scoring);
         let substitution = |s: &AffineScoring| (s.matched, s.mismatch);
         let evidence = KarlinAltschul::ungapped(&config.v.scoring).map(|ka| EvidenceModel {
             lambda: ka.lambda,
@@ -614,20 +631,26 @@ impl Assigner {
             d_allele: config.d_allele,
             ..PlacementDag::new(grammar, objective, config.min_retained)
         };
-        // A D database of several loci: a read of one locus prices a D by
-        // that locus' D genes.
-        let d_loci: Vec<Locus> = d.as_ref().map_or(Vec::new(), |d| {
-            Locus::ALL
-                .into_iter()
-                .filter(|&l| d.alleles().iter().any(|a| a.loci == Loci::of(l)))
-                .collect()
-        });
-        let locus_adjudicators: Vec<(Locus, PlacementDag)> = match &d {
-            Some(d) if d_loci.len() > 1 => d_loci
-                .iter()
+        // A D or J database of several loci: a read of one locus prices a D
+        // and a J by that locus' genes.
+        let loci: Vec<Locus> = Locus::ALL
+            .into_iter()
+            .filter(|&l| {
+                let of = |set: &GermlineSet| set.alleles().iter().any(|a| a.loci == Loci::of(l));
+                of(&j) || d.as_ref().is_some_and(of)
+            })
+            .collect();
+        let locus_adjudicators: Vec<(Locus, PlacementDag)> = if loci.len() > 1 {
+            loci.iter()
                 .map(|&locus| {
-                    let (part, _) = d.subset(|a| a.loci.contains(locus));
-                    let model = config.objective.resolve(Some(&part), &config.d);
+                    let part = |set: &GermlineSet| set.subset(|a| a.loci.contains(locus)).0;
+                    let d_part = d.as_ref().map(part).filter(|d| !d.is_empty());
+                    let model = config.objective.resolve(
+                        d_part.as_ref(),
+                        &config.d,
+                        &part(&j),
+                        &config.j.scoring,
+                    );
                     (
                         locus,
                         PlacementDag {
@@ -636,20 +659,19 @@ impl Assigner {
                         },
                     )
                 })
-                .collect(),
-            _ => Vec::new(),
+                .collect()
+        } else {
+            Vec::new()
         };
         // The D floor must not prune a D any locus would call.
+        let d_cost = |m: &EngineeringObjective| m.presence[SegmentKind::D.index()];
         let floor = locus_adjudicators
             .iter()
             .map(|(_, a)| a.model)
-            .fold(objective, |low, m| {
-                if m.d_presence < low.d_presence {
-                    m
-                } else {
-                    low
-                }
-            });
+            .fold(
+                objective,
+                |low, m| if d_cost(&m) < d_cost(&low) { m } else { low },
+            );
         Ok(Assigner {
             v: v_stage(v, &config.v)?,
             j: j_stage(j, &config.j),
@@ -724,11 +746,14 @@ mod tests {
         assert_eq!(cost(more_likely, genes(32)), 8.36);
         // The fixed-scale call charges ⌊P*_D⌋: an integer D score must exceed it.
         let objective = EngineeringObjective {
-            d_presence: DPrior::DERIVED.cost(genes(32), &scoring),
+            presence: [0.0, DPrior::DERIVED.cost(genes(32), &scoring), 0.0],
             ..EngineeringObjective::default()
         };
         assert_eq!(
-            (objective.d_presence_score(), objective.d_floor()),
+            (
+                objective.presence_score(SegmentKind::D),
+                objective.d_floor()
+            ),
             (10, 11)
         );
     }
@@ -843,6 +868,45 @@ mod tests {
                 "S = {score}: brute force {brute:.3}, closed form {closed:.3}"
             );
         }
+    }
+
+    /// A J database of two loci prices a J by the genes of the read's
+    /// locus: each locus' adjudicator counts its own J genes, and reads of
+    /// no single locus count them all.
+    #[test]
+    fn a_j_is_priced_by_the_genes_of_its_locus() {
+        let mut next = crate::testing::rng(3);
+        let mut fasta = |names: &[&str], len: usize| -> String {
+            names
+                .iter()
+                .map(|name| {
+                    let codes = crate::testing::random_codes(&mut next, len);
+                    format!(">{name}\n{}\n", crate::alphabet::decode(&codes))
+                })
+                .collect()
+        };
+        let v = fasta(&["IGHV1-1*01", "IGKV1-1*01"], 120);
+        let j = fasta(
+            &["IGHJ1*01", "IGHJ2*01", "IGHJ3*01", "IGKJ1*01", "IGKJ2*01"],
+            40,
+        );
+        let v = GermlineSet::from_fasta(SegmentKind::V, &v).unwrap();
+        let j = GermlineSet::from_fasta(SegmentKind::J, &j).unwrap();
+        let config = EngineConfig::default();
+        let assigner = Assigner::from_config(&config, v, None, j).unwrap();
+        let scoring = &config.j.scoring;
+        let cost = |genes| {
+            let space = DSearchSpace { genes, offsets: 1 };
+            config.objective.j_prior.cost(space, scoring)
+        };
+        let j_cost = |dag: &PlacementDag| dag.model.presence(SegmentKind::J);
+        assert_eq!(j_cost(&assigner.adjudicator), cost(5));
+        let by_locus: Vec<(Locus, f64)> = assigner
+            .locus_adjudicators
+            .iter()
+            .map(|(locus, dag)| (*locus, j_cost(dag)))
+            .collect();
+        assert_eq!(by_locus, [(Locus::Igh, cost(3)), (Locus::Igk, cost(2))]);
     }
 
     #[test]

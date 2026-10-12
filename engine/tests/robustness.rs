@@ -4,7 +4,7 @@
 use swig::prelude::*;
 use swig::scoring::Score;
 use swig::segment::Significance;
-use swig::sim::{C_STREAM, Rng, SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
+use swig::sim::{C_STREAM, Region, Rng, SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
 
 fn database() -> SyntheticDatabase {
     SyntheticDatabase::generate(&SyntheticSpec::default(), 11)
@@ -295,4 +295,42 @@ fn a_call_keeps_a_significant_clip() {
             v.name
         );
     }
+}
+
+/// A read that stops before its J (an unmerged or quality-trimmed read)
+/// gets no J. A J pays its presence cost like a D, so a few chance bases of
+/// a J's stitched 3′ flank or of a random tail no longer complete the path
+/// for free.
+#[test]
+fn reads_that_stop_before_the_j_get_no_j() {
+    let db = database();
+    let assigner = assigner(&db, &EngineConfig::default());
+    let params = SimParams::mid().with_reverse_complement(0.0);
+    let sim = Simulator::new(&db.v, Some(&db.d), &db.j, params).expect("simulator");
+    let mut rng = Rng::new(29);
+    let mut ws = assigner.workspace();
+    let (mut reads, mut with_j) = (0, 0);
+    for read in sim.reads(200, 31).expect("reads") {
+        let j_start = read.span(Region::J).expect("every read has a J").start;
+        for tail in [0, 30, 100] {
+            let mut sequence = read.forward[..j_start].to_vec();
+            sequence.extend(random(&mut rng, tail));
+            let call = assigner.assign(&encode(&sequence), &mut ws);
+            reads += 1;
+            let j = call
+                .path
+                .iter()
+                .flat_map(|path| &path.segments)
+                .find(|s| call.placements[s.placement].kind == SegmentKind::J);
+            if let Some(j) = j {
+                with_j += 1;
+                // Exact runs of ⌊P*_J/2⌋ = 3 bases never pay for a J.
+                assert!(j.span.q_len() > 3, "a J of {} bases", j.span.q_len());
+            }
+        }
+    }
+    assert!(
+        with_j * 100 <= reads * 3,
+        "{with_j} of {reads} reads without a J got one"
+    );
 }

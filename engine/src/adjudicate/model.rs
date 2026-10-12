@@ -86,15 +86,17 @@ impl Grammar for VdjGrammar {
 }
 
 pub trait PathModel: Send + Sync {
-    /// Prior cost of including a D (`P*_D`), in score units and unrounded.
-    /// Every D on a path pays it. On the fixed scale an integer path score
-    /// beats it exactly when it beats `⌊P*_D⌋` ([`PathModel::d_presence_score`]).
-    fn d_presence(&self) -> f64;
+    /// Prior cost of including a segment of `kind` (`P*_k`), in score units
+    /// of that kind's scoring and unrounded. Every segment of the kind on a
+    /// path pays it. On the fixed scale an integer path score beats it
+    /// exactly when it beats `⌊P*_k⌋` ([`PathModel::presence_score`]).
+    fn presence(&self, kind: SegmentKind) -> f64;
 
-    /// `⌊P*_D⌋`: for integer scores `S`, `S > P*_D ⟺ S > ⌊P*_D⌋`, so this is
-    /// the fixed-scale cost of a D, not an approximation of it.
-    fn d_presence_score(&self) -> Score {
-        self.d_presence().floor() as Score
+    /// `⌊P*_k⌋`: for integer scores `S`, `S > P*_k ⟺ S > ⌊P*_k⌋`, so this is
+    /// the fixed-scale cost of a segment of `kind`, not an approximation of
+    /// it.
+    fn presence_score(&self, kind: SegmentKind) -> Score {
+        self.presence(kind).floor() as Score
     }
 
     /// Added to the clip score of `placement` besides the D presence cost;
@@ -121,8 +123,8 @@ pub trait PathModel: Send + Sync {
 }
 
 impl<M: PathModel> PathModel for &M {
-    fn d_presence(&self) -> f64 {
-        (**self).d_presence()
+    fn presence(&self, kind: SegmentKind) -> f64 {
+        (**self).presence(kind)
     }
 
     fn segment_bonus(&self, placement: &Placement, d_ordinal: u8) -> Score {
@@ -138,19 +140,24 @@ impl<M: PathModel> PathModel for &M {
     }
 }
 
-/// The path objective, `Σ S_clip − P_D·#D − tandem·[2nd D] + pair_bonus·[V…J]
-/// + per-base N/P cost`, read as a log-likelihood ratio.
+/// The path objective, `Σ S_clip − P_D·#D − P_J·#J − tandem·[2nd D] +
+/// pair_bonus·[V…J] + per-base N/P cost`, read as a log-likelihood ratio.
 ///
 /// Substitution scores are log-odds (in units of `1/λ` nats) of "templated by
 /// this germline" against "random sequence"; N/P bases score 0 under both.
 /// The remaining terms are log prior odds of the path's hypotheses:
 ///
-/// * `d_presence` (`P*_D`) — a D is one of `N` genes at one of `L` positions
-///   of the junction, so its prior is spread over `N·L` hypotheses: including
-///   the best one is worth it when `λ·S_D > ln(N·L) − ln(prior odds of D)`.
-///   [`crate::config::DPrior`] derives it from the database at build time.
-///   It is kept unrounded: the posterior uses it as it is, and the fixed-scale
-///   call as `⌊P*_D⌋` ([`PathModel::d_presence_score`]).
+/// * `presence` (`P*_k` per kind) — a D is one of `N` genes at one of `L`
+///   positions of the junction, so its prior is spread over `N·L`
+///   hypotheses: including the best one is worth it when
+///   `λ·S_D > ln(N·L) − ln(prior odds of D)`. A J is one of the J genes at
+///   one of `L` positions after the V, so the same rule prices it: without
+///   that cost any J clip of positive value would complete a path for free,
+///   and a read that stops before its J would get one from a few bases of a
+///   J's outer flank or of whatever follows. [`crate::config::DPrior`]
+///   derives both from the databases at build time; V pays nothing. They
+///   are kept unrounded: the posterior uses them as they are, and the
+///   fixed-scale call as `⌊P*_k⌋` ([`PathModel::presence_score`]).
 /// * `tandem_d_penalty` — prior odds of a second D (DJ → DDJ), on top of its `P_D`.
 /// * `pair_bonus` — prior odds of a complete V…J rearrangement over a partial
 ///   read. 0 by default: on full-length reads the J's own clip score already
@@ -158,7 +165,9 @@ impl<M: PathModel> PathModel for &M {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EngineeringObjective {
     pub pair_bonus: Score,
-    pub d_presence: f64,
+    /// `P*_k` per rearranged kind ([`SegmentKind::REARRANGED`]), indexed by
+    /// [`SegmentKind::index`].
+    pub presence: [f64; 3],
     /// Extra prior cost for every D beyond the first.
     pub tandem_d_penalty: Score,
     /// Score per unassigned junction base (0 = no N/P length prior).
@@ -169,7 +178,7 @@ impl Default for EngineeringObjective {
     fn default() -> Self {
         Self {
             pair_bonus: 0,
-            d_presence: 11.0,
+            presence: [0.0, 11.0, 0.0],
             tandem_d_penalty: 12,
             insertion_per_base: 0,
         }
@@ -194,14 +203,14 @@ impl EngineeringObjective {
         if self.insertion_per_base < 0 {
             Score::MIN
         } else {
-            self.d_presence_score() + 1
+            self.presence_score(SegmentKind::D) + 1
         }
     }
 }
 
 impl PathModel for EngineeringObjective {
-    fn d_presence(&self) -> f64 {
-        self.d_presence
+    fn presence(&self, kind: SegmentKind) -> f64 {
+        self.presence[kind.index()]
     }
 
     fn segment_bonus(&self, placement: &Placement, d_ordinal: u8) -> Score {

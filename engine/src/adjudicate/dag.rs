@@ -331,12 +331,8 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         let width = node.width();
         let placement = &placements[node.placement];
         let min = self.min_bases(node.kind) as usize;
-        let presence = if node.kind == SegmentKind::D {
-            read.d_cost()
-        } else {
-            0
-        };
-        let bonus = read.prior(self.model.segment_bonus(placement, d_used)) - presence;
+        let bonus =
+            read.prior(self.model.segment_bonus(placement, d_used)) - read.presence(node.kind);
         let support = placement.score();
 
         // Running best of F(y) − entry(y) over entries, read min bases later.
@@ -511,19 +507,17 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         Some((score, self.trace(placements, s, end)))
     }
 
-    /// The fixed-scale objective of a path's `segments` (non-empty, D cost
-    /// `⌊P*_D⌋`), with its D count and germline support.
+    /// The fixed-scale objective of a path's `segments` (non-empty, presence
+    /// costs `⌊P*_k⌋`), with its D count and germline support.
     pub fn path_score(&self, placements: &[Placement], segments: &[CalledSegment]) -> PathScore {
         let kind = |segment: &CalledSegment| placements[segment.placement].kind;
         let (first, last) = (kind(&segments[0]), kind(&segments[segments.len() - 1]));
         let (mut score, mut d_count, mut support) = (0, 0u8, 0);
         for (k, segment) in segments.iter().enumerate() {
             let placement = &placements[segment.placement];
-            if placement.kind == SegmentKind::D {
-                d_count += 1;
-                score -= self.model.d_presence_score();
-            }
-            score += segment.span.score + self.model.segment_bonus(placement, d_count);
+            d_count += u8::from(placement.kind == SegmentKind::D);
+            score += segment.span.score - self.model.presence_score(placement.kind)
+                + self.model.segment_bonus(placement, d_count);
             support += placement.score();
             if let Some(before) = k.checked_sub(1).map(|b| &segments[b]) {
                 score +=
@@ -543,14 +537,18 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         self.calls == CallModel::FixedScale || self.evidence.is_none()
     }
 
+    /// `P*_k` of each rearranged kind.
+    fn presence(&self) -> [f64; 3] {
+        SegmentKind::REARRANGED.map(|kind| self.model.presence(kind))
+    }
+
     /// The model a call at divergence `p` maximises.
     fn read_model(&self, p: f64) -> ReadModel {
-        let d_presence = self.model.d_presence();
         match (self.calls, &self.evidence) {
-            (CallModel::PerRead, Some(evidence)) => ReadModel::at(evidence, p, d_presence),
+            (CallModel::PerRead, Some(evidence)) => ReadModel::at(evidence, p, self.presence()),
             // One unit per score unit, λ nats each (1 when the scores have no
             // log-odds λ; nothing then reads them as nats).
-            (_, evidence) => ReadModel::fixed(evidence.map_or(1.0, |e| e.lambda), d_presence),
+            (_, evidence) => ReadModel::fixed(evidence.map_or(1.0, |e| e.lambda), self.presence()),
         }
     }
 
@@ -560,7 +558,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         let evidence = self.evidence.as_ref()?;
         Some(match self.calls {
             CallModel::PerRead => self.read_model(p).nats(),
-            CallModel::FixedScale => evidence.nats(p, self.model.d_presence()),
+            CallModel::FixedScale => evidence.nats(p, self.presence()),
         })
     }
 }
@@ -750,6 +748,45 @@ mod tests {
         assert_eq!(spans, vec![(0, 20), (22, 40)]);
     }
 
+    /// A V of 20 exact bases, then a J whose alignment matches the read only
+    /// in its last 3 bases. The J ends the path, so its clip keeps its end:
+    /// those 3 bases, worth 6 points or `3·a(p̂)`. Free, they complete the
+    /// path; at `P*_J = 7.91` (exact runs of 4 win) they do not pay for a J,
+    /// on the fixed scale or at any divergence.
+    #[test]
+    fn a_j_pays_its_presence_cost() {
+        let ascii = b"TTTTTTTTTTTTTTTTTTTTACGTACGTACGTCCA";
+        let query = encode(ascii);
+        let mut j = encode(&ascii[20..]);
+        for base in &mut j[..12] {
+            *base = (*base + 1) & 3;
+        }
+        let placements = [
+            placement(SegmentKind::V, &query, &query[..20], 0),
+            placement(SegmentKind::J, &query, &j, 20),
+        ];
+        let kinds = |presence: [f64; 3], read: &ReadModel| {
+            let model = EngineeringObjective {
+                presence,
+                ..EngineeringObjective::default()
+            };
+            let dag = PlacementDag::new(VdjGrammar::VJ, model, [1, 1, 1]);
+            let (_, segments) = dag
+                .viterbi(&placements, read, &mut DagScratch::default())
+                .expect("a path");
+            segments.len()
+        };
+        let (free, priced) = ([0.0; 3], [0.0, 0.0, 7.91]);
+        for p in [None, Some(0.001), Some(0.1), Some(0.4)] {
+            let read = |presence| match p {
+                None => ReadModel::fixed(1.0, presence),
+                Some(p) => ReadModel::at(&evidence(), p, presence),
+            };
+            assert_eq!(kinds(free, &read(free)), 2, "{p:?}");
+            assert_eq!(kinds(priced, &read(priced)), 1, "{p:?}");
+        }
+    }
+
     /// `(2, −3)` scored at the KA λ0 for every kind.
     fn evidence() -> EvidenceModel {
         EvidenceModel {
@@ -794,7 +831,7 @@ mod tests {
     fn a_per_read_call_takes_the_exact_short_d_at_low_divergence() {
         let (query, placements) = two_ds();
         let model = EngineeringObjective {
-            d_presence: 10.0,
+            presence: [0.0, 10.0, 0.0],
             ..EngineeringObjective::default()
         };
         let fixed = PlacementDag {
@@ -820,7 +857,7 @@ mod tests {
         assert_eq!(call.score.score, 84);
         // At δ0 the per-read model is the fixed one.
         let delta0 = evidence().log_odds_divergence(SegmentKind::D);
-        let at = ReadModel::at(&evidence(), delta0, 10.0);
+        let at = ReadModel::at(&evidence(), delta0, model.presence);
         let (_, segments) = per_read.viterbi(&placements, &at, &mut scratch).unwrap();
         assert_eq!(segments[1].placement, 2);
     }
@@ -839,7 +876,7 @@ mod tests {
             ..PlacementDag::new(
                 VdjGrammar::VDJ,
                 EngineeringObjective {
-                    d_presence: 10.0,
+                    presence: [0.0, 10.0, 0.0],
                     ..EngineeringObjective::default()
                 },
                 [1, 4, 1],
@@ -898,7 +935,7 @@ mod tests {
             placement(SegmentKind::J, &query, &encode(j), 34),
         ];
         let model = EngineeringObjective {
-            d_presence: 10.0,
+            presence: [0.0, 10.0, 0.0],
             ..EngineeringObjective::default()
         };
         assert_eq!(placements[1].score(), model.d_floor() - 1);
@@ -907,8 +944,11 @@ mod tests {
         let d_count = |read: &ReadModel, scratch: &mut DagScratch| {
             dag.viterbi(&placements, read, scratch).unwrap().0.d_count
         };
-        assert_eq!(d_count(&ReadModel::fixed(1.0, 10.0), &mut scratch), 0);
-        let high = ReadModel::at(&evidence(), 0.3, 10.0);
+        assert_eq!(
+            d_count(&ReadModel::fixed(1.0, model.presence), &mut scratch),
+            0
+        );
+        let high = ReadModel::at(&evidence(), 0.3, model.presence);
         assert_eq!(d_count(&high, &mut scratch), 1);
     }
 }
