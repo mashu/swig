@@ -479,8 +479,7 @@ where
     ) {
         out.reserve(reads.len());
         for (state, placed) in reads.iter().zip(placements.iter_mut()) {
-            let len = state.query.len();
-            let (path, marginals) = self.adjudicate_loci(len, placed, adjudication);
+            let (path, marginals) = self.adjudicate_loci(placed, adjudication);
             out.push(Call {
                 orientation: state.orientation.expect("stage 1 orients every read"),
                 query: state.query.clone(),
@@ -502,7 +501,6 @@ where
     /// as each locus' paths are hypotheses of one model.
     fn adjudicate_loci(
         &self,
-        query_len: usize,
         placed: &[Placement],
         scratch: &mut Adj::Scratch,
     ) -> (Option<CallPath>, Option<Marginals>) {
@@ -510,7 +508,7 @@ where
         let shared = loci.iter().fold(Loci::ANY, |all, &l| all.intersection(l));
         if !shared.is_empty() {
             let adjudicator = self.adjudicator_for(shared.single());
-            return self.adjudicate_read(adjudicator, query_len, placed, scratch);
+            return self.adjudicate_read(adjudicator, placed, scratch);
         }
         let all = loci.iter().fold(Loci::NONE, |all, &l| all.union(l));
         // Per locus: the placement ids, the path and the marginals.
@@ -524,9 +522,7 @@ where
             }
             let subset: Vec<Placement> = ids.iter().map(|&i| placed[i].clone()).collect();
             let adjudicator = self.adjudicator_for(Some(locus));
-            if let (Some(path), marginals) =
-                self.adjudicate_read(adjudicator, query_len, &subset, scratch)
-            {
+            if let (Some(path), marginals) = self.adjudicate_read(adjudicator, &subset, scratch) {
                 found.push((ids, path, marginals));
             }
         }
@@ -586,7 +582,6 @@ where
     fn adjudicate_read(
         &self,
         adjudicator: &Adj,
-        query_len: usize,
         placed: &[Placement],
         scratch: &mut Adj::Scratch,
     ) -> (Option<CallPath>, Option<Marginals>) {
@@ -597,9 +592,7 @@ where
                     .iter()
                     .any(|s| placed[s.placement].anchors(&s.span))
         };
-        let mut path = adjudicator
-            .adjudicate(query_len, placed, scratch)
-            .filter(anchored);
+        let mut path = adjudicator.adjudicate(placed, scratch).filter(anchored);
         let marginals = path
             .as_ref()
             .and_then(|path| adjudicator.marginals(placed, path, scratch));

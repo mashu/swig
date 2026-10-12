@@ -76,22 +76,28 @@ pub struct PlacementDag<G = VdjGrammar, M = EngineeringObjective> {
     /// Minimum query bases a clipped segment must keep, per rearranged kind
     /// ([`SegmentKind::REARRANGED`]), indexed by [`SegmentKind::index`].
     pub min_retained: [u32; 3],
-    /// How alignments read as log-odds at a read's divergence. Without it
-    /// everything stays on the fixed scale and there are no posteriors.
-    pub evidence: Option<EvidenceModel>,
-    /// The model the call maximises.
-    pub calls: CallModel,
-    /// Whether [`Adjudicator::marginals`] returns posterior marginals (see
-    /// [`PlacementDag::posterior`]); needs `evidence`.
-    pub posterior: bool,
-    /// How [`Adjudicator::decode`] chooses the D allele.
-    pub d_allele: DAlleleDecoding,
+    mode: Mode,
 }
 
-impl Default for PlacementDag {
-    fn default() -> Self {
-        Self::new(VdjGrammar::VDJ, EngineeringObjective::default(), [10, 3, 6])
-    }
+/// What a [`PlacementDag`] computes for a read: the model its call
+/// maximises and whether it reports posteriors. Each variant holds what it
+/// needs, so no mode asks for a per-read call or posteriors without the
+/// evidence model they read. The engine's DAG comes from
+/// [`crate::config::EngineConfig`] ([`crate::config::DefaultAssigner::from_config`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Mode {
+    /// Calls on the fixed scores, without posteriors.
+    Fixed,
+    /// Alignment evidence read as log-odds at each read's divergence.
+    Read {
+        evidence: EvidenceModel,
+        /// The model the call maximises.
+        calls: CallModel,
+        /// Posterior marginals ([`Adjudicator::marginals`]), with the rule
+        /// that chooses the reported D allele from them
+        /// ([`Adjudicator::decode`]); `None`: no posteriors.
+        posterior: Option<DAlleleDecoding>,
+    },
 }
 
 /// Value, then germline support (the summed unclipped scores of the path's
@@ -171,17 +177,17 @@ pub struct DagScratch {
 }
 
 impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
-    /// A DAG on the fixed scale, without posteriors.
-    pub fn new(grammar: G, model: M, min_retained: [u32; 3]) -> Self {
+    pub fn new(grammar: G, model: M, min_retained: [u32; 3], mode: Mode) -> Self {
         Self {
             grammar,
             model,
             min_retained,
-            evidence: None,
-            calls: CallModel::FixedScale,
-            posterior: false,
-            d_allele: DAlleleDecoding::Map,
+            mode,
         }
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.mode
     }
 
     #[inline]
@@ -475,10 +481,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
             },
             model: &self.model,
             min_retained: self.min_retained,
-            evidence: self.evidence,
-            calls: self.calls,
-            posterior: false,
-            d_allele: DAlleleDecoding::Map,
+            mode: self.mode,
         };
         within.best_path(placements, keep, read, s)
     }
@@ -530,9 +533,12 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         }
     }
 
-    /// Whether the call maximises the fixed scores.
-    pub fn calls_on_fixed_scale(&self) -> bool {
-        self.calls == CallModel::FixedScale || self.evidence.is_none()
+    /// The model the call maximises.
+    pub fn calls(&self) -> CallModel {
+        match self.mode {
+            Mode::Read { calls, .. } => calls,
+            Mode::Fixed => CallModel::FixedScale,
+        }
     }
 
     /// `P*_k` of each rearranged kind.
@@ -542,19 +548,31 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
 
     /// The model a call at divergence `p` maximises.
     fn read_model(&self, p: f64) -> ReadModel {
-        match (self.calls, &self.evidence) {
-            (CallModel::PerRead, Some(evidence)) => ReadModel::at(evidence, p, self.presence()),
-            // One unit per score unit, λ nats each (1 when the scores have no
-            // log-odds λ; nothing then reads them as nats).
-            (_, evidence) => ReadModel::fixed(evidence.map_or(1.0, |e| e.lambda), self.presence()),
+        match self.mode {
+            Mode::Read {
+                evidence,
+                calls: CallModel::PerRead,
+                ..
+            } => ReadModel::at(&evidence, p, self.presence()),
+            // One unit per score unit, λ nats each (1 without an evidence
+            // model; nothing then reads them as nats).
+            Mode::Read { evidence, .. } => ReadModel::fixed(evidence.lambda, self.presence()),
+            Mode::Fixed => ReadModel::fixed(1.0, self.presence()),
         }
     }
 
-    /// The posterior's model at divergence `p`: the call's own under
-    /// [`CallModel::PerRead`].
+    /// The posterior's model at divergence `p`, when the DAG reports
+    /// posteriors: the call's own under [`CallModel::PerRead`].
     fn nats(&self, p: f64) -> Option<PathNats> {
-        let evidence = self.evidence.as_ref()?;
-        Some(match self.calls {
+        let Mode::Read {
+            evidence,
+            calls,
+            posterior: Some(_),
+        } = self.mode
+        else {
+            return None;
+        };
+        Some(match calls {
             CallModel::PerRead => self.read_model(p).nats(),
             CallModel::FixedScale => evidence.nats(p, self.presence()),
         })
@@ -564,23 +582,14 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
 impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
     type Scratch = DagScratch;
 
-    fn adjudicate(
-        &self,
-        _query_len: usize,
-        placements: &[Placement],
-        scratch: &mut DagScratch,
-    ) -> Option<CallPath> {
+    fn adjudicate(&self, placements: &[Placement], scratch: &mut DagScratch) -> Option<CallPath> {
         let divergence = divergence(placements);
         let (_, segments) = self.viterbi(placements, &self.read_model(divergence), scratch)?;
         Some(CallPath {
             score: self.path_score(placements, &segments),
             segments,
             divergence,
-            model: if self.calls_on_fixed_scale() {
-                CallModel::FixedScale
-            } else {
-                CallModel::PerRead
-            },
+            model: self.calls(),
         })
     }
 
@@ -590,8 +599,24 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
         path: &CallPath,
         scratch: &mut DagScratch,
     ) -> Option<Marginals> {
-        let nats = self.nats(path.divergence).filter(|_| self.posterior)?;
+        let nats = self.nats(path.divergence)?;
         self.posterior(placements, &nats, &mut scratch.posterior)
+    }
+
+    /// A fixed-scale call without posteriors never takes a D scoring at
+    /// most `⌊P*_D⌋` ([`PathModel::d_floor`]); a per-read call can, and a
+    /// posterior gives every D its probability.
+    fn d_score_floor(&self) -> Score {
+        match self.mode {
+            Mode::Read {
+                calls: CallModel::PerRead,
+                ..
+            }
+            | Mode::Read {
+                posterior: Some(_), ..
+            } => Score::MIN,
+            _ => self.model.d_floor(),
+        }
     }
 
     /// Under [`DAlleleDecoding::MaxMarginal`], a call with one D whose
@@ -604,9 +629,13 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
         marginals: &Marginals,
         scratch: &mut DagScratch,
     ) -> Option<CallPath> {
-        if self.d_allele != DAlleleDecoding::MaxMarginal {
+        let Mode::Read {
+            posterior: Some(DAlleleDecoding::MaxMarginal),
+            ..
+        } = self.mode
+        else {
             return None;
-        }
+        };
         let kind = |segment: &CalledSegment| placements[segment.placement].kind;
         let mut ds = path.segments.iter().filter(|s| kind(s) == SegmentKind::D);
         let (Some(called), None) = (ds.next(), ds.next()) else {
@@ -654,9 +683,14 @@ mod tests {
             placement(SegmentKind::J, &query, &j, 10),
         ];
         assert_eq!((placements[0].score(), placements[1].score()), (22, 22));
-        let dag = PlacementDag::new(VdjGrammar::VJ, EngineeringObjective::default(), [1, 1, 1]);
+        let dag = PlacementDag::new(
+            VdjGrammar::VJ,
+            EngineeringObjective::priced([0.0, 11.0, 0.0]),
+            [1, 1, 1],
+            Mode::Fixed,
+        );
         let path = dag
-            .adjudicate(query.len(), &placements, &mut DagScratch::default())
+            .adjudicate(&placements, &mut DagScratch::default())
             .expect("a VJ path");
         // Single cut: 40 + 2 = 42. Two cuts (V to 11, J from 15): 44.
         assert_eq!(path.score.score, 44);
@@ -676,8 +710,13 @@ mod tests {
             placement(SegmentKind::J, &query, &query[10..26], 10),
             placement(SegmentKind::C, &query, &query[26..], 26),
         ];
-        let dag = PlacementDag::new(VdjGrammar::VJ, EngineeringObjective::default(), [1, 1, 1]);
-        dag.adjudicate(query.len(), &placements, &mut DagScratch::default());
+        let dag = PlacementDag::new(
+            VdjGrammar::VJ,
+            EngineeringObjective::priced([0.0, 11.0, 0.0]),
+            [1, 1, 1],
+            Mode::Fixed,
+        );
+        dag.adjudicate(&placements, &mut DagScratch::default());
     }
 
     /// The J alignment starts one base before the D, its first 13 bases
@@ -704,9 +743,14 @@ mod tests {
             placements.iter().map(Placement::score).collect::<Vec<_>>(),
             [40, 24, 7]
         );
-        let dag = PlacementDag::new(VdjGrammar::VDJ, EngineeringObjective::default(), [1, 1, 1]);
+        let dag = PlacementDag::new(
+            VdjGrammar::VDJ,
+            EngineeringObjective::priced([0.0, 11.0, 0.0]),
+            [1, 1, 1],
+            Mode::Fixed,
+        );
         let path = dag
-            .adjudicate(query.len(), &placements, &mut DagScratch::default())
+            .adjudicate(&placements, &mut DagScratch::default())
             .expect("a path");
         // V 40 + D (24 − 11) + J from base 34 (46) = 99; V → J alone is 86.
         assert_eq!(path.score.score, 99);
@@ -732,9 +776,14 @@ mod tests {
             placement(SegmentKind::J, &query, &j, 16),
         ];
         assert_eq!((placements[0].score(), placements[1].score()), (40, 38));
-        let dag = PlacementDag::new(VdjGrammar::VJ, EngineeringObjective::default(), [1, 1, 1]);
+        let dag = PlacementDag::new(
+            VdjGrammar::VJ,
+            EngineeringObjective::priced([0.0, 11.0, 0.0]),
+            [1, 1, 1],
+            Mode::Fixed,
+        );
         let path = dag
-            .adjudicate(query.len(), &placements, &mut DagScratch::default())
+            .adjudicate(&placements, &mut DagScratch::default())
             .expect("a VJ path");
         // Inside the overlap the best is V[0,16) + J whole = 32 + 38 = 70.
         assert_eq!(path.score.score, 76);
@@ -764,11 +813,8 @@ mod tests {
             placement(SegmentKind::J, &query, &j, 20),
         ];
         let kinds = |presence: [f64; 3], read: &ReadModel| {
-            let model = EngineeringObjective {
-                presence,
-                ..EngineeringObjective::default()
-            };
-            let dag = PlacementDag::new(VdjGrammar::VJ, model, [1, 1, 1]);
+            let model = EngineeringObjective::priced(presence);
+            let dag = PlacementDag::new(VdjGrammar::VJ, model, [1, 1, 1], Mode::Fixed);
             let (_, segments) = dag
                 .viterbi(&placements, read, &mut DagScratch::default())
                 .expect("a path");
@@ -825,28 +871,22 @@ mod tests {
     /// read's own model takes the exact 7-mer: 9.6 nats against 8.3.
     #[test]
     fn a_per_read_call_takes_the_exact_short_d_at_low_divergence() {
-        let (query, placements) = two_ds();
-        let model = EngineeringObjective {
-            presence: [0.0, 10.0, 0.0],
-            ..EngineeringObjective::default()
+        let (_, placements) = two_ds();
+        let model = EngineeringObjective::priced([0.0, 10.0, 0.0]);
+        let dag = |calls| {
+            let mode = Mode::Read {
+                evidence: evidence(),
+                calls,
+                posterior: None,
+            };
+            PlacementDag::new(VdjGrammar::VDJ, model, [1, 4, 1], mode)
         };
-        let fixed = PlacementDag {
-            evidence: Some(evidence()),
-            ..PlacementDag::new(VdjGrammar::VDJ, model, [1, 4, 1])
-        };
-        let per_read = PlacementDag {
-            calls: CallModel::PerRead,
-            ..fixed
-        };
+        let (fixed, per_read) = (dag(CallModel::FixedScale), dag(CallModel::PerRead));
         let mut scratch = DagScratch::default();
         let d_of = |path: &CallPath| path.segments[1].placement;
-        let call = fixed
-            .adjudicate(query.len(), &placements, &mut scratch)
-            .unwrap();
+        let call = fixed.adjudicate(&placements, &mut scratch).unwrap();
         assert_eq!((d_of(&call), call.model), (2, CallModel::FixedScale));
-        let call = per_read
-            .adjudicate(query.len(), &placements, &mut scratch)
-            .unwrap();
+        let call = per_read.adjudicate(&placements, &mut scratch).unwrap();
         assert_eq!(call.divergence, 0.5 / 41.0);
         assert_eq!((d_of(&call), call.model), (1, CallModel::PerRead));
         // The reported path score stays the fixed scale's: 40 + 14 − 10 + 40.
@@ -864,24 +904,19 @@ mod tests {
     /// the call's topology, V and J.
     #[test]
     fn the_max_marginal_d_allele_is_retraced() {
-        let (query, placements) = two_ds();
-        let dag = PlacementDag {
-            evidence: Some(evidence()),
-            posterior: true,
-            d_allele: DAlleleDecoding::MaxMarginal,
-            ..PlacementDag::new(
-                VdjGrammar::VDJ,
-                EngineeringObjective {
-                    presence: [0.0, 10.0, 0.0],
-                    ..EngineeringObjective::default()
-                },
-                [1, 4, 1],
-            )
+        let (_, placements) = two_ds();
+        let dag = |d_allele| {
+            let mode = Mode::Read {
+                evidence: evidence(),
+                calls: CallModel::FixedScale,
+                posterior: Some(d_allele),
+            };
+            let model = EngineeringObjective::priced([0.0, 10.0, 0.0]);
+            PlacementDag::new(VdjGrammar::VDJ, model, [1, 4, 1], mode)
         };
+        let (map, dag) = (dag(DAlleleDecoding::Map), dag(DAlleleDecoding::MaxMarginal));
         let mut scratch = DagScratch::default();
-        let call = dag
-            .adjudicate(query.len(), &placements, &mut scratch)
-            .unwrap();
+        let call = dag.adjudicate(&placements, &mut scratch).unwrap();
         assert_eq!(call.segments[1].placement, 2);
         let m = dag.marginals(&placements, &call, &mut scratch).unwrap();
         assert!(m.placement[1] > m.placement[2], "{:?}", m.placement);
@@ -895,10 +930,6 @@ mod tests {
         assert_eq!(picks(&decoded), [(0, false), (1, true), (3, false)]);
         assert_eq!(decoded.score.score, 84);
         // The call's own allele is kept when it is the max-marginal one.
-        let map = PlacementDag {
-            d_allele: DAlleleDecoding::Map,
-            ..dag
-        };
         assert!(map.decode(&placements, &call, &m, &mut scratch).is_none());
         assert!(
             dag.decode(&placements, &decoded, &m, &mut scratch)
@@ -930,12 +961,9 @@ mod tests {
             placement(SegmentKind::D, &query, &reference, 22),
             placement(SegmentKind::J, &query, &encode(j), 34),
         ];
-        let model = EngineeringObjective {
-            presence: [0.0, 10.0, 0.0],
-            ..EngineeringObjective::default()
-        };
+        let model = EngineeringObjective::priced([0.0, 10.0, 0.0]);
         assert_eq!(placements[1].score(), model.d_floor() - 1);
-        let dag = PlacementDag::new(VdjGrammar::VDJ, model, [1, 4, 1]);
+        let dag = PlacementDag::new(VdjGrammar::VDJ, model, [1, 4, 1], Mode::Fixed);
         let mut scratch = DagScratch::default();
         let d_count = |read: &ReadModel, scratch: &mut DagScratch| {
             dag.viterbi(&placements, read, scratch).unwrap().0.d_count

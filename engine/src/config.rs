@@ -10,7 +10,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::adjudicate::{
-    CallModel, DAlleleDecoding, EngineeringObjective, EvidenceModel, PlacementDag, VdjGrammar,
+    Adjudicator, CallModel, DAlleleDecoding, EngineeringObjective, EvidenceModel, Mode,
+    PlacementDag, VdjGrammar,
 };
 use crate::admission::{AnyOf, DistributedEvidence, ExactRunFloor};
 use crate::align::{Backend, InterSequenceGotoh};
@@ -296,19 +297,21 @@ pub struct EngineConfig {
     /// ([`SegmentKind::REARRANGED`]), indexed by [`SegmentKind::index`].
     pub min_retained: [u32; 3],
     /// The model the DAG's call maximises: each read's own (the model its
-    /// posteriors come from) or the fixed scores.
+    /// posteriors come from) or the fixed scores. The read's model needs
+    /// the V scoring's Karlin–Altschul λ ([`BuildError::NoStatistics`]).
     pub calls: CallModel,
     /// How the reported D allele is chosen: the call's, or the one of
     /// largest posterior marginal given the call's topology. The latter
     /// needs `posterior`; without it the D allele is the call's.
     pub d_allele: DAlleleDecoding,
     /// Report posterior probabilities (forward–backward over the placement
-    /// DAG, priors at the V scoring's λ, alignment evidence at each read's
-    /// divergence): per called segment and for D presence. With posteriors,
-    /// or with a per-read call, D placements below the objective's floor
-    /// (`P_D + 1`) are kept, since they carry probability and can win a
-    /// per-read call; otherwise they are pruned, which never changes a
-    /// fixed-scale call.
+    /// DAG, priors at the λ they were derived with, alignment evidence at
+    /// each read's divergence): per called segment and for D presence. The
+    /// DAG's [`Mode`] holds the choice. With posteriors, or with a per-read
+    /// call, D placements below the objective's floor (`P_D + 1`) are kept,
+    /// since they carry probability and can win a per-read call; otherwise
+    /// they are pruned, which never changes a fixed-scale call
+    /// ([`Adjudicator::d_score_floor`]).
     pub posterior: bool,
     /// Instruction set of the alignment kernel; `None` picks the fastest
     /// this CPU runs ([`Backend::detect`]).
@@ -548,23 +551,18 @@ fn j_stage(set: GermlineSet, config: &JSegmentConfig) -> SegmentStage<Exhaustive
     stage
 }
 
+/// The D stage, keeping no alignment below `floor`, the adjudicators'
+/// [`Adjudicator::d_score_floor`].
 fn d_stage(
     set: GermlineSet,
     config: &DSegmentConfig,
-    objective: &EngineeringObjective,
-    keep_below_floor: bool,
+    floor: Score,
 ) -> SegmentStage<LmerMaskRetriever> {
     let lmer = config.lmer.unwrap_or_else(|| config.lossless_lmer());
     let retriever = LmerMaskRetriever::build(&set, lmer, 1);
     let segment = PreparedSegment::new(set, &config.scoring, config.scoring.gaps);
     let keep = KeepPolicy {
-        // The objective's D floor prunes only what cannot win a fixed-scale
-        // call (see `EngineeringObjective::d_floor`).
-        min_score: if keep_below_floor {
-            config.lossless_min_score()
-        } else {
-            config.lossless_min_score().max(objective.d_floor())
-        },
+        min_score: config.lossless_min_score().max(floor),
         ..config.keep
     };
     let mut stage = SegmentStage::new(Arc::new(segment), retriever, keep);
@@ -608,15 +606,22 @@ impl Assigner {
         let objective = config
             .objective
             .resolve(d.as_ref(), &config.d, &j, &config.j.scoring);
-        let evidence =
-            EvidenceModel::new([&config.v.scoring, &config.d.scoring, &config.j.scoring]);
-        let adjudicator = PlacementDag {
-            evidence,
-            calls: config.calls,
-            posterior: config.posterior && evidence.is_some(),
-            d_allele: config.d_allele,
-            ..PlacementDag::new(grammar, objective, config.min_retained)
+        let mode = if config.calls == CallModel::FixedScale && !config.posterior {
+            Mode::Fixed
+        } else {
+            Mode::Read {
+                evidence: EvidenceModel::new([
+                    &config.v.scoring,
+                    &config.d.scoring,
+                    &config.j.scoring,
+                ])
+                .ok_or(BuildError::NoStatistics(SegmentKind::V))?,
+                calls: config.calls,
+                posterior: config.posterior.then_some(config.d_allele),
+            }
         };
+        let dag = |model| PlacementDag::new(grammar, model, config.min_retained, mode);
+        let adjudicator = dag(objective);
         // A D or J database of several loci: a read of one locus prices a D
         // and a J by that locus' genes.
         let loci: Vec<Locus> = Locus::ALL
@@ -637,36 +642,21 @@ impl Assigner {
                         &part(&j),
                         &config.j.scoring,
                     );
-                    (
-                        locus,
-                        PlacementDag {
-                            model,
-                            ..adjudicator
-                        },
-                    )
+                    (locus, dag(model))
                 })
                 .collect()
         } else {
             Vec::new()
         };
         // The D floor must not prune a D any locus would call.
-        let d_cost = |m: &EngineeringObjective| m.presence[SegmentKind::D.index()];
         let floor = locus_adjudicators
             .iter()
-            .map(|(_, a)| a.model)
-            .fold(
-                objective,
-                |low, m| if d_cost(&m) < d_cost(&low) { m } else { low },
-            );
+            .map(|(_, a)| a.d_score_floor())
+            .fold(adjudicator.d_score_floor(), Score::min);
         Ok(Assigner {
             v: v_stage(v, &config.v)?,
             j: j_stage(j, &config.j),
-            // A D below the objective's floor carries posterior mass, and can
-            // win a per-read call.
-            d: d.map(|set| {
-                let keep = adjudicator.posterior || !adjudicator.calls_on_fixed_scale();
-                d_stage(set, &config.d, &floor, keep)
-            }),
+            d: d.map(|set| d_stage(set, &config.d, floor)),
             strand,
             j_window: config.j.window,
             aligner: match config.simd {
@@ -733,7 +723,7 @@ mod tests {
         // The fixed-scale call charges ⌊P*_D⌋: an integer D score must exceed it.
         let objective = EngineeringObjective {
             presence: [0.0, DPrior::DERIVED.cost(genes(32), &scoring), 0.0],
-            ..EngineeringObjective::default()
+            ..EngineeringObjective::priced([0.0, 11.0, 0.0])
         };
         assert_eq!(
             (
@@ -895,6 +885,65 @@ mod tests {
         assert_eq!(by_locus, [(Locus::Igh, cost(3)), (Locus::Igk, cost(2))]);
     }
 
+    /// The engine's DAG is the configuration's: its mode, and the D stage's
+    /// floor from that mode (pruning only for a fixed-scale call without
+    /// posteriors). A V scoring without log-odds λ cannot read a read's
+    /// evidence, so only the fixed mode builds from it.
+    #[test]
+    fn the_adjudicator_and_its_d_floor_follow_the_configuration() {
+        let db = crate::sim::SyntheticDatabase::generate(&crate::sim::SyntheticSpec::default(), 5);
+        let build = |config: &EngineConfig| {
+            Assigner::from_config(config, db.v.clone(), Some(db.d.clone()), db.j.clone())
+        };
+        let evidence =
+            |c: &EngineConfig| EvidenceModel::new([&c.v.scoring, &c.d.scoring, &c.j.scoring]);
+        let default = EngineConfig::default();
+        let lossless = default.d.lossless_min_score();
+        let objective =
+            default
+                .objective
+                .resolve(Some(&db.d), &default.d, &db.j, &default.j.scoring);
+        for (calls, posterior, d_allele) in [
+            (CallModel::PerRead, true, DAlleleDecoding::Map),
+            (CallModel::PerRead, false, DAlleleDecoding::MaxMarginal),
+            (CallModel::FixedScale, true, DAlleleDecoding::MaxMarginal),
+            (CallModel::FixedScale, false, DAlleleDecoding::MaxMarginal),
+        ] {
+            let config = EngineConfig {
+                calls,
+                posterior,
+                d_allele,
+                ..EngineConfig::default()
+            };
+            let assigner = build(&config).unwrap();
+            let dag = &assigner.adjudicator;
+            let (mode, floor) = if calls == CallModel::FixedScale && !posterior {
+                (Mode::Fixed, objective.d_floor())
+            } else {
+                let mode = Mode::Read {
+                    evidence: evidence(&config).unwrap(),
+                    calls,
+                    posterior: posterior.then_some(d_allele),
+                };
+                (mode, Score::MIN)
+            };
+            assert_eq!((dag.mode(), dag.model), (mode, objective));
+            assert_eq!(dag.min_retained, default.min_retained);
+            assert_eq!(dag.d_score_floor(), floor);
+            let d = assigner.d.as_ref().unwrap();
+            assert_eq!(d.keep.min_score, lossless.max(floor));
+        }
+        let mut config = EngineConfig::default();
+        config.v.scoring = AffineScoring::new(2, 1, -9, -1);
+        assert!(matches!(
+            build(&config),
+            Err(BuildError::NoStatistics(SegmentKind::V))
+        ));
+        config.calls = CallModel::FixedScale;
+        config.posterior = false;
+        assert_eq!(build(&config).unwrap().adjudicator.mode(), Mode::Fixed);
+    }
+
     /// The fixed-scale posterior reads each presence cost at the λ of the
     /// scoring it was derived with: the D's, not the V's.
     #[test]
@@ -903,7 +952,9 @@ mod tests {
         config.d.scoring = AffineScoring::new(2, -4, -13, -1);
         let db = crate::sim::SyntheticDatabase::generate(&crate::sim::SyntheticSpec::default(), 5);
         let assigner = Assigner::from_config(&config, db.v, Some(db.d), db.j).unwrap();
-        let evidence = assigner.adjudicator.evidence.expect("an evidence model");
+        let Mode::Read { evidence, .. } = assigner.adjudicator.mode() else {
+            panic!("the default mode reads evidence");
+        };
         let lambda = |s: &AffineScoring| KarlinAltschul::ungapped(s).unwrap().lambda;
         assert_eq!(evidence.lambda, lambda(&config.v.scoring));
         assert_eq!(

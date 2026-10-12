@@ -97,6 +97,13 @@ pub trait PathModel: Send + Sync {
         self.presence(kind).floor() as Score
     }
 
+    /// Smallest D local score that can improve a fixed-scale path; lower
+    /// ones can be pruned before adjudication. `Score::MIN` (no floor)
+    /// unless the model proves one.
+    fn d_floor(&self) -> Score {
+        Score::MIN
+    }
+
     /// Score per unassigned query base (N/P region) between two segments.
     /// Junction scores are linear in the inserted length, which keeps both
     /// cuts of a transition separable (see [`super::PlacementDag`]).
@@ -118,6 +125,10 @@ pub trait PathModel: Send + Sync {
 impl<M: PathModel> PathModel for &M {
     fn presence(&self, kind: SegmentKind) -> f64 {
         (**self).presence(kind)
+    }
+
+    fn d_floor(&self) -> Score {
+        (**self).d_floor()
     }
 
     fn junction_per_base(&self, prev: SegmentKind, next: SegmentKind) -> Score {
@@ -160,17 +171,24 @@ pub struct EngineeringObjective {
     pub insertion_per_base: Score,
 }
 
-impl Default for EngineeringObjective {
-    fn default() -> Self {
+#[cfg(test)]
+impl EngineeringObjective {
+    /// The objective of the unit tests: presence costs `presence`, no pair
+    /// bonus, no N/P cost.
+    pub(crate) fn priced(presence: [f64; 3]) -> Self {
         Self {
             pair_bonus: 0,
-            presence: [0.0, 11.0, 0.0],
+            presence,
             insertion_per_base: 0,
         }
     }
 }
 
-impl EngineeringObjective {
+impl PathModel for EngineeringObjective {
+    fn presence(&self, kind: SegmentKind) -> f64 {
+        self.presence[kind.index()]
+    }
+
     /// Smallest D local score that can improve a fixed-scale path: `P_D + 1`,
     /// with `P_D = ⌊P*_D⌋`. It bounds nothing for a per-read call: there a D
     /// scoring 10 ≤ `P_D` (8 matches, 2 mismatches) is worth 6.40 nats at
@@ -184,18 +202,12 @@ impl EngineeringObjective {
     /// scores at least as much and "with-D must strictly beat no-D" rejects
     /// it. With a negative per-base junction score a D could pay for itself
     /// by replacing N bases, so no floor is derived then.
-    pub fn d_floor(&self) -> Score {
+    fn d_floor(&self) -> Score {
         if self.insertion_per_base < 0 {
             Score::MIN
         } else {
             self.presence_score(SegmentKind::D) + 1
         }
-    }
-}
-
-impl PathModel for EngineeringObjective {
-    fn presence(&self, kind: SegmentKind) -> f64 {
-        self.presence[kind.index()]
     }
 
     fn junction_per_base(&self, _prev: SegmentKind, _next: SegmentKind) -> Score {

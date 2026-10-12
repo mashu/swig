@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 
 use swig::adjudicate::{
-    Adjudicator, DagScratch, EvidenceModel, PathScore, ReadModel, Topology, Units, Within,
+    Adjudicator, DagScratch, EvidenceModel, Mode, PathScore, ReadModel, Topology, Units, Within,
     divergence,
 };
 use swig::placement::Placement;
@@ -740,7 +740,7 @@ fn dag_equals_brute_force_on_hypermutated_igsim_reads() {
                 insertion_per_base: iota,
                 ..base
             };
-            let dag = PlacementDag::new(VdjGrammar::VDJ, model, config.min_retained);
+            let dag = PlacementDag::new(VdjGrammar::VDJ, model, config.min_retained, Mode::Fixed);
             let (fast, exhaustive) = dag_and_brute(&dag, &placements, fixed(&dag), &mut scratch);
             assert_eq!(
                 fast,
@@ -749,7 +749,7 @@ fn dag_equals_brute_force_on_hypermutated_igsim_reads() {
                 read.sequence.len()
             );
             // Count reads whose optimum enters some placement beyond the overlap.
-            if let Some(path) = dag.adjudicate(0, &placements, &mut scratch) {
+            if let Some(path) = dag.adjudicate(&placements, &mut scratch) {
                 beyond += usize::from(path.segments.windows(2).any(|w| {
                     let (b, e) = (&placements[w[0].placement], &placements[w[1].placement]);
                     e.q_start() < b.q_end() && w[1].entry > b.q_end()
@@ -799,7 +799,7 @@ fn per_read_dag_equals_exhaustive_enumeration() {
                     insertion_per_base: iota,
                     ..base
                 };
-                let dag = PlacementDag::new(TANDEM_D, objective, config.min_retained);
+                let dag = PlacementDag::new(TANDEM_D, objective, config.min_retained, Mode::Fixed);
                 let Some((fixed_key, fixed_path)) =
                     dag.viterbi(&placements, &fixed(&dag), &mut scratch)
                 else {
@@ -822,6 +822,7 @@ fn per_read_dag_equals_exhaustive_enumeration() {
                         ..objective
                     },
                     config.min_retained,
+                    Mode::Fixed,
                 );
                 let model = ReadModel::at(&evidence, delta0, integer.model.presence);
                 let (fast, exhaustive) = dag_and_brute(&integer, &placements, model, &mut scratch);
@@ -866,7 +867,7 @@ fn conditioned_dag_equals_exhaustive_enumeration() {
         .resolve(Some(&db.d), &config.d, &db.j, &config.j.scoring);
     let evidence =
         EvidenceModel::new([&config.v.scoring, &config.d.scoring, &config.j.scoring]).unwrap();
-    let dag = PlacementDag::new(VdjGrammar::VDJ, objective, config.min_retained);
+    let dag = PlacementDag::new(VdjGrammar::VDJ, objective, config.min_retained, Mode::Fixed);
     let sim = Simulator::new(&db.v, Some(&db.d), &db.j, SimParams::hard()).unwrap();
     let mut ws = assigner.workspace();
     let mut scratch = DagScratch::default();
@@ -999,7 +1000,7 @@ fn dag_equals_brute_force_over_all_paths_and_cuts() {
             &config.j.scoring,
         )
     };
-    let dag = PlacementDag::new(TANDEM_D, model, [10, 3, 6]);
+    let dag = PlacementDag::new(TANDEM_D, model, [10, 3, 6], Mode::Fixed);
     let mut rng = Rng::new(23);
     let mut ws = assigner.workspace();
     let mut scratch = DagScratch::default();
@@ -1014,7 +1015,7 @@ fn dag_equals_brute_force_over_all_paths_and_cuts() {
 
         let (fast, exhaustive) = dag_and_brute(&dag, &placements, fixed(&dag), &mut scratch);
         assert_eq!(fast, exhaustive);
-        if let Some(path) = dag.adjudicate(call.query.len(), &placements, &mut scratch) {
+        if let Some(path) = dag.adjudicate(&placements, &mut scratch) {
             // On the fixed scale the reported path score is the DAG's key.
             let key = fast.expect("a path");
             assert_eq!(

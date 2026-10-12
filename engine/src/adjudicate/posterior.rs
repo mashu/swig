@@ -817,7 +817,7 @@ mod tests {
     use super::*;
     use crate::adjudicate::units::{EvidenceModel, ReadModel, Units};
     use crate::adjudicate::{
-        CalledSegment, DagScratch, EngineeringObjective, PathScore, VdjGrammar,
+        CalledSegment, DagScratch, EngineeringObjective, Mode, PathScore, VdjGrammar,
     };
     use crate::align::{Alignment, Op};
     use crate::alphabet::encode;
@@ -1150,14 +1150,11 @@ mod tests {
         let (_, placements) = junction();
         // Unrounded presence priors: the posterior uses 4.5 for a D and 3.5
         // for a J, the Viterbi call 4 and 3.
-        let model = EngineeringObjective {
-            presence: [0.0, 4.5, 3.5],
-            ..EngineeringObjective::default()
-        };
+        let model = EngineeringObjective::priced([0.0, 4.5, 3.5]);
         let fixed = EvidenceScale::fixed(LAMBDA);
         for grammar in [VdjGrammar::VDJ, TANDEM_D, VdjGrammar::VJ] {
             check_fixed(
-                &PlacementDag::new(grammar, model, [4, 3, 4]),
+                &PlacementDag::new(grammar, model, [4, 3, 4], Mode::Fixed),
                 &placements,
                 fixed,
             );
@@ -1166,21 +1163,25 @@ mod tests {
             insertion_per_base: -1,
             ..model
         };
-        let dag = PlacementDag::new(TANDEM_D, per_base, [4, 3, 4]);
+        let dag = PlacementDag::new(TANDEM_D, per_base, [4, 3, 4], Mode::Fixed);
         check_fixed(&dag, &placements, fixed);
         // Evidence at a read's own divergence: a per-column term μ ≠ 0.
         check_fixed(&dag, &placements, EvidenceScale::at_divergence(0.02, 2, -3));
         // A D before a J whose alignment starts earlier.
         let (_, over) = j_reaching_over_d();
         for grammar in [VdjGrammar::VDJ, TANDEM_D] {
-            check_fixed(&PlacementDag::new(grammar, model, [4, 3, 4]), &over, fixed);
+            check_fixed(
+                &PlacementDag::new(grammar, model, [4, 3, 4], Mode::Fixed),
+                &over,
+                fixed,
+            );
         }
         // An N column and an insertion, at the read's divergence and fixed.
         let (_, gapped) = gapped_junction();
         for evidence in [fixed, EvidenceScale::at_divergence(0.005, 2, -3)] {
             check_fixed(&dag, &gapped, evidence);
             check_fixed(
-                &PlacementDag::new(VdjGrammar::VDJ, model, [4, 3, 4]),
+                &PlacementDag::new(VdjGrammar::VDJ, model, [4, 3, 4], Mode::Fixed),
                 &gapped,
                 evidence,
             );
@@ -1192,10 +1193,7 @@ mod tests {
     /// Viterbi key is its exhaustive maximum, so the call is a mode.
     #[test]
     fn per_read_call_is_a_mode_of_the_posterior() {
-        let model = EngineeringObjective {
-            presence: [0.0, 4.5, 3.5],
-            ..EngineeringObjective::default()
-        };
+        let model = EngineeringObjective::priced([0.0, 4.5, 3.5]);
         let per_base = EngineeringObjective {
             insertion_per_base: -1,
             ..model
@@ -1206,7 +1204,7 @@ mod tests {
             for placements in &fixtures {
                 for grammar in [VdjGrammar::VDJ, TANDEM_D, VdjGrammar::VJ] {
                     for objective in [model, per_base] {
-                        let dag = PlacementDag::new(grammar, objective, [4, 3, 4]);
+                        let dag = PlacementDag::new(grammar, objective, [4, 3, 4], Mode::Fixed);
                         check_per_read(&dag, placements, p);
                     }
                 }
@@ -1238,9 +1236,9 @@ mod tests {
         for iota in [-4, -8] {
             let model = EngineeringObjective {
                 insertion_per_base: iota,
-                ..EngineeringObjective::default()
+                ..EngineeringObjective::priced([0.0, 11.0, 0.0])
             };
-            let dag = PlacementDag::new(VdjGrammar::VDJ, model, [24, 4, 10]);
+            let dag = PlacementDag::new(VdjGrammar::VDJ, model, [24, 4, 10], Mode::Fixed);
             check_fixed(&dag, &placements, EvidenceScale::fixed(LAMBDA));
             check_fixed(
                 &dag,
@@ -1262,14 +1260,14 @@ mod tests {
         ];
         let model = EngineeringObjective {
             insertion_per_base: -4,
-            ..EngineeringObjective::default()
+            ..EngineeringObjective::priced([0.0, 11.0, 0.0])
         };
         let grammar = VdjGrammar {
             require_v: true,
             require_j: true,
             ..VdjGrammar::VDJ
         };
-        let dag = PlacementDag::new(grammar, model, [4, 3, 4]);
+        let dag = PlacementDag::new(grammar, model, [4, 3, 4], Mode::Fixed);
         check_fixed(&dag, &placements, EvidenceScale::fixed(LAMBDA));
         check_per_read(&dag, &placements, 0.01);
     }
@@ -1284,7 +1282,12 @@ mod tests {
             placement(SegmentKind::V, &query, &query[..600], 0),
             placement(SegmentKind::J, &query, &query[60..], 60),
         ];
-        let dag = PlacementDag::new(VdjGrammar::VDJ, EngineeringObjective::default(), [4, 3, 4]);
+        let dag = PlacementDag::new(
+            VdjGrammar::VDJ,
+            EngineeringObjective::priced([0.0, 11.0, 0.0]),
+            [4, 3, 4],
+            Mode::Fixed,
+        );
         let nats = EVIDENCE.nats(0.01, dag.model.presence);
         let m = dag.posterior(&placements, &nats, &mut PosteriorScratch::default());
         assert!(m.is_none(), "{m:?}");
@@ -1301,7 +1304,12 @@ mod tests {
     #[test]
     fn d_presence_without_a_d_class_is_positive_zero() {
         let (_, placements) = junction();
-        let dag = PlacementDag::new(VdjGrammar::VJ, EngineeringObjective::default(), [4, 3, 4]);
+        let dag = PlacementDag::new(
+            VdjGrammar::VJ,
+            EngineeringObjective::priced([0.0, 11.0, 0.0]),
+            [4, 3, 4],
+            Mode::Fixed,
+        );
         let nats = PathNats {
             lambda: LAMBDA,
             evidence: [EvidenceScale::fixed(LAMBDA); 3],
@@ -1318,7 +1326,12 @@ mod tests {
     #[test]
     fn marginals_are_probabilities() {
         let (_, placements) = junction();
-        let dag = PlacementDag::new(VdjGrammar::VDJ, EngineeringObjective::default(), [4, 3, 4]);
+        let dag = PlacementDag::new(
+            VdjGrammar::VDJ,
+            EngineeringObjective::priced([0.0, 11.0, 0.0]),
+            [4, 3, 4],
+            Mode::Fixed,
+        );
         let nats = PathNats {
             lambda: LAMBDA,
             evidence: [EvidenceScale::fixed(LAMBDA); 3],

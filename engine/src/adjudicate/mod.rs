@@ -25,7 +25,7 @@ mod model;
 mod posterior;
 mod units;
 
-pub use dag::{DagScratch, PlacementDag};
+pub use dag::{DagScratch, Mode, PlacementDag};
 pub use decode::{DAlleleDecoding, Topology, Within};
 pub use model::{EngineeringObjective, Grammar, PathModel, VdjGrammar};
 pub use posterior::{MAX_SPREAD, Marginals, OVERLAP_SPREAD, PosteriorScratch};
@@ -104,12 +104,15 @@ pub struct CallPath {
 pub trait Adjudicator: Send + Sync {
     type Scratch: Default + Send;
 
-    fn adjudicate(
-        &self,
-        query_len: usize,
-        placements: &[Placement],
-        scratch: &mut Self::Scratch,
-    ) -> Option<CallPath>;
+    fn adjudicate(&self, placements: &[Placement], scratch: &mut Self::Scratch)
+    -> Option<CallPath>;
+
+    /// The smallest local score a D placement needs to matter: one that
+    /// scores less can be neither called nor given probability, so the D
+    /// stage need not keep it. `Score::MIN` keeps every D.
+    fn d_score_floor(&self) -> Score {
+        Score::MIN
+    }
 
     /// Posterior marginals of `placements` given the adjudicated `path`, for
     /// adjudicators with a probabilistic reading that are configured to
