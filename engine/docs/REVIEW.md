@@ -11,6 +11,71 @@ quoted. Findings marked *suspected* were reasoned about but not
 reproduced. File and function names are given rather than line numbers,
 since the fixes moved lines.
 
+## 0. Status after the 0.39.1 audit
+
+A second audit, made after Swig 0.39.1, covered the input layer, retrieval,
+alignment, adjudication, the pipeline, the interfaces and the simulator. It
+re-checked this review's open items as well. Its fixes are one commit each,
+with a regression test that fails without them. Of this review's open
+items, these are now fixed:
+
+| Item | Fix |
+|---|---|
+| 3.1.1 D traces taken before admission | admission is the D stage's acceptance predicate |
+| 3.1.2 residual adjudicator | removed, with `--residual` |
+| 3.1.3 `prepare` round trip | a prepared database reads back with the trust, loci and provenance its annotation gave |
+| 3.1.4 pseudogene-heavy synthetic reads | `simulate` draws only alleles a rearranged transcript carries, within one locus |
+| 3.1.5 `evaluate` and `rev_comp` | allele identity no longer depends on the reported orientation |
+| 3.1.7 inverted D window | never proposed |
+| 3.1.9 silent 64-allele cap | every allele of a kept V gene is a candidate |
+| 3.1.10 max-marginal D decoding | the decoded D carries its allele and is kept only if its posterior holds |
+| 3.1.12 frame ties, σ series, trace memory, BOM and non-UTF-8 input, `--tail`, timing test, floors | fixed (σ as two binomial tails; scores up to 30,000 in lanes with a bound per traceback group) |
+| 4.1–4.3, 4.7, 4.8 | one acceptance mechanism; the adjudication mode as a validated type; the lattice recursion written once; typed notes; one test kit |
+| 4.5 (part) | the tandem-D grammar and the residual path are gone |
+
+The audit's own fixes are listed in the commit log; the README and
+ALGORITHM describe the behaviour they changed. Still open, by priority:
+
+1. **Strand test** (`orient`). Its null is random sequence, which the
+   antisense strand of an IG read is not, and its fallback ignores J:
+   reads with very high SHM or a short V can lose their orientation.
+   Needs a model and a measurement.
+2. **Posterior calibration under SHM.** At 30 % SHM the top bin
+   (posterior ≥ 0.999) is 50–80× overconfident: the posterior is exact
+   over its candidates, but the V/J keep policy has no score margin and the
+   report credits shorter co-optimal placements. D presence is also
+   overconfident because every D trim gets full prior weight. A
+   posterior-only `ln T(p̂)` term was measured and not adopted: it would
+   break "the call is a mode of the posterior", and a constant shift fits as
+   well. An N/P and trim-length prior should replace it.
+3. **Anchor gate and wrong V calls.** A call now needs a V or J whose clip
+   on the path is significant on its own. At 30 % SHM, 18 of the 19 calls
+   this drops had the wrong V, but 15 had the right J. With the J presence
+   cost, the set loses 0.43 pp of J and 0.46 pp of C accuracy. Keeping J and
+   C when only V fails the gate is worth measuring.
+4. **Annotation transfer.** Sibling transfer copies region starts through a
+   local alignment with no frame or motif check. The 3′-partial
+   IGHV1/OR16-3/-4/-22 alleles get a low-confidence Cys104 in a non-coding
+   frame.
+5. **Public fields bypass validation** (3.1.8): literal `GapCosts` with
+   positive costs, `Allele` regions, `DistributedEvidence` (and with it
+   3.1.6, `lossless_lmer` fixed at 4).
+6. **FR/CDR from another allele than `v_call`'s first name** (3.1.11):
+   regions project through the called placement's primary allele.
+7. **Throughput.** The calling thread reads, builds rows and writes alone,
+   leaving three cores idle for 10–13 % of wall time at 4 threads.
+   Adjudication scratch and about 360 allocations per read remain.
+8. **Structure.** `segment.rs` and `annotate/mod.rs` should be split
+   (4.4); dead API remains (`InterSequenceGotoh::scalar_only`,
+   `KmerIndex::build_from`, `FixedBudget`, `GeneFrames::is_empty`); the
+   public surface is wider than any caller needs (4.6); ALGORITHM.md still
+   carries review narrative (4.9).
+9. **Swig's shipped references** (outside the aligner). `SWIGMETA`
+   misplaces the anchors of 50 J alleles (TRAJ24*01–03 and TRAJ48*01
+   among them) and gives 13 5′-partial V alleles the wrong frame. The
+   engine now replaces such anchors with the motif hit at load, but the
+   references should be regenerated.
+
 ## 1. Verdict
 
 **Is the algorithm sound?** Yes. The model and its search hold up under
