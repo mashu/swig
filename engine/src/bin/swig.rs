@@ -81,8 +81,8 @@ options:
   --calls MODEL        the model the call maximises: per-read (each read's own, the
                        model its posteriors come from) | fixed (the (2, -3) scores)
   --d-allele RULE      the reported D allele: map (the call's) | max-marginal (largest
-                       posterior marginal given the call's D presence and topology;
-                       needs posteriors, so --no-posterior and --residual report map)
+                       posterior marginal given a D, aligned in the call's topology;
+                       needs posteriors, so --no-posterior reports map)
   --d-presence-rate R  D prior from the D search's own chance-hit count (alleles x
                        offsets x positions) at D-presence rate R, 0 < R < 1, instead
                        of genes x positions at even odds (docs/ALGORITHM.md 2.3)
@@ -103,7 +103,6 @@ options:
                        the screen's evidence rules (defaults 40, 11, 5, 3, 8)
   --simd NAME          alignment kernel: avx512 | avx2 | neon | portable | scalar
                        (default: the fastest this CPU supports, avx512 excepted)
-  --residual           ordinary commit-V/J-then-D adjudication instead of the DAG
   -V, --version        the version
   -h, --help           this message";
 

@@ -5,7 +5,7 @@ use crate::clip::ClipIndex;
 use crate::evidence::Evidence;
 use crate::germline::SegmentKind;
 use crate::placement::Placement;
-use crate::scoring::{AffineScoring, SubstitutionProfile};
+use crate::scoring::{AffineScoring, Score, SubstitutionProfile};
 use crate::sim::Rng;
 
 /// A deterministic stream of random words.
@@ -39,9 +39,10 @@ pub fn placement(kind: SegmentKind, query: &[u8], reference: &[u8], q_start: u32
     Placement {
         kind,
         alleles: vec![0],
+        shifted: Vec::new(),
         clip: ClipIndex::build(&alignment, query, &profile, scoring.gaps),
         evidence: Evidence::default(),
-        anchor: true,
+        anchor: Some(Score::MIN),
         alignment,
     }
 }

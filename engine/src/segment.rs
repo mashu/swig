@@ -288,10 +288,11 @@ impl BatchScratch {
 /// * `accept`: the largest E-value of a hit kept at all — at most one chance
 ///   hit of that score is expected in the window.
 /// * `anchor`: the largest E-value of a hit that can *anchor* a call. A read
-///   is called only when its path contains an anchor ([`Placement::anchor`]),
-///   so a random read — whose best V or J is never that significant — gets
-///   no call, while a J downstream of a significant V needs only `accept`:
-///   given the V, a J is expected there.
+///   is called only when a segment of its path keeps a clip that is this
+///   significant ([`Placement::anchors`]), so a random read — whose best V
+///   or J is never that significant — gets no call, while a J downstream of
+///   a significant V needs only `accept`: given the V, a J is expected
+///   there.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EvalueGates {
     pub accept: f64,
@@ -950,7 +951,8 @@ impl<R: Retriever> SegmentStage<R> {
         );
         placement.anchor = self
             .significance
-            .is_some_and(|s| local >= s.min_score(request.window.len(), s.gates.anchor));
+            .map(|s| s.min_score(request.window.len(), s.gates.anchor))
+            .filter(|&floor| local >= floor);
         if self.accept.allows(&placement.evidence) {
             let at = accepted.partition_point(|&s| s >= local);
             accepted.insert(at, local);

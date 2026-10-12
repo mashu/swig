@@ -3,48 +3,48 @@
 //! Input: all admitted V, D and J placements of one oriented query.
 //! Output: a [`CallPath`] — an ordered list of clipped placements.
 //!
-//! Two implementations:
-//! * [`PlacementDag`] — the note's target architecture: semi-Markov Viterbi
-//!   over placements with a pluggable [`Grammar`] (VJ / VDJ / VDDJ …) and
-//!   [`PathModel`] (bonuses, D-presence prior, N/P edge scores). It subsumes
-//!   AER-R: "candidate A" and "candidate B" are two particular cuts of an
-//!   overlap, and the DAG evaluates *every* cut exactly.
-//! * [`ResidualAdjudicator`] — the ordinary commit-V/J-then-D path, kept as a
-//!   baseline and for regression comparisons.
+//! [`PlacementDag`] is the note's target architecture: semi-Markov Viterbi
+//! over placements with a pluggable [`Grammar`] and [`PathModel`]
+//! (presence priors, N/P edge scores). It evaluates every cut of an
+//! overlap exactly, including the two extreme cuts (the D takes the
+//! overlap, or the V or J does). The note's ordinary path, which commits V
+//! and J first and searches a D in the residual between them, was a
+//! baseline exhibiting "V/J eat D"; the DAG replaced it.
 //!
 //! [`PlacementDag`] also reads the objective as a distribution over paths and
 //! cuts, `P ∝ exp(nats)`, and returns posterior [`Marginals`] of the
 //! placements and of the D count by forward–backward over the same DAG, with
 //! alignment evidence rescored at the read's own divergence. Both passes read
-//! one [`ReadModel`]: under [`CallModel::PerRead`] the call is a mode of the
+//! one per-read model, `ReadModel`: under [`CallModel::PerRead`] the call is a mode of the
 //! reported posterior.
 
 mod dag;
 mod decode;
 mod lattice;
 mod model;
+#[cfg(test)]
+mod oracle;
 mod posterior;
-mod residual;
 mod units;
 
-pub use dag::{DagScratch, PlacementDag};
-pub use decode::{DAlleleDecoding, Topology, Within};
+pub use dag::{DagScratch, Mode, PlacementDag};
+pub use decode::DAlleleDecoding;
 pub use model::{EngineeringObjective, Grammar, PathModel, VdjGrammar};
 pub use posterior::{MAX_SPREAD, Marginals, OVERLAP_SPREAD, PosteriorScratch};
-pub use residual::{ResidualAdjudicator, ResidualScratch};
 pub use units::{
-    CallModel, EvidenceModel, EvidenceScale, PathNats, ReadModel, UNITS_PER_NAT, Units, divergence,
+    CallModel, EvidenceModel, EvidenceScale, PathNats, UNITS_PER_NAT, Units, divergence,
 };
 
 use std::cmp::Ordering;
 
 use crate::clip::ClipSpan;
+use crate::germline::AlleleId;
 use crate::placement::Placement;
 use crate::scoring::Score;
 
 /// Path objective with its tie rules built in, compared lexicographically:
 ///
-/// 1. `score` — the objective, in fixed scores or in a [`ReadModel`]'s units;
+/// 1. `score` — the objective, in fixed scores or in a read model's units;
 /// 2. fewer D segments ("with-D must strictly beat no-D");
 /// 3. `support` — the summed *unclipped* scores of the path's placements.
 ///
@@ -85,10 +85,10 @@ pub struct CalledSegment {
     pub exit: u32,
     /// The retained sub-alignment (its bounds may be tighter than the cuts).
     pub span: ClipSpan,
-    /// Chosen by its allele's posterior marginal
-    /// ([`DAlleleDecoding::MaxMarginal`]), so that allele is reported first;
-    /// otherwise the call's tie rules order co-optimal names.
-    pub by_marginal: bool,
+    /// The allele chosen by its posterior marginal
+    /// ([`DAlleleDecoding::MaxMarginal`]), one of the placement's, which is
+    /// reported first; `None`: the call's tie rules order co-optimal names.
+    pub allele: Option<AlleleId>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -107,12 +107,15 @@ pub struct CallPath {
 pub trait Adjudicator: Send + Sync {
     type Scratch: Default + Send;
 
-    fn adjudicate(
-        &self,
-        query_len: usize,
-        placements: &[Placement],
-        scratch: &mut Self::Scratch,
-    ) -> Option<CallPath>;
+    fn adjudicate(&self, placements: &[Placement], scratch: &mut Self::Scratch)
+    -> Option<CallPath>;
+
+    /// The smallest local score a D placement needs to matter: one that
+    /// scores less can be neither called nor given probability, so the D
+    /// stage need not keep it. `Score::MIN` keeps every D.
+    fn d_score_floor(&self) -> Score {
+        Score::MIN
+    }
 
     /// Posterior marginals of `placements` given the adjudicated `path`, for
     /// adjudicators with a probabilistic reading that are configured to

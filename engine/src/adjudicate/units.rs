@@ -24,40 +24,44 @@
 //! Every term of a path is then an integer, so the DAG's maximum and its ties
 //! are exact, and the posterior reads the same integers as nats,
 //! `P(path, cuts) ∝ e^{units/F}` ([`ReadModel::nats`]): the call is a mode of
-//! the reported distribution. At `p̂ = δ0`, `u_r = u0` and `v_r = 0`, so the
-//! per-read model is the fixed model times `u0`, and the fixed model
-//! ([`ReadModel::fixed`], one unit per score unit) is its exact special case.
+//! the reported distribution. At `p̂ = δ0`, `u_r = u0` and `v_r = 0` for
+//! every kind whose match and mismatch scores have `λ0` as their own
+//! Karlin–Altschul λ (all three by default), so the per-read model is then
+//! the fixed model times `u0`, and the fixed model ([`ReadModel::fixed`], one
+//! unit per score unit) is its exact special case.
 //! `F` is a power of two, so `units/F` is exact in `f64`; a mismatch at
 //! `p̂ = 10⁻⁴` is about `−6·10⁵` units, so `i64` holds any read.
 //!
-//! **The D cost.** `P*_D` ([`crate::config::DPrior`]) is derived as prior odds,
-//! but the call uses it as a significance threshold against chance D hits in
-//! the random N/P sequence of a junction. Their null distribution does not
-//! depend on `p̂` and is dominated by exact runs. A cost that is constant in
-//! nats would make specificity depend on divergence: an exact 5-mer is worth
-//! `5·a(p̂) = 6.93` nats at low `p̂`, above `λ0·P*_D = 6.62` for
-//! `P*_D = 10.45`, while the fixed scale rejects it (10 < 10.45). The cost
-//! is therefore read at the read's scale, as `P*_D/m` matched D columns
-//! (`m` the D match score, 2):
+//! **The presence costs.** `P*_D` and `P*_J` ([`crate::config::DPrior`]) are
+//! derived as prior odds, but the call uses them as significance thresholds
+//! against chance hits in random sequence: the N/P bases of a junction, or
+//! whatever a read holds where its J would be. Their null distribution does
+//! not depend on `p̂` and is dominated by exact runs. A cost that is
+//! constant in nats would make specificity depend on divergence: an exact
+//! 5-mer is worth `5·a(p̂) = 6.93` nats at low `p̂`, above `λ0·P*_D = 6.62`
+//! for `P*_D = 10.45`, while the fixed scale rejects it (10 < 10.45). Each
+//! kind's cost is therefore read at the read's scale, as `P*_k/m` matched
+//! columns of that kind (`m` its match score, 2):
 //!
 //! ```text
-//! c_D(p̂) = (P*_D / m) · a(p̂)       units: ⌊P*_D · (m·u_D + v_D) / m⌋
+//! c_k(p̂) = (P*_k / m) · a(p̂)       units: ⌊P*_k · (m·u_k + v_k) / m⌋
 //! ```
 //!
-//! An exact `k`-mer is worth `k·a(p̂)`, so exact runs of `⌊P*_D/m⌋` bases lose
-//! and runs of `⌊P*_D/m⌋ + 1` win at every `p̂`, by `min(f, 1 − f)·a(p̂)` with
-//! `f` the fraction of `P*_D/m` (0.17 and 0.22 for the synthetic and the
-//! human IGH database): the fixed model's admitted exact-run classes,
-//! without relying on ties. At `δ0` it is `λ0·P*_D`. The
+//! An exact `n`-mer is worth `n·a(p̂)`, so exact runs of `⌊P*_k/m⌋` bases lose
+//! and runs of `⌊P*_k/m⌋ + 1` win at every `p̂`, by `min(f, 1 − f)·a(p̂)` with
+//! `f` the fraction of `P*_k/m` (for D, 0.17 and 0.22 for the synthetic and
+//! the human IGH database): the fixed model's admitted exact-run classes,
+//! without relying on ties. At `δ0` it is `λ0·P*_k`. The
 //! floor is the faithful rounding: an integer value beats a real cost `c`
 //! exactly when it beats `⌊c⌋`. Conditioning the cost on `p̂` does not use
 //! the junction twice, because `p̂` comes from columns outside it.
 
 use crate::germline::SegmentKind;
 use crate::placement::Placement;
-use crate::scoring::Score;
+use crate::scoring::{AffineScoring, Score};
+use crate::stats::KarlinAltschul;
 
-/// An integer value in a [`ReadModel`]'s units.
+/// An integer value in a read model's units (see the module documentation).
 pub type Units = i64;
 
 /// `F`: units per nat of the per-read model.
@@ -66,11 +70,11 @@ pub const UNITS_PER_NAT: f64 = 65536.0;
 /// Which model the Viterbi call maximises.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CallModel {
-    /// The read's own model ([`ReadModel::at`]): the same integers as the
+    /// The read's own model (`ReadModel::at`): the same integers as the
     /// posterior, so the call is a mode of the reported distribution.
     #[default]
     PerRead,
-    /// The fixed scores ([`ReadModel::fixed`]). The posterior still reads
+    /// The fixed scores (`ReadModel::fixed`). The posterior still reads
     /// evidence at the read's divergence ([`EvidenceModel::nats`]), so the
     /// call need not be its mode.
     FixedScale,
@@ -113,9 +117,24 @@ pub struct EvidenceModel {
     /// Match and mismatch score per rearranged kind ([`SegmentKind::REARRANGED`]), indexed by
     /// [`SegmentKind::index`].
     pub substitution: [(Score, Score); 3],
+    /// Nats per score unit of each kind's presence cost `P*_k`: the
+    /// Karlin–Altschul λ of the kind's scoring, the one
+    /// [`crate::config::DPrior::cost`] derives `P*_k` with (1 without one).
+    pub presence_lambda: [f64; 3],
 }
 
 impl EvidenceModel {
+    /// The model of the V, D and J scorings, `None` when the V scoring has
+    /// no Karlin–Altschul λ (its scores are then not log-odds).
+    pub fn new(scorings: [&AffineScoring; 3]) -> Option<Self> {
+        let lambda = |s: &AffineScoring| KarlinAltschul::ungapped(s).map(|ka| ka.lambda);
+        Some(Self {
+            lambda: lambda(scorings[0])?,
+            substitution: scorings.map(|s| (s.matched, s.mismatch)),
+            presence_lambda: scorings.map(|s| lambda(s).unwrap_or(1.0)),
+        })
+    }
+
     /// Evidence scales of the three rearranged kinds at divergence `p`.
     pub fn evidence(&self, p: f64) -> [EvidenceScale; 3] {
         self.substitution
@@ -130,13 +149,13 @@ impl EvidenceModel {
     }
 
     /// The posterior of a [`CallModel::FixedScale`] call: evidence at `p`,
-    /// unquantised, and the prior terms, the D cost `P*_D` included, at
-    /// `lambda`.
-    pub fn nats(&self, p: f64, d_presence: f64) -> PathNats {
+    /// unquantised, the prior terms at `lambda`, and the presence costs at
+    /// the λ they were derived with, `λ_k·P*_k = ln(N·L) − ln odds`.
+    pub fn nats(&self, p: f64, presence: [f64; 3]) -> PathNats {
         PathNats {
             lambda: self.lambda,
             evidence: self.evidence(p),
-            d_cost: self.lambda * d_presence,
+            presence: std::array::from_fn(|k| self.presence_lambda[k] * presence[k]),
         }
     }
 }
@@ -149,50 +168,53 @@ pub struct PathNats {
     /// Alignment evidence per rearranged kind ([`SegmentKind::REARRANGED`]), indexed by
     /// [`SegmentKind::index`].
     pub evidence: [EvidenceScale; 3],
-    /// What including a D costs.
-    pub d_cost: f64,
+    /// What including a segment costs, per rearranged kind.
+    pub presence: [f64; 3],
 }
 
 /// One read's model in integer units (see the module documentation).
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ReadModel {
+pub(crate) struct ReadModel {
     /// Units per nat.
     per_nat: f64,
     /// Units per score unit of a prior term or gap.
     u0: Units,
     /// `(u_r, v_r)` per [`SegmentKind::index`].
     affine: [(Units, Units); 3],
-    /// What including a D costs.
-    d_cost: Units,
+    /// What including a segment costs, per [`SegmentKind::index`].
+    presence: [Units; 3],
 }
 
 impl ReadModel {
     /// The fixed scale: one unit per score unit (`u0 = u_r = 1`, `v_r = 0`),
-    /// `λ` nats each, and the D cost `⌊P*_D⌋`.
-    pub fn fixed(lambda: f64, d_presence: f64) -> Self {
+    /// `λ` nats each, and the presence costs `⌊P*_k⌋`.
+    pub fn fixed(lambda: f64, presence: [f64; 3]) -> Self {
         Self {
             per_nat: 1.0 / lambda,
             u0: 1,
             affine: [(1, 0); 3],
-            d_cost: d_presence.floor() as Units,
+            presence: presence.map(|cost| cost.floor() as Units),
         }
     }
 
-    /// The read's own model at divergence `p`, in `1/F` nats, with the D cost
-    /// `c_D(p)` derived from `P*_D` (`d_presence`).
-    pub fn at(model: &EvidenceModel, p: f64, d_presence: f64) -> Self {
+    /// The read's own model at divergence `p`, in `1/F` nats, with the
+    /// presence costs `c_k(p)` derived from `P*_k` (`presence`).
+    pub fn at(model: &EvidenceModel, p: f64, presence: [f64; 3]) -> Self {
         let quantise = |nats: f64| (UNITS_PER_NAT * nats).round() as Units;
         let affine = model
             .evidence(p)
             .map(|e| (quantise(e.lambda), quantise(e.mu)));
-        let matched = model.substitution[SegmentKind::D.index()].0;
-        let (u, v) = affine[SegmentKind::D.index()];
-        let column = (Units::from(matched) * u + v) as f64;
+        let cost = |kind: SegmentKind| {
+            let matched = model.substitution[kind.index()].0;
+            let (u, v) = affine[kind.index()];
+            let column = (Units::from(matched) * u + v) as f64;
+            (presence[kind.index()] * column / f64::from(matched)).floor() as Units
+        };
         Self {
             per_nat: UNITS_PER_NAT,
             u0: quantise(model.lambda),
             affine,
-            d_cost: (d_presence * column / f64::from(matched)).floor() as Units,
+            presence: SegmentKind::REARRANGED.map(cost),
         }
     }
 
@@ -212,9 +234,10 @@ impl ReadModel {
         Units::from(k) * self.u0
     }
 
-    /// What including a D costs.
-    pub fn d_cost(&self) -> Units {
-        self.d_cost
+    /// What including a segment of `kind` costs.
+    #[inline]
+    pub fn presence(&self, kind: SegmentKind) -> Units {
+        self.presence[kind.index()]
     }
 
     /// The same model in nats, `units / F` exactly (up to `f64` rounding of
@@ -227,7 +250,7 @@ impl ReadModel {
                 lambda: nats(u),
                 mu: nats(v),
             }),
-            d_cost: nats(self.d_cost),
+            presence: self.presence.map(nats),
         }
     }
 }
@@ -290,7 +313,6 @@ mod tests {
     use super::*;
     use crate::alphabet::N;
     use crate::scoring::AffineScoring;
-    use crate::stats::KarlinAltschul;
 
     /// An ungapped placement of `kind` on `query[q_start..q_start + len]`
     /// with mismatches at the `mismatched` offsets.
@@ -343,9 +365,36 @@ mod tests {
 
     fn model() -> EvidenceModel {
         let scoring = AffineScoring::new(2, -3, -9, -1);
-        EvidenceModel {
-            lambda: KarlinAltschul::ungapped(&scoring).expect("λ").lambda,
-            substitution: [(2, -3); 3],
+        EvidenceModel::new([&scoring; 3]).expect("λ")
+    }
+
+    /// Under `--calls fixed` the posterior charges a presence cost at the λ
+    /// it was derived with: `P*_D = ln(N·L)/λ_D` costs `ln(N·L)` nats even
+    /// when the D scoring's λ is not the V scoring's.
+    #[test]
+    fn fixed_scale_posterior_charges_the_derived_presence_prior_in_nats() {
+        use crate::config::{DPrior, DSearchSpace};
+        let (v, d) = (
+            AffineScoring::new(2, -3, -13, -1),
+            AffineScoring::new(2, -4, -13, -1),
+        );
+        let space = DSearchSpace {
+            genes: 30,
+            offsets: 1,
+        };
+        let presence = [
+            0.0,
+            DPrior::DERIVED.cost(space, &d),
+            DPrior::DERIVED.cost(space, &v),
+        ];
+        let model = EvidenceModel::new([&v, &d, &v]).expect("λ");
+        assert_ne!(model.presence_lambda[1], model.lambda);
+        for p in [0.01, 0.112, 0.3] {
+            let nats = model.nats(p, presence);
+            assert_eq!(nats.presence[0], 0.0);
+            for k in [1, 2] {
+                assert!((nats.presence[k] - 750f64.ln()).abs() < 1e-9, "{nats:?}");
+            }
         }
     }
 
@@ -381,8 +430,9 @@ mod tests {
         let m = model();
         let delta0 = m.log_odds_divergence(SegmentKind::D);
         for d_presence in [10.0, 11.0] {
-            let read = ReadModel::at(&m, delta0, d_presence);
-            let fixed = ReadModel::fixed(m.lambda, d_presence);
+            let presence = [0.0, d_presence, d_presence - 3.0];
+            let read = ReadModel::at(&m, delta0, presence);
+            let fixed = ReadModel::fixed(m.lambda, presence);
             let u0 = read.prior(1);
             assert_eq!(u0, (UNITS_PER_NAT * m.lambda).round() as Units);
             for kind in SegmentKind::REARRANGED {
@@ -390,7 +440,9 @@ mod tests {
                     assert_eq!(read.column(kind, s), fixed.column(kind, s) * u0);
                 }
             }
-            assert_eq!(read.d_cost(), fixed.d_cost() * u0);
+            for kind in SegmentKind::REARRANGED {
+                assert_eq!(read.presence(kind), fixed.presence(kind) * u0);
+            }
             let lambda = (read.nats().lambda, fixed.nats().lambda);
             assert!(
                 (lambda.0 - lambda.1).abs() <= 0.5 / UNITS_PER_NAT,
@@ -399,51 +451,56 @@ mod tests {
         }
     }
 
-    /// Exact runs of `⌊P*_D/m⌋` bases lose and one base more wins at every
-    /// divergence, by `min(f, 1 − f)·a(p)`, `f` the fraction of `P*_D/m`.
+    /// Exact runs of `⌊P*_k/m⌋` bases lose and one base more wins at every
+    /// divergence, by `min(f, 1 − f)·a(p)`, `f` the fraction of `P*_k/m`:
+    /// for a D and for a J.
     #[test]
-    fn d_cost_keeps_the_fixed_scale_exact_run_classes() {
+    fn presence_costs_keep_the_fixed_scale_exact_run_classes() {
         let m = model();
-        for d_presence in [10.34f64, 10.45, 10.55, 11.2] {
-            let runs = (d_presence / 2.0).floor() as Units;
-            let f = d_presence / 2.0 - runs as f64;
+        for cost in [7.27f64, 7.91, 10.34, 10.45, 10.55, 11.2] {
+            let runs = (cost / 2.0).floor() as Units;
+            let f = cost / 2.0 - runs as f64;
             let share = f.min(1.0 - f) - 1e-3;
-            let fixed = ReadModel::fixed(m.lambda, d_presence);
-            // The fixed scale: 2k > ⌊P*⌋ exactly for k > runs.
-            assert!(2 * runs <= fixed.d_cost() && 2 * (runs + 1) > fixed.d_cost());
-            for i in 0..64 {
-                let p = 1e-4 * (0.5e4f64).powf(f64::from(i) / 63.0);
-                let read = ReadModel::at(&m, p, d_presence);
-                let a = read.column(SegmentKind::D, 2);
-                let margin = (a as f64 * share) as Units;
-                assert!(runs * a + margin < read.d_cost(), "{d_presence} at {p}");
-                assert!(
-                    (runs + 1) * a > read.d_cost() + margin,
-                    "{d_presence} at {p}"
-                );
+            let presence = [0.0, cost, cost];
+            let fixed = ReadModel::fixed(m.lambda, presence);
+            for kind in [SegmentKind::D, SegmentKind::J] {
+                // The fixed scale: 2k > ⌊P*⌋ exactly for k > runs.
+                let charged = fixed.presence(kind);
+                assert!(2 * runs <= charged && 2 * (runs + 1) > charged);
+                for i in 0..64 {
+                    let p = 1e-4 * (0.5e4f64).powf(f64::from(i) / 63.0);
+                    let read = ReadModel::at(&m, p, presence);
+                    let a = read.column(kind, 2);
+                    let margin = (a as f64 * share) as Units;
+                    let charged = read.presence(kind);
+                    assert!(runs * a + margin < charged, "{cost} at {p}");
+                    assert!((runs + 1) * a > charged + margin, "{cost} at {p}");
+                }
             }
+            assert_eq!(fixed.presence(SegmentKind::V), 0);
         }
     }
 
     #[test]
     fn nats_are_units_over_f() {
         let m = model();
-        let read = ReadModel::at(&m, 0.02, 10.45);
+        let read = ReadModel::at(&m, 0.02, [0.0, 10.45, 7.91]);
         let nats = read.nats();
         let exact = m.evidence(0.02)[0];
         assert!((nats.evidence[0].lambda - exact.lambda).abs() <= 0.5 / UNITS_PER_NAT);
         assert!((nats.evidence[0].mu - exact.mu).abs() <= 0.5 / UNITS_PER_NAT);
-        assert_eq!(
-            nats.d_cost * UNITS_PER_NAT,
-            read.d_cost() as f64,
-            "a power-of-two F divides exactly"
-        );
-        // c_D(p) = (P*_D/m)·a(p) to within the quantisation.
+        for kind in SegmentKind::REARRANGED {
+            assert_eq!(
+                nats.presence[kind.index()] * UNITS_PER_NAT,
+                read.presence(kind) as f64,
+                "a power-of-two F divides exactly"
+            );
+        }
+        // c_k(p) = (P*_k/m)·a(p) to within the quantisation.
         let a = (4.0f64 * 0.98).ln();
-        assert!(
-            (nats.d_cost - 10.45 / 2.0 * a).abs() < 1e-3,
-            "{}",
-            nats.d_cost
-        );
+        let d = nats.presence[SegmentKind::D.index()];
+        assert!((d - 10.45 / 2.0 * a).abs() < 1e-3, "{d}");
+        let j = nats.presence[SegmentKind::J.index()];
+        assert!((j - 7.91 / 2.0 * a).abs() < 1e-3, "{j}");
     }
 }

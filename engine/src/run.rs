@@ -28,26 +28,23 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io::{self, BufRead, Write};
 
-use crate::adjudicate::{CallModel, DAlleleDecoding, ResidualAdjudicator};
-use crate::admission::DefaultAdmission;
-use crate::align::{Backend, InterSequenceGotoh};
+use crate::adjudicate::{CallModel, DAlleleDecoding};
+use crate::align::Backend;
 use crate::alphabet::encode;
 use crate::annotate::{AnnotateOptions, ChainType};
 use crate::batch::assign_map;
-use crate::config::{BuildError, DPrior, DefaultAssigner, DefaultVRetriever, EngineConfig};
+use crate::config::{BuildError, DPrior, DefaultAssigner, EngineConfig};
 use crate::double_d::{self, DoubleDMode, DoubleDOptions, DoubleDScreen};
 use crate::germline::SegmentKind;
 use crate::orient::OrientationPolicy;
-use crate::pipeline::{AlleleCatalog, Assigner, VdjAssigner};
+use crate::pipeline::{AlleleCatalog, VdjAssigner};
 use crate::prepare::PreparedDatabase;
 use crate::profiles::CallingProfile;
 use crate::reads::{ReadError, ReadReader, ReadRecord};
 use crate::report::{AirrRecord, SupportModels};
-use crate::retrieve::{ExhaustiveRetriever, LmerMaskRetriever};
 use crate::scoring::{AffineScoring, Score};
 use crate::segment::HitAcceptance;
 use crate::stats::KarlinAltschul;
-use crate::window::{ExpandedResidual, WithAnchorWindow};
 
 /// Reads assigned per batch by [`Run::write_airr`] (bounds memory on large
 /// inputs). swig-cli keeps more records than this in flight when it streams
@@ -100,10 +97,8 @@ pub struct RunOptions {
     pub strand: Strand,
     /// Add the conserved-anchor D window.
     pub anchor_window: bool,
-    /// Report posterior probabilities (the residual adjudicator has none).
+    /// Report posterior probabilities.
     pub posterior: bool,
-    /// Commit V and J, then search D in the residual, instead of the DAG.
-    pub residual: bool,
     /// The model the call maximises; `None` keeps the profile's.
     pub calls: Option<CallModel>,
     /// How the reported D allele is chosen; `None` keeps the profile's.
@@ -140,7 +135,6 @@ impl Default for RunOptions {
             strand: Strand::Both,
             anchor_window: true,
             posterior: true,
-            residual: false,
             calls: None,
             d_allele: None,
             d_presence_rate: None,
@@ -185,7 +179,7 @@ fn with_mismatch(scoring: AffineScoring, mismatch: Score) -> AffineScoring {
 
 impl RunOptions {
     /// Every option [`Self::set`] reads, and whether it takes a value.
-    pub const NAMES: [(&'static str, bool); 24] = [
+    pub const NAMES: [(&'static str, bool); 23] = [
         ("profile", true),
         ("chain", true),
         ("strand", true),
@@ -209,7 +203,6 @@ impl RunOptions {
         ("double-d-min-gain", true),
         ("no-anchor-window", false),
         ("no-posterior", false),
-        ("residual", false),
     ];
 
     /// Whether option `name` takes a value; `None` for an unknown option.
@@ -331,7 +324,6 @@ impl RunOptions {
             }
             "no-anchor-window" => self.anchor_window = false,
             "no-posterior" => self.posterior = false,
-            "residual" => self.residual = true,
             _ => unreachable!("every name in NAMES is handled"),
         }
         Ok(())
@@ -349,8 +341,7 @@ impl RunOptions {
         config.options.min_identity = self.min_identity.unwrap_or(0.0);
         config.anchor_window = self.anchor_window;
         config.simd = self.simd;
-        // The residual adjudicator computes no posteriors.
-        config.posterior = self.posterior && !self.residual;
+        config.posterior = self.posterior;
         if let Some(calls) = self.calls {
             config.calls = calls;
         }
@@ -454,23 +445,6 @@ pub struct Rows {
     pub tally: Tally,
 }
 
-/// The default assigner with the residual adjudicator swapped in.
-type ResidualAssigner = Assigner<
-    InterSequenceGotoh,
-    DefaultVRetriever,
-    ExhaustiveRetriever,
-    LmerMaskRetriever,
-    WithAnchorWindow<ExpandedResidual>,
-    DefaultAdmission,
-    ResidualAdjudicator,
->;
-
-/// The assigner of a run; each variant monomorphises the pipeline once.
-enum Engine {
-    Dag(DefaultAssigner),
-    Residual(ResidualAssigner),
-}
-
 /// What a sequence's rows are, besides the identifier and qualities.
 #[derive(Clone, Debug)]
 struct Assigned {
@@ -555,7 +529,7 @@ fn assigned<T: VdjAssigner + AlleleCatalog + Sync>(
 
 /// An assigner built from [`RunOptions`] and a database, writing AIRR rows.
 pub struct Run {
-    engine: Engine,
+    assigner: DefaultAssigner,
     support: SupportModels,
     threads: usize,
     c_prefix_identity: Option<f64>,
@@ -584,16 +558,8 @@ impl Run {
             .segment(SegmentKind::D)
             .filter(|_| options.double_d.mode != DoubleDMode::Off)
             .map(|d| DoubleDScreen::new(d.set(), options.double_d));
-        let engine = if options.residual {
-            Engine::Residual(assigner.with_adjudicator(ResidualAdjudicator {
-                min_retained: config.min_retained,
-                ..ResidualAdjudicator::default()
-            }))
-        } else {
-            Engine::Dag(assigner)
-        };
         Ok(Self {
-            engine,
+            assigner,
             support,
             threads: options.threads,
             c_prefix_identity: options.c_prefix_identity,
@@ -605,10 +571,7 @@ impl Run {
 
     /// The alignment kernel the run uses.
     pub fn backend(&self) -> Backend {
-        match &self.engine {
-            Engine::Dag(assigner) => assigner.aligner.backend(),
-            Engine::Residual(assigner) => assigner.aligner.backend(),
-        }
+        self.assigner.aligner.backend()
     }
 
     /// The AIRR TSV header, without a line break.
@@ -633,24 +596,14 @@ impl Run {
                 fresh.push(sequence);
             }
         }
-        let found = match &self.engine {
-            Engine::Dag(a) => assigned(
-                a,
-                &self.support,
-                &fresh,
-                self.threads,
-                self.c_prefix_identity,
-                self.screen.as_ref(),
-            ),
-            Engine::Residual(a) => assigned(
-                a,
-                &self.support,
-                &fresh,
-                self.threads,
-                self.c_prefix_identity,
-                self.screen.as_ref(),
-            ),
-        };
+        let found = assigned(
+            &self.assigner,
+            &self.support,
+            &fresh,
+            self.threads,
+            self.c_prefix_identity,
+            self.screen.as_ref(),
+        );
         let batch: HashMap<&[u8], Assigned> = fresh.into_iter().zip(found).collect();
         let mut rows = Rows::default();
         for (index, record) in records.iter().enumerate() {
@@ -767,7 +720,6 @@ mod tests {
             ("double-d-min-gain", Some("6")),
             ("no-anchor-window", None),
             ("no-posterior", None),
-            ("residual", None),
         ] {
             options.set(name, value).unwrap();
         }
@@ -777,7 +729,6 @@ mod tests {
             strand: Strand::Reverse,
             anchor_window: false,
             posterior: false,
-            residual: true,
             calls: Some(CallModel::FixedScale),
             d_allele: Some(DAlleleDecoding::MaxMarginal),
             d_presence_rate: Some(0.9),
@@ -824,7 +775,8 @@ mod tests {
             ("double-d", Some("some")),
             ("simd", Some("mmx")),
             ("profile", None),
-            ("residual", Some("yes")),
+            ("no-posterior", Some("yes")),
+            ("residual", None),
             ("unknown", None),
         ] {
             assert!(options.set(name, value).is_err(), "--{name} {value:?}");

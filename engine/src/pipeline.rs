@@ -25,9 +25,7 @@
 //! Swapping a component changes the type:
 //!
 //! ```ignore
-//! let experimental = assigner
-//!     .with_adjudicator(ResidualAdjudicator::default())
-//!     .with_d_window(ResidualWindow { overlap_margin: 2 });
+//! let scalar = assigner.with_aligner(BandedGotoh);
 //! ```
 
 use std::ops::Range;
@@ -42,6 +40,7 @@ use crate::germline::SegmentKind;
 use crate::locus::{Loci, Locus};
 use crate::orient::{Orientation, OrientationPolicy, StrandIndex};
 use crate::placement::Placement;
+use crate::report::reported_posterior;
 use crate::retrieve::{
     Candidate, ExhaustiveRetriever, LmerMaskRetriever, RetrievalScratch, Retriever,
 };
@@ -216,32 +215,6 @@ impl<A, RV, RJ, RD, W, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj> {
         d_admission: Adm2,
     ) -> Assigner<A, RV, RJ, RD, W, Adm2, Adj> {
         replace!(self { v, j, d, strand, j_window, aligner, d_window, adjudicator, locus_adjudicators, c, options } d_admission: d_admission)
-    }
-
-    /// Swap the adjudicator, for reads of every locus. The D stage keeps
-    /// the D placements the original one needed: built with posteriors, it
-    /// keeps those below the DAG's D floor, so pair an adjudicator without
-    /// its own D significance floor (such as
-    /// [`crate::adjudicate::ResidualAdjudicator`]) with `posterior: false`.
-    pub fn with_adjudicator<Adj2>(
-        self,
-        adjudicator: Adj2,
-    ) -> Assigner<A, RV, RJ, RD, W, Adm, Adj2> {
-        let assigner = self;
-        Assigner {
-            adjudicator,
-            locus_adjudicators: Vec::new(),
-            v: assigner.v,
-            j: assigner.j,
-            d: assigner.d,
-            strand: assigner.strand,
-            j_window: assigner.j_window,
-            aligner: assigner.aligner,
-            d_window: assigner.d_window,
-            d_admission: assigner.d_admission,
-            c: assigner.c,
-            options: assigner.options,
-        }
     }
 
     pub fn with_options(mut self, options: AssignerOptions) -> Self {
@@ -507,8 +480,7 @@ where
     ) {
         out.reserve(reads.len());
         for (state, placed) in reads.iter().zip(placements.iter_mut()) {
-            let len = state.query.len();
-            let (path, marginals) = self.adjudicate_loci(len, placed, adjudication);
+            let (path, marginals) = self.adjudicate_loci(&state.query, placed, adjudication);
             out.push(Call {
                 orientation: state.orientation.expect("stage 1 orients every read"),
                 query: state.query.clone(),
@@ -530,7 +502,7 @@ where
     /// as each locus' paths are hypotheses of one model.
     fn adjudicate_loci(
         &self,
-        query_len: usize,
+        query: &[u8],
         placed: &[Placement],
         scratch: &mut Adj::Scratch,
     ) -> (Option<CallPath>, Option<Marginals>) {
@@ -538,7 +510,7 @@ where
         let shared = loci.iter().fold(Loci::ANY, |all, &l| all.intersection(l));
         if !shared.is_empty() {
             let adjudicator = self.adjudicator_for(shared.single());
-            return self.adjudicate_read(adjudicator, query_len, placed, scratch);
+            return self.adjudicate_read(adjudicator, query, placed, scratch);
         }
         let all = loci.iter().fold(Loci::NONE, |all, &l| all.union(l));
         // Per locus: the placement ids, the path and the marginals.
@@ -553,7 +525,7 @@ where
             let subset: Vec<Placement> = ids.iter().map(|&i| placed[i].clone()).collect();
             let adjudicator = self.adjudicator_for(Some(locus));
             if let (Some(path), marginals) =
-                self.adjudicate_read(adjudicator, query_len, &subset, scratch)
+                self.adjudicate_read(adjudicator, query, &subset, scratch)
             {
                 found.push((ids, path, marginals));
             }
@@ -607,32 +579,65 @@ where
         (Some(path), marginals)
     }
 
-    /// A path without an anchor ([`Placement::anchor`]) is not a call. A
+    /// A path without an anchor, a segment whose retained clip is
+    /// significant on its own ([`Placement::anchors`]), is not a call. A
     /// path the adjudicator decodes from the posterior replaces the call
-    /// when it keeps an anchor.
+    /// when it keeps an anchor and its D is reported at least as probable
+    /// ([`Self::keeps_the_d_posterior`]).
     fn adjudicate_read(
         &self,
         adjudicator: &Adj,
-        query_len: usize,
+        query: &[u8],
         placed: &[Placement],
         scratch: &mut Adj::Scratch,
     ) -> (Option<CallPath>, Option<Marginals>) {
         let anchored = |path: &CallPath| {
-            !self.requires_anchor() || path.segments.iter().any(|s| placed[s.placement].anchor)
+            !self.requires_anchor()
+                || path
+                    .segments
+                    .iter()
+                    .any(|s| placed[s.placement].anchors(&s.span))
         };
-        let mut path = adjudicator
-            .adjudicate(query_len, placed, scratch)
-            .filter(anchored);
+        let mut path = adjudicator.adjudicate(placed, scratch).filter(anchored);
         let marginals = path
             .as_ref()
             .and_then(|path| adjudicator.marginals(placed, path, scratch));
         if let (Some(called), Some(m)) = (&path, &marginals)
             && let Some(decoded) = adjudicator.decode(placed, called, m, scratch)
             && anchored(&decoded)
+            && self.keeps_the_d_posterior(query, placed, called, &decoded, m)
         {
             path = Some(decoded);
         }
         (path, marginals)
+    }
+
+    /// Whether the report rates `decoded`'s D at least as probable as
+    /// `called`'s. The decoder maximises one allele's posterior marginal;
+    /// the report's probability is that its names include the read's allele
+    /// ([`crate::report::reported_posterior`]), which also counts shorter
+    /// placements whose germline the first allele carries. A switch the
+    /// report rates less probable would contradict the reason for it.
+    fn keeps_the_d_posterior(
+        &self,
+        query: &[u8],
+        placed: &[Placement],
+        called: &CallPath,
+        decoded: &CallPath,
+        marginals: &Marginals,
+    ) -> bool {
+        let Some(d) = self.segment(SegmentKind::D) else {
+            return false;
+        };
+        let posterior = |path: &CallPath| {
+            path.segments
+                .iter()
+                .find(|s| placed[s.placement].kind == SegmentKind::D)
+                .map_or(0.0, |s| {
+                    reported_posterior(placed, query, d.set(), path, s, marginals)
+                })
+        };
+        posterior(decoded) >= posterior(called)
     }
 }
 
