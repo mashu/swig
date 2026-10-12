@@ -338,17 +338,6 @@ impl ConstantStats {
         self.first_gene += usize::from(gene(primary) == gene(&truth.allele));
         self.gene_set += usize::from(genes(&call.names) == genes(&truth.equivalent));
     }
-
-    fn merge(&mut self, other: &ConstantStats) {
-        self.reads += other.reads;
-        self.called += other.called;
-        self.equivalent += other.equivalent;
-        self.first_gene += other.first_gene;
-        self.gene_set += other.gene_set;
-        self.over_call += other.over_call;
-        self.genes_listed += other.genes_listed;
-        self.genes_equivalent += other.genes_equivalent;
-    }
 }
 
 /// D remnant length strata.
@@ -391,15 +380,6 @@ impl Calibration {
 
     pub fn count(&self) -> usize {
         self.bins.iter().map(|b| b.count).sum()
-    }
-
-    pub fn merge(&mut self, other: &Calibration) {
-        for (a, b) in self.bins.iter_mut().zip(&other.bins) {
-            a.count += b.count;
-            a.posterior += b.posterior;
-            a.correct += b.correct;
-        }
-        self.squared_error += other.squared_error;
     }
 
     /// Expected calibration error: `Σ_bins n_b · |mean posterior − frequency| / n`.
@@ -539,49 +519,6 @@ impl Evaluation {
                 .d_presence
                 .add(posterior, truth.segment(Slot::D).is_some());
         }
-    }
-
-    /// Merge another evaluation (e.g. from another thread or stratum).
-    pub fn merge(&mut self, other: &Evaluation) {
-        fn segment(a: &mut SegmentStats, b: &SegmentStats) {
-            a.reads += b.reads;
-            a.called += b.called;
-            a.exact += b.exact;
-            a.equivalent += b.equivalent;
-            a.truth_listed += b.truth_listed;
-            a.gene += b.gene;
-            a.names += b.names;
-            a.spurious += b.spurious;
-            a.start_error += b.start_error;
-            a.end_error += b.end_error;
-            a.start_exact += b.start_exact;
-            a.end_exact += b.end_exact;
-            a.boundary_reads += b.boundary_reads;
-        }
-        self.reads += other.reads;
-        self.oriented += other.oriented;
-        self.unassigned += other.unassigned;
-        segment(&mut self.v, &other.v);
-        segment(&mut self.d, &other.d);
-        segment(&mut self.d2, &other.d2);
-        segment(&mut self.j, &other.j);
-        for (a, b) in self.d_presence.iter_mut().zip(&other.d_presence) {
-            a.reads += b.reads;
-            a.called += b.called;
-            a.correct += b.correct;
-        }
-        self.junction_reads += other.junction_reads;
-        self.junction_exact += other.junction_exact;
-        for (a, b) in self.c.iter_mut().zip(&other.c) {
-            a.merge(b);
-        }
-        self.calibration.v.merge(&other.calibration.v);
-        self.calibration.d.merge(&other.calibration.d);
-        self.calibration.j.merge(&other.calibration.j);
-        self.calibration
-            .d_presence
-            .merge(&other.calibration.d_presence);
-        self.calibration.c.merge(&other.calibration.c);
     }
 
     pub fn junction_rate(&self) -> f64 {
