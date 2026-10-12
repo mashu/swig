@@ -370,6 +370,10 @@ pub enum GermlineError {
     ConflictingDuplicate {
         name: String,
     },
+    /// The name holds a character that separates names in the report.
+    BadName {
+        name: String,
+    },
 }
 
 impl fmt::Display for GermlineError {
@@ -387,6 +391,11 @@ impl fmt::Display for GermlineError {
                     "allele name '{name}' occurs twice with different sequences"
                 )
             }
+            Self::BadName { name } => write!(
+                f,
+                "allele name '{name}' holds one of ',' ';' '|' (or '+' in a D name), \
+                 which separate names in the report"
+            ),
         }
     }
 }
@@ -479,6 +488,22 @@ impl GermlineSet {
         }
     }
 
+    /// Refuse a name holding a character that separates names in the
+    /// report: `,` between co-optimal names, `;` and `|` in
+    /// `*_alternatives`, and `+` between the two Ds of a double-D pair.
+    fn check_name(&self, name: &str) -> Result<(), GermlineError> {
+        let separators: &[char] = match self.kind {
+            SegmentKind::D => &[',', ';', '|', '+'],
+            _ => &[',', ';', '|'],
+        };
+        if name.contains(separators) {
+            return Err(GermlineError::BadName {
+                name: name.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Gene part of an allele label (`IGHV1-2*02` → `IGHV1-2`).
     pub fn gene_of_name(name: &str) -> &str {
         name.split('*').next().unwrap_or(name)
@@ -505,6 +530,7 @@ impl GermlineSet {
         codes: Vec<u8>,
         anchor: Option<u32>,
     ) -> Result<AlleleId, GermlineError> {
+        self.check_name(name)?;
         // In u64: on 32-bit targets `a as usize + 3` can wrap.
         if anchor.is_some_and(|a| u64::from(a) + 3 > codes.len() as u64) {
             return Err(GermlineError::BadRegions {
@@ -605,11 +631,15 @@ impl GermlineSet {
                 allele.imgt = ImgtNumbering::read(&record.gaps, &allele.codes).map(Box::new);
             }
             if let Some(list) = record.attribute("aliases") {
-                allele.aliases = list
+                let aliases: Vec<String> = list
                     .split(',')
                     .filter(|a| !a.is_empty())
                     .map(str::to_string)
                     .collect();
+                for alias in &aliases {
+                    set.check_name(alias)?;
+                }
+                set.alleles[id as usize].aliases = aliases;
             }
         }
         Ok(set)
@@ -808,6 +838,31 @@ impl GermlineSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A name or alias holding a separator of the report's name lists is
+    /// refused; an IMGT header still reads its allele field.
+    #[test]
+    fn rejects_names_holding_report_separators() {
+        for (kind, header) in [
+            (SegmentKind::V, "V1,x*01"),
+            (SegmentKind::V, "V1;x*01"),
+            (SegmentKind::V, "V1*01 aliases=A;B*01"),
+            (SegmentKind::V, "V1*01 aliases=A|B*01"),
+            (SegmentKind::D, "D1+D2*01"),
+        ] {
+            let found = GermlineSet::from_fasta(kind, &format!(">{header}\nACGTACGT\n"));
+            assert!(
+                matches!(found, Err(GermlineError::BadName { .. })),
+                "{header}: {found:?}"
+            );
+        }
+        let mut set = GermlineSet::new(SegmentKind::J);
+        assert!(set.push("J1|x", b"ACGT", None).is_err());
+        let imgt = GermlineSet::from_fasta(SegmentKind::V, ">X1|V1*01|Homo sapiens|F|\nACGT\n");
+        assert_eq!(imgt.unwrap().allele(0).name, "V1*01");
+        let v = GermlineSet::from_fasta(SegmentKind::V, ">IGHV1-2*02+G35A\nACGT\n");
+        assert_eq!(v.unwrap().allele(0).name, "IGHV1-2*02+G35A");
+    }
 
     /// Per-rearranged-kind arrays (`[_; 3]` indexed by `index()`) cover V, D
     /// and J exactly; C indexes past them and is the one non-rearranged kind.
