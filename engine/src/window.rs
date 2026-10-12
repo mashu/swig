@@ -21,6 +21,9 @@ pub trait DWindowPolicy: Send + Sync {
     );
 }
 
+/// `[b_V − margin, a_J + margin)` of the best V and J, clamped to the read
+/// and to V's start; empty (never inverted) when V reaches past the J's
+/// start by more than the margin.
 fn residual(query_len: usize, v: &[Placement], j: &[Placement], margin: u32) -> Range<usize> {
     let v_best = v.first();
     let j_best = j.first();
@@ -31,7 +34,7 @@ fn residual(query_len: usize, v: &[Placement], j: &[Placement], margin: u32) -> 
     let end = j_best
         .map_or(query_len, |p| (p.q_start() + margin) as usize)
         .min(query_len);
-    start..end
+    start..end.max(start)
 }
 
 /// The ordinary residual `[b_V − margin, a_J + margin)` of the best V and J.
@@ -55,7 +58,8 @@ impl DWindowPolicy for ResidualWindow {
     }
 }
 
-/// Residual widened by `reclaim` bases into V and J.
+/// Residual widened by `reclaim` bases into V and J, searched when it holds
+/// at least `min_width` bases (and at least one).
 ///
 /// This replaces the note's gated *boundary rescue*: D hits that overlap an
 /// over-extended V or J are found up front, and the adjudicator's exact cut
@@ -91,7 +95,7 @@ impl DWindowPolicy for ExpandedResidual {
         out: &mut Vec<Range<usize>>,
     ) {
         let window = residual(query_len, v, j, self.reclaim);
-        if window.len() >= self.min_width {
+        if window.len() >= self.min_width.max(1) {
             out.push(window);
         }
     }
@@ -252,5 +256,32 @@ mod tests {
         let mut anchor = v.clone();
         anchor.anchor = true;
         assert_eq!(window.window(218, &[anchor, v]), 138..218);
+    }
+
+    /// A V that reaches past the J's start by more than the margin makes the
+    /// residual empty; no policy may propose an inverted window.
+    #[test]
+    fn crossing_v_and_j_propose_no_window() {
+        let mut next = crate::testing::rng(6);
+        let query = crate::testing::random_codes(&mut next, 100);
+        let v = crate::testing::placement(SegmentKind::V, &query, &query[..80], 0);
+        let j = crate::testing::placement(SegmentKind::J, &query, &query[40..60], 40);
+        for min_width in [0, 1, 4] {
+            let mut out = Vec::new();
+            ExpandedResidual {
+                reclaim: 12,
+                min_width,
+            }
+            .windows(
+                100,
+                std::slice::from_ref(&v),
+                std::slice::from_ref(&j),
+                &mut out,
+            );
+            assert!(
+                out.iter().all(|w| w.start < w.end),
+                "min_width {min_width}: {out:?}"
+            );
+        }
     }
 }
