@@ -498,6 +498,19 @@ impl<R: Retriever> SegmentStage<R> {
         request.candidates.len() > self.keep.top.saturating_add(1).min(self.keep.cap)
     }
 
+    /// Whether a request ranked without sibling bounds aligns every
+    /// candidate instead of scoring it. A traceback costs about 1.5
+    /// score-only DPs (1.65 on the scalar kernel), so once at least half the
+    /// candidates reach traceback anyway, aligning all of them is cheaper
+    /// than scoring all and aligning the top again; an alignment's score is
+    /// the exact score ([`Aligner`]'s contract), so the ranking is the same.
+    /// The D stage (`top = cap = 32`, about 40 candidates per window) is the
+    /// case.
+    fn aligns_all(&self, request: &SegmentRequest<'_>) -> bool {
+        let traced = self.keep.top.min(self.keep.cap);
+        request.candidates.len() <= traced.saturating_mul(2)
+    }
+
     /// Each candidate's gene leader (see [`TieOrder::GeneLeadersFirst`]) as
     /// a candidate index.
     fn find_leaders(&self, candidates: &[Candidate], leaders: &mut [u32], best: &mut Vec<u32>) {
@@ -542,9 +555,15 @@ impl<R: Retriever> SegmentStage<R> {
                 for (index, request) in requests.iter().enumerate() {
                     if self.needs_scores(request) {
                         let count = request.candidates.len() as u32;
-                        batch.owners.extend((0..count).map(|c| (index, c)));
+                        let jobs = if self.aligns_all(request) {
+                            &mut batch.early
+                        } else {
+                            &mut batch.owners
+                        };
+                        jobs.extend((0..count).map(|c| (index, c)));
                     }
                 }
+                self.trace_early(aligner, requests, dp, batch);
                 self.score_owners(aligner, requests, dp, batch);
             }
             Some(table) => self.rank_with_bounds(aligner, requests, table, dp, batch),
@@ -767,7 +786,7 @@ impl<R: Retriever> SegmentStage<R> {
         self.score_owners(aligner, requests, dp, batch);
     }
 
-    /// Align the siblings in `batch.early`: record each exact score, rank
+    /// Align the candidates in `batch.early`: record each exact score, rank
     /// those that rank, and cache the alignments for traceback.
     fn trace_early<'a, A: Aligner>(
         &'a self,
@@ -1485,6 +1504,96 @@ mod tests {
         ) -> Option<Alignment> {
             self.0.borrow_mut().push((query.as_ptr(), profile, true));
             BandedGotoh.align(query, profile, gaps, band, workspace)
+        }
+    }
+
+    /// A request ranked without sibling bounds whose candidates mostly reach
+    /// traceback anyway (`n ≤ 2·min(top, cap)`, the D stage's case) aligns
+    /// each candidate once and scores none, and keeps what ranking by score
+    /// keeps: the first `cap` candidates by score, then retrieval order.
+    #[test]
+    fn few_candidates_are_aligned_not_scored() {
+        let scoring = AffineScoring::new(2, -3, -13, -1);
+        let mut next = crate::testing::rng(31);
+        let mut set = GermlineSet::new(SegmentKind::D);
+        let alleles: Vec<Vec<u8>> = (0..6)
+            .map(|_| crate::testing::random_codes(&mut next, 20))
+            .collect();
+        for (k, codes) in alleles.iter().enumerate() {
+            let name = format!("IGHD{}-1*01", k + 1);
+            set.push(&name, decode(codes).as_bytes(), None).unwrap();
+        }
+        let segment = Arc::new(PreparedSegment::new(set, &scoring, scoring.gaps));
+        // Allele k contributes its last 20 − 2k bases: six different scores.
+        let mut query = Vec::new();
+        for (k, codes) in alleles.iter().enumerate() {
+            query.extend(crate::testing::random_codes(&mut next, 4));
+            query.extend(&codes[2 * k..]);
+        }
+        let candidates: Vec<Candidate> = [3, 0, 5, 1, 4, 2]
+            .map(|allele| Candidate {
+                allele,
+                band: Band::Full,
+                votes: 0,
+            })
+            .into();
+        for (bound, scored) in [(4, 0), (2, 6)] {
+            let keep = KeepPolicy {
+                top: bound,
+                min_score: 1,
+                cap: bound,
+            };
+            let stage = SegmentStage::new(Arc::clone(&segment), EmptyRetriever, keep);
+            let aligner = Recording::default();
+            let (mut dp, mut batch, mut out) =
+                (Default::default(), BatchScratch::default(), Vec::new());
+            let window = 0..query.len();
+            stage.place_candidates(
+                &aligner,
+                &candidates,
+                &query,
+                window,
+                &mut dp,
+                &mut batch,
+                &mut out,
+            );
+            let runs = aligner.0.into_inner();
+            assert_eq!(
+                runs.iter().filter(|r| !r.2).count(),
+                scored,
+                "top = cap = {bound}"
+            );
+            if scored == 0 {
+                assert_eq!(runs.len(), candidates.len());
+            }
+            // Ranking by exact score, ties in retrieval order; `cap` traced.
+            let score = |c: &Candidate| {
+                let profile = segment.profile(c.allele);
+                let hit = BandedGotoh.score(
+                    &query,
+                    profile,
+                    scoring.gaps,
+                    c.band,
+                    &mut Default::default(),
+                );
+                hit.map_or(0, |hit| hit.score)
+            };
+            let mut ranked: Vec<(Score, usize)> = (0..candidates.len())
+                .map(|i| (score(&candidates[i]), i))
+                .filter(|&(s, _)| s >= keep.min_score)
+                .collect();
+            ranked.sort_by_key(|&(s, i)| (std::cmp::Reverse(s), i));
+            let mut expected: Vec<(AlleleId, Score)> = ranked[..keep.cap.min(ranked.len())]
+                .iter()
+                .map(|&(s, i)| (candidates[i].allele, s))
+                .collect();
+            expected.sort_unstable();
+            let mut kept: Vec<(AlleleId, Score)> = out
+                .iter()
+                .flat_map(|p| p.alleles.iter().map(|&a| (a, p.score())))
+                .collect();
+            kept.sort_unstable();
+            assert_eq!(kept, expected, "top = cap = {bound}");
         }
     }
 
