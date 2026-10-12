@@ -276,15 +276,52 @@ fn parse_args() -> Result<Command, String> {
         };
         *slot = value;
     }
+    args.check()?;
     Ok(Command::Run(Box::new(args)))
+}
+
+impl Args {
+    /// Refuse a command line that lacks an input its mode needs, or gives
+    /// the double-D screen without its sidecar (or the reverse): a usage
+    /// error like any other bad command line.
+    fn check(&self) -> Result<(), String> {
+        let mode = self.mode;
+        let germline = matches!(mode, Mode::Assign | Mode::Prepare | Mode::Simulate);
+        let missing = [
+            (germline && self.files.v.is_none(), "--v V.fasta"),
+            (germline && self.files.j.is_none(), "--j J.fasta"),
+            (mode == Mode::Prepare && self.out.is_none(), "--out DIR"),
+            (mode == Mode::Simulate && self.out.is_none(), "--out PREFIX"),
+            (
+                mode == Mode::Evaluate && self.truth.is_none(),
+                "--truth PREFIX.truth.tsv",
+            ),
+            (
+                mode == Mode::Evaluate && self.input.is_none(),
+                "an AIRR TSV of calls",
+            ),
+            (
+                mode == Mode::Assign && self.input.is_none(),
+                "a reads file (FASTA, FASTQ, AIRR TSV or '-')",
+            ),
+        ];
+        if let Some((_, what)) = missing.iter().find(|(missing, _)| *missing) {
+            return Err(format!("{} needs {what}", mode.name()));
+        }
+        let screening = self.run.double_d.mode != DoubleDMode::Off;
+        if screening != self.double_d_out.is_some() {
+            return Err("--double-d and --double-d-out go together".into());
+        }
+        Ok(())
+    }
 }
 
 /// Read the germline FASTA files and prepare the database, logging its
 /// summary and warnings.
 fn load_database(files: &Files, options: &RunOptions) -> Result<PreparedDatabase, Box<dyn Error>> {
     let read = |path: &str| fs::read_to_string(path).map_err(|e| format!("{path}: {e}"));
-    let v = read(files.v.as_deref().ok_or("--v is required")?)?;
-    let j = read(files.j.as_deref().ok_or("--j is required")?)?;
+    let v = read(files.v.as_deref().expect("checked by Args::check"))?;
+    let j = read(files.j.as_deref().expect("checked by Args::check"))?;
     let d = files.d.as_deref().map(read).transpose()?;
     let c = files.c.as_deref().map(read).transpose()?;
     let texts = GermlineTexts {
@@ -315,7 +352,7 @@ fn load_database(files: &Files, options: &RunOptions) -> Result<PreparedDatabase
 }
 
 fn run_prepare(args: &Args) -> Result<(), Box<dyn Error>> {
-    let out = args.out.as_deref().ok_or("prepare needs --out DIR")?;
+    let out = args.out.as_deref().expect("checked by Args::check");
     let database = load_database(&args.files, &args.run)?;
     database.write(Path::new(out))?;
     let names: Vec<&str> = database.files().iter().map(|&(name, _)| name).collect();
@@ -329,14 +366,8 @@ fn run_assign(args: &Args) -> Result<(), Box<dyn Error>> {
             "swig: warning: debug build, typically 10-50x slower; build with `cargo build --release`"
         );
     }
-    let reads = args
-        .input
-        .as_deref()
-        .ok_or("a reads file (FASTA, FASTQ, AIRR TSV or '-') is required")?;
+    let reads = args.input.as_deref().expect("checked by Args::check");
     let screening = args.run.double_d.mode != DoubleDMode::Off;
-    if screening != args.double_d_out.is_some() {
-        return Err("--double-d and --double-d-out go together".into());
-    }
     let database = load_database(&args.files, &args.run)?;
     let mut run = Run::new(&args.run, database)?;
     let mut sidecar = args
@@ -412,7 +443,7 @@ fn probability(value: &Option<String>, option: &str, default: f64) -> Result<f64
 }
 
 fn run_simulate(args: &Args) -> Result<(), Box<dyn Error>> {
-    let out = args.out.as_deref().ok_or("simulate needs --out PREFIX")?;
+    let out = args.out.as_deref().expect("checked by Args::check");
     let preset = args.preset.as_deref().unwrap_or("mid");
     let mut params = SimParams::preset(preset)
         .ok_or_else(|| format!("unknown preset '{preset}' (easy, mid, train, hard)"))?
@@ -471,14 +502,8 @@ fn read_calls(path: &str) -> Result<HashMap<String, Assignment>, Box<dyn Error>>
 }
 
 fn run_evaluate(args: &Args) -> Result<(), Box<dyn Error>> {
-    let truth_path = args
-        .truth
-        .as_deref()
-        .ok_or("evaluate needs --truth PREFIX.truth.tsv")?;
-    let calls_path = args
-        .input
-        .as_deref()
-        .ok_or("evaluate needs an AIRR TSV of calls")?;
+    let truth_path = args.truth.as_deref().expect("checked by Args::check");
+    let calls_path = args.input.as_deref().expect("checked by Args::check");
     let calls = read_calls(calls_path)?;
     let other = args.other.as_deref().map(read_calls).transpose()?;
     let truth_text = fs::read_to_string(truth_path).map_err(|e| format!("{truth_path}: {e}"))?;
@@ -516,21 +541,25 @@ fn run_evaluate(args: &Args) -> Result<(), Box<dyn Error>> {
             );
         }
     }
-    println!("{evaluation}");
+    // Written, not printed: a closed or full stdout is an error, not a panic.
+    let mut out = io::stdout().lock();
+    writeln!(out, "{evaluation}")?;
     if let Some(other_path) = &args.other {
-        println!("\nfirst: {calls_path}\nsecond: {other_path}\n{paired}");
+        writeln!(out, "\nfirst: {calls_path}\nsecond: {other_path}\n{paired}")?;
     }
+    out.flush()?;
     Ok(())
 }
 
 fn main() -> ExitCode {
     match parse_args() {
+        // A closed stdout leaves no one to tell: neither is an error.
         Ok(Command::Help) => {
-            println!("{USAGE}");
+            let _ = writeln!(io::stdout(), "{USAGE}");
             ExitCode::SUCCESS
         }
         Ok(Command::Version) => {
-            println!("swig {}", env!("CARGO_PKG_VERSION"));
+            let _ = writeln!(io::stdout(), "swig {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
         Ok(Command::Run(args)) => {

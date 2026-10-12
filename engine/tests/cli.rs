@@ -3,7 +3,7 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 /// A small single-locus (IGH) database with header anchors.
 const V: &str = "\
@@ -128,6 +128,80 @@ fn simulate_refuses_out_of_range_parameters() {
             "{option} {value}: {}",
             stderr(&output)
         );
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// evaluate's report goes to a stdout that may be closed or full: that is
+/// an error (exit 1), not a panic.
+#[test]
+fn evaluate_reports_a_failed_write() {
+    let dir = workspace("evaluate");
+    fs::write(dir.join("truth.tsv"), "sequence_id\tv_call\n").unwrap();
+    fs::write(dir.join("calls.tsv"), "sequence_id\tv_call\n").unwrap();
+    let args = ["evaluate", "--truth", "truth.tsv", "calls.tsv"];
+    let output = run(&dir, &args);
+    assert!(output.status.success(), "{}", stderr(&output));
+    // A reader that leaves at once.
+    let mut child = swig(&dir, &args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let output = child.wait_with_output().unwrap();
+    assert!(matches!(output.status.code(), Some(0 | 1)), "{output:?}");
+    assert!(!stderr(&output).contains("panicked"), "{}", stderr(&output));
+    if cfg!(target_os = "linux") {
+        let full = fs::File::create("/dev/full").unwrap();
+        let output = swig(&dir, &args).stdout(full).output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+        assert!(
+            stderr(&output).contains("No space left"),
+            "{}",
+            stderr(&output)
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// A command line without an input its mode needs is a usage error (exit 2
+/// with the usage), like any other bad command line.
+#[test]
+fn missing_inputs_are_usage_errors() {
+    let dir = workspace("usage");
+    for args in [
+        &[][..],
+        &["--v", "V.fasta", "--j", "J.fasta"],
+        &["reads.fasta", "--v", "V.fasta"],
+        &["prepare", "--v", "V.fasta", "--j", "J.fasta"],
+        &["simulate", "--v", "V.fasta", "--j", "J.fasta"],
+        &["evaluate", "--truth", "truth.tsv"],
+        &["evaluate", "calls.tsv"],
+        &[
+            "reads.fasta",
+            "--v",
+            "V.fasta",
+            "--j",
+            "J.fasta",
+            "--double-d",
+            "all",
+        ],
+    ] {
+        let output = run(&dir, args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+        assert!(stderr(&output).contains("usage:"), "{args:?}");
+    }
+    // Help on a stdout that cannot take it does not panic either.
+    if cfg!(target_os = "linux") {
+        let full = fs::File::create("/dev/full").unwrap();
+        let output = swig(&dir, &["--help"]).stdout(full).output().unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
     }
     fs::remove_dir_all(dir).unwrap();
 }
