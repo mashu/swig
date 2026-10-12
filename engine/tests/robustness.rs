@@ -2,6 +2,8 @@
 //! produce malformed output, and must call nothing it cannot support.
 
 use swig::prelude::*;
+use swig::scoring::Score;
+use swig::segment::Significance;
 use swig::sim::{C_STREAM, Rng, SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
 
 fn database() -> SyntheticDatabase {
@@ -255,5 +257,42 @@ fn fixed_tails_after_a_j_are_not_called_c() {
             assert_eq!(last.kind, SegmentKind::J);
             assert!(call.c.is_none(), "{} + {}", j.name, read.len());
         }
+    }
+}
+
+/// A read is called only when the clip a path keeps of some V or J is
+/// significant on its own. Each read here holds 40 exact V bases behind a
+/// 5′ flank that mismatches the allele everywhere, then random bases and no
+/// J: the V's local alignment is significant, but a path that keeps a few
+/// junk bases of its outer flank beside chance D or J hits in the tail is
+/// no call.
+#[test]
+fn a_call_keeps_a_significant_clip() {
+    let db = database();
+    let config = EngineConfig::default();
+    let assigner = assigner(&db, &config);
+    let gates = config.v.evalue.expect("V E-value gates");
+    let significance = Significance::new(&db.v, &config.v.scoring, gates).expect("V statistics");
+    let mut ws = assigner.workspace();
+    let mut rng = Rng::new(17);
+    for v in db.v.alleles().iter().take(20) {
+        let core = v.codes.len() - 40;
+        let mut read: Vec<u8> = v.codes[..core].iter().map(|&c| (c + 1) & 3).collect();
+        read.extend_from_slice(&v.codes[core..]);
+        read.extend_from_slice(&encode(&random(&mut rng, 60)));
+        let call = assigner.assign(&read, &mut ws);
+        let Some(path) = &call.path else {
+            continue;
+        };
+        // The V window is the whole read; a J's is shorter, its floor lower.
+        let floor = significance.min_score(read.len(), gates.anchor);
+        let scores: Vec<Score> = path.segments.iter().map(|s| s.span.score).collect();
+        assert!(
+            path.segments.iter().any(|s| {
+                call.placements[s.placement].kind != SegmentKind::D && s.span.score >= floor
+            }),
+            "{}: called on clips scoring {scores:?}, anchor floor {floor}",
+            v.name
+        );
     }
 }

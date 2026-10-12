@@ -7,7 +7,7 @@
 //! so co-optimal alleles do not multiply DAG work.
 
 use crate::align::Alignment;
-use crate::clip::ClipIndex;
+use crate::clip::{ClipIndex, ClipSpan};
 use crate::evidence::Evidence;
 use crate::germline::{AlleleId, SegmentKind};
 use crate::scoring::Score;
@@ -23,9 +23,10 @@ pub struct Placement {
     pub clip: ClipIndex,
     /// Evidence of the unclipped alignment.
     pub evidence: Evidence,
-    /// Significant enough on its own to call the read (see
-    /// [`crate::segment::EvalueGates`]).
-    pub anchor: bool,
+    /// The score a clipped span of this placement must keep to anchor a
+    /// call, the anchor gate of its window ([`crate::segment::EvalueGates`]);
+    /// `None` when its local alignment never reached it.
+    pub anchor: Option<Score>,
 }
 
 impl Placement {
@@ -46,7 +47,7 @@ impl Placement {
             alignment,
             clip,
             evidence,
-            anchor: false,
+            anchor: None,
         }
     }
 
@@ -68,6 +69,14 @@ impl Placement {
     #[inline]
     pub fn primary_allele(&self) -> AlleleId {
         self.alleles[0]
+    }
+
+    /// Whether `span`, a clip of this placement, anchors a call: the bases
+    /// a path keeps are significant on their own. A significant local
+    /// alignment is not enough, since the outer flank stitched onto it and
+    /// the cuts of a path can leave few of its bases, or junk.
+    pub fn anchors(&self, span: &ClipSpan) -> bool {
+        self.anchor.is_some_and(|floor| span.score >= floor)
     }
 }
 

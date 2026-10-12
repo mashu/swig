@@ -1120,7 +1120,7 @@ mod tests {
             alleles: vec![1],
             clip,
             evidence: Evidence::default(),
-            anchor: true,
+            anchor: Some(Score::MIN),
             alignment,
         });
         (query, placements)

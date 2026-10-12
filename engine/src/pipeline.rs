@@ -607,7 +607,8 @@ where
         (Some(path), marginals)
     }
 
-    /// A path without an anchor ([`Placement::anchor`]) is not a call. A
+    /// A path without an anchor, a segment whose retained clip is
+    /// significant on its own ([`Placement::anchors`]), is not a call. A
     /// path the adjudicator decodes from the posterior replaces the call
     /// when it keeps an anchor.
     fn adjudicate_read(
@@ -618,7 +619,11 @@ where
         scratch: &mut Adj::Scratch,
     ) -> (Option<CallPath>, Option<Marginals>) {
         let anchored = |path: &CallPath| {
-            !self.requires_anchor() || path.segments.iter().any(|s| placed[s.placement].anchor)
+            !self.requires_anchor()
+                || path
+                    .segments
+                    .iter()
+                    .any(|s| placed[s.placement].anchors(&s.span))
         };
         let mut path = adjudicator
             .adjudicate(query_len, placed, scratch)
