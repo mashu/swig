@@ -35,6 +35,7 @@ impl FastaRecord {
 pub enum FastaError {
     SequenceBeforeHeader { line: usize },
     EmptyRecord { header: String },
+    CarriageReturn { line: usize },
 }
 
 impl fmt::Display for FastaError {
@@ -44,6 +45,10 @@ impl fmt::Display for FastaError {
                 write!(f, "sequence data before the first header (line {line})")
             }
             Self::EmptyRecord { header } => write!(f, "record '{header}' has no sequence"),
+            Self::CarriageReturn { line } => write!(
+                f,
+                "line {line}: carriage return inside a line (CR-only line endings?); convert them, e.g. `tr '\\r' '\\n'`"
+            ),
         }
     }
 }
@@ -55,6 +60,11 @@ pub fn parse_fasta(text: &str) -> Result<Vec<FastaRecord>, FastaError> {
     let mut records: Vec<FastaRecord> = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let line = line.trim_end();
+        // CR-only (classic Mac) line endings would read the whole file as
+        // one header without a sequence.
+        if line.contains('\r') {
+            return Err(FastaError::CarriageReturn { line: index + 1 });
+        }
         if let Some(header) = line.strip_prefix('>') {
             if let Some(last) = records.last()
                 && last.sequence.is_empty()
@@ -111,6 +121,21 @@ mod tests {
         assert_eq!(records[0].gaps, [(0, 2), (3, 2), (6, 3)]);
         assert_eq!(records[1].sequence, b"ACTAC");
         assert!(records[1].gaps.is_empty());
+    }
+
+    #[test]
+    fn rejects_cr_only_line_endings() {
+        assert_eq!(
+            parse_fasta(">a\rACGT\r>b\rTTTT\r"),
+            Err(FastaError::CarriageReturn { line: 1 })
+        );
+        assert_eq!(
+            parse_fasta(">a\nAC\rGT\n"),
+            Err(FastaError::CarriageReturn { line: 2 })
+        );
+        let records = parse_fasta(">a\r\nACGT\r\n>b\r\nTT\r\n").unwrap();
+        assert_eq!(records[0].sequence, b"ACGT");
+        assert_eq!(records[1].sequence, b"TT");
     }
 
     #[test]
