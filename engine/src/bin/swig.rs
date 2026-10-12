@@ -25,8 +25,9 @@ use swig::sim::{Assignment, C_STREAM, Evaluation, Paired, Rng, SimParams, Simula
 const USAGE: &str = "\
 usage: swig --v V.fasta --j J.fasta [--d D.fasta] [--c C.fasta] [options] <reads|->
        swig prepare --v V.fasta --j J.fasta [--d D.fasta] [--c C.fasta] [--chain heavy|light] --out DIR
-       swig simulate --v V.fasta --j J.fasta [--d D.fasta] [--c C.fasta] --out PREFIX
-                  [--preset easy|mid|hard] [--reads N] [--seed S] [--rc P] [--shm RATE] [--dd P]
+       swig simulate --v V.fasta --j J.fasta [--d D.fasta] [--c C.fasta] [--chain heavy|light]
+                  --out PREFIX [--preset easy|mid|train|hard] [--reads N] [--seed S]
+                  [--rc P] [--shm RATE] [--dd P]
        swig evaluate --truth PREFIX.truth.tsv <calls.tsv> [other.tsv]
 
 Assigns V(D)J (and C) germline alleles to reads and writes Swig's AIRR
@@ -397,21 +398,40 @@ fn number<T: std::str::FromStr>(
     }
 }
 
+/// Parse an optional probability or per-base rate, which must lie in
+/// `[0, 1]` (not NaN).
+fn probability(value: &Option<String>, option: &str, default: f64) -> Result<f64, String> {
+    let p = number(value, option, default)?;
+    match (0.0..=1.0).contains(&p) {
+        true => Ok(p),
+        false => Err(format!(
+            "{option} expects a value in [0, 1], got '{}'",
+            value.as_deref().unwrap_or_default()
+        )),
+    }
+}
+
 fn run_simulate(args: &Args) -> Result<(), Box<dyn Error>> {
     let out = args.out.as_deref().ok_or("simulate needs --out PREFIX")?;
     let preset = args.preset.as_deref().unwrap_or("mid");
     let mut params = SimParams::preset(preset)
         .ok_or_else(|| format!("unknown preset '{preset}' (easy, mid, train, hard)"))?
-        .with_reverse_complement(number(&args.rc, "--rc", 0.5)?);
+        .with_reverse_complement(probability(&args.rc, "--rc", 0.5)?);
     if args.shm.is_some() {
-        params = params.with_shm(number(&args.shm, "--shm", 0.0)?);
+        params = params.with_shm(probability(&args.shm, "--shm", 0.0)?);
     }
     if args.dd.is_some() {
-        params.include_dd = number(&args.dd, "--dd", 0.0)?;
+        params.include_dd = probability(&args.dd, "--dd", 0.0)?;
     }
     let count: usize = number(&args.count, "--reads", 10_000)?;
+    if count == 0 {
+        return Err("--reads expects a positive count, got '0'".into());
+    }
     let seed: u64 = number(&args.seed, "--seed", 1)?;
     let database = load_database(&args.files, &args.run)?;
+    if params.include_dd > 0.0 && database.d.as_ref().map_or(0, GermlineSet::len) < 2 {
+        eprintln!("swig: warning: --dd has no effect without at least two D alleles");
+    }
     let mut sim = Simulator::new(&database.v, database.d.as_ref(), &database.j, params)?;
     if let Some(c) = &database.c {
         sim = sim.with_constant(c)?;

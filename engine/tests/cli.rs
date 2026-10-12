@@ -89,3 +89,45 @@ fn simulating_a_single_locus_keeps_its_reads() {
     assert_eq!(hash("sim.truth.tsv"), 0xbc14_6828_0a92_8d33);
     fs::remove_dir_all(dir).unwrap();
 }
+
+/// Probabilities and rates outside [0, 1] (a percentage typed for a
+/// fraction, NaN) and an empty simulation are refused, naming the option.
+#[test]
+fn simulate_refuses_out_of_range_parameters() {
+    let dir = workspace("ranges");
+    let simulate = |extra: &[&str]| {
+        let reads: &[&str] = match extra.contains(&"--reads") {
+            true => &[],
+            false => &["--reads", "20"],
+        };
+        let base = ["simulate", "--out", "sim"];
+        run(&dir, &[&base[..], &GERMLINES[..], reads, extra].concat())
+    };
+    for (option, value) in [
+        ("--rc", "50"),
+        ("--rc", "-1"),
+        ("--shm", "3"),
+        ("--shm", "NaN"),
+        ("--shm", "inf"),
+        ("--dd", "7"),
+        ("--reads", "0"),
+    ] {
+        let output = simulate(&[option, value]);
+        assert_eq!(output.status.code(), Some(1), "{option} {value}");
+        assert!(stderr(&output).contains(option), "{}", stderr(&output));
+    }
+    for (option, value) in [
+        ("--rc", "0"),
+        ("--rc", "1"),
+        ("--shm", "0.05"),
+        ("--dd", "1"),
+    ] {
+        let output = simulate(&[option, value]);
+        assert!(
+            output.status.success(),
+            "{option} {value}: {}",
+            stderr(&output)
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
+}

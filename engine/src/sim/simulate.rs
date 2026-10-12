@@ -151,6 +151,8 @@ pub enum SimError {
     Retries(usize),
     /// No J allele shares a locus with a V allele.
     Unpaired,
+    /// A parameter outside its domain ([`SimParams::validate`]).
+    Parameter(String),
 }
 
 impl fmt::Display for SimError {
@@ -162,6 +164,7 @@ impl fmt::Display for SimError {
             }
             Self::Retries(n) => write!(f, "no read met the length limits after {n} attempts"),
             Self::Unpaired => write!(f, "no J allele shares a locus with a V allele"),
+            Self::Parameter(problem) => write!(f, "simulation parameter {problem}"),
         }
     }
 }
@@ -181,7 +184,7 @@ pub struct Simulator<'a> {
     /// The loci of the V alleles together: a J outside them is never drawn.
     v_loci: Loci,
     sets: [Option<&'a GermlineSet>; 4],
-    pub params: SimParams,
+    params: SimParams,
 }
 
 #[derive(Clone, Copy)]
@@ -245,6 +248,7 @@ impl<'a> Simulator<'a> {
             check(d, SegmentKind::D)?;
         }
         check(j, SegmentKind::J)?;
+        params.validate()?;
         let v_loci = v.alleles().iter().fold(Loci::NONE, |u, a| u.union(a.loci));
         if !j.alleles().iter().any(|a| a.loci.pairs_with(v_loci)) {
             return Err(SimError::Unpaired);
@@ -644,6 +648,54 @@ mod tests {
             }
         }
         assert!(tandem > 30, "tandem DD should occur at include_dd = 0.3");
+    }
+
+    /// Parameters outside their domain are refused, not clamped or wrapped
+    /// at sampling time; every preset is valid.
+    #[test]
+    fn invalid_parameters_are_refused() {
+        use crate::sim::random::Rate;
+        let (v, d, j) = sets();
+        let new = |params: SimParams| Simulator::new(&v, Some(&d), &j, params).err();
+        for name in ["easy", "mid", "train", "hard"] {
+            assert_eq!(new(SimParams::preset(name).unwrap()), None, "{name}");
+        }
+        let mid = SimParams::mid();
+        let invalid = [
+            SimParams {
+                include_dd: 7.0,
+                ..mid
+            },
+            mid.with_reverse_complement(1.5),
+            mid.with_reverse_complement(-1.0),
+            mid.with_shm(f64::NAN),
+            mid.with_shm(3.0),
+            SimParams {
+                indel_rate: GatedRate {
+                    p: 0.1,
+                    rate: Rate::Uniform { lo: 0.2, hi: 0.1 },
+                },
+                ..mid
+            },
+            SimParams {
+                n1_length: Count::Uniform { lo: 5, hi: 2 },
+                ..mid
+            },
+            SimParams {
+                d_trim_5p: Count::Geometric { p: 0.0 },
+                ..mid
+            },
+            SimParams {
+                min_length: 1000,
+                ..mid
+            },
+        ];
+        for params in invalid {
+            assert!(
+                matches!(new(params), Some(SimError::Parameter(_))),
+                "{params:?}"
+            );
+        }
     }
 
     #[test]
