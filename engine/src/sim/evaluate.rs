@@ -47,8 +47,10 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::ops::Range;
 
+use super::simulate::{SimulatedRead, Simulator};
 use super::truth::{Slot, TrueSegment, Truth};
 use crate::germline::GermlineSet;
+use crate::pipeline::{AlleleCatalog, Call};
 use crate::report::{AirrRecord, SegmentReport};
 
 fn gene(name: &str) -> &str {
@@ -458,6 +460,24 @@ pub struct Evaluation {
 }
 
 impl Evaluation {
+    /// The evaluation of `calls`, one per read of `reads` (simulated by
+    /// `sim`), as `catalog` reports them in its AIRR records.
+    pub fn of_calls<C: AlleleCatalog>(
+        sim: &Simulator<'_>,
+        reads: &[SimulatedRead],
+        calls: &[Call],
+        catalog: &C,
+    ) -> Self {
+        let mut evaluation = Self::default();
+        for (read, call) in reads.iter().zip(calls) {
+            let sequence = String::from_utf8_lossy(&read.sequence);
+            let record = AirrRecord::from_call("r", &sequence, call, catalog, &[None, None, None]);
+            let truth = Truth::from_read(sim, read, "r");
+            evaluation.add(&truth, &Assignment::from_record(&record));
+        }
+        evaluation
+    }
+
     pub fn add(&mut self, truth: &Truth, call: &Assignment) {
         self.reads += 1;
         let oriented = call.oriented(truth);

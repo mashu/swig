@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use common::Args;
 use swig::prelude::*;
-use swig::sim::{Assignment, Evaluation, SimParams, SimulatedRead, Simulator, Truth};
+use swig::sim::{Evaluation, SimParams, SimulatedRead, Simulator};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::from_env();
@@ -200,13 +200,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let calls = assign_all(&assigner, &queries, threads);
     let seconds = started.elapsed().as_secs_f64();
 
-    let mut evaluation = Evaluation::default();
-    for (read, call) in simulated.iter().zip(&calls) {
-        let sequence = String::from_utf8_lossy(&read.sequence);
-        let record = AirrRecord::from_call("r", &sequence, call, &assigner, &[None, None, None]);
-        let truth = Truth::from_read(&sim, read, "r");
-        evaluation.add(&truth, &Assignment::from_record(&record));
-    }
+    let evaluation = Evaluation::of_calls(&sim, &simulated, &calls, &assigner);
     println!(
         "preset {preset}  profile {}  {} reads  {:.0} reads/s on {threads} thread(s)",
         profile.name(),

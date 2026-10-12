@@ -9,8 +9,7 @@ fn database() -> SyntheticDatabase {
 }
 
 fn assigner(db: &SyntheticDatabase, config: &EngineConfig) -> DefaultAssigner {
-    DefaultAssigner::from_config(config, db.v.clone(), Some(db.d.clone()), db.j.clone())
-        .expect("synthetic database builds")
+    db.assigner(config).expect("synthetic database builds")
 }
 
 /// [`assigner`] with the C stage.

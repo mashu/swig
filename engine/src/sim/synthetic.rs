@@ -22,6 +22,7 @@
 //! the isotype, not the subclass.
 
 use super::random::Rng;
+use crate::config::{BuildError, DefaultAssigner, EngineConfig};
 use crate::germline::{GermlineSet, SegmentKind};
 use crate::translate::codon;
 
@@ -170,6 +171,12 @@ fn snps(
 }
 
 impl SyntheticDatabase {
+    /// The assigner `config` builds over this database's V, D and J (add C
+    /// with [`crate::pipeline::Assigner::with_constant`]).
+    pub fn assigner(&self, config: &EngineConfig) -> Result<DefaultAssigner, BuildError> {
+        DefaultAssigner::from_config(config, self.v.clone(), Some(self.d.clone()), self.j.clone())
+    }
+
     pub fn generate(spec: &SyntheticSpec, seed: u64) -> Self {
         let mut rng = Rng::new(seed);
         Self {
