@@ -781,15 +781,20 @@ test("WASM annotates FASTA, FASTQ, and AIRR; handles heavy, light, TCR, strand, 
   assert.equal(fastq.rows[0].sequence_id, "fastq_case");
   assert.equal(fastq.rows[0].quality.length, heavy.sequence.length);
 
-  // A malformed identifier/quality value must never inject another AIRR
-  // delimiter. This keeps the optimized writer safe for ordinary cut -f
-  // pipelines even when input metadata contains control characters.
+  // A malformed identifier or quality must never inject another AIRR
+  // delimiter, so ordinary cut -f pipelines stay safe. Qualities are
+  // printable ASCII ('!' to '~'): a control character is refused with its
+  // line instead of being rewritten into the row, and the engine stays usable.
   const unsafeQuality = `${"I".repeat(12)}\t${"I".repeat(heavy.sequence.length - 13)}`;
+  assert.throws(
+    () => runtime.annotate(`@delimiter_safe\n${heavy.sequence}\n+\n${unsafeQuality}\n`, 2),
+    /line 4: '\\t' in a quality/,
+  );
   const delimiterSafe = runtime.annotate(
-    `@delimiter_safe\n${heavy.sequence}\n+\n${unsafeQuality}\n`,
+    `@delimiter\u0001safe\n${heavy.sequence}\n+\n${"I".repeat(heavy.sequence.length)}\n`,
     2,
   );
-  assert.equal(delimiterSafe.rows[0].quality[12], " ");
+  assert.equal(delimiterSafe.rows.length, 1);
   for (const line of delimiterSafe.tsv.split("\n").filter((value) => value.length > 0)) {
     assert.equal(line.split("\t").length, delimiterSafe.headers.length);
   }
