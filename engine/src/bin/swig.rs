@@ -461,7 +461,11 @@ fn run_simulate(args: &Args) -> Result<(), Box<dyn Error>> {
     }
     let seed: u64 = number(&args.seed, "--seed", 1)?;
     let database = load_database(&args.files, &args.run)?;
-    if params.include_dd > 0.0 && database.d.as_ref().map_or(0, GermlineSet::len) < 2 {
+    // The presets carry a small tandem-DD fraction; warn only when asked.
+    if args.dd.is_some()
+        && params.include_dd > 0.0
+        && database.d.as_ref().map_or(0, GermlineSet::len) < 2
+    {
         eprintln!("swig: warning: --dd has no effect without at least two D alleles");
     }
     let sim = Simulator::from_database(&database, params)?;
