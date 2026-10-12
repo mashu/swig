@@ -75,12 +75,11 @@ impl Alignment {
     }
 }
 
-/// Result of a score-only pass. `q_end`/`r_end` are exclusive end coordinates.
+/// Result of a score-only pass: the best local score. It locates no end
+/// cell; [`Aligner::align`] reports an alignment's coordinates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScoreHit {
     pub score: Score,
-    pub q_end: u32,
-    pub r_end: u32,
 }
 
 /// One independent alignment problem of a batch.

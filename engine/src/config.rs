@@ -13,7 +13,7 @@ use crate::adjudicate::{
     Adjudicator, CallModel, DAlleleDecoding, EngineeringObjective, EvidenceModel, Mode,
     PlacementDag, VdjGrammar,
 };
-use crate::admission::{AnyOf, DistributedEvidence, ExactRunFloor};
+use crate::admission::{AnyOf, DefaultAdmission, DistributedEvidence, ExactRunFloor};
 use crate::align::{Backend, InterSequenceGotoh};
 use crate::constant::ConstantStage;
 use crate::family_bound::FamilyBoundTable;
@@ -392,11 +392,12 @@ impl Default for DSegmentConfig {
         Self {
             scoring: AffineScoring::new(2, -3, -13, -1),
             lmer: None,
-            // Every admissible D hit (up to 32) reaches adjudication.
+            // The 32 best admissible D hits reach adjudication; inadmissible
+            // ones are traced (up to 64 tracebacks) but take no slot.
             keep: KeepPolicy {
                 top: 32,
                 min_score: 0,
-                cap: 32,
+                cap: 64,
             },
             min_exact_run: 4,
             // The note's distributed-D gate admits nothing the exact run and
@@ -557,7 +558,7 @@ fn d_stage(
     set: GermlineSet,
     config: &DSegmentConfig,
     floor: Score,
-) -> SegmentStage<LmerMaskRetriever> {
+) -> SegmentStage<LmerMaskRetriever, DefaultAdmission> {
     let lmer = config.lmer.unwrap_or_else(|| config.lossless_lmer());
     let retriever = LmerMaskRetriever::build(&set, lmer, 1);
     let segment = PreparedSegment::new(set, &config.scoring, config.scoring.gaps);
@@ -565,12 +566,13 @@ fn d_stage(
         min_score: config.lossless_min_score().max(floor),
         ..config.keep
     };
-    let mut stage = SegmentStage::new(Arc::new(segment), retriever, keep);
-    stage.accept = HitAcceptance {
-        min_subst: config.min_exact_run,
-        min_identity: 0.60,
-    };
-    stage
+    let admission = AnyOf(
+        ExactRunFloor {
+            min_run: config.min_exact_run,
+        },
+        config.distributed,
+    );
+    SegmentStage::new(Arc::new(segment), retriever, keep).with_accept(admission)
 }
 
 /// The default engine: batched banded Gotoh (AVX2 inter-sequence kernel when
@@ -665,12 +667,6 @@ impl Assigner {
                     .ok_or(BuildError::Unsupported(backend))?,
             },
             d_window,
-            d_admission: AnyOf(
-                ExactRunFloor {
-                    min_run: config.d.min_exact_run,
-                },
-                config.d.distributed,
-            ),
             adjudicator,
             locus_adjudicators,
             c: None,

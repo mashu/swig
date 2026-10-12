@@ -60,7 +60,7 @@ pub(super) trait Kernel<const L: usize> {
     /// # Safety
     ///
     /// The CPU must support the backend.
-    unsafe fn fill<const DIAG: bool, const TRACE: bool, const UNIFORM: bool>(
+    unsafe fn fill<const DIAG: bool, const TRACE: bool, const UNIFORM: bool, const ANCHORED: bool>(
         shape: &Shape<L>,
         query: &[[i16; L]],
         profile: &[[i16; L]],
@@ -76,7 +76,12 @@ macro_rules! kernel {
     ($backend:ty, $lanes:literal $(, $feature:literal)?) => {
         impl Kernel<$lanes> for $backend {
             $(#[target_feature(enable = $feature)])?
-            unsafe fn fill<const DIAG: bool, const TRACE: bool, const UNIFORM: bool>(
+            unsafe fn fill<
+                const DIAG: bool,
+                const TRACE: bool,
+                const UNIFORM: bool,
+                const ANCHORED: bool,
+            >(
                 shape: &Shape<$lanes>,
                 query: &[[i16; $lanes]],
                 profile: &[[i16; $lanes]],
@@ -86,7 +91,7 @@ macro_rules! kernel {
             ) -> LaneBest<$lanes> {
                 // SAFETY: forwarded from the caller.
                 unsafe {
-                    crate::align::inter_seq::fill::<Self, $lanes, DIAG, TRACE, UNIFORM>(
+                    crate::align::inter_seq::fill::<Self, $lanes, DIAG, TRACE, UNIFORM, ANCHORED>(
                         shape, query, profile, h, ins, trace,
                     )
                 }

@@ -260,6 +260,9 @@ impl SubstitutionModel for AnchorColumn {
 pub struct UniformScores {
     pub matched: Score,
     pub mismatch: Score,
+    /// `Some(bonus)` when position 0 is an anchor column ([`AnchorColumn`]):
+    /// an `N` that scores `bonus` against every query code.
+    pub anchor: Option<Score>,
 }
 
 /// `ALPHABET_SIZE` rows × `len` columns of substitution scores for one allele.
@@ -274,8 +277,9 @@ pub struct SubstitutionProfile {
     /// Reference codes (ambiguity collapsed to `N`).
     codes: Vec<u8>,
     /// `Some` when every entry is `matched` / `mismatch` / 0 (for `N`) by
-    /// identity alone, as for [`AffineScoring`]; kernels may then compare
-    /// codes instead of reading the profile.
+    /// identity alone, as for [`AffineScoring`], but for an anchor column
+    /// ([`AnchorColumn`]); kernels may then compare codes instead of reading
+    /// the profile.
     uniform: Option<UniformScores>,
 }
 
@@ -322,7 +326,8 @@ impl SubstitutionProfile {
         }
     }
 
-    /// Match/mismatch scores when the profile depends on identity alone.
+    /// Match/mismatch scores when the profile depends on identity alone,
+    /// but for an anchor column.
     pub fn uniform(&self) -> Option<UniformScores> {
         self.uniform
     }
@@ -382,19 +387,25 @@ impl SubstitutionProfile {
 
 /// The uniform scores reproducing `rows` exactly, if any: `matched` where
 /// the query code equals a canonical reference code, 0 where either is `N`,
-/// `mismatch` elsewhere.
+/// `mismatch` elsewhere; but for an anchor column, an `N` at position 0
+/// scoring the same nonzero bonus against every code.
 fn uniform_scores(rows: &[Score], codes: &[u8]) -> Option<UniformScores> {
     let len = codes.len();
     let at = |q: usize, j: usize| rows[q * len + j];
+    let anchor = (codes.first() == Some(&N))
+        .then(|| at(0, 0))
+        .filter(|&bonus| bonus != 0 && (0..ALPHABET_SIZE).all(|q| at(q, 0) == bonus));
     let canonical = codes.iter().position(|&c| c < N);
     let scores = match canonical {
         Some(j) => UniformScores {
             matched: at(usize::from(codes[j]), j),
             mismatch: at(usize::from((codes[j] + 1) % N), j),
+            anchor,
         },
         None => UniformScores {
             matched: 0,
             mismatch: 0,
+            anchor,
         },
     };
     let expected = |q: u8, r: u8| {
@@ -410,6 +421,7 @@ fn uniform_scores(rows: &[Score], codes: &[u8]) -> Option<UniformScores> {
         codes
             .iter()
             .enumerate()
+            .skip(usize::from(anchor.is_some()))
             .all(|(j, &r)| at(usize::from(q), j) == expected(q, r))
     });
     exact.then_some(scores)
@@ -429,7 +441,8 @@ mod tests {
             uniform.uniform(),
             Some(UniformScores {
                 matched: 2,
-                mismatch: -3
+                mismatch: -3,
+                anchor: None,
             })
         );
         assert_eq!(uniform.codes(), &reference[..]);
@@ -482,6 +495,42 @@ mod tests {
                 assert!(best <= profile.local_bound(k));
             }
         }
+    }
+
+    /// An anchor column keeps a profile uniform when it is an `N` at
+    /// position 0 (`C′ = [N] + C`); in any other column, or under a
+    /// position-specific model, the profile is not uniform.
+    #[test]
+    fn anchor_columns_keep_profiles_uniform() {
+        let scoring = AffineScoring::new(2, -3, -9, -1);
+        let model = AnchorColumn::new(scoring, 50);
+        let anchored = encode(b"NACGTNCA");
+        assert_eq!(
+            SubstitutionProfile::build(&model, &anchored).uniform(),
+            Some(UniformScores {
+                matched: 2,
+                mismatch: -3,
+                anchor: Some(101),
+            })
+        );
+        assert_eq!(
+            SubstitutionProfile::build(&model, &anchored[1..]).uniform(),
+            None
+        );
+        let hotspot = HotspotScoring::for_shm(scoring);
+        let shifted = encode(b"NAGCTGTC");
+        assert_eq!(
+            SubstitutionProfile::build(&hotspot, &shifted).uniform(),
+            None
+        );
+        assert_eq!(
+            SubstitutionProfile::build(&scoring, &shifted).uniform(),
+            Some(UniformScores {
+                matched: 2,
+                mismatch: -3,
+                anchor: None,
+            })
+        );
     }
 
     /// An anchor profile is bounded by its bonus once plus `matched` per

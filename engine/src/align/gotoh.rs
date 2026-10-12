@@ -197,14 +197,20 @@ fn fill<const TRACE: bool>(
             row_max = max_branchless(row_max, score);
         }
         if row_max > best.score {
-            let k = h_row
-                .iter()
-                .position(|&x| x == row_max)
-                .expect("row maximum is attained in the row");
+            // Only traceback starts from the end cell.
+            let col = if TRACE {
+                let k = h_row
+                    .iter()
+                    .position(|&x| x == row_max)
+                    .expect("row maximum is attained in the row");
+                lo + k
+            } else {
+                0
+            };
             best = Best {
                 score: row_max,
                 row: i,
-                col: lo + k,
+                col,
             };
         }
     }
@@ -279,11 +285,7 @@ impl Aligner for BandedGotoh {
         workspace: &mut GotohWorkspace,
     ) -> Option<ScoreHit> {
         let best = fill::<false>(query, profile, gaps, band, workspace)?;
-        Some(ScoreHit {
-            score: best.score,
-            q_end: best.row as u32,
-            r_end: best.col as u32,
-        })
+        Some(ScoreHit { score: best.score })
     }
 
     fn align(

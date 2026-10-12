@@ -190,7 +190,7 @@ impl Default for DownstreamWindow {
 
 impl DownstreamWindow {
     pub fn window(&self, query_len: usize, upstream: &[Placement]) -> Range<usize> {
-        if !upstream.iter().any(|p| p.anchor) {
+        if !upstream.iter().any(|p| p.anchor.is_some()) {
             return 0..query_len;
         }
         let start = upstream
@@ -251,10 +251,10 @@ mod tests {
         let query = crate::testing::random_codes(&mut next, 218);
         let mut v = crate::testing::placement(SegmentKind::V, &query, &query[..150], 0);
         let window = DownstreamWindow { reclaim: 12 };
-        v.anchor = false;
+        v.anchor = None;
         assert_eq!(window.window(218, std::slice::from_ref(&v)), 0..218);
         let mut anchor = v.clone();
-        anchor.anchor = true;
+        anchor.anchor = Some(0);
         assert_eq!(window.window(218, &[anchor, v]), 138..218);
     }
 

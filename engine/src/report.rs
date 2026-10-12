@@ -571,14 +571,8 @@ pub(crate) fn segment_report<C: AlleleCatalog>(
     let set = segment.set();
     let co = path_co_optimal(&call.placements, &call.query, set, path, called);
     let posterior = marginals.map(|m| counted_mass(&co, m));
-    let evalue = support[kind.index()].map(|ka| {
-        ka.evalue(
-            called.span.score,
-            call.query.len(),
-            set.total_len(),
-            set.len(),
-        )
-    });
+    let evalue = support[kind.index()]
+        .map(|ka| ka.evalue(called.span.score, call.query.len(), set.total_len()));
     Some(called_report(
         call,
         &call.placements,
