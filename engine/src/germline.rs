@@ -398,6 +398,8 @@ pub enum GermlineError {
     BadName {
         name: String,
     },
+    /// A record has an empty name.
+    EmptyName,
 }
 
 impl fmt::Display for GermlineError {
@@ -420,6 +422,7 @@ impl fmt::Display for GermlineError {
                 "allele name '{name}' holds one of ',' ';' '|' (or '+' in a D name), \
                  which separate names in the report"
             ),
+            Self::EmptyName => write!(f, "a record has an empty allele name"),
         }
     }
 }
@@ -513,10 +516,14 @@ impl GermlineSet {
         }
     }
 
-    /// Refuse a name holding a character that separates names in the
-    /// report: `,` between co-optimal names, `;` and `|` in
-    /// `*_alternatives`, and `+` between the two Ds of a double-D pair.
+    /// Refuse an empty name, which a call could not report, and a name
+    /// holding a character that separates names in the report: `,` between
+    /// co-optimal names, `;` and `|` in `*_alternatives`, and `+` between the
+    /// two Ds of a double-D pair.
     fn check_name(&self, name: &str) -> Result<(), GermlineError> {
+        if name.trim().is_empty() {
+            return Err(GermlineError::EmptyName);
+        }
         let separators: &[char] = match self.kind {
             SegmentKind::D => &[',', ';', '|', '+'],
             _ => &[',', ';', '|'],
@@ -940,6 +947,28 @@ mod tests {
         assert_eq!(imgt.unwrap().allele(0).name, "V1*01");
         let v = GermlineSet::from_fasta(SegmentKind::V, ">IGHV1-2*02+G35A\nACGT\n");
         assert_eq!(v.unwrap().allele(0).name, "IGHV1-2*02+G35A");
+    }
+
+    /// A record without a name is refused: a call of it would report an
+    /// empty `j_call` beside a J alignment.
+    #[test]
+    fn rejects_records_without_a_name() {
+        for fasta in [
+            ">\nACGTACGT\n",
+            ">  \nACGTACGT\n",
+            ">J1*01\nACGT\n>\nACGTACGT\n",
+        ] {
+            let found = GermlineSet::from_fasta(SegmentKind::J, fasta);
+            assert!(
+                matches!(found, Err(GermlineError::EmptyName)),
+                "{fasta:?}: {found:?}"
+            );
+        }
+        let mut set = GermlineSet::new(SegmentKind::J);
+        assert!(matches!(
+            set.push("", b"ACGT", None),
+            Err(GermlineError::EmptyName)
+        ));
     }
 
     /// Per-rearranged-kind arrays (`[_; 3]` indexed by `index()`) cover V, D

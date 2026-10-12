@@ -33,14 +33,15 @@ pub struct SwigMeta {
 
 impl SwigMeta {
     /// The field after `SWIGMETA=`: exactly thirteen integers, the frame in
-    /// −1…2 and the CDR3 stop at least −1. `None` when malformed.
+    /// −1…2 and the CDR3 stop in −1…2³² − 2 (its J anchor, one base later,
+    /// must be a `u32` position). `None` when malformed.
     pub fn parse(text: &str) -> Option<Self> {
         let values: Vec<i64> = text
             .split(',')
             .map(|v| v.parse().ok())
             .collect::<Option<_>>()?;
         let values: [i64; 13] = values.try_into().ok()?;
-        if !(-1..=2).contains(&values[0]) || values[1] < -1 {
+        if !(-1..=2).contains(&values[0]) || !(-1..i64::from(u32::MAX)).contains(&values[1]) {
             return None;
         }
         let position = |v: i64| u32::try_from(v).ok();
@@ -119,6 +120,8 @@ mod tests {
             "0,-2,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,1",
             "0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,1,7",
             "0,x,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,1",
+            // A CDR3 stop whose J anchor would not be a u32 position.
+            "0,4294967295,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,6",
         ] {
             assert_eq!(SwigMeta::parse(text), None, "{text}");
         }
