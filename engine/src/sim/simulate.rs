@@ -136,6 +136,43 @@ impl SimulatedRead {
         Some(first..last + 1)
     }
 
+    /// The read cut to its last `n` bases, as a short read covering part of
+    /// the V (a germline-sense read only). A segment cut into keeps the
+    /// germline that remains: its 5′ trim grows to its first surviving
+    /// germline base. A segment cut away has no span, so its truth goes
+    /// ([`super::Truth::from_read`]).
+    pub fn tail(&self, n: usize) -> SimulatedRead {
+        assert!(
+            !self.reverse_complemented,
+            "the tail of a germline-sense read"
+        );
+        let cut = self.forward.len().saturating_sub(n);
+        let mut read = self.clone();
+        read.forward.drain(..cut);
+        read.regions.drain(..cut);
+        read.origins.drain(..cut);
+        read.sequence = read.forward.clone();
+        read.flank_5p = read.flank_5p.saturating_sub(cut as u32);
+        // The germline start of each segment cut into: its first surviving
+        // templated base, or past its end when none survives.
+        let start = |region: Region| {
+            self.regions[..cut].contains(&region).then(|| {
+                let mut kept = read.regions.iter().zip(&read.origins);
+                kept.find(|&(&r, &o)| r == region && o != NO_ORIGIN)
+                    .map_or(u32::MAX, |(_, &o)| o)
+            })
+        };
+        let starts = [Region::V, Region::D, Region::D2, Region::J].map(start);
+        let t = &mut read.trims;
+        let trims = [&mut t.v_5p, &mut t.d_5p, &mut t.d2_5p, &mut t.j_5p];
+        for (trim, start) in trims.into_iter().zip(starts) {
+            if let Some(start) = start {
+                *trim = start;
+            }
+        }
+        read
+    }
+
     /// Forward-read index of the base templated from germline position `at`
     /// of `region`'s allele, if it survived trimming and indels.
     pub fn locate(&self, region: Region, at: u32) -> Option<usize> {
@@ -934,5 +971,57 @@ mod tests {
         assert_eq!(sim.drawn(SegmentKind::V), v_set.len() - 1);
         assert_eq!(sim.drawn(SegmentKind::J), database.j.len());
         assert_eq!(sim.drawn(SegmentKind::C), c_set.len() - 1);
+    }
+
+    /// A read's tail is scored against the germline it keeps: spans on the
+    /// tail, the V's remaining body (so more alleles are equivalent), the
+    /// junction while the V anchor remains, and no V once the V is cut away.
+    #[test]
+    fn a_tail_keeps_the_truth_of_what_remains() {
+        use crate::sim::truth::{Slot, Truth};
+        use crate::sim::{IlluminaError, SyntheticDatabase, SyntheticSpec};
+        let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 3);
+        let params = SimParams {
+            body_error_rate: GatedRate::NONE,
+            indel_rate: GatedRate::NONE,
+            illumina_error: IlluminaError::NONE,
+            ..SimParams::mid()
+        };
+        let sim = Simulator::new(&db.v, Some(&db.d), &db.j, params).unwrap();
+        let mut wider = 0;
+        for (i, read) in sim.reads(200, 4).unwrap().iter().enumerate() {
+            let full = Truth::from_read(&sim, read, "r");
+            let len = read.forward.len();
+            // The last 40 V bases and what follows, or what follows the V.
+            let n = len - read.span(Region::V).unwrap().end + [40, 0][i % 2];
+            let tail = read.tail(n);
+            assert_eq!(tail.sequence, read.forward[len - n..]);
+            let truth = Truth::from_read(&sim, &tail, "r");
+            let j = truth.segment(Slot::J).unwrap();
+            let whole_j = full.segment(Slot::J).unwrap();
+            assert_eq!(
+                j.span,
+                whole_j.span.start - (len - n)..whole_j.span.end - (len - n)
+            );
+            assert_eq!(
+                (&j.allele, &j.equivalent),
+                (&whole_j.allele, &whole_j.equivalent)
+            );
+            let Some(v) = truth.segment(Slot::V) else {
+                assert_eq!(i % 2, 1);
+                assert_eq!(truth.junction, None);
+                continue;
+            };
+            assert_eq!(v.span, 0..40);
+            assert_eq!(
+                &tail.forward[..40],
+                sim.germline_body(&tail, Region::V).unwrap()
+            );
+            let whole = full.segment(Slot::V).unwrap();
+            assert!(whole.equivalent.iter().all(|a| v.equivalent.contains(a)));
+            wider += usize::from(v.equivalent.len() > whole.equivalent.len());
+            assert_eq!(truth.junction, full.junction);
+        }
+        assert!(wider >= 20, "{wider} of 100 tails widen the V");
     }
 }

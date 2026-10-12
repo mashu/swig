@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use common::Args;
 use swig::prelude::*;
-use swig::sim::{Assignment, Evaluation, SimParams, Simulator, Truth};
+use swig::sim::{Assignment, Evaluation, SimParams, SimulatedRead, Simulator, Truth};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::from_env();
@@ -179,21 +179,22 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let db = args.database(seed)?;
     let sim = Simulator::new(&db.v, db.d.as_ref(), &db.j, params)?;
-    let simulated = sim.reads(reads, seed)?;
     let assigner = DefaultAssigner::from_config(&config, db.v.clone(), db.d.clone(), db.j.clone())?;
     // `--tail N`: keep the last N bases of each read (germline sense only),
-    // as a short read covering part of V.
+    // as a short read covering part of V, scored against what it keeps.
     let tail: Option<usize> = value("--tail").map(|v| v.parse()).transpose()?;
     if tail.is_some() && rc != 0.0 {
         return Err("--tail needs --rc 0".into());
     }
-    let queries: Vec<Vec<u8>> = simulated
-        .iter()
-        .map(|r| {
-            let keep = tail.map_or(0, |n| r.sequence.len().saturating_sub(n));
-            encode(&r.sequence[keep..])
+    let simulated: Vec<SimulatedRead> = sim
+        .reads(reads, seed)?
+        .into_iter()
+        .map(|read| match tail {
+            Some(n) => read.tail(n),
+            None => read,
         })
         .collect();
+    let queries: Vec<Vec<u8>> = simulated.iter().map(|r| encode(&r.sequence)).collect();
 
     let started = Instant::now();
     let calls = assign_all(&assigner, &queries, threads);
