@@ -19,11 +19,14 @@
 //! control characters are errors, and qualities (optional in a table) must
 //! match the sequence in length.
 //!
-//! A leading UTF-8 byte-order mark is skipped. Lines end in `\n` or
-//! `\r\n`; a carriage return inside a line (CR-only line endings) is an
-//! error rather than one long line. Gzip input is recognised by its magic
-//! bytes and rejected with a hint to decompress on the fly (the crate has no
-//! dependencies).
+//! Input is read as UTF-8, a byte that is no valid UTF-8 as U+FFFD (as the
+//! Swig app's `TextDecoder` reads it): a Latin-1 header description, which
+//! is dropped anyway, does not stop a run, and an identifier keeps its
+//! readable part. A leading UTF-8 byte-order mark is skipped. Lines end in
+//! `\n` or `\r\n`; a carriage return inside a line (CR-only line endings)
+//! is an error rather than one long line. Gzip input is recognised by its
+//! magic bytes and rejected with a hint to decompress on the fly (the crate
+//! has no dependencies).
 
 use std::fmt;
 use std::io::{self, BufRead};
@@ -338,12 +341,17 @@ impl<R: BufRead> ReadReader<R> {
     }
 
     /// Read one line into `self.buffer` without its line terminator (`\n`
-    /// or `\r\n`). A carriage return left inside the line is an error: no
-    /// FASTA/FASTQ line or unquoted table field holds one, and with CR-only
-    /// line endings the whole input would read as one line.
+    /// or `\r\n`). Bytes that are not UTF-8 read as U+FFFD. A carriage
+    /// return left inside the line is an error: no FASTA/FASTQ line or
+    /// unquoted table field holds one, and with CR-only line endings the
+    /// whole input would read as one line.
     fn next_line(&mut self) -> Result<bool, ReadError> {
-        self.buffer.clear();
-        if self.input.read_line(&mut self.buffer)? == 0 {
+        let mut bytes = std::mem::take(&mut self.buffer).into_bytes();
+        bytes.clear();
+        let read = self.input.read_until(b'\n', &mut bytes);
+        self.buffer = String::from_utf8(bytes)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+        if read? == 0 {
             return Ok(false);
         }
         self.line += 1;
@@ -571,6 +579,18 @@ mod tests {
             [fastq("r", "AC", "II")]
         );
         assert!(read_all(b"\xef\xbb\xbf").unwrap().is_empty());
+    }
+
+    #[test]
+    fn reads_bytes_that_are_not_utf8_as_replacement_characters() {
+        assert_eq!(
+            read_all(b">r1 caf\xe9\nAC\xffGT\n>r\xe92\nGG\n").unwrap(),
+            [record("r1", "ACGT"), record("r\u{fffd}2", "GG")]
+        );
+        assert_eq!(
+            read_all(b"@r1 \xe9\nAC\n+\nII\n").unwrap(),
+            [fastq("r1", "AC", "II")]
+        );
     }
 
     #[test]
