@@ -109,25 +109,33 @@ var AlignerEngine = class AlignerEngine {
 		if (returned < 0) throw new Error(AlignerEngine.error(exports));
 		if (returned !== count) throw new Error(`The Swig aligner returned ${returned} records for a ${count}-record input batch.`);
 		const batch = {
-			...splitTable(new Uint8Array(exports.memory.buffer, exports.swig_result_ptr(), exports.swig_result_len()), "AIRR table"),
+			...splitTable(AlignerEngine.view(exports, exports.swig_result_ptr(), exports.swig_result_len()), "AIRR table"),
 			count
 		};
 		if (doubleD) {
-			const { header, body } = splitTable(new Uint8Array(exports.memory.buffer, exports.swig_double_d_result_ptr(), exports.swig_double_d_result_len()), "double-D evidence table");
+			const { header, body } = splitTable(AlignerEngine.view(exports, exports.swig_double_d_result_ptr(), exports.swig_double_d_result_len()), "double-D evidence table");
 			batch.doubleDHeader = header;
 			batch.doubleDBody = body;
 			batch.doubleDCount = exports.swig_double_d_count();
 		}
 		return batch;
 	}
+	/**
+	* The module's `length` bytes at `pointer`. Pointers and lengths are wasm
+	* `i32`s, which JavaScript reads as signed: from 2 GiB on they arrive
+	* negative, so they are read back as unsigned.
+	*/
+	static view(exports, pointer, length) {
+		return new Uint8Array(exports.memory.buffer, pointer >>> 0, length >>> 0);
+	}
 	static put(exports, bytes) {
-		const pointer = exports.swig_alloc(bytes.byteLength);
-		if (!pointer) throw new Error("The Swig aligner ran out of WebAssembly memory.");
-		new Uint8Array(exports.memory.buffer, pointer, bytes.byteLength).set(bytes);
+		const pointer = exports.swig_alloc(bytes.byteLength) >>> 0;
+		if (pointer === 0) throw new Error("The Swig aligner ran out of WebAssembly memory.");
+		AlignerEngine.view(exports, pointer, bytes.byteLength).set(bytes);
 		return [pointer, bytes.byteLength];
 	}
 	static read(exports, pointer, length) {
-		return decoder.decode(new Uint8Array(exports.memory.buffer, pointer, length));
+		return decoder.decode(AlignerEngine.view(exports, pointer, length));
 	}
 	static error(exports) {
 		return AlignerEngine.read(exports, exports.swig_error_ptr(), exports.swig_error_len()) || "The Swig aligner could not complete the request.";
