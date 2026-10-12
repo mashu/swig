@@ -196,9 +196,10 @@ pub unsafe extern "C" fn swig_free(ptr: *mut u8, len: usize) {
 }
 
 /// Set run option `name` (as on the command line, without `--`) to the
-/// value, or set flag `name` (`value_len` 0). The run is rebuilt from the
-/// loaded germlines on the next annotation. 0, or −1 for an unknown option
-/// or a bad value.
+/// value, or set flag `name`, whose value must be empty (`value_len` 0).
+/// The run is rebuilt from the loaded germlines on the next annotation. 0,
+/// or −1 for an unknown option, a missing or bad value, or a flag given
+/// one.
 ///
 /// # Safety
 ///
@@ -213,7 +214,9 @@ pub unsafe extern "C" fn swig_set_option(
     with_state(|state| {
         // SAFETY: forwarded from the caller.
         let (name, value) = unsafe { (text(name, name_len)?, text(value, value_len)?) };
-        let value = (RunOptions::takes_value(name) == Some(true)).then_some(value);
+        // An empty value is none: `set` refuses it for an option that needs
+        // one, and refuses any other for a flag.
+        let value = (!value.is_empty()).then_some(value);
         state.options.set(name, value).map_err(|e| e.to_string())?;
         state.run = None;
         Ok(0)
@@ -470,6 +473,16 @@ mod tests {
 
         assert_eq!(set("strand", "sideways"), -1);
         assert!(error().contains("--strand"), "{}", error());
+        // A flag takes no value: "false" or "no" is refused, not read as
+        // the flag; an option that needs a value refuses an empty one.
+        assert_eq!(set("no-posterior", "false"), -1);
+        assert!(error().contains("takes no value"), "{}", error());
+        assert_eq!(set("residual", "no"), -1);
+        assert_eq!(set("no-anchor-window", "0"), -1);
+        assert_eq!(set("profile", ""), -1);
+        assert!(error().contains("needs a value"), "{}", error());
+        assert_eq!(annotate(&text), 20);
+        assert_eq!(result(), rows, "refused options change nothing");
         assert_eq!(set("no-posterior", ""), 0);
         assert_eq!(annotate(&text), 20);
         let header = rows.lines().next().unwrap();
