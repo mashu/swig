@@ -39,6 +39,7 @@ pub fn placement(kind: SegmentKind, query: &[u8], reference: &[u8], q_start: u32
     Placement {
         kind,
         alleles: vec![0],
+        shifted: Vec::new(),
         clip: ClipIndex::build(&alignment, query, &profile, scoring.gaps),
         evidence: Evidence::default(),
         anchor: Some(Score::MIN),

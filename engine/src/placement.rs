@@ -18,6 +18,9 @@ pub struct Placement {
     pub kind: SegmentKind,
     /// Alleles sharing this exact alignment; the first is the one that was aligned.
     pub alleles: Vec<AlleleId>,
+    /// The merged alleles whose germline coordinates differ from the
+    /// first's, with the difference ([`Placement::germline_shift`]).
+    pub shifted: Vec<(AlleleId, i32)>,
     /// Query coordinates are absolute (whole oriented query).
     pub alignment: Alignment,
     pub clip: ClipIndex,
@@ -44,6 +47,7 @@ impl Placement {
         Self {
             kind,
             alleles: vec![allele],
+            shifted: Vec::new(),
             alignment,
             clip,
             evidence,
@@ -71,6 +75,17 @@ impl Placement {
         self.alleles[0]
     }
 
+    /// Germline coordinate of `allele`, one of [`Placement::alleles`], minus
+    /// the first's. Merged alignments share their query columns, operations
+    /// and per-column scores, so an allele of another length before the
+    /// aligned bases has the first's coordinates shifted by a constant.
+    pub fn germline_shift(&self, allele: AlleleId) -> i32 {
+        self.shifted
+            .iter()
+            .find(|&&(merged, _)| merged == allele)
+            .map_or(0, |&(_, shift)| shift)
+    }
+
     /// Whether `span`, a clip of this placement, anchors a call: the bases
     /// a path keeps are significant on their own. A significant local
     /// alignment is not enough, since the outer flank stitched onto it and
@@ -81,7 +96,8 @@ impl Placement {
 }
 
 /// Merge placements in `placements[from..]` whose clip indices are equivalent,
-/// keeping the first occurrence (order is preserved).
+/// keeping the first occurrence (order is preserved) and the germline shift
+/// of every allele merged into it.
 pub fn merge_identical(placements: &mut Vec<Placement>, from: usize) {
     let mut kept = from;
     for i in from..placements.len() {
@@ -91,10 +107,16 @@ pub fn merge_identical(placements: &mut Vec<Placement>, from: usize) {
         });
         match target {
             Some(k) => {
-                let extra = std::mem::take(&mut placements[i].alleles);
-                for allele in extra {
+                let start = |p: &Placement| i64::from(p.alignment.r_start);
+                let shift = (start(&placements[i]) - start(&placements[k])) as i32;
+                let merged = std::mem::take(&mut placements[i].alleles);
+                for allele in merged {
                     if !placements[k].alleles.contains(&allele) {
+                        let own = shift + placements[i].germline_shift(allele);
                         placements[k].alleles.push(allele);
+                        if own != 0 {
+                            placements[k].shifted.push((allele, own));
+                        }
                     }
                 }
             }
@@ -105,4 +127,39 @@ pub fn merge_identical(placements: &mut Vec<Placement>, from: usize) {
         }
     }
     placements.truncate(kept);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::alphabet::encode;
+    use crate::testing::placement;
+
+    /// An allele whose germline starts 3 bases earlier aligns the same read
+    /// bases column for column: merged, its coordinates are the first's
+    /// shifted by 3, also when it reaches the first through another merge.
+    #[test]
+    fn merged_alleles_keep_their_germline_shift() {
+        let query = encode(b"ACGTTGCAAGTCGGAT");
+        let at = |allele: AlleleId, r_start: u32| {
+            let mut p = placement(SegmentKind::D, &query, &query[2..12], 2);
+            p.alleles = vec![allele];
+            p.alignment.r_start += r_start;
+            p.alignment.r_end += r_start;
+            p
+        };
+        let mut merged = vec![at(0, 0), at(1, 3), at(2, 0)];
+        merge_identical(&mut merged, 0);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].alleles, [0, 1, 2]);
+        assert_eq!([0, 1, 2].map(|a| merged[0].germline_shift(a)), [0, 3, 0]);
+        // A placement merged earlier brings its own alleles' shifts along.
+        let mut later = vec![at(5, 1), merged.remove(0)];
+        merge_identical(&mut later, 0);
+        assert_eq!(later[0].alleles, [5, 0, 1, 2]);
+        assert_eq!(
+            [5, 0, 1, 2].map(|a| later[0].germline_shift(a)),
+            [0, -1, 2, -1]
+        );
+    }
 }

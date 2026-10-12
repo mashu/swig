@@ -437,7 +437,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
                     .clip
                     .span(y, x)
                     .expect("canonical cuts keep at least min_retained bases"),
-                by_marginal: false,
+                allele: None,
             });
             let back =
                 s.forward[slot.values + entry as usize].expect("traced entries are reachable");
@@ -652,7 +652,7 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
         let read = self.read_model(path.divergence);
         let (_, mut segments) = self.conditioned(placements, keep, topology, &read, scratch)?;
         for segment in &mut segments {
-            segment.by_marginal = kind(segment) == SegmentKind::D;
+            segment.allele = (kind(segment) == SegmentKind::D).then_some(allele);
         }
         Some(CallPath {
             score: self.path_score(placements, &segments),
@@ -666,6 +666,7 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
 mod tests {
     use super::*;
     use crate::alphabet::encode;
+    use crate::germline::AlleleId;
     use crate::testing::placement;
 
     /// V's tail and J's head overlap on six bases, V mismatching at the 2nd and
@@ -919,13 +920,13 @@ mod tests {
         let m = dag.marginals(&placements, &call, &mut scratch).unwrap();
         assert!(m.placement[1] > m.placement[2], "{:?}", m.placement);
         let decoded = dag.decode(&placements, &call, &m, &mut scratch).unwrap();
-        let picks = |path: &CallPath| -> Vec<(usize, bool)> {
+        let picks = |path: &CallPath| -> Vec<(usize, Option<AlleleId>)> {
             path.segments
                 .iter()
-                .map(|s| (s.placement, s.by_marginal))
+                .map(|s| (s.placement, s.allele))
                 .collect()
         };
-        assert_eq!(picks(&decoded), [(0, false), (1, true), (3, false)]);
+        assert_eq!(picks(&decoded), [(0, None), (1, Some(0)), (3, None)]);
         assert_eq!(decoded.score.score, 84);
         // The call's own allele is kept when it is the max-marginal one.
         assert!(map.decode(&placements, &call, &m, &mut scratch).is_none());

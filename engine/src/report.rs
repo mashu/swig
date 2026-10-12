@@ -65,7 +65,7 @@ use crate::align::Op;
 use crate::alphabet::{N, decode, decode_base};
 use crate::clip::ClipSpan;
 use crate::evidence::Evidence;
-use crate::germline::{GermlineSet, SegmentKind};
+use crate::germline::{AlleleId, GermlineSet, SegmentKind};
 use crate::pipeline::{AlleleCatalog, Call};
 use crate::placement::Placement;
 use crate::read_regions::ReadRegions;
@@ -172,21 +172,24 @@ pub(crate) fn push_run(cigar: &mut String, symbol: char, length: u32) {
 pub(crate) struct CoOptimal<'a> {
     /// Tied placements, the primary — reported first — at index 0.
     pub tied: Vec<&'a Placement>,
+    /// The allele reported first: the call's own ([`CalledSegment::allele`]),
+    /// or the primary placement's first.
+    pub first: AlleleId,
     /// Indices of the placements of the called kind whose probability the
     /// posterior sums: tied with the call, or carried by its primary allele.
     pub counted: Vec<usize>,
 }
 
 impl CoOptimal<'_> {
-    /// The tied placements' allele names, primary first, each once.
+    /// The tied placements' allele names, the first allele's first, each
+    /// once.
     pub fn names<'s>(&self, set: &'s GermlineSet) -> Vec<&'s str> {
         let mut names: Vec<&str> = Vec::new();
-        for p in &self.tied {
-            for &allele in &p.alleles {
-                for name in set.allele(allele).names() {
-                    if !names.contains(&name) {
-                        names.push(name);
-                    }
+        let alleles = self.tied.iter().flat_map(|p| &p.alleles);
+        for &allele in std::iter::once(&self.first).chain(alleles) {
+            for name in set.allele(allele).names() {
+                if !names.contains(&name) {
+                    names.push(name);
                 }
             }
         }
@@ -202,12 +205,12 @@ impl CoOptimal<'_> {
 /// mismatches. The primary is the one with the most germline support
 /// (unclipped score, the DAG's own tie-break), then the longest exact run
 /// and most matches on the interval, then the lowest allele id; a call
-/// chosen by its allele's posterior marginal stays first.
+/// that names its allele stays first, and that allele is reported first.
 ///
 /// Counted by the posterior: the tied placements, and every placement that
 /// explains most of the read bases the call explains (more than half of the
 /// called span, within `region`, the read the call's neighbours leave to
-/// it) with germline bases there that the primary allele contains. If the
+/// it) with germline bases there that the first allele contains. If the
 /// read came from such a placement, the call still carries its germline
 /// bases. A placement that only reaches into the region by a few bases (a
 /// D inside the called J, a tandem D's partner) is another hypothesis, so
@@ -239,7 +242,7 @@ pub(crate) fn co_optimal<'a>(
         })
         .collect();
     // The called placement first, so it wins ties of the sort key; one
-    // chosen by its allele's posterior marginal stays first.
+    // whose allele the call names stays first.
     let mut tied: Vec<&Placement> = std::iter::once(called_placement)
         .chain(
             tied_indices
@@ -248,7 +251,7 @@ pub(crate) fn co_optimal<'a>(
                 .map(|&i| &placements[i]),
         )
         .collect();
-    tied[usize::from(called.by_marginal)..].sort_by_cached_key(|p| {
+    tied[usize::from(called.allele.is_some())..].sort_by_cached_key(|p| {
         let own = p
             .clip
             .span(called.entry, called.exit)
@@ -265,7 +268,8 @@ pub(crate) fn co_optimal<'a>(
             p.primary_allele(),
         )
     });
-    let reference = &set.allele(tied[0].primary_allele()).codes;
+    let first = called.allele.unwrap_or(tied[0].primary_allele());
+    let reference = &set.allele(first).codes;
     let called_bases = called.span.q_lo..called.span.q_hi;
     let carried = |p: &Placement| {
         let Some(own) = p.clip.span(region.start, region.end) else {
@@ -288,24 +292,38 @@ pub(crate) fn co_optimal<'a>(
             p.kind == kind && (tied_indices.contains(&i) || carried(p))
         })
         .collect();
-    CoOptimal { tied, counted }
+    CoOptimal {
+        tied,
+        first,
+        counted,
+    }
 }
 
 /// The CIGAR, the sequence and germline alignment strings, and the evidence
-/// of `placement`'s columns on `span` (`reference` its primary allele).
+/// of `placement`'s columns on `span` against `reference`, one of its
+/// alleles, whose coordinates are the primary's moved by `shift`
+/// ([`Placement::germline_shift`]).
 fn aligned(
     query: &[u8],
     placement: &Placement,
     span: &ClipSpan,
     reference: &[u8],
+    shift: i32,
 ) -> (String, String, String, Evidence) {
+    let shifted = |r: u32| (i64::from(r) + i64::from(shift)) as u32;
+    let columns = || {
+        placement
+            .clip
+            .columns(span)
+            .map(|(op, q, r)| (op, q, shifted(r)))
+    };
     let mut cigar = String::new();
     push_run(&mut cigar, 'S', span.q_lo);
-    push_run(&mut cigar, 'N', span.r_lo);
+    push_run(&mut cigar, 'N', shifted(span.r_lo));
     let mut sequence_alignment = String::with_capacity(span.q_len() as usize + 8);
     let mut germline_alignment = String::with_capacity(span.r_len() as usize + 8);
     let mut run: Option<(char, u32)> = None;
-    for (op, q, r) in placement.clip.columns(span) {
+    for (op, q, r) in columns() {
         let (symbol, qs, rs) = match op {
             Op::Match => {
                 let (a, b) = (query[q as usize], reference[r as usize]);
@@ -334,7 +352,7 @@ fn aligned(
         push_run(&mut cigar, s, len);
     }
     push_run(&mut cigar, 'S', query.len() as u32 - span.q_hi);
-    let evidence = Evidence::from_columns(placement.clip.columns(span), query, reference);
+    let evidence = Evidence::from_columns(columns(), query, reference);
     (cigar, sequence_alignment, germline_alignment, evidence)
 }
 
@@ -446,8 +464,8 @@ fn alternatives(
     found
 }
 
-/// The report of `called`: the co-optimal names, the primary's clipped
-/// alignment and coordinates, and the near-tied alternatives.
+/// The report of `called`: the co-optimal names, the clipped alignment and
+/// coordinates of the first allele, and the near-tied alternatives.
 fn called_report(
     call: &Call,
     placements: &[Placement],
@@ -463,9 +481,10 @@ fn called_report(
         .clip
         .span(called.entry, called.exit)
         .expect("primary tied placement clips to the called interval");
-    let reference = &set.allele(placement.primary_allele()).codes;
+    let shift = placement.germline_shift(co.first);
+    let reference = &set.allele(co.first).codes;
     let (cigar, sequence_alignment, germline_alignment, evidence) =
-        aligned(query, placement, &span, reference);
+        aligned(query, placement, &span, reference, shift);
     let names = co.names(set);
     SegmentReport {
         alternatives: alternatives(placements, query, set, called, &names),
@@ -477,12 +496,60 @@ fn called_report(
         cigar,
         sequence_start: span.q_lo + 1,
         sequence_end: span.q_hi,
-        germline_start: span.r_lo + 1,
-        germline_end: span.r_hi,
+        germline_start: (i64::from(span.r_lo) + i64::from(shift)) as u32 + 1,
+        germline_end: (i64::from(span.r_hi) + i64::from(shift)) as u32,
         sequence_alignment,
         germline_alignment,
         prefix_identity: None,
     }
+}
+
+/// The co-optimal placements of `called`, a segment of `path`, within the
+/// read its neighbours on the path leave to it.
+fn path_co_optimal<'a>(
+    placements: &'a [Placement],
+    query: &[u8],
+    set: &GermlineSet,
+    path: &CallPath,
+    called: &CalledSegment,
+) -> CoOptimal<'a> {
+    let at = path.segments.iter().position(|s| s == called);
+    let before = at
+        .and_then(|i| i.checked_sub(1))
+        .map(|i| path.segments[i].span.q_hi);
+    let after = at
+        .and_then(|i| path.segments.get(i + 1))
+        .map(|s| s.span.q_lo);
+    let region = before.unwrap_or(0)..after.unwrap_or(query.len() as u32);
+    let per_read = path.model == CallModel::PerRead;
+    co_optimal(placements, query, set, called, per_read, region)
+}
+
+/// The probability a report gives its names: the mass of the placements
+/// `co` counts.
+fn counted_mass(co: &CoOptimal<'_>, marginals: &Marginals) -> f64 {
+    co.counted
+        .iter()
+        .filter_map(|&i| marginals.placement.get(i))
+        .sum::<f64>()
+        // Rounding.
+        .min(1.0)
+}
+
+/// The posterior the report gives `called`, a segment of `path`, over
+/// `placements` of `query` with `marginals` ([`co_optimal`]).
+pub(crate) fn reported_posterior(
+    placements: &[Placement],
+    query: &[u8],
+    set: &GermlineSet,
+    path: &CallPath,
+    called: &CalledSegment,
+    marginals: &Marginals,
+) -> f64 {
+    counted_mass(
+        &path_co_optimal(placements, query, set, path, called),
+        marginals,
+    )
 }
 
 /// The report of `called`, a segment of `path` (the call's, or another
@@ -502,26 +569,8 @@ pub(crate) fn segment_report<C: AlleleCatalog>(
     );
     let segment = catalog.segment(kind)?;
     let set = segment.set();
-    let per_read = path.model == CallModel::PerRead;
-    let region = {
-        let at = path.segments.iter().position(|s| s == called);
-        let before = at
-            .and_then(|i| i.checked_sub(1))
-            .map(|i| path.segments[i].span.q_hi);
-        let after = at
-            .and_then(|i| path.segments.get(i + 1))
-            .map(|s| s.span.q_lo);
-        before.unwrap_or(0)..after.unwrap_or(call.query.len() as u32)
-    };
-    let co = co_optimal(&call.placements, &call.query, set, called, per_read, region);
-    let posterior = marginals.map(|m| {
-        co.counted
-            .iter()
-            .filter_map(|&i| m.placement.get(i))
-            .sum::<f64>()
-            // Rounding.
-            .min(1.0)
-    });
+    let co = path_co_optimal(&call.placements, &call.query, set, path, called);
+    let posterior = marginals.map(|m| counted_mass(&co, m));
     let evalue = support[kind.index()].map(|ka| {
         ka.evalue(
             called.span.score,

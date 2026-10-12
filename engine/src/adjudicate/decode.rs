@@ -12,7 +12,10 @@
 //! ```
 //!
 //! ([`super::Marginals::placement`]; an allele merged into several placements
-//! sums them). D presence stays the Viterbi decision: the presence marginal
+//! sums them). Every path through a D placement holds a D, so `a*` is also
+//! the allele of largest marginal given that a D is present; the marginal is
+//! not conditioned on the call's topology, which only the re-traced
+//! alignment keeps. D presence stays the Viterbi decision: the presence marginal
 //! sums the look-elsewhere mass of every chance hit, and taken as a decision
 //! it gives a D to a third of D-free reads (docs/ASSESSMENT.md §5.3). So only
 //! a call with exactly one D is decoded, and a tie within a relative `10⁻⁹`
@@ -21,7 +24,13 @@
 //! The reported alignment is then the best path, under the call's own model,
 //! with the call's [`Topology`] whose D contains `a*`: the same DAG over the
 //! V and J placements and the D placements of `a*`, with the grammar
-//! restricted by [`Within`].
+//! restricted by [`Within`]. Its D segment names `a*`
+//! ([`super::CalledSegment::allele`]), which the report lists first even
+//! when `a*` shares its placement's alignment with another allele. The
+//! pipeline keeps the decoded path only when the report rates its D at
+//! least as probable as the call's: the report's probability counts every
+//! placement whose germline the named allele carries, not one allele's
+//! placements, so the two can disagree.
 
 use super::Marginals;
 use super::model::Grammar;
@@ -34,9 +43,9 @@ pub enum DAlleleDecoding {
     /// The call's own: the allele of the Viterbi path.
     #[default]
     Map,
-    /// The allele of largest posterior marginal, given the call's D presence
-    /// and topology. Needs posteriors: without them (`--no-posterior`) the
-    /// D allele is the call's.
+    /// The allele of largest posterior marginal (given a D is present),
+    /// aligned in the call's topology. Needs posteriors: without them
+    /// (`--no-posterior`) the D allele is the call's.
     MaxMarginal,
 }
 

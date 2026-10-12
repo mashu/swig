@@ -40,6 +40,7 @@ use crate::germline::SegmentKind;
 use crate::locus::{Loci, Locus};
 use crate::orient::{Orientation, OrientationPolicy, StrandIndex};
 use crate::placement::Placement;
+use crate::report::reported_posterior;
 use crate::retrieve::{
     Candidate, ExhaustiveRetriever, LmerMaskRetriever, RetrievalScratch, Retriever,
 };
@@ -479,7 +480,7 @@ where
     ) {
         out.reserve(reads.len());
         for (state, placed) in reads.iter().zip(placements.iter_mut()) {
-            let (path, marginals) = self.adjudicate_loci(placed, adjudication);
+            let (path, marginals) = self.adjudicate_loci(&state.query, placed, adjudication);
             out.push(Call {
                 orientation: state.orientation.expect("stage 1 orients every read"),
                 query: state.query.clone(),
@@ -501,6 +502,7 @@ where
     /// as each locus' paths are hypotheses of one model.
     fn adjudicate_loci(
         &self,
+        query: &[u8],
         placed: &[Placement],
         scratch: &mut Adj::Scratch,
     ) -> (Option<CallPath>, Option<Marginals>) {
@@ -508,7 +510,7 @@ where
         let shared = loci.iter().fold(Loci::ANY, |all, &l| all.intersection(l));
         if !shared.is_empty() {
             let adjudicator = self.adjudicator_for(shared.single());
-            return self.adjudicate_read(adjudicator, placed, scratch);
+            return self.adjudicate_read(adjudicator, query, placed, scratch);
         }
         let all = loci.iter().fold(Loci::NONE, |all, &l| all.union(l));
         // Per locus: the placement ids, the path and the marginals.
@@ -522,7 +524,9 @@ where
             }
             let subset: Vec<Placement> = ids.iter().map(|&i| placed[i].clone()).collect();
             let adjudicator = self.adjudicator_for(Some(locus));
-            if let (Some(path), marginals) = self.adjudicate_read(adjudicator, &subset, scratch) {
+            if let (Some(path), marginals) =
+                self.adjudicate_read(adjudicator, query, &subset, scratch)
+            {
                 found.push((ids, path, marginals));
             }
         }
@@ -578,10 +582,12 @@ where
     /// A path without an anchor, a segment whose retained clip is
     /// significant on its own ([`Placement::anchors`]), is not a call. A
     /// path the adjudicator decodes from the posterior replaces the call
-    /// when it keeps an anchor.
+    /// when it keeps an anchor and its D is reported at least as probable
+    /// ([`Self::keeps_the_d_posterior`]).
     fn adjudicate_read(
         &self,
         adjudicator: &Adj,
+        query: &[u8],
         placed: &[Placement],
         scratch: &mut Adj::Scratch,
     ) -> (Option<CallPath>, Option<Marginals>) {
@@ -599,10 +605,39 @@ where
         if let (Some(called), Some(m)) = (&path, &marginals)
             && let Some(decoded) = adjudicator.decode(placed, called, m, scratch)
             && anchored(&decoded)
+            && self.keeps_the_d_posterior(query, placed, called, &decoded, m)
         {
             path = Some(decoded);
         }
         (path, marginals)
+    }
+
+    /// Whether the report rates `decoded`'s D at least as probable as
+    /// `called`'s. The decoder maximises one allele's posterior marginal;
+    /// the report's probability is that its names include the read's allele
+    /// ([`crate::report::reported_posterior`]), which also counts shorter
+    /// placements whose germline the first allele carries. A switch the
+    /// report rates less probable would contradict the reason for it.
+    fn keeps_the_d_posterior(
+        &self,
+        query: &[u8],
+        placed: &[Placement],
+        called: &CallPath,
+        decoded: &CallPath,
+        marginals: &Marginals,
+    ) -> bool {
+        let Some(d) = self.segment(SegmentKind::D) else {
+            return false;
+        };
+        let posterior = |path: &CallPath| {
+            path.segments
+                .iter()
+                .find(|s| placed[s.placement].kind == SegmentKind::D)
+                .map_or(0.0, |s| {
+                    reported_posterior(placed, query, d.set(), path, s, marginals)
+                })
+        };
+        posterior(decoded) >= posterior(called)
     }
 }
 

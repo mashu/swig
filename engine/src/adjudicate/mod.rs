@@ -38,6 +38,7 @@ pub use units::{
 use std::cmp::Ordering;
 
 use crate::clip::ClipSpan;
+use crate::germline::AlleleId;
 use crate::placement::Placement;
 use crate::scoring::Score;
 
@@ -84,10 +85,10 @@ pub struct CalledSegment {
     pub exit: u32,
     /// The retained sub-alignment (its bounds may be tighter than the cuts).
     pub span: ClipSpan,
-    /// Chosen by its allele's posterior marginal
-    /// ([`DAlleleDecoding::MaxMarginal`]), so that allele is reported first;
-    /// otherwise the call's tie rules order co-optimal names.
-    pub by_marginal: bool,
+    /// The allele chosen by its posterior marginal
+    /// ([`DAlleleDecoding::MaxMarginal`]), one of the placement's, which is
+    /// reported first; `None`: the call's tie rules order co-optimal names.
+    pub allele: Option<AlleleId>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

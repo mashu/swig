@@ -501,7 +501,11 @@ fn a_c_placement_never_reaches_the_vdj_report() {
 }
 
 /// Max-marginal D decoding keeps the call's topology and D presence on every
-/// read, and changes a D only to an allele of larger posterior mass.
+/// read, and changes a D only to an allele of larger posterior mass that
+/// the report rates at least as probable as the call's. The row names the
+/// decoded allele first, also when it shares its placement's alignment with
+/// another allele, and reports that allele's own germline: its bases
+/// between the reported germline coordinates.
 #[test]
 fn max_marginal_d_keeps_the_topology_and_raises_the_d_mass() {
     use swig::sim::{SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
@@ -520,8 +524,9 @@ fn max_marginal_d_keeps_the_topology_and_raises_the_d_mass() {
     );
     let sim = Simulator::new(&db.v, Some(&db.d), &db.j, SimParams::hard()).unwrap();
     let (mut ws, mut ws2) = (map.workspace(), decoded.workspace());
-    let mut changed = 0;
-    for read in sim.reads(600, 9).unwrap() {
+    let set = decoded.segment(SegmentKind::D).unwrap().set();
+    let (mut changed, mut merged) = (0, 0);
+    for read in sim.reads(1200, 9).unwrap() {
         let query = encode(&read.sequence);
         let (a, b) = (
             map.assign(&query, &mut ws),
@@ -539,28 +544,56 @@ fn max_marginal_d_keeps_the_topology_and_raises_the_d_mass() {
                 .collect()
         };
         assert_eq!(kinds(&a, pa), kinds(&b, pb));
-        let d = |c: &Call, p: &CallPath| {
+        let d = |c: &'_ Call, p: &CallPath| {
             p.segments
                 .iter()
                 .find(|s| c.placements[s.placement].kind == SegmentKind::D)
-                .map(|s| c.placements[s.placement].primary_allele())
+                .map(|s| (s.allele, c.placements[s.placement].alleles.clone()))
         };
-        let (da, db_) = (d(&a, pa), d(&b, pb));
-        if da != db_ {
-            let m = b.marginals.as_ref().unwrap();
-            let mass = |allele| -> f64 {
-                b.placements
-                    .iter()
-                    .zip(&m.placement)
-                    .filter(|(p, _)| p.kind == SegmentKind::D && p.alleles.contains(&allele))
-                    .map(|(_, &q)| q)
-                    .sum()
-            };
-            assert!(mass(db_.unwrap()) > mass(da.unwrap()));
-            changed += 1;
-        }
+        let (Some((None, called)), Some((chosen, alleles))) = (d(&a, pa), d(&b, pb)) else {
+            continue;
+        };
+        let sequence = String::from_utf8_lossy(&read.sequence);
+        let record = AirrRecord::from_call("q", &sequence, &b, &decoded, &[None, None, None]);
+        let report = record.d.expect("a D call");
+        // The reported first allele's own bases lie between its coordinates.
+        let first = report.call.split(',').next().unwrap();
+        let allele = set.alleles().iter().find(|a| a.names().any(|n| n == first));
+        let codes = &allele.expect("a known name").codes;
+        let germline: String = report
+            .germline_alignment
+            .chars()
+            .filter(|&c| c != '-')
+            .collect();
+        let range = report.germline_start as usize - 1..report.germline_end as usize;
+        assert_eq!(germline, decode(&codes[range]), "{first}");
+        let Some(chosen) = chosen else {
+            continue;
+        };
+        // The decoded allele is named first, outweighs the call's, and is
+        // reported at least as probable.
+        assert!(set.allele(chosen).names().any(|n| n == first), "{first}");
+        let map_record = AirrRecord::from_call("q", &sequence, &a, &map, &[None, None, None]);
+        let posterior = |r: &swig::report::SegmentReport| r.posterior.expect("posteriors");
+        assert!(posterior(&report) >= posterior(map_record.d.as_ref().unwrap()));
+        let m = b.marginals.as_ref().unwrap();
+        let mass = |allele| -> f64 {
+            b.placements
+                .iter()
+                .zip(&m.placement)
+                .filter(|(p, _)| p.kind == SegmentKind::D && p.alleles.contains(&allele))
+                .map(|(_, &q)| q)
+                .sum()
+        };
+        assert!(called.iter().all(|&c| mass(chosen) > mass(c)));
+        changed += 1;
+        merged += usize::from(alleles[0] != chosen);
     }
     assert!(changed > 0, "some D calls should change ({changed})");
+    assert!(
+        merged > 0,
+        "some decoded alleles share a placement ({merged})"
+    );
 }
 
 #[test]

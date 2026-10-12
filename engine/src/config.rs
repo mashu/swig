@@ -301,8 +301,8 @@ pub struct EngineConfig {
     /// the V scoring's Karlin–Altschul λ ([`BuildError::NoStatistics`]).
     pub calls: CallModel,
     /// How the reported D allele is chosen: the call's, or the one of
-    /// largest posterior marginal given the call's topology. The latter
-    /// needs `posterior`; without it the D allele is the call's.
+    /// largest posterior marginal, aligned in the call's topology. The
+    /// latter needs `posterior`; without it the D allele is the call's.
     pub d_allele: DAlleleDecoding,
     /// Report posterior probabilities (forward–backward over the placement
     /// DAG, priors at the λ they were derived with, alignment evidence at

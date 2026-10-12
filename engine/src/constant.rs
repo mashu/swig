@@ -361,7 +361,7 @@ impl ConstantStage {
             entry: x,
             exit: n,
             span: best.clip.full(),
-            by_marginal: false,
+            allele: None,
         };
         let co = co_optimal(
             &call.constant,

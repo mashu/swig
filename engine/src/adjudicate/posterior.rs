@@ -1128,6 +1128,7 @@ mod tests {
         placements.push(Placement {
             kind: SegmentKind::J,
             alleles: vec![1],
+            shifted: Vec::new(),
             clip,
             evidence: Evidence::default(),
             anchor: Some(Score::MIN),
