@@ -271,9 +271,8 @@ fn junctions_without_d_do_not_invent_one() {
     );
 }
 
-/// AIRR names N/P regions by their neighbours: `np1` follows V, `np2` the
-/// first D and `np3` the second, so a read without V reports its D–J
-/// bases as `np2`.
+/// AIRR names N/P regions by their neighbours: `np1` follows V and `np2`
+/// the D, so a read without V reports its D–J bases as `np2`.
 #[test]
 fn np_regions_are_named_by_their_neighbours() {
     let db = Db::new();
@@ -291,52 +290,9 @@ fn np_regions_are_named_by_their_neighbours() {
 }
 
 #[test]
-fn tandem_d_is_a_first_class_path() {
-    let db = Db::new();
-    let tandem = db.assigner(&EngineConfig {
-        grammar: VdjGrammar::TANDEM_D,
-        ..EngineConfig::default()
-    });
-    let single = db.assigner(&EngineConfig::default());
-    let mut rng = Rng::new(5);
-    let mut both_correct = 0;
-    let trials = 30;
-    for _ in 0..trials {
-        let first = 5 + rng.below(3);
-        let second = (first - 5 + 1 + rng.below(2)) % 3 + 5;
-        let sim = simulate(&db, &mut rng, &[first, second], 0.0);
-        let d_labels = |assigner: &DefaultAssigner| {
-            let call = assigner.assign(&encode(sim.query.as_bytes()), &mut assigner.workspace());
-            let set = assigner.segment(SegmentKind::D).unwrap().set();
-            call.path
-                .iter()
-                .flat_map(|p| &p.segments)
-                .map(|s| &call.placements[s.placement])
-                .filter(|p| p.kind == SegmentKind::D)
-                .map(|p| set.allele(p.primary_allele()).name.clone())
-                .collect::<Vec<_>>()
-        };
-        if d_labels(&tandem) == sim.d[..2] {
-            both_correct += 1;
-        }
-        assert!(
-            d_labels(&single).len() <= 1,
-            "the default grammar allows one D"
-        );
-    }
-    assert!(
-        both_correct * 100 >= trials * 90,
-        "tandem D {both_correct}/{trials}"
-    );
-}
-
-#[test]
 fn called_segments_never_share_query_bases() {
     let db = Db::new();
-    let assigner = db.assigner(&EngineConfig {
-        grammar: VdjGrammar::TANDEM_D,
-        ..EngineConfig::default()
-    });
+    let assigner = db.assigner(&EngineConfig::default());
     let mut rng = Rng::new(13);
     let mut ws = assigner.workspace();
     for _ in 0..50 {
@@ -555,6 +511,13 @@ fn a_c_placement_never_reaches_the_vdj_report() {
 // Brute-force check of the DAG's running-maximum shortcuts.
 // ---------------------------------------------------------------------------
 
+/// VJ, VDJ and VDDJ paths: the engine builds at most one D, the DAG
+/// handles any number.
+const TANDEM_D: VdjGrammar = VdjGrammar {
+    max_d: 2,
+    ..VdjGrammar::VDJ
+};
+
 /// Exhaustive search of the segmentation model: every path of `grammar`, and
 /// for every transition every canonical exit cut `x` and every canonical
 /// entry cut `y ≥ x` of the next placement, with no shortcut, valued term by
@@ -614,9 +577,9 @@ impl<'a, G: Grammar> Brute<'a, G> {
         value
     }
 
-    /// The cut-independent terms of `p` as a segment with `d_used` D so far.
-    fn bonus(&self, p: &Placement, d_used: u8) -> Units {
-        self.read.prior(self.dag.model.segment_bonus(p, d_used)) - self.read.presence(p.kind)
+    /// The cut-independent term of `p`, its kind's presence cost.
+    fn bonus(&self, p: &Placement) -> Units {
+        -self.read.presence(p.kind)
     }
 
     /// Best rest of a path whose current segment is `b`, entered at `entry`.
@@ -633,7 +596,7 @@ impl<'a, G: Grammar> Brute<'a, G> {
         }
         let (grammar, model) = (self.grammar, &self.dag.model);
         let pb = &self.placements[b];
-        let bonus = self.bonus(pb, d_used);
+        let bonus = self.bonus(pb);
         let mut best: Option<PathScore<Units>> = None;
         let mut consider = |candidate: PathScore<Units>| {
             if best.is_none_or(|current| candidate > current) {
@@ -714,7 +677,7 @@ impl<'a, G: Grammar> Brute<'a, G> {
         for (k, segment) in segments.iter().enumerate() {
             let p = &self.placements[segment.placement];
             d_used += u8::from(p.kind == SegmentKind::D);
-            value += self.clip(p, segment.entry, segment.exit) + self.bonus(p, d_used);
+            value += self.clip(p, segment.entry, segment.exit) + self.bonus(p);
             if let Some(before) = k.checked_sub(1).map(|k| &segments[k]) {
                 let inserted = segment.entry - before.exit;
                 value += self
@@ -836,7 +799,7 @@ fn per_read_dag_equals_exhaustive_enumeration() {
                     insertion_per_base: iota,
                     ..base
                 };
-                let dag = PlacementDag::new(VdjGrammar::TANDEM_D, objective, config.min_retained);
+                let dag = PlacementDag::new(TANDEM_D, objective, config.min_retained);
                 let Some((fixed_key, fixed_path)) =
                     dag.viterbi(&placements, &fixed(&dag), &mut scratch)
                 else {
@@ -853,7 +816,7 @@ fn per_read_dag_equals_exhaustive_enumeration() {
                 }
                 // At δ0 the per-read model is the fixed one times u0.
                 let integer = PlacementDag::new(
-                    VdjGrammar::TANDEM_D,
+                    TANDEM_D,
                     EngineeringObjective {
                         presence: objective.presence.map(f64::floor),
                         ..objective
@@ -1025,10 +988,7 @@ fn top_by_kind(placements: &[Placement], kind: SegmentKind, n: usize) -> Vec<Pla
 #[test]
 fn dag_equals_brute_force_over_all_paths_and_cuts() {
     let db = Db::new();
-    let assigner = db.assigner(&EngineConfig {
-        grammar: VdjGrammar::TANDEM_D,
-        ..EngineConfig::default()
-    });
+    let assigner = db.assigner(&EngineConfig::default());
     let config = EngineConfig::default();
     let model = EngineeringObjective {
         insertion_per_base: -1,
@@ -1039,7 +999,7 @@ fn dag_equals_brute_force_over_all_paths_and_cuts() {
             &config.j.scoring,
         )
     };
-    let dag = PlacementDag::new(VdjGrammar::TANDEM_D, model, [10, 3, 6]);
+    let dag = PlacementDag::new(TANDEM_D, model, [10, 3, 6]);
     let mut rng = Rng::new(23);
     let mut ws = assigner.workspace();
     let mut scratch = DagScratch::default();
@@ -1087,10 +1047,7 @@ fn dag_equals_brute_force_over_all_paths_and_cuts() {
 #[test]
 fn simd_batched_pipeline_equals_scalar_per_read() {
     let db = Db::new();
-    let config = EngineConfig {
-        grammar: VdjGrammar::TANDEM_D,
-        ..EngineConfig::default()
-    };
+    let config = EngineConfig::default();
     let simd = db.assigner(&config);
     let scalar = db.assigner(&config).with_aligner(BandedGotoh);
     let mut rng = Rng::new(29);

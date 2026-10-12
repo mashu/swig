@@ -519,8 +519,7 @@ pub(crate) fn segment_report<C: AlleleCatalog>(
             .iter()
             .filter_map(|&i| m.placement.get(i))
             .sum::<f64>()
-            // Rounding; and under a tandem grammar, a path holding two such
-            // D placements, so the sum is then an upper bound.
+            // Rounding.
             .min(1.0)
     });
     let evalue = support[kind.index()].map(|ka| {

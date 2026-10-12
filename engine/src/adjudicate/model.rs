@@ -1,15 +1,15 @@
 //! Path grammar (which topologies are legal) and path model (how they score).
 //!
-//! Separating the two keeps "VDDJ allowed?" (a grammar question) apart from
-//! "what does a second D cost?" (a scoring question). The DAG needs one
+//! Separating the two keeps "which topologies?" (a grammar question) apart
+//! from "what does a segment cost?" (a scoring question). The DAG needs one
 //! structural property from a [`PathModel`]: a segment contributes
-//! *clip score + a bonus that does not depend on the cut positions*, and a
-//! junction contributes a score linear in its inserted length. That
+//! *clip score − a presence cost that does not depend on the cut
+//! positions*, and a junction contributes a score linear in its inserted
+//! length. That
 //! separability is what lets running maxima (or sums) evaluate every pair of
 //! cuts in O(1) amortised per cut (see [`super::PlacementDag`]).
 
 use crate::germline::SegmentKind;
-use crate::placement::Placement;
 use crate::scoring::Score;
 
 /// Which segment sequences form a path. Transitions between kinds must go
@@ -23,7 +23,11 @@ pub trait Grammar: Send + Sync {
     fn can_end(&self, first: SegmentKind, last: SegmentKind, d_count: u8) -> bool;
 }
 
-/// V → D{0..max_d} → J with optional truncation at either end.
+/// V → D{0..max_d} → J with optional truncation at either end. The engine
+/// builds [`VdjGrammar::VDJ`], or [`VdjGrammar::VJ`] without a D database:
+/// an AIRR row holds one D, and Swig's double-D screen reports tandem D
+/// beside the call ([`crate::double_d`]). The DAG itself handles any
+/// `max_d`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VdjGrammar {
     pub max_d: u8,
@@ -37,12 +41,6 @@ impl VdjGrammar {
     /// Heavy-chain default: VJ or VDJ, partial reads allowed.
     pub const VDJ: Self = Self {
         max_d: 1,
-        require_v: false,
-        require_j: false,
-    };
-    /// Tandem D as a first-class topology: VJ, VDJ, VDDJ.
-    pub const TANDEM_D: Self = Self {
-        max_d: 2,
         require_v: false,
         require_j: false,
     };
@@ -99,11 +97,6 @@ pub trait PathModel: Send + Sync {
         self.presence(kind).floor() as Score
     }
 
-    /// Added to the clip score of `placement` besides the D presence cost;
-    /// `d_ordinal` counts D segments up to and including this one (so the
-    /// first D sees 1).
-    fn segment_bonus(&self, placement: &Placement, d_ordinal: u8) -> Score;
-
     /// Score per unassigned query base (N/P region) between two segments.
     /// Junction scores are linear in the inserted length, which keeps both
     /// cuts of a transition separable (see [`super::PlacementDag`]).
@@ -127,10 +120,6 @@ impl<M: PathModel> PathModel for &M {
         (**self).presence(kind)
     }
 
-    fn segment_bonus(&self, placement: &Placement, d_ordinal: u8) -> Score {
-        (**self).segment_bonus(placement, d_ordinal)
-    }
-
     fn junction_per_base(&self, prev: SegmentKind, next: SegmentKind) -> Score {
         (**self).junction_per_base(prev, next)
     }
@@ -140,8 +129,8 @@ impl<M: PathModel> PathModel for &M {
     }
 }
 
-/// The path objective, `Σ S_clip − P_D·#D − P_J·#J − tandem·[2nd D] +
-/// pair_bonus·[V…J] + per-base N/P cost`, read as a log-likelihood ratio.
+/// The path objective, `Σ S_clip − P_D·#D − P_J·#J + pair_bonus·[V…J] +
+/// per-base N/P cost`, read as a log-likelihood ratio.
 ///
 /// Substitution scores are log-odds (in units of `1/λ` nats) of "templated by
 /// this germline" against "random sequence"; N/P bases score 0 under both.
@@ -158,7 +147,6 @@ impl<M: PathModel> PathModel for &M {
 ///   derives both from the databases at build time; V pays nothing. They
 ///   are kept unrounded: the posterior uses them as they are, and the
 ///   fixed-scale call as `⌊P*_k⌋` ([`PathModel::presence_score`]).
-/// * `tandem_d_penalty` — prior odds of a second D (DJ → DDJ), on top of its `P_D`.
 /// * `pair_bonus` — prior odds of a complete V…J rearrangement over a partial
 ///   read. 0 by default: on full-length reads the J's own clip score already
 ///   completes the path, and 0–48 changed no call.
@@ -168,8 +156,6 @@ pub struct EngineeringObjective {
     /// `P*_k` per rearranged kind ([`SegmentKind::REARRANGED`]), indexed by
     /// [`SegmentKind::index`].
     pub presence: [f64; 3],
-    /// Extra prior cost for every D beyond the first.
-    pub tandem_d_penalty: Score,
     /// Score per unassigned junction base (0 = no N/P length prior).
     pub insertion_per_base: Score,
 }
@@ -179,7 +165,6 @@ impl Default for EngineeringObjective {
         Self {
             pair_bonus: 0,
             presence: [0.0, 11.0, 0.0],
-            tandem_d_penalty: 12,
             insertion_per_base: 0,
         }
     }
@@ -211,14 +196,6 @@ impl EngineeringObjective {
 impl PathModel for EngineeringObjective {
     fn presence(&self, kind: SegmentKind) -> f64 {
         self.presence[kind.index()]
-    }
-
-    fn segment_bonus(&self, placement: &Placement, d_ordinal: u8) -> Score {
-        if placement.kind == SegmentKind::D && d_ordinal >= 2 {
-            -self.tandem_d_penalty
-        } else {
-            0
-        }
     }
 
     fn junction_per_base(&self, _prev: SegmentKind, _next: SegmentKind) -> Score {

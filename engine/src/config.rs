@@ -238,7 +238,6 @@ pub struct ObjectiveConfig {
     /// positive value completes a path for free, so a read that stops
     /// before its J gets one from a few chance bases.
     pub j_prior: DPrior,
-    pub tandem_d_penalty: Score,
     pub insertion_per_base: Score,
 }
 
@@ -248,7 +247,6 @@ impl Default for ObjectiveConfig {
             pair_bonus: 0,
             d_prior: DPrior::DERIVED,
             j_prior: DPrior::DERIVED,
-            tandem_d_penalty: 12,
             insertion_per_base: 0,
         }
     }
@@ -278,7 +276,6 @@ impl ObjectiveConfig {
                 self.d_prior.cost(space, &d_config.scoring),
                 self.j_prior.cost(DSearchSpace::of(j, 1), j_scoring),
             ],
-            tandem_d_penalty: self.tandem_d_penalty,
             insertion_per_base: self.insertion_per_base,
         }
     }
@@ -294,7 +291,6 @@ pub struct EngineConfig {
     pub d_window: ExpandedResidual,
     /// Add the conserved-anchor D window when alleles carry `anchor=` positions.
     pub anchor_window: bool,
-    pub grammar: VdjGrammar,
     pub objective: ObjectiveConfig,
     /// Minimum retained query bases after clipping, per rearranged kind
     /// ([`SegmentKind::REARRANGED`]), indexed by [`SegmentKind::index`].
@@ -416,7 +412,6 @@ impl Default for EngineConfig {
             c: CSegmentConfig::default(),
             d_window: ExpandedResidual::default(),
             anchor_window: true,
-            grammar: VdjGrammar::VDJ,
             objective: ObjectiveConfig::default(),
             // A clipped V or J keeps at least one base, a D `min_d_match`.
             min_retained: [1, 4, 1],
@@ -603,13 +598,11 @@ impl Assigner {
         } else {
             WithAnchorWindow::disabled(config.d_window)
         };
+        // An AIRR row holds one D: tandem D is the double-D screen's.
         let grammar = if d.is_some() {
-            config.grammar
+            VdjGrammar::VDJ
         } else {
-            VdjGrammar {
-                max_d: 0,
-                ..config.grammar
-            }
+            VdjGrammar::VJ
         };
         let strand = StrandIndex::build([&v, &j], StrandIndex::K);
         let objective = config

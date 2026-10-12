@@ -317,12 +317,9 @@ struct Pass<'a, G, M> {
 }
 
 impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
-    /// Weight of `node`'s cut-independent terms: its bonus and its kind's
-    /// presence cost.
-    fn segment_bonus(&self, node: Node, d_used: u8) -> f64 {
-        let placement = &self.placements[node.placement];
-        self.w.of(self.dag.model.segment_bonus(placement, d_used))
-            * self.presence[node.kind.index()]
+    /// Weight of `node`'s cut-independent term, its kind's presence cost.
+    fn presence(&self, node: Node) -> f64 {
+        self.presence[node.kind.index()]
     }
 
     fn run(&self, s: &mut PosteriorScratch) -> Option<Marginals> {
@@ -608,7 +605,7 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
         }
         let width = node.width();
         let min = self.dag.min_bases(node.kind) as usize;
-        let bonus = self.segment_bonus(node, d_used);
+        let bonus = self.presence(node);
         let mut x = std::mem::take(&mut s.work);
         x.clear();
         let mut acc = 0.0;
@@ -741,7 +738,7 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
 
         // B(y) = e^{−λ entry(y)} · Σ_{x ≥ y + min} X-weight(x) · inner(x).
         let min = self.dag.min_bases(node.kind) as usize;
-        let bonus = self.segment_bonus(node, d_used);
+        let bonus = self.presence(node);
         let mut acc = 0.0;
         for o in (0..width).rev() {
             acc += s.exit_w[node.cuts + o] * bonus * inner[o];
@@ -831,6 +828,13 @@ mod tests {
 
     const LAMBDA: f64 = 0.6337;
 
+    /// VJ, VDJ and VDDJ paths: the engine builds at most one D, the DAG
+    /// handles any number.
+    const TANDEM_D: VdjGrammar = VdjGrammar {
+        max_d: 2,
+        ..VdjGrammar::VDJ
+    };
+
     /// The fixtures' scorings: `(2, −3)` for every kind, priors at `LAMBDA`.
     const EVIDENCE: EvidenceModel = EvidenceModel {
         lambda: LAMBDA,
@@ -886,12 +890,11 @@ mod tests {
             (nats, units)
         }
 
-        /// `b`'s cut-independent terms as the `d_used`-th D (if a D).
-        fn bonus(&self, b: &Placement, d_used: u8) -> (f64, Units) {
-            let bonus = self.dag.model.segment_bonus(b, d_used);
+        /// `b`'s cut-independent term, its kind's presence cost.
+        fn bonus(&self, b: &Placement) -> (f64, Units) {
             (
-                self.nats.lambda * f64::from(bonus) - self.nats.presence[b.kind.index()],
-                self.read.prior(bonus) - self.read.presence(b.kind),
+                -self.nats.presence[b.kind.index()],
+                -self.read.presence(b.kind),
             )
         }
 
@@ -914,7 +917,7 @@ mod tests {
             let (dag, placements) = (self.dag, self.placements);
             let b = &placements[*path.last().expect("non-empty")];
             let min_b = dag.min_retained[b.kind.index()].max(1);
-            let bonus = self.bonus(b, d_used);
+            let bonus = self.bonus(b);
             for x in Self::exits(b).into_iter().filter(|&x| x >= entry + min_b) {
                 let evidence = self.evidence(b, entry, x);
                 let (nats, units) = (nats + evidence.0 + bonus.0, units + evidence.1 + bonus.1);
@@ -992,7 +995,7 @@ mod tests {
             for (k, segment) in segments.iter().enumerate() {
                 let b = &placements[segment.placement];
                 d_used += u8::from(b.kind == SegmentKind::D);
-                units += self.evidence(b, segment.entry, segment.exit).1 + self.bonus(b, d_used).1;
+                units += self.evidence(b, segment.entry, segment.exit).1 + self.bonus(b).1;
                 if let Some(before) = k.checked_sub(1).map(|k| &segments[k]) {
                     let kind = placements[before.placement].kind;
                     let inserted = segment.entry - before.exit;
@@ -1152,7 +1155,7 @@ mod tests {
             ..EngineeringObjective::default()
         };
         let fixed = EvidenceScale::fixed(LAMBDA);
-        for grammar in [VdjGrammar::VDJ, VdjGrammar::TANDEM_D, VdjGrammar::VJ] {
+        for grammar in [VdjGrammar::VDJ, TANDEM_D, VdjGrammar::VJ] {
             check_fixed(
                 &PlacementDag::new(grammar, model, [4, 3, 4]),
                 &placements,
@@ -1163,13 +1166,13 @@ mod tests {
             insertion_per_base: -1,
             ..model
         };
-        let dag = PlacementDag::new(VdjGrammar::TANDEM_D, per_base, [4, 3, 4]);
+        let dag = PlacementDag::new(TANDEM_D, per_base, [4, 3, 4]);
         check_fixed(&dag, &placements, fixed);
         // Evidence at a read's own divergence: a per-column term μ ≠ 0.
         check_fixed(&dag, &placements, EvidenceScale::at_divergence(0.02, 2, -3));
         // A D before a J whose alignment starts earlier.
         let (_, over) = j_reaching_over_d();
-        for grammar in [VdjGrammar::VDJ, VdjGrammar::TANDEM_D] {
+        for grammar in [VdjGrammar::VDJ, TANDEM_D] {
             check_fixed(&PlacementDag::new(grammar, model, [4, 3, 4]), &over, fixed);
         }
         // An N column and an insertion, at the read's divergence and fixed.
@@ -1201,7 +1204,7 @@ mod tests {
         let fixtures = [junction().1, gapped_junction().1, j_reaching_over_d().1];
         for p in [0.005, delta0, 0.3] {
             for placements in &fixtures {
-                for grammar in [VdjGrammar::VDJ, VdjGrammar::TANDEM_D, VdjGrammar::VJ] {
+                for grammar in [VdjGrammar::VDJ, TANDEM_D, VdjGrammar::VJ] {
                     for objective in [model, per_base] {
                         let dag = PlacementDag::new(grammar, objective, [4, 3, 4]);
                         check_per_read(&dag, placements, p);

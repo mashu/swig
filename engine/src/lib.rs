@@ -20,7 +20,7 @@
 //! segment / family_bound / flank   retrieve → score-only DP → keep → traceback
 //! clip / evidence / placement      O(1) clip-and-rescore, admission evidence
 //! window / admission               where D is searched, which D hits count
-//! adjudicate                       placement DAG (VJ / VDJ; VDDJ as a grammar)
+//! adjudicate                       placement DAG (VJ / VDJ)
 //! constant                         C anchored at the J exit, after adjudication
 //! pipeline / config / profiles     stage-wise, chunk-batched composition and the
 //!                                  note's calling profiles

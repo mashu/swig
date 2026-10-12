@@ -331,8 +331,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         let width = node.width();
         let placement = &placements[node.placement];
         let min = self.min_bases(node.kind) as usize;
-        let bonus =
-            read.prior(self.model.segment_bonus(placement, d_used)) - read.presence(node.kind);
+        let bonus = -read.presence(node.kind);
         let support = placement.score();
 
         // Running best of F(y) − entry(y) over entries, read min bases later.
@@ -516,8 +515,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         for (k, segment) in segments.iter().enumerate() {
             let placement = &placements[segment.placement];
             d_count += u8::from(placement.kind == SegmentKind::D);
-            score += segment.span.score - self.model.presence_score(placement.kind)
-                + self.model.segment_bonus(placement, d_count);
+            score += segment.span.score - self.model.presence_score(placement.kind);
             support += placement.score();
             if let Some(before) = k.checked_sub(1).map(|b| &segments[b]) {
                 score +=

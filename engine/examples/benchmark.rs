@@ -3,7 +3,7 @@
 //! ```text
 //! cargo run --release --example benchmark -- [--v V.fasta --d D.fasta --j J.fasta]
 //!     [--preset easy|mid|hard] [--shm RATE] [--reads N] [--seed S] [--rc P]
-//!     [--profile r|truth|igblast|sensitive-d] [--tandem-d] [--threads N]
+//!     [--profile r|truth|igblast|sensitive-d] [--threads N]
 //!     [--simd avx512|avx2|neon|portable|scalar]
 //! ```
 //!
@@ -42,9 +42,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut config = profile.config();
     if let Some(name) = value("--simd") {
         config.simd = Some(swig::align::Backend::from_name(&name).ok_or("unknown --simd backend")?);
-    }
-    if args.flag("--tandem-d") {
-        config.grammar = VdjGrammar::TANDEM_D;
     }
     if let Some(penalty) = value("--p-d") {
         config.objective.d_prior = swig::config::DPrior::Fixed(penalty.parse()?);
@@ -116,9 +113,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     if let Some(bonus) = value("--pair-bonus") {
         config.objective.pair_bonus = bonus.parse()?;
-    }
-    if let Some(tandem) = value("--tandem") {
-        config.objective.tandem_d_penalty = tandem.parse()?;
     }
     for (name, accept) in [
         ("--v-accept", &mut config.v.accept),

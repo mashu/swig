@@ -158,7 +158,6 @@ fn degenerate_reads_are_handled_by_every_configuration() {
     let mut configs = vec![EngineConfig::default()];
     for profile in CallingProfile::ALL {
         let mut config = profile.config();
-        config.grammar = VdjGrammar::TANDEM_D;
         config.posterior = profile == CallingProfile::SensitiveD;
         configs.push(config);
     }

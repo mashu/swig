@@ -153,7 +153,10 @@ mod tests {
     fn within_keeps_one_topology() {
         use SegmentKind::{D, J, V};
         let vdj = Within {
-            grammar: &VdjGrammar::TANDEM_D,
+            grammar: &VdjGrammar {
+                max_d: 2,
+                ..VdjGrammar::VDJ
+            },
             topology: Topology {
                 first: V,
                 last: J,
