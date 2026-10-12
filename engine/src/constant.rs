@@ -67,7 +67,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::adjudicate::{CalledSegment, EvidenceScale};
+use crate::adjudicate::{CalledSegment, EvidenceScale, co_optimal};
 use crate::align::{Aligner, Alignment, Op};
 use crate::band::Band;
 use crate::clip::ClipIndex;
@@ -76,7 +76,6 @@ use crate::germline::{GermlineSet, SegmentKind};
 use crate::locus::{Loci, Locus};
 use crate::pipeline::Call;
 use crate::placement::{Placement, merge_identical};
-use crate::report::co_optimal;
 use crate::retrieve::{Candidate, ReachClasses, RetrievalScratch};
 use crate::scoring::{AffineScoring, AnchorColumn, GapCosts, Score};
 use crate::segment::{BatchScratch, KeepPolicy, PreparedSegment, SegmentRequest, SegmentStage};

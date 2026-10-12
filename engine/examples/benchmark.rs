@@ -218,8 +218,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         let queries: Vec<Vec<u8>> = random.iter().map(|r| encode(r)).collect();
         let calls = assign_all(&assigner, &queries, threads);
         let (mut v, mut j, mut path) = (0, 0, 0);
-        for call in &calls {
-            let record = AirrRecord::from_call("r", "", call, &assigner, &[None, None, None]);
+        for (read, call) in random.iter().zip(&calls) {
+            let sequence = String::from_utf8_lossy(read);
+            let record =
+                AirrRecord::from_call("r", &sequence, call, &assigner, &[None, None, None]);
             v += usize::from(record.v.is_some());
             j += usize::from(record.j.is_some());
             path += usize::from(call.path.is_some());

@@ -408,7 +408,7 @@ fn the_constant_region_is_called_from_the_j_exit() {
         for (a, b) in alone.constant.iter().zip(&call.constant) {
             assert_eq!((&a.alleles, &a.alignment), (&b.alleles, &b.alignment));
         }
-        let record = AirrRecord::from_call("q", "", call, &simd, &[None, None, None]);
+        let record = AirrRecord::from_call("q", &decode(query), call, &simd, &[None, None, None]);
         let primary = call.c.map(|c| {
             let allele = call.constant[c.segment.placement].primary_allele();
             simd.segment(SegmentKind::C)

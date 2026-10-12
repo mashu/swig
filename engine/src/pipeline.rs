@@ -25,7 +25,9 @@
 //! Swapping a component changes the type:
 //!
 //! ```ignore
-//! let scalar = assigner.with_aligner(BandedGotoh);
+//! let experimental = assigner
+//!     .with_d_window(ExpandedResidual::default())
+//!     .with_d_admission(ExactRunFloor { min_run: 5 });
 //! ```
 
 use std::ops::Range;
@@ -217,11 +219,6 @@ impl<A, RV, RJ, RD, W, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj> {
     ) -> Assigner<A, RV, RJ, RD, W, Adm2, Adj> {
         let d = self.d.map(|stage| stage.with_accept(d_admission));
         replace!(self { v, j, strand, j_window, aligner, d_window, adjudicator, locus_adjudicators, c, options } d: d)
-    }
-
-    pub fn with_options(mut self, options: AssignerOptions) -> Self {
-        self.options = options;
-        self
     }
 }
 
@@ -729,6 +726,69 @@ impl<A, RV, RJ, RD, W, Adm, Adj> AlleleCatalog for Assigner<A, RV, RJ, RD, W, Ad
             SegmentKind::D => self.d.as_ref().map(|stage| &*stage.segment),
             SegmentKind::J => Some(&self.j.segment),
             SegmentKind::C => self.c.as_ref().map(|stage| &*stage.plain),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::admission::AdmitAll;
+    use crate::alphabet::encode;
+    use crate::annotate::AnnotateOptions;
+    use crate::batch::assign_all;
+    use crate::config::DefaultAssigner;
+    use crate::prepare::prepare;
+    use crate::profiles::CallingProfile;
+    use crate::sim::{SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
+
+    /// Swapping a component rebuilds the assigner around it and moves the
+    /// others across: the D window and admission of an identical assigner,
+    /// swapped in, give the same calls; admitting every D hit keeps at
+    /// least as many D placements per read.
+    #[test]
+    fn swapped_components_keep_the_others() {
+        let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 5);
+        let assigner = || {
+            let database = prepare(
+                db.v.clone(),
+                Some(db.d.clone()),
+                db.j.clone(),
+                AnnotateOptions::default(),
+            )
+            .unwrap();
+            let config = CallingProfile::ROptimized.config();
+            DefaultAssigner::from_config(&config, database.v, database.d, database.j).unwrap()
+        };
+        let sim = Simulator::new(&db.v, Some(&db.d), &db.j, SimParams::mid()).unwrap();
+        let queries: Vec<Vec<u8>> = sim
+            .reads(60, 4)
+            .unwrap()
+            .iter()
+            .map(|read| encode(&read.sequence))
+            .collect();
+        let shown = |calls: &[Call]| -> Vec<String> {
+            calls
+                .iter()
+                .map(|c| format!("{:?} {:?}", c.path, c.placements.len()))
+                .collect()
+        };
+        let base = assign_all(&assigner(), &queries, 1);
+        let donor = assigner();
+        let swapped = assigner()
+            .with_d_window(donor.d_window)
+            .with_d_admission(donor.d.expect("the test database has D").accept);
+        assert_eq!(shown(&assign_all(&swapped, &queries, 1)), shown(&base));
+        let d_count = |call: &Call| {
+            call.placements
+                .iter()
+                .filter(|p| p.kind == SegmentKind::D)
+                .count()
+        };
+        let admitted = assign_all(&assigner().with_d_admission(AdmitAll), &queries, 1);
+        assert!(base.iter().any(|call| d_count(call) > 0));
+        for (all, gated) in admitted.iter().zip(&base) {
+            assert!(d_count(all) >= d_count(gated));
         }
     }
 }

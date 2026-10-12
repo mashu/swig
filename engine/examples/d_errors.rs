@@ -89,7 +89,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         let tally = &mut tallies[usize::from(true_d.span.len() < 8)];
         tally.reads += 1;
-        let record = AirrRecord::from_call("x", "", &call, &assigner, &[None, None, None]);
+        let sequence = String::from_utf8_lossy(&read.sequence);
+        let record = AirrRecord::from_call("x", &sequence, &call, &assigner, &[None, None, None]);
         let span = |r: &Option<swig::report::SegmentReport>| {
             r.as_ref()
                 .map(|s| s.sequence_start as usize - 1..s.sequence_end as usize)

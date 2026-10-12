@@ -27,6 +27,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io::{self, BufRead, Write};
+use std::sync::Arc;
 
 use crate::adjudicate::{CallModel, DAlleleDecoding};
 use crate::align::Backend;
@@ -53,6 +54,11 @@ pub const BATCH: usize = 16_384;
 
 /// Rows [`Run`] keeps for sequences it may see again.
 pub const CACHE: usize = 4096;
+
+/// The most negative mismatch score an option takes. Alignment scores then
+/// stay far inside `i32` on any read, and within the step the SIMD kernels
+/// admit.
+pub const MIN_MISMATCH: Score = -1_000;
 
 /// An option that is unknown, lacks its value, or cannot take the one given.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -162,16 +168,20 @@ fn parsed<T>(
     parse(value).ok_or_else(|| OptionError(format!("--{name} expects {expects}, got '{value}'")))
 }
 
+/// The mismatch score `value` of option `name`: negative, down to
+/// [`MIN_MISMATCH`].
+fn mismatch(name: &str, value: &str) -> Result<Score, OptionError> {
+    let expects = format!("a negative score down to {MIN_MISMATCH}");
+    parsed(name, value, &expects, |v| {
+        v.parse().ok().filter(|s| (MIN_MISMATCH..0).contains(s))
+    })
+}
+
 /// A fraction in [0, 1].
 fn fraction(value: &str) -> Option<f64> {
     value.parse().ok().filter(|f: &f64| (0.0..=1.0).contains(f))
 }
 
-/// Most negative `--d-mismatch` / `--j-mismatch`.
-const MIN_MISMATCH: Score = -1_000;
-
-/// What `--d-mismatch` / `--j-mismatch` take.
-const PENALTY: &str = "a negative score of at least -1000";
 
 /// `scoring` with mismatch score `mismatch`.
 fn with_mismatch(scoring: AffineScoring, mismatch: Score) -> AffineScoring {
@@ -237,13 +247,6 @@ impl RunOptions {
         };
         let count = |v: &str| v.parse::<u32>().ok();
         let positive = |v: &str| v.parse::<u32>().ok().filter(|&n| n > 0);
-        // Alignment scores sum per-column scores in `Score`: a mismatch score
-        // far below any real one (IgBLAST takes −1 to −5) would wrap them.
-        let penalty = |v: &str| {
-            v.parse::<Score>()
-                .ok()
-                .filter(|s| (MIN_MISMATCH..0).contains(s))
-        };
         match name {
             "profile" => {
                 self.profile = parsed(
@@ -302,12 +305,8 @@ impl RunOptions {
             "min-d-match" => {
                 self.min_d_match = Some(parsed(name, value, "a positive number", positive)?);
             }
-            "d-mismatch" => {
-                self.d_mismatch = Some(parsed(name, value, PENALTY, penalty)?);
-            }
-            "j-mismatch" => {
-                self.j_mismatch = Some(parsed(name, value, PENALTY, penalty)?);
-            }
+            "d-mismatch" => self.d_mismatch = Some(mismatch(name, value)?),
+            "j-mismatch" => self.j_mismatch = Some(mismatch(name, value)?),
             "min-j-length" => self.min_j_length = Some(parsed(name, value, "a number", count)?),
             "double-d" => {
                 self.double_d.mode =
@@ -462,27 +461,34 @@ pub struct Rows {
 struct Assigned {
     /// The AIRR row from the tab before `sequence_aa`.
     airr: String,
-    /// The sidecar row from the tab before `locus`.
+    /// The sidecar fields from `locus` on, without a leading tab.
     double_d: Option<String>,
     called: bool,
 }
 
-/// Rows of recently assigned sequences, oldest dropped first.
+/// The rows of the [`CACHE`] most recently assigned distinct sequences,
+/// oldest dropped first (a hit does not refresh an entry).
 #[derive(Debug, Default)]
 struct Cache {
-    rows: HashMap<Vec<u8>, Assigned>,
-    order: VecDeque<Vec<u8>>,
+    rows: HashMap<Arc<[u8]>, Assigned>,
+    order: VecDeque<Arc<[u8]>>,
 }
 
 impl Cache {
-    fn insert(&mut self, sequence: Vec<u8>, assigned: Assigned) {
-        if self.order.len() == CACHE
-            && let Some(oldest) = self.order.pop_front()
-        {
-            self.rows.remove(&oldest);
+    /// Keep the rows of `assigned`, sequences in the order they were
+    /// assigned: only the last [`CACHE`] of them stay.
+    fn extend<'a>(&mut self, assigned: impl ExactSizeIterator<Item = (&'a [u8], Assigned)>) {
+        let skip = assigned.len().saturating_sub(CACHE);
+        for (sequence, rows) in assigned.skip(skip) {
+            if self.order.len() == CACHE
+                && let Some(oldest) = self.order.pop_front()
+            {
+                self.rows.remove(&oldest);
+            }
+            let sequence: Arc<[u8]> = sequence.into();
+            self.order.push_back(Arc::clone(&sequence));
+            self.rows.insert(sequence, rows);
         }
-        self.order.push_back(sequence.clone());
-        self.rows.insert(sequence, assigned);
     }
 }
 
@@ -512,24 +518,12 @@ fn assigned<T: VdjAssigner + AlleleCatalog + Sync>(
     assign_map(assigner, &encoded, threads, |i, call| {
         let sequence = String::from_utf8_lossy(sequences[i]);
         let mut record = AirrRecord::from_call("", &sequence, &call, assigner, support);
-        if let Some(gate) = c_prefix_identity
-            && record
-                .c
-                .as_ref()
-                .is_some_and(|c| c.prefix_identity.is_none_or(|p| p + 1e-9 < gate))
-        {
-            record.c = None;
+        if let Some(min) = c_prefix_identity {
+            record.gate_c_prefix(min);
         }
         let double_d = screen
             .zip(assigner.segment(SegmentKind::D))
-            .and_then(|(screen, d)| {
-                screen.screen(
-                    d.set(),
-                    &call.query,
-                    record.locus,
-                    [record.v.as_ref(), record.d.as_ref(), record.j.as_ref()],
-                )
-            });
+            .and_then(|(screen, d)| screen.screen(d.set(), &call.query, &record));
         Assigned {
             // `sequence_id`, `sequence` and `quality` are the read's own.
             airr: tail(&record.to_tsv(), 3).to_string(),
@@ -599,13 +593,23 @@ impl Run {
     /// The AIRR and double-D rows of `records`, in order: a sidecar row
     /// starts with its read's index in `records`.
     pub fn assign(&mut self, records: &[ReadRecord]) -> Rows {
-        // The sequences to assign: each once, and none the cache holds.
+        self.assign_from(records, 0)
+    }
+
+    /// [`Self::assign`], a sidecar row starting with `first` plus its
+    /// read's index in `records`.
+    fn assign_from(&mut self, records: &[ReadRecord], first: usize) -> Rows {
+        // The sequences to assign, in input order: each once, and none the
+        // cache holds; `queued` holds each one's index in `fresh`.
         let mut fresh: Vec<&[u8]> = Vec::new();
-        let mut queued: HashMap<&[u8], ()> = HashMap::new();
+        let mut queued: HashMap<&[u8], usize> = HashMap::new();
         for record in records {
             let sequence = record.sequence.as_slice();
-            if !self.cache.rows.contains_key(sequence) && queued.insert(sequence, ()).is_none() {
-                fresh.push(sequence);
+            if !self.cache.rows.contains_key(sequence) {
+                queued.entry(sequence).or_insert_with(|| {
+                    fresh.push(sequence);
+                    fresh.len() - 1
+                });
             }
         }
         let found = assigned(
@@ -616,13 +620,13 @@ impl Run {
             self.c_prefix_identity,
             self.screen.as_ref(),
         );
-        let batch: HashMap<&[u8], Assigned> = fresh.into_iter().zip(found).collect();
         let mut rows = Rows::default();
         for (index, record) in records.iter().enumerate() {
             self.ordinal += 1;
             let sequence = record.sequence.as_slice();
-            let assigned = batch
+            let assigned = queued
                 .get(sequence)
+                .map(|&i| &found[i])
                 .or_else(|| self.cache.rows.get(sequence))
                 .expect("every sequence is assigned or cached");
             let id = if record.id.is_empty() {
@@ -638,15 +642,13 @@ impl Run {
             rows.airr += &assigned.airr;
             rows.airr.push('\n');
             if let Some(rest) = &assigned.double_d {
-                rows.double_d += &format!("{index}\t{id}\t{rest}\n");
+                rows.double_d += &format!("{}\t{id}\t{rest}\n", first + index);
                 rows.tally.double_d += 1;
             }
             rows.tally.reads += 1;
             rows.tally.called += usize::from(assigned.called);
         }
-        for (sequence, assigned) in batch {
-            self.cache.insert(sequence.to_vec(), assigned);
-        }
+        self.cache.extend(fresh.into_iter().zip(found));
         rows
     }
 
@@ -658,35 +660,43 @@ impl Run {
         &mut self,
         reads: R,
         out: &mut W,
+        double_d: Option<&mut dyn Write>,
+    ) -> Result<Tally, RunError> {
+        self.write_batches(reads, out, double_d, BATCH)
+    }
+
+    /// [`Self::write_airr`], `batch` reads at a time.
+    fn write_batches<R: BufRead, W: Write>(
+        &mut self,
+        reads: R,
+        out: &mut W,
         mut double_d: Option<&mut dyn Write>,
+        batch_size: usize,
     ) -> Result<Tally, RunError> {
         writeln!(out, "{}", self.airr_header()).map_err(RunError::Output)?;
         if let Some(sidecar) = double_d.as_mut() {
             writeln!(sidecar, "{}", self.double_d_header()).map_err(RunError::Output)?;
         }
         let mut reader = ReadReader::new(reads);
-        let mut batch = Vec::with_capacity(BATCH);
+        let mut batch = Vec::with_capacity(batch_size);
         let mut tally = Tally::default();
         loop {
             batch.clear();
             if reader
-                .read_batch(BATCH, &mut batch)
+                .read_batch(batch_size, &mut batch)
                 .map_err(RunError::Reads)?
                 == 0
             {
                 return Ok(tally);
             }
-            let rows = self.assign(&batch);
+            // Sidecar indices count from the input's start.
+            let rows = self.assign_from(&batch, tally.reads);
             out.write_all(rows.airr.as_bytes())
                 .map_err(RunError::Output)?;
             if let Some(sidecar) = double_d.as_mut() {
-                // Batch indices become indices in the whole input.
-                for line in rows.double_d.lines() {
-                    let (index, rest) = line.split_once('\t').expect("an indexed row");
-                    let index: usize = index.parse().expect("a batch index");
-                    writeln!(sidecar, "{}\t{rest}", tally.reads + index)
-                        .map_err(RunError::Output)?;
-                }
+                sidecar
+                    .write_all(rows.double_d.as_bytes())
+                    .map_err(RunError::Output)?;
             }
             tally += rows.tally;
             // A batch's rows reach a reader as soon as they are assigned:
@@ -776,6 +786,8 @@ mod tests {
             RunOptions::default().config(),
             CallingProfile::ROptimized.config()
         );
+        options.set("j-mismatch", Some("-1000")).unwrap();
+        assert_eq!(options.j_mismatch, Some(MIN_MISMATCH));
         for (name, value) in [
             ("profile", Some("best")),
             ("strand", Some("plus")),
@@ -905,6 +917,36 @@ mod tests {
         assert_eq!(fields[3..], original[3..]);
     }
 
+    /// The cache keeps the rows of the most recently assigned distinct
+    /// sequences, in the order they were assigned.
+    #[test]
+    fn the_cache_keeps_the_latest_sequences() {
+        let ([v, d, j, _], _) = texts_and_reads(0);
+        let texts = GermlineTexts {
+            v: &v,
+            d: Some(&d),
+            j: &j,
+            c: None,
+        };
+        let database = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+        let mut run = Run::new(&RunOptions::default(), database).unwrap();
+        let mut rng = crate::sim::Rng::new(9);
+        let records: Vec<ReadRecord> = (0..CACHE + 100)
+            .map(|i| ReadRecord {
+                id: format!("junk{i}"),
+                sequence: rng.bases(30),
+                quality: String::new(),
+            })
+            .collect();
+        run.assign(&records[..50]);
+        run.assign(&records[50..]);
+        let kept: Vec<&[u8]> = run.cache.order.iter().map(|s| &s[..]).collect();
+        let latest: Vec<&[u8]> = records[100..].iter().map(|r| &r.sequence[..]).collect();
+        assert_eq!(kept, latest);
+        assert_eq!(run.cache.rows.len(), CACHE);
+        assert!(latest.iter().all(|s| run.cache.rows.contains_key(*s)));
+    }
+
     /// The double-D screen leaves every AIRR row as it is and writes
     /// sidecar rows for tandem-D reads.
     #[test]
@@ -949,6 +991,112 @@ mod tests {
             assert!(d_end < d2_start);
             assert!(at("swig_double_d_score_gain").parse::<i32>().unwrap() >= 8);
         }
+    }
+
+    /// Streamed in batches, the sidecar's `swig_batch_record_index` counts
+    /// from the start of the input and names the read of that AIRR row.
+    #[test]
+    fn streamed_sidecar_rows_index_the_whole_input() {
+        let params = SimParams {
+            include_dd: 0.5,
+            ..SimParams::preset("easy").unwrap()
+        };
+        let ([v, d, j, _], reads) = texts_and_simulated(120, params);
+        let texts = GermlineTexts {
+            v: &v,
+            d: Some(&d),
+            j: &j,
+            c: None,
+        };
+        let mut options = RunOptions::default();
+        options.set("double-d", Some("all")).unwrap();
+        options.set("double-d-seed-length", Some("6")).unwrap();
+        let run = || {
+            let database = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+            Run::new(&options, database).unwrap()
+        };
+        let (mut out, mut sidecar) = (Vec::new(), Vec::new());
+        run()
+            .write_batches(reads.as_bytes(), &mut out, Some(&mut sidecar), 7)
+            .unwrap();
+        let (out, sidecar) = (
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(sidecar).unwrap(),
+        );
+        let records: Vec<ReadRecord> = ReadReader::new(reads.as_bytes())
+            .map(Result::unwrap)
+            .collect();
+        let whole = run().assign(&records);
+        assert_eq!(out, format!("{}\n{}", AirrRecord::tsv_header(), whole.airr));
+        assert_eq!(
+            sidecar,
+            format!("{}\n{}", double_d::header(), whole.double_d)
+        );
+        let rows: Vec<&str> = out.lines().skip(1).collect();
+        let indices: Vec<usize> = sidecar
+            .lines()
+            .skip(1)
+            .map(|line| {
+                let (index, rest) = line.split_once('\t').unwrap();
+                let index: usize = index.parse().unwrap();
+                let id = rest.split('\t').next().unwrap();
+                assert!(rows[index].starts_with(&format!("{id}\t")), "{line}");
+                index
+            })
+            .collect();
+        assert!(indices.windows(2).all(|w| w[0] < w[1]));
+        assert!(indices.last().is_some_and(|&i| i >= 7), "{indices:?}");
+    }
+
+    /// The sidecar quotes the read's own symbols, as the AIRR row does: an
+    /// IUPAC code between the two Ds stays in `np2`.
+    #[test]
+    fn the_double_d_sidecar_quotes_the_read() {
+        let params = SimParams {
+            include_dd: 0.5,
+            reverse_complement: 0.0,
+            ..SimParams::preset("easy").unwrap()
+        };
+        let ([v, d, j, _], reads) = texts_and_simulated(120, params);
+        let texts = GermlineTexts {
+            v: &v,
+            d: Some(&d),
+            j: &j,
+            c: None,
+        };
+        let mut records: Vec<ReadRecord> = ReadReader::new(reads.as_bytes())
+            .map(Result::unwrap)
+            .collect();
+        let mut options = RunOptions::default();
+        options.set("double-d", Some("all")).unwrap();
+        options.set("double-d-seed-length", Some("6")).unwrap();
+        let screen = |records: &[ReadRecord]| {
+            let database = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+            Run::new(&options, database)
+                .unwrap()
+                .assign(records)
+                .double_d
+        };
+        let at = |name: &str| double_d::COLUMNS.iter().position(|c| *c == name).unwrap();
+        // The first base between the two Ds becomes K (G or T).
+        for row in screen(&records).lines() {
+            let fields: Vec<&str> = row.split('\t').collect();
+            let d_end: usize = fields[at("d_sequence_end")].parse().unwrap();
+            if !fields[at("np2")].is_empty() {
+                let index: usize = fields[0].parse().unwrap();
+                records[index].sequence[d_end] = b'K';
+            }
+        }
+        let mut quoted = 0;
+        for row in screen(&records).lines() {
+            let fields: Vec<&str> = row.split('\t').collect();
+            let read = &records[fields[0].parse::<usize>().unwrap()].sequence;
+            let d_end: usize = fields[at("d_sequence_end")].parse().unwrap();
+            let np2 = fields[at("np2")];
+            assert_eq!(np2.as_bytes(), &read[d_end..d_end + np2.len()]);
+            quoted += usize::from(np2.starts_with('K'));
+        }
+        assert!(quoted >= 3, "{quoted} sidecar rows quote the code");
     }
 
     #[test]

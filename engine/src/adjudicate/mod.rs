@@ -25,12 +25,14 @@ mod model;
 #[cfg(test)]
 mod oracle;
 mod posterior;
+mod ties;
 mod units;
 
 pub use dag::{DagScratch, Mode, PlacementDag};
 pub use decode::DAlleleDecoding;
 pub use model::{EngineeringObjective, Grammar, PathModel, VdjGrammar};
 pub use posterior::{MAX_SPREAD, Marginals, OVERLAP_SPREAD, PosteriorScratch};
+pub(crate) use ties::{CoOptimal, co_optimal};
 pub use units::{
     CallModel, EvidenceModel, EvidenceScale, PathNats, UNITS_PER_NAT, Units, divergence,
 };

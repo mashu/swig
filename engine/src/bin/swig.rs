@@ -88,8 +88,8 @@ options:
                        offsets x positions) at D-presence rate R, 0 < R < 1, instead
                        of genes x positions at even odds (docs/ALGORITHM.md 2.3)
   --min-d-match N      shortest exact run of an admissible D (default: the profile's)
-  --d-mismatch S       D mismatch score, negative (default: the profile's)
-  --j-mismatch S       J mismatch score, negative (default: the profile's)
+  --d-mismatch S       D mismatch score, -1000 to -1 (default: the profile's)
+  --j-mismatch S       J mismatch score, -1000 to -1 (default: the profile's)
   --min-j-length N     fewest aligned J columns of a J hit (default none)
   --c-evalue E         call C when its anchored E-value, C genes x 7 start
                        diagonals x e^(-lambda S), is at most E (default 1e-3)
