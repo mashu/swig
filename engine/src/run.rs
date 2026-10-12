@@ -27,6 +27,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io::{self, BufRead, Write};
+use std::sync::Arc;
 
 use crate::adjudicate::{CallModel, DAlleleDecoding, ResidualAdjudicator};
 use crate::admission::DefaultAdmission;
@@ -490,22 +491,29 @@ struct Assigned {
     called: bool,
 }
 
-/// Rows of recently assigned sequences, oldest dropped first.
+/// The rows of the [`CACHE`] most recently assigned distinct sequences,
+/// oldest dropped first (a hit does not refresh an entry).
 #[derive(Debug, Default)]
 struct Cache {
-    rows: HashMap<Vec<u8>, Assigned>,
-    order: VecDeque<Vec<u8>>,
+    rows: HashMap<Arc<[u8]>, Assigned>,
+    order: VecDeque<Arc<[u8]>>,
 }
 
 impl Cache {
-    fn insert(&mut self, sequence: Vec<u8>, assigned: Assigned) {
-        if self.order.len() == CACHE
-            && let Some(oldest) = self.order.pop_front()
-        {
-            self.rows.remove(&oldest);
+    /// Keep the rows of `assigned`, sequences in the order they were
+    /// assigned: only the last [`CACHE`] of them stay.
+    fn extend<'a>(&mut self, assigned: impl ExactSizeIterator<Item = (&'a [u8], Assigned)>) {
+        let skip = assigned.len().saturating_sub(CACHE);
+        for (sequence, rows) in assigned.skip(skip) {
+            if self.order.len() == CACHE
+                && let Some(oldest) = self.order.pop_front()
+            {
+                self.rows.remove(&oldest);
+            }
+            let sequence: Arc<[u8]> = sequence.into();
+            self.order.push_back(Arc::clone(&sequence));
+            self.rows.insert(sequence, rows);
         }
-        self.order.push_back(sequence.clone());
-        self.rows.insert(sequence, assigned);
     }
 }
 
@@ -626,13 +634,17 @@ impl Run {
     /// The AIRR and double-D rows of `records`, in order: a sidecar row
     /// starts with its read's index in `records`.
     pub fn assign(&mut self, records: &[ReadRecord]) -> Rows {
-        // The sequences to assign: each once, and none the cache holds.
+        // The sequences to assign, in input order: each once, and none the
+        // cache holds; `queued` holds each one's index in `fresh`.
         let mut fresh: Vec<&[u8]> = Vec::new();
-        let mut queued: HashMap<&[u8], ()> = HashMap::new();
+        let mut queued: HashMap<&[u8], usize> = HashMap::new();
         for record in records {
             let sequence = record.sequence.as_slice();
-            if !self.cache.rows.contains_key(sequence) && queued.insert(sequence, ()).is_none() {
-                fresh.push(sequence);
+            if !self.cache.rows.contains_key(sequence) {
+                queued.entry(sequence).or_insert_with(|| {
+                    fresh.push(sequence);
+                    fresh.len() - 1
+                });
             }
         }
         let found = match &self.engine {
@@ -653,13 +665,13 @@ impl Run {
                 self.screen.as_ref(),
             ),
         };
-        let batch: HashMap<&[u8], Assigned> = fresh.into_iter().zip(found).collect();
         let mut rows = Rows::default();
         for (index, record) in records.iter().enumerate() {
             self.ordinal += 1;
             let sequence = record.sequence.as_slice();
-            let assigned = batch
+            let assigned = queued
                 .get(sequence)
+                .map(|&i| &found[i])
                 .or_else(|| self.cache.rows.get(sequence))
                 .expect("every sequence is assigned or cached");
             let id = if record.id.is_empty() {
@@ -681,9 +693,7 @@ impl Run {
             rows.tally.reads += 1;
             rows.tally.called += usize::from(assigned.called);
         }
-        for (sequence, assigned) in batch {
-            self.cache.insert(sequence.to_vec(), assigned);
-        }
+        self.cache.extend(fresh.into_iter().zip(found));
         rows
     }
 
@@ -942,6 +952,36 @@ mod tests {
         assert_eq!(fields[2].len(), records[0].sequence.len());
         let original: Vec<&str> = lines[0].split('\t').collect();
         assert_eq!(fields[3..], original[3..]);
+    }
+
+    /// The cache keeps the rows of the most recently assigned distinct
+    /// sequences, in the order they were assigned.
+    #[test]
+    fn the_cache_keeps_the_latest_sequences() {
+        let ([v, d, j, _], _) = texts_and_reads(0);
+        let texts = GermlineTexts {
+            v: &v,
+            d: Some(&d),
+            j: &j,
+            c: None,
+        };
+        let database = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+        let mut run = Run::new(&RunOptions::default(), database).unwrap();
+        let mut rng = crate::sim::Rng::new(9);
+        let records: Vec<ReadRecord> = (0..CACHE + 100)
+            .map(|i| ReadRecord {
+                id: format!("junk{i}"),
+                sequence: rng.bases(30),
+                quality: String::new(),
+            })
+            .collect();
+        run.assign(&records[..50]);
+        run.assign(&records[50..]);
+        let kept: Vec<&[u8]> = run.cache.order.iter().map(|s| &s[..]).collect();
+        let latest: Vec<&[u8]> = records[100..].iter().map(|r| &r.sequence[..]).collect();
+        assert_eq!(kept, latest);
+        assert_eq!(run.cache.rows.len(), CACHE);
+        assert!(latest.iter().all(|s| run.cache.rows.contains_key(*s)));
     }
 
     /// The double-D screen leaves every AIRR row as it is and writes
