@@ -35,7 +35,11 @@
 //! *codes* instead of five interleaved profile rows, and a cell's score is
 //! one load, one comparison and a blend instead of five masked loads. `N`
 //! scores 0 and out-of-matrix cells score `−∞` exactly as in the profile
-//! path, so results are identical.
+//! path, so results are identical. An anchored C profile
+//! ([`crate::scoring::AnchorColumn`]) is uniform but for its first column,
+//! which the layout marks with its own code and a group holding one
+//! (`ANCHORED`, a compile-time switch, so other groups pay nothing) scores
+//! with the lane's bonus.
 //!
 //! **Exact scalar semantics.** Out-of-band and out-of-matrix cells read as
 //! `H = 0, I = D = −∞`, exactly like the scalar kernel's never-written
@@ -72,6 +76,9 @@ const CODES: usize = N as usize + 1;
 const SENTINEL: i16 = N as i16 + 1;
 /// Reference code for positions past a lane's reference (uniform layout).
 const REF_SENTINEL: i16 = N as i16 + 2;
+/// Reference code of an anchor column (uniform layout); below `N`, so never
+/// outside the matrix.
+const ANCHOR: i16 = -1;
 const NEG: i16 = -16_384;
 /// Largest attainable score admitted into a lane.
 const MAX_SCORE: i64 = 8_000;
@@ -322,9 +329,11 @@ pub(super) struct Shape<const L: usize> {
     extend: [i16; L],
     step: [i16; L],
     lane_width: [i16; L],
-    /// Uniform layout only: per-lane match and mismatch scores.
+    /// Uniform layout only: per-lane match and mismatch scores, and the
+    /// anchor column's bonus (0 without one).
     matched: [i16; L],
     mismatch: [i16; L],
+    anchor: [i16; L],
 }
 
 /// Best cell of each lane in kernel coordinates.
@@ -397,6 +406,7 @@ fn build<const DIAG: bool, const UNIFORM: bool, const L: usize>(
         lane_width: [0; L],
         matched: [0; L],
         mismatch: [0; L],
+        anchor: [0; L],
     };
     for (l, lane) in lanes.iter().enumerate() {
         let job = &jobs[lane.job];
@@ -416,8 +426,15 @@ fn build<const DIAG: bool, const UNIFORM: bool, const L: usize>(
             let scores = job.profile.uniform().expect("uniform group");
             shape.matched[l] = scores.matched as i16;
             shape.mismatch[l] = scores.mismatch as i16;
+            let anchored = reach.start == 0 && !reach.is_empty();
             for (t, &code) in (first..).zip(&job.profile.codes()[reach]) {
                 profile[t][l] = i16::from(code);
+            }
+            if let Some(bonus) = scores.anchor {
+                shape.anchor[l] = bonus as i16;
+                if anchored {
+                    profile[first][l] = ANCHOR;
+                }
             }
         } else {
             for code in 0..CODES {
@@ -452,6 +469,7 @@ pub(super) unsafe fn fill<
     const DIAG: bool,
     const TRACE: bool,
     const UNIFORM: bool,
+    const ANCHORED: bool,
 >(
     shape: &Shape<L>,
     query: &[[i16; L]],
@@ -479,6 +497,7 @@ where
         let sentinel = V::splat(SENTINEL);
         let ambiguous_code = V::splat(i16::from(N));
         let (matched, mismatch) = (V::load(&shape.matched), V::load(&shape.mismatch));
+        let (anchor_code, anchor) = (V::splat(ANCHOR), V::load(&shape.anchor));
         let (mut best, mut best_row, mut best_k) = (zero, zero, zero);
 
         for r in 1..=rows {
@@ -523,7 +542,13 @@ where
                     let base = V::select(q.eq(reference), matched, mismatch);
                     let ambiguous = V::mask_or(query_ambiguous, reference.eq(ambiguous_code));
                     let outside = V::mask_or(past_query_lanes, reference.gt(ambiguous_code));
-                    V::select(outside, neg, base.clear(ambiguous))
+                    let base = base.clear(ambiguous);
+                    let base = if ANCHORED {
+                        V::select(reference.eq(anchor_code), anchor, base)
+                    } else {
+                        base
+                    };
+                    V::select(outside, neg, base)
                 } else {
                     let mut s = past_query;
                     for (c, &mask) in code_mask.iter().enumerate() {
@@ -600,6 +625,13 @@ fn run_group<K, const L: usize, const DIAG: bool, const TRACE: bool>(
     let uniform = lanes
         .iter()
         .all(|l| jobs[l.job].profile.uniform().is_some());
+    let anchored = uniform
+        && lanes.iter().any(|l| {
+            jobs[l.job]
+                .profile
+                .uniform()
+                .is_some_and(|u| u.anchor.is_some())
+        });
     let shape = if uniform {
         build::<DIAG, true, L>(jobs, lanes, &mut ws.query, &mut ws.profile)
     } else {
@@ -618,10 +650,16 @@ fn run_group<K, const L: usize, const DIAG: bool, const TRACE: bool>(
     let trace = &mut ws.trace.as_chunks_mut::<L>().0[..cells];
     // SAFETY: `K` was chosen from `Backend::available`.
     let best = unsafe {
-        if uniform {
-            K::fill::<DIAG, TRACE, true>(&shape, query, profile, h, ins, trace)
-        } else {
-            K::fill::<DIAG, TRACE, false>(&shape, query, profile, h, ins, trace)
+        match (uniform, anchored) {
+            (true, true) => {
+                K::fill::<DIAG, TRACE, true, true>(&shape, query, profile, h, ins, trace)
+            }
+            (true, false) => {
+                K::fill::<DIAG, TRACE, true, false>(&shape, query, profile, h, ins, trace)
+            }
+            (false, _) => {
+                K::fill::<DIAG, TRACE, false, false>(&shape, query, profile, h, ins, trace)
+            }
         }
     };
     let trace = &*trace;
