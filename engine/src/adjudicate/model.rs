@@ -193,7 +193,7 @@ impl PathModel for EngineeringObjective {
     /// with `P_D = ⌊P*_D⌋`. It bounds nothing for a per-read call: there a D
     /// scoring 10 ≤ `P_D` (8 matches, 2 mismatches) is worth 6.40 nats at
     /// `p̂ = 0.3`, above its cost `c_D` of 5.38 for `P*_D = 10.45`
-    /// ([`super::ReadModel`]).
+    /// (`ReadModel`).
     ///
     /// A clipped span of an optimal local alignment never outscores the
     /// whole alignment (its prefixes and suffixes score ≥ 0), so a D scoring

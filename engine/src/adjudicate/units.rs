@@ -61,7 +61,7 @@ use crate::placement::Placement;
 use crate::scoring::{AffineScoring, Score};
 use crate::stats::KarlinAltschul;
 
-/// An integer value in a [`ReadModel`]'s units.
+/// An integer value in a read model's units (see the module documentation).
 pub type Units = i64;
 
 /// `F`: units per nat of the per-read model.
@@ -70,11 +70,11 @@ pub const UNITS_PER_NAT: f64 = 65536.0;
 /// Which model the Viterbi call maximises.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CallModel {
-    /// The read's own model ([`ReadModel::at`]): the same integers as the
+    /// The read's own model (`ReadModel::at`): the same integers as the
     /// posterior, so the call is a mode of the reported distribution.
     #[default]
     PerRead,
-    /// The fixed scores ([`ReadModel::fixed`]). The posterior still reads
+    /// The fixed scores (`ReadModel::fixed`). The posterior still reads
     /// evidence at the read's divergence ([`EvidenceModel::nats`]), so the
     /// call need not be its mode.
     FixedScale,
@@ -174,7 +174,7 @@ pub struct PathNats {
 
 /// One read's model in integer units (see the module documentation).
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ReadModel {
+pub(crate) struct ReadModel {
     /// Units per nat.
     per_nat: f64,
     /// Units per score unit of a prior term or gap.

@@ -42,7 +42,7 @@ pub enum DAlleleDecoding {
 
 /// A path's shape: its first and last segment kinds and its D count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Topology {
+pub(crate) struct Topology {
     pub first: SegmentKind,
     pub last: SegmentKind,
     pub d_count: u8,
@@ -50,7 +50,7 @@ pub struct Topology {
 
 /// The paths of `grammar` with one [`Topology`].
 #[derive(Clone, Copy, Debug)]
-pub struct Within<'a, G> {
+pub(crate) struct Within<'a, G> {
     pub grammar: &'a G,
     pub topology: Topology,
 }
@@ -75,7 +75,7 @@ impl<G: Grammar> Grammar for Within<'_, G> {
 /// The allele of largest posterior marginal among the D placements, when
 /// it beats every allele of `called`, the call's only D, by more than a
 /// relative `10⁻⁹` (ties go to the call, then to the smaller id).
-pub fn max_marginal_d(
+pub(crate) fn max_marginal_d(
     placements: &[Placement],
     called: &Placement,
     marginals: &Marginals,

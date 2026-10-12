@@ -453,7 +453,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
 
 impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
     /// The best path under `read`, with its key.
-    pub fn viterbi(
+    pub(crate) fn viterbi(
         &self,
         placements: &[Placement],
         read: &ReadModel,
@@ -464,7 +464,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
 
     /// The best path under `read` with `topology` through the placements
     /// that `keep`.
-    pub fn conditioned(
+    pub(crate) fn conditioned(
         &self,
         placements: &[Placement],
         keep: impl Fn(usize) -> bool,

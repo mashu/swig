@@ -15,22 +15,24 @@
 //! cuts, `P ∝ exp(nats)`, and returns posterior [`Marginals`] of the
 //! placements and of the D count by forward–backward over the same DAG, with
 //! alignment evidence rescored at the read's own divergence. Both passes read
-//! one [`ReadModel`]: under [`CallModel::PerRead`] the call is a mode of the
+//! one per-read model, `ReadModel`: under [`CallModel::PerRead`] the call is a mode of the
 //! reported posterior.
 
 mod dag;
 mod decode;
 mod lattice;
 mod model;
+#[cfg(test)]
+mod oracle;
 mod posterior;
 mod units;
 
 pub use dag::{DagScratch, Mode, PlacementDag};
-pub use decode::{DAlleleDecoding, Topology, Within};
+pub use decode::DAlleleDecoding;
 pub use model::{EngineeringObjective, Grammar, PathModel, VdjGrammar};
 pub use posterior::{MAX_SPREAD, Marginals, OVERLAP_SPREAD, PosteriorScratch};
 pub use units::{
-    CallModel, EvidenceModel, EvidenceScale, PathNats, ReadModel, UNITS_PER_NAT, Units, divergence,
+    CallModel, EvidenceModel, EvidenceScale, PathNats, UNITS_PER_NAT, Units, divergence,
 };
 
 use std::cmp::Ordering;
@@ -41,7 +43,7 @@ use crate::scoring::Score;
 
 /// Path objective with its tie rules built in, compared lexicographically:
 ///
-/// 1. `score` — the objective, in fixed scores or in a [`ReadModel`]'s units;
+/// 1. `score` — the objective, in fixed scores or in a read model's units;
 /// 2. fewer D segments ("with-D must strictly beat no-D");
 /// 3. `support` — the summed *unclipped* scores of the path's placements.
 ///
