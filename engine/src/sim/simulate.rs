@@ -7,7 +7,10 @@
 //!    trimmed away entirely means no D. With probability `include_dd` a
 //!    second, different D joins that DJ on its 5′ side, separated by N3
 //!    (DJ → DDJ). Finally sample V, trim it and add N1. Alleles are sampled
-//!    uniformly.
+//!    uniformly among those that can join one rearrangement: J among the J
+//!    alleles of the V loci, then D and V among those of the J's locus (and
+//!    the D's), so a database of several loci gives no cross-locus reads
+//!    ([`crate::locus`]); in a single-locus database that is every allele.
 //! 2. **Assembly**: `flank5 + V + N1 + [D + [N3 + D2] + N2] + J + flank3`,
 //!    flanks being random DNA. Reads outside `[min_length, max_length]` are
 //!    redrawn.
@@ -18,10 +21,10 @@
 //! 5. Optionally (not in IgSim) the emitted read is reverse-complemented.
 //!
 //! With a C database (not in IgSim), [`Simulator::append_constant`] then
-//! reads through the J–C splice: the start of the 3′ flank becomes the C
-//! allele's germline, from the base that follows the J's last base in the
-//! reading frame. It draws from a stream of its own, so the V(D)J part of
-//! every read is the same with and without C.
+//! reads through the J–C splice: the start of the 3′ flank becomes the
+//! germline of a C allele of the J's locus, from the base that follows the
+//! J's last base in the reading frame. It draws from a stream of its own, so
+//! the V(D)J part of every read is the same with and without C.
 //!
 //! Unlike IgSim, which labels bases by region only, every base here also
 //! carries its germline **origin** (position in its allele, or none for N,
@@ -35,6 +38,7 @@ use super::params::SimParams;
 use super::random::{Count, Rng};
 use crate::alphabet::decode_base;
 use crate::germline::{GermlineSet, SegmentKind};
+use crate::locus::Loci;
 use crate::translate::open_frames;
 
 /// The C stream's seed is the read stream's seed XOR this
@@ -145,6 +149,8 @@ pub enum SimError {
     },
     /// No read met the length constraints within `max_retries` attempts.
     Retries(usize),
+    /// No J allele shares a locus with a V allele.
+    Unpaired,
 }
 
 impl fmt::Display for SimError {
@@ -155,6 +161,7 @@ impl fmt::Display for SimError {
                 write!(f, "expected a {} germline set", expected.label())
             }
             Self::Retries(n) => write!(f, "no read met the length limits after {n} attempts"),
+            Self::Unpaired => write!(f, "no J allele shares a locus with a V allele"),
         }
     }
 }
@@ -169,6 +176,10 @@ pub struct Simulator<'a> {
     c: Vec<Vec<u8>>,
     /// Stop-free reading frame of each C allele.
     c_frames: Vec<Option<usize>>,
+    /// The loci of each allele, by [`SegmentKind::index`].
+    loci: [Vec<Loci>; 4],
+    /// The loci of the V alleles together: a J outside them is never drawn.
+    v_loci: Loci,
     sets: [Option<&'a GermlineSet>; 4],
     pub params: SimParams,
 }
@@ -197,6 +208,23 @@ fn check(set: &GermlineSet, kind: SegmentKind) -> Result<(), SimError> {
     Ok(())
 }
 
+fn loci(set: &GermlineSet) -> Vec<Loci> {
+    set.alleles().iter().map(|a| a.loci).collect()
+}
+
+/// The alleles of loci `of` that pair with `loci`, `except` excluded.
+fn pool(of: &[Loci], loci: Loci, except: Option<usize>) -> impl Iterator<Item = usize> + '_ {
+    (0..of.len()).filter(move |&i| Some(i) != except && of[i].pairs_with(loci))
+}
+
+/// A uniform draw from [`pool`], `None` when it is empty. When every allele
+/// pairs (a single-locus database) this is IgSim's `below(len)`, with
+/// `except` skipped.
+fn draw(rng: &mut Rng, of: &[Loci], loci: Loci, except: Option<usize>) -> Option<usize> {
+    let n = pool(of, loci, except).count();
+    (n > 0).then(|| pool(of, loci, except).nth(rng.below(n)).expect("k < n"))
+}
+
 /// `sequence[t5 .. len − t3]` with positions, empty when the trims meet.
 fn trimmed(sequence: &[u8], t5: u32, t3: u32) -> Range<usize> {
     let len = sequence.len();
@@ -217,12 +245,23 @@ impl<'a> Simulator<'a> {
             check(d, SegmentKind::D)?;
         }
         check(j, SegmentKind::J)?;
+        let v_loci = v.alleles().iter().fold(Loci::NONE, |u, a| u.union(a.loci));
+        if !j.alleles().iter().any(|a| a.loci.pairs_with(v_loci)) {
+            return Err(SimError::Unpaired);
+        }
         Ok(Self {
             v: ascii(v),
             d: d.map(ascii).unwrap_or_default(),
             j: ascii(j),
             c: Vec::new(),
             c_frames: Vec::new(),
+            loci: [
+                loci(v),
+                d.map(loci).unwrap_or_default(),
+                loci(j),
+                Vec::new(),
+            ],
+            v_loci,
             sets: [Some(v), d, Some(j), None],
             params,
         })
@@ -237,6 +276,7 @@ impl<'a> Simulator<'a> {
             .iter()
             .map(|a| open_frames(&a.codes).next())
             .collect();
+        self.loci[SegmentKind::C.index()] = loci(c);
         self.sets[SegmentKind::C.index()] = Some(c);
         Ok(self)
     }
@@ -291,18 +331,22 @@ impl<'a> Simulator<'a> {
     }
 
     /// With probability `include_c`, read through the J–C splice: a C
-    /// allele drawn uniformly overwrites the start of the 3′ flank from
-    /// germline position `o` ([`Self::constant_offset`]), for the whole
-    /// flank with probability `c_whole_flank`, else for a length uniform in
-    /// `0..=flank`, and never past the allele's end; then instrument errors
-    /// at the 3′ rate. Draws only from `rng`, so call it with a stream of
-    /// its own; without a C database it does nothing.
+    /// allele of the J's locus, drawn uniformly, overwrites the start of the
+    /// 3′ flank from germline position `o` ([`Self::constant_offset`]), for
+    /// the whole flank with probability `c_whole_flank`, else for a length
+    /// uniform in `0..=flank`, and never past the allele's end; then
+    /// instrument errors at the 3′ rate. Draws only from `rng`, so call it with a stream of
+    /// its own; without a C allele of the J's locus it does nothing.
     pub fn append_constant(&self, read: &mut SimulatedRead, rng: &mut Rng) {
         let p = &self.params;
-        if self.c.is_empty() || !rng.bernoulli(p.include_c) {
+        let (c_loci, j_loci) = (
+            &self.loci[SegmentKind::C.index()],
+            self.loci[SegmentKind::J.index()][read.j],
+        );
+        if pool(c_loci, j_loci, None).next().is_none() || !rng.bernoulli(p.include_c) {
             return;
         }
-        let allele = rng.below(self.c.len());
+        let allele = draw(rng, c_loci, j_loci, None).expect("a C of the J's locus");
         let offset = self.constant_offset(allele, read.j);
         let Some(flank) = read.span(Region::Flank3) else {
             return;
@@ -350,24 +394,27 @@ impl<'a> Simulator<'a> {
         let p = &self.params;
         let mut trims = Trims::default();
 
-        // 1. DJ, optional DDJ, then V (IgSim's order of draws).
-        let j = rng.below(self.j.len());
+        // 1. DJ, optional DDJ, then V (IgSim's order of draws), each allele
+        // among those of the loci drawn so far: `loci` keeps every V pool
+        // non-empty, as it stays within the V loci.
+        let [v_loci, d_loci, j_loci, _] = &self.loci;
+        let j = draw(rng, j_loci, self.v_loci, None).expect("a J pairs with a V");
+        let mut loci = j_loci[j].intersection(self.v_loci);
         trims.j_5p = p.j_trim_5p.sample(rng);
         let j_body = trimmed(&self.j[j], trims.j_5p, 0);
         let (mut d, mut d2) = (None, None);
         let (mut n2, mut n3) = (Vec::new(), Vec::new());
-        if !self.d.is_empty() && rng.bernoulli(p.include_d) {
-            let first = rng.below(self.d.len());
+        if pool(d_loci, loci, None).next().is_some() && rng.bernoulli(p.include_d) {
+            let first = draw(rng, d_loci, loci, None).expect("a D of the J's locus");
             let (t5, t3) = (p.d_trim_5p.sample(rng), p.d_trim_3p.sample(rng));
             if !trimmed(&self.d[first], t5, t3).is_empty() {
                 n2 = random_n(rng, &p.n2_length);
                 d = Some(first);
                 (trims.d_5p, trims.d_3p) = (t5, t3);
-                if self.d.len() >= 2 && rng.bernoulli(p.include_dd) {
-                    let mut other = rng.below(self.d.len() - 1);
-                    if other >= first {
-                        other += 1;
-                    }
+                loci = loci.intersection(d_loci[first]);
+                let another = pool(d_loci, loci, Some(first)).next().is_some();
+                if another && rng.bernoulli(p.include_dd) {
+                    let other = draw(rng, d_loci, loci, Some(first)).expect("another D");
                     let (u5, u3) = (p.d_trim_5p.sample(rng), p.d_trim_3p.sample(rng));
                     if !trimmed(&self.d[other], u5, u3).is_empty() {
                         // D + DJ → DDJ: the new D is 5′ of the original one.
@@ -376,11 +423,12 @@ impl<'a> Simulator<'a> {
                         (trims.d2_5p, trims.d2_3p) = (t5, t3);
                         d = Some(other);
                         (trims.d_5p, trims.d_3p) = (u5, u3);
+                        loci = loci.intersection(d_loci[other]);
                     }
                 }
             }
         }
-        let v = rng.below(self.v.len());
+        let v = draw(rng, v_loci, loci, None).expect("a V of the read's locus");
         trims.v_5p = p.v_trim_5p.sample(rng);
         trims.v_3p = p.v_trim_3p.sample(rng);
         let v_body = trimmed(&self.v[v], trims.v_5p, trims.v_3p);

@@ -37,15 +37,15 @@ zcat reads.fastq.gz | swig ... -
 
 simulate writes PREFIX.fasta and PREFIX.truth.tsv: reads from the IgSim model
 (presets as in IgSim.jl; --rc reverse-complements that fraction, default 0.5;
---shm fixes the SHM rate of every read; --dd sets the tandem-DD fraction)
-with their true alleles, the germline-equivalent alleles, segment intervals
-and junctions. evaluate scores an AIRR Rearrangement TSV from any tool
-against that truth (germline-equivalence-aware allele, gene, boundary,
-D-presence and junction accuracy). Given a second calls file, evaluate also
-compares the two read by read: accuracy difference with its 95 % confidence
-interval and an exact McNemar test on the reads only one of them gets right
-(D also by remnant length), and the D allele and D-presence Brier scores
-with a paired t.
+--shm fixes the SHM rate of every read; --dd sets the tandem-DD fraction) with
+their true alleles, the germline-equivalent alleles, segment intervals and
+junctions; each read's V, D and C come from its J's locus. evaluate scores an
+AIRR Rearrangement TSV from any tool against that truth
+(germline-equivalence-aware allele, gene, boundary, D-presence and junction
+accuracy). Given a second calls file, evaluate also compares the two read by
+read: accuracy difference with its 95 % confidence interval and an exact
+McNemar test on the reads only one of them gets right (D also by remnant
+length), and the D allele and D-presence Brier scores with a paired t.
 
 Germline databases are FASTA and may hold several loci (IGH, IGK and IGL;
 or the TR loci): each allele's locus is read from its name, and every
