@@ -94,7 +94,10 @@ pub const SEED_LENGTHS: std::ops::RangeInclusive<u32> = 6..=24;
 /// Alternatives reported beside the selected pair.
 const MAX_ALTERNATIVES: usize = 12;
 
-/// The sidecar's columns.
+/// The sidecar's columns. `swig_batch_record_index` is the read's 0-based
+/// index in the reads of one [`crate::run::Run::assign`] call (in the
+/// WebAssembly ABI, the batch), and in the whole input in
+/// [`crate::run::Run::write_airr`] (the command line's `--double-d-out`).
 pub const COLUMNS: [&str; 38] = [
     "swig_batch_record_index",
     "sequence_id",

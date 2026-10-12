@@ -486,7 +486,7 @@ enum Engine {
 struct Assigned {
     /// The AIRR row from the tab before `sequence_aa`.
     airr: String,
-    /// The sidecar row from the tab before `locus`.
+    /// The sidecar fields from `locus` on, without a leading tab.
     double_d: Option<String>,
     called: bool,
 }
@@ -634,6 +634,12 @@ impl Run {
     /// The AIRR and double-D rows of `records`, in order: a sidecar row
     /// starts with its read's index in `records`.
     pub fn assign(&mut self, records: &[ReadRecord]) -> Rows {
+        self.assign_from(records, 0)
+    }
+
+    /// [`Self::assign`], a sidecar row starting with `first` plus its
+    /// read's index in `records`.
+    fn assign_from(&mut self, records: &[ReadRecord], first: usize) -> Rows {
         // The sequences to assign, in input order: each once, and none the
         // cache holds; `queued` holds each one's index in `fresh`.
         let mut fresh: Vec<&[u8]> = Vec::new();
@@ -687,7 +693,7 @@ impl Run {
             rows.airr += &assigned.airr;
             rows.airr.push('\n');
             if let Some(rest) = &assigned.double_d {
-                rows.double_d += &format!("{index}\t{id}\t{rest}\n");
+                rows.double_d += &format!("{}\t{id}\t{rest}\n", first + index);
                 rows.tally.double_d += 1;
             }
             rows.tally.reads += 1;
@@ -705,35 +711,43 @@ impl Run {
         &mut self,
         reads: R,
         out: &mut W,
+        double_d: Option<&mut dyn Write>,
+    ) -> Result<Tally, RunError> {
+        self.write_batches(reads, out, double_d, BATCH)
+    }
+
+    /// [`Self::write_airr`], `batch` reads at a time.
+    fn write_batches<R: BufRead, W: Write>(
+        &mut self,
+        reads: R,
+        out: &mut W,
         mut double_d: Option<&mut dyn Write>,
+        batch_size: usize,
     ) -> Result<Tally, RunError> {
         writeln!(out, "{}", self.airr_header()).map_err(RunError::Output)?;
         if let Some(sidecar) = double_d.as_mut() {
             writeln!(sidecar, "{}", self.double_d_header()).map_err(RunError::Output)?;
         }
         let mut reader = ReadReader::new(reads);
-        let mut batch = Vec::with_capacity(BATCH);
+        let mut batch = Vec::with_capacity(batch_size);
         let mut tally = Tally::default();
         loop {
             batch.clear();
             if reader
-                .read_batch(BATCH, &mut batch)
+                .read_batch(batch_size, &mut batch)
                 .map_err(RunError::Reads)?
                 == 0
             {
                 return Ok(tally);
             }
-            let rows = self.assign(&batch);
+            // Sidecar indices count from the input's start.
+            let rows = self.assign_from(&batch, tally.reads);
             out.write_all(rows.airr.as_bytes())
                 .map_err(RunError::Output)?;
             if let Some(sidecar) = double_d.as_mut() {
-                // Batch indices become indices in the whole input.
-                for line in rows.double_d.lines() {
-                    let (index, rest) = line.split_once('\t').expect("an indexed row");
-                    let index: usize = index.parse().expect("a batch index");
-                    writeln!(sidecar, "{}\t{rest}", tally.reads + index)
-                        .map_err(RunError::Output)?;
-                }
+                sidecar
+                    .write_all(rows.double_d.as_bytes())
+                    .map_err(RunError::Output)?;
             }
             tally += rows.tally;
             // A batch's rows reach a reader as soon as they are assigned:
@@ -1028,6 +1042,61 @@ mod tests {
             assert!(d_end < d2_start);
             assert!(at("swig_double_d_score_gain").parse::<i32>().unwrap() >= 8);
         }
+    }
+
+    /// Streamed in batches, the sidecar's `swig_batch_record_index` counts
+    /// from the start of the input and names the read of that AIRR row.
+    #[test]
+    fn streamed_sidecar_rows_index_the_whole_input() {
+        let params = SimParams {
+            include_dd: 0.5,
+            ..SimParams::preset("easy").unwrap()
+        };
+        let ([v, d, j, _], reads) = texts_and_simulated(120, params);
+        let texts = GermlineTexts {
+            v: &v,
+            d: Some(&d),
+            j: &j,
+            c: None,
+        };
+        let mut options = RunOptions::default();
+        options.set("double-d", Some("all")).unwrap();
+        options.set("double-d-seed-length", Some("6")).unwrap();
+        let run = || {
+            let database = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+            Run::new(&options, database).unwrap()
+        };
+        let (mut out, mut sidecar) = (Vec::new(), Vec::new());
+        run()
+            .write_batches(reads.as_bytes(), &mut out, Some(&mut sidecar), 7)
+            .unwrap();
+        let (out, sidecar) = (
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(sidecar).unwrap(),
+        );
+        let records: Vec<ReadRecord> = ReadReader::new(reads.as_bytes())
+            .map(Result::unwrap)
+            .collect();
+        let whole = run().assign(&records);
+        assert_eq!(out, format!("{}\n{}", AirrRecord::tsv_header(), whole.airr));
+        assert_eq!(
+            sidecar,
+            format!("{}\n{}", double_d::header(), whole.double_d)
+        );
+        let rows: Vec<&str> = out.lines().skip(1).collect();
+        let indices: Vec<usize> = sidecar
+            .lines()
+            .skip(1)
+            .map(|line| {
+                let (index, rest) = line.split_once('\t').unwrap();
+                let index: usize = index.parse().unwrap();
+                let id = rest.split('\t').next().unwrap();
+                assert!(rows[index].starts_with(&format!("{id}\t")), "{line}");
+                index
+            })
+            .collect();
+        assert!(indices.windows(2).all(|w| w[0] < w[1]));
+        assert!(indices.last().is_some_and(|&i| i >= 7), "{indices:?}");
     }
 
     /// The sidecar quotes the read's own symbols, as the AIRR row does: an
