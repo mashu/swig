@@ -522,4 +522,41 @@ mod tests {
         );
         assert_eq!(forward, candidates(&mut alleles.iter().rev()));
     }
+
+    /// An exact 3′ fragment of a gene's longest allele collects one vote
+    /// per seed, although a sibling with a 3-base deletion near the 3′ end
+    /// holds the same seeds at shifted positions; the gene leads a decoy
+    /// that shares only that fragment.
+    #[test]
+    fn a_three_prime_fragment_collects_every_seed_of_its_gene() {
+        let mut next = crate::testing::rng(12);
+        let shape = SeedShape::contiguous(9);
+        // An allele without repeated 9-mers, whose seeds each vote once.
+        let full = std::iter::repeat_with(|| crate::testing::random_codes(&mut next, 300))
+            .find(|codes| {
+                let mut keys: Vec<u64> = shape.kmers(codes).map(|(_, key)| key).collect();
+                let all = keys.len();
+                keys.sort_unstable();
+                keys.dedup();
+                keys.len() == all
+            })
+            .expect("a repeat-free sequence");
+        let mut deletion = full.clone();
+        deletion.drain(270..273);
+        let decoy = [
+            &crate::testing::random_codes(&mut next, 240)[..],
+            &full[240..],
+        ]
+        .concat();
+        let mut set = GermlineSet::new(SegmentKind::V);
+        push_codes(&mut set, "IGHV1-1*01", &full);
+        push_codes(&mut set, "IGHV1-1*02", &deletion);
+        push_codes(&mut set, "IGHV2-2*01", &decoy);
+        let retriever = retriever(&set);
+        let mut out = Vec::new();
+        retriever.retrieve(&full[240..], &mut RetrievalScratch::default(), &mut out);
+        let seeds = 60 - 9 + 1;
+        assert_eq!(out[0].allele, 0, "{out:?}");
+        assert_eq!(out[0].votes, 4 * seeds, "{out:?}");
+    }
 }
