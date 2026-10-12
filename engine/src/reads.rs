@@ -28,7 +28,8 @@
 //! end in `\n` or `\r\n`; a carriage return inside a line (CR-only line
 //! endings) is an error rather than one long line. Gzip input is recognised
 //! by its magic bytes and rejected with a hint to decompress on the fly (the
-//! crate has no dependencies). An error ends the input.
+//! crate has no dependencies). The reads end at the end of the input or
+//! at the first error.
 
 use std::fmt;
 use std::io::{self, BufRead};
@@ -218,8 +219,9 @@ pub struct ReadReader<R> {
     input: R,
     format: Option<ReadFormat>,
     started: bool,
-    /// An error ended the input: where the next record starts is unknown.
-    failed: bool,
+    /// The input ended, or an error ended it (where the next record starts
+    /// is then unknown): no record follows.
+    ended: bool,
     line: usize,
     buffer: String,
     /// FASTA header already read while finishing the previous record.
@@ -234,7 +236,7 @@ impl<R: BufRead> ReadReader<R> {
             input,
             format: None,
             started: false,
-            failed: false,
+            ended: false,
             line: 0,
             buffer: String::new(),
             pending_header: None,
@@ -273,15 +275,17 @@ impl<R: BufRead> ReadReader<R> {
         Ok(count)
     }
 
-    /// The next record, `None` at the end of the input. An error ends the
-    /// input: later calls return `None`, since where the next record starts
-    /// is unknown (a FASTQ quality line may start with `@`).
+    /// The next record, `None` at the end of the input. The end is final,
+    /// even if the input has more data later (a terminal after Ctrl-D, a
+    /// growing file), and so is an error: later calls return `None`, since
+    /// where the next record starts is unknown (a FASTQ quality line may
+    /// start with `@`).
     pub fn next_record(&mut self) -> Result<Option<ReadRecord>, ReadError> {
-        if self.failed {
+        if self.ended {
             return Ok(None);
         }
         let next = self.read_record();
-        self.failed = next.is_err();
+        self.ended = !matches!(next, Ok(Some(_)));
         next
     }
 
@@ -657,6 +661,30 @@ mod tests {
             reader.next(),
             Some(Err(ReadError::UnknownFormat { .. }))
         ));
+        assert!(reader.next().is_none());
+    }
+
+    /// A `Read` that returns its chunks one per call: an empty chunk ends
+    /// the input as stdin does after Ctrl-D, while more data may follow.
+    struct Chunks(Vec<&'static [u8]>);
+
+    impl io::Read for Chunks {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.0.is_empty() {
+                return Ok(0);
+            }
+            let chunk = self.0.remove(0);
+            buf[..chunk.len()].copy_from_slice(chunk);
+            Ok(chunk.len())
+        }
+    }
+
+    #[test]
+    fn the_end_of_the_input_is_final() {
+        let chunks = Chunks(vec![b">a\nACGT\n", b"", b"", b">b\nGGGG\n"]);
+        let mut reader = ReadReader::new(io::BufReader::new(chunks));
+        assert_eq!(reader.next().unwrap().unwrap(), record("a", "ACGT"));
+        assert!(reader.next().is_none());
         assert!(reader.next().is_none());
     }
 
