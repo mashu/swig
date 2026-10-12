@@ -304,15 +304,38 @@ fn header_values_are_never_overridden() {
     assert_eq!(regions.fr3, Some(gene.starts[4]));
 }
 
+/// Annotation is linear in the database: 4× the alleles take about 4× the
+/// time (a quadratic step would take 16×), and 3,000 alleles take tens of
+/// milliseconds. Each size is timed by its fastest of five interleaved runs,
+/// so a loaded machine slows both sizes alike and the bounds hold under load.
 #[test]
 fn annotation_of_thousands_of_alleles_takes_milliseconds() {
-    let mut rng = Rng::new(5);
-    let (mut v, _, mut j, _) = database(ChainType::Heavy, 3000, &mut rng);
-    let started = std::time::Instant::now();
-    annotate(&mut v, Some(&mut j), AnnotateOptions::default());
-    let elapsed = started.elapsed();
-    eprintln!("annotated 3000 V + 6 J alleles in {elapsed:?}");
-    assert!(elapsed.as_millis() < if cfg!(debug_assertions) { 3000 } else { 200 });
+    let databases = [750, 3000].map(|genes| {
+        let mut rng = Rng::new(5);
+        let (v, _, j, _) = database(ChainType::Heavy, genes, &mut rng);
+        (v, j)
+    });
+    let mut fastest = [std::time::Duration::MAX; 2];
+    for _ in 0..5 {
+        for ((v, j), best) in databases.iter().zip(&mut fastest) {
+            let (mut v, mut j) = (v.clone(), j.clone());
+            let started = std::time::Instant::now();
+            annotate(&mut v, Some(&mut j), AnnotateOptions::default());
+            *best = (*best).min(started.elapsed());
+        }
+    }
+    let [small, large] = fastest;
+    eprintln!("annotated 750 V alleles in {small:?}, 3000 in {large:?}");
+    assert!(
+        large < 10 * small,
+        "{large:?} for 4x the alleles of {small:?}"
+    );
+    let ceiling = if cfg!(debug_assertions) {
+        15_000
+    } else {
+        1_000
+    };
+    assert!(large.as_millis() < ceiling, "{large:?}");
 }
 
 /// 6,000 adversarial alleles per chain type: every anchor must be exact,
