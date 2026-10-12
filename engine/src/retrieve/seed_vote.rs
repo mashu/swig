@@ -61,9 +61,6 @@ pub struct SeedVoteParams {
     pub unbanded: bool,
     /// Minimum weighted votes for an allele to be a candidate.
     pub min_votes: u32,
-    /// Safety pool: never return more alleles than this (all alleles of the
-    /// best genes first).
-    pub max_alleles: usize,
     /// Which k-mers are seeds, in the index and in the query alike.
     pub sampling: SeedSampling,
 }
@@ -81,7 +78,6 @@ impl Default for SeedVoteParams {
             band_max: 256,
             unbanded: false,
             min_votes: 1,
-            max_alleles: 64,
             // Every k-mer: with the noise-based gene margin, sampled seeds
             // (closed or open syncmers) lose V accuracy at high SHM and on
             // short reads for < 1 % fewer instructions (docs/ASSESSMENT.md §8).
@@ -402,9 +398,6 @@ impl<B: CandidateBudget> Retriever for SeedVoteRetriever<B> {
         votes.sort_by(|a, b| b.votes.cmp(&a.votes).then(a.target.cmp(&b.target)));
         for vote in votes.iter() {
             for &allele in self.frames.members(vote.target) {
-                if out.len() == self.params.max_alleles {
-                    return;
-                }
                 out.push(Candidate {
                     allele,
                     band: self.band_for(vote, allele),
@@ -470,5 +463,63 @@ mod tests {
             out[0].band.contains(10, 5),
             "diagonal +5 must be inside the band"
         );
+    }
+
+    fn retriever(set: &GermlineSet) -> SeedVoteRetriever {
+        SeedVoteRetriever::build(
+            set,
+            SeedShape::contiguous(9),
+            Some(SeedShape::contiguous(7)),
+            SeedVoteParams::default(),
+            AmbiguityBudget::default(),
+        )
+        .unwrap()
+    }
+
+    fn push_codes(set: &mut GermlineSet, name: &str, codes: &[u8]) {
+        let text = crate::alphabet::decode(codes);
+        set.push(name, text.as_bytes(), None).unwrap();
+    }
+
+    /// Every allele of a kept gene is a candidate, whatever the gene's
+    /// size or the order of the database records.
+    #[test]
+    fn every_allele_of_a_kept_gene_is_a_candidate_in_any_record_order() {
+        let mut next = crate::testing::rng(11);
+        let base = crate::testing::random_codes(&mut next, 300);
+        let other = crate::testing::random_codes(&mut next, 300);
+        let alleles: Vec<(String, Vec<u8>)> = (0..80)
+            .map(|i| {
+                let mut codes = base.clone();
+                codes[3 * i + 20] = (codes[3 * i + 20] + 1) % 4;
+                (format!("IGHV1-1*{:02}", i + 1), codes)
+            })
+            .chain(std::iter::once(("IGHV2-2*01".to_string(), other)))
+            .collect();
+        let candidates = |order: &mut dyn Iterator<Item = &(String, Vec<u8>)>| {
+            let mut set = GermlineSet::new(SegmentKind::V);
+            for (name, codes) in order {
+                push_codes(&mut set, name, codes);
+            }
+            let mut out = Vec::new();
+            retriever(&set).retrieve(
+                &alleles[40].1[10..290],
+                &mut RetrievalScratch::default(),
+                &mut out,
+            );
+            let mut names: Vec<String> = out
+                .iter()
+                .map(|c| set.allele(c.allele).name.clone())
+                .collect();
+            names.sort();
+            names
+        };
+        let forward = candidates(&mut alleles.iter());
+        assert_eq!(
+            forward.iter().filter(|n| n.starts_with("IGHV1-1*")).count(),
+            80,
+            "every allele of the kept gene"
+        );
+        assert_eq!(forward, candidates(&mut alleles.iter().rev()));
     }
 }
