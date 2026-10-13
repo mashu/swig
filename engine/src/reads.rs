@@ -9,6 +9,8 @@
 //! column. An AIRR table is tab-separated, or comma-separated when its
 //! header line holds no tab, and is read from its `sequence`, `sequence_id`
 //! and `quality` columns: Swig re-annotates AIRR input from its sequences.
+//! The header line keeps its leading blank space: one that starts with a
+//! tab starts with an empty column name, as pandas writes its index column.
 //!
 //! Symbols follow the format. FASTA sequence lines keep only letters:
 //! whitespace, digits, `*` and the gap symbols `.` and `-` (IMGT-gapped or
@@ -299,7 +301,8 @@ impl<R: BufRead> ReadReader<R> {
     }
 
     /// Reject gzip, skip a UTF-8 byte-order mark and leading blank space,
-    /// and classify the first symbol.
+    /// and classify the first symbol. The blank space before it on its own
+    /// line is kept for a table's header ([`Self::airr_header`]).
     fn detect(&mut self) -> Result<Option<ReadFormat>, ReadError> {
         let start = self.input.fill_buf()?;
         if start.starts_with(&[0x1f, 0x8b]) {
@@ -308,26 +311,29 @@ impl<R: BufRead> ReadReader<R> {
         if start.starts_with(BYTE_ORDER_MARK) {
             self.input.consume(BYTE_ORDER_MARK.len());
         }
+        let mut indent = String::new();
         loop {
             let chunk = self.input.fill_buf()?;
             if chunk.is_empty() {
                 return Ok(None);
             }
             let blank = chunk.iter().take_while(|b| b.is_ascii_whitespace()).count();
-            let newlines = chunk[..blank].iter().filter(|&&b| b == b'\n').count();
-            if blank == chunk.len() {
-                self.line += newlines;
-                self.input.consume(blank);
-                continue;
+            for &byte in &chunk[..blank] {
+                if byte == b'\n' {
+                    self.line += 1;
+                    indent.clear();
+                } else {
+                    indent.push(char::from(byte));
+                }
             }
-            let symbol = chunk[blank];
-            self.line += newlines;
+            let symbol = chunk.get(blank).copied();
             self.input.consume(blank);
+            let Some(symbol) = symbol else { continue };
             return match symbol {
                 b'>' => Ok(Some(ReadFormat::Fasta)),
                 b'@' => Ok(Some(ReadFormat::Fastq)),
                 other if other.is_ascii_graphic() => {
-                    self.airr = Some(self.airr_header()?);
+                    self.airr = Some(self.airr_header(&indent)?);
                     Ok(Some(ReadFormat::Airr))
                 }
                 other => Err(ReadError::UnknownFormat {
@@ -338,9 +344,12 @@ impl<R: BufRead> ReadReader<R> {
         }
     }
 
-    /// Read an AIRR table's header line and find its columns.
-    fn airr_header(&mut self) -> Result<AirrColumns, ReadError> {
+    /// Read an AIRR table's header line, whose leading blank space
+    /// `indent` detection consumed, and find its columns. A leading
+    /// delimiter is an empty first column name, whose values the rows hold.
+    fn airr_header(&mut self, indent: &str) -> Result<AirrColumns, ReadError> {
         self.next_line()?;
+        self.buffer.insert_str(0, indent);
         let delimiter = if self.buffer.contains('\t') {
             '\t'
         } else {
@@ -773,6 +782,36 @@ mod tests {
         );
         let mut reader = ReadReader::new(&csv[..]);
         assert_eq!(reader.format().unwrap(), Some(ReadFormat::Airr));
+    }
+
+    #[test]
+    fn an_airr_header_may_start_with_an_empty_column_name() {
+        // pandas writes its index as a first column without a name, so the
+        // header starts with the delimiter; swig-cli writes such a CSV
+        // header as `\tsequence_id\tsequence`. That tab is no blank space
+        // before the table: dropped, every column reads one to the left.
+        let tsv = b"\tsequence_id\tsequence\n0\tq\tACGT\n1\tr\tGG\n";
+        let expected = [record("q", "ACGT"), record("r", "GG")];
+        assert_eq!(read_all(tsv).unwrap(), expected);
+        assert_eq!(
+            read_all(b",sequence_id,sequence\n0,q,ACGT\n1,r,GG\n").unwrap(),
+            expected
+        );
+        assert_eq!(
+            read_all(b"\n \r\n\tsequence_id\tsequence\n0\tq\tACGT\n").unwrap(),
+            [record("q", "ACGT")]
+        );
+        // Only the header line's own blank space counts, wherever the
+        // input's chunks break it.
+        for chunks in [
+            vec![&b"\t"[..], b"sequence_id\tsequence\n0\tq\tACGT\n"],
+            vec![b"\t \n", b"\n\t", b"sequence_id\tsequence\n0\tq\tACGT\n"],
+            vec![b"\t", b"\n", b"\tsequence_id\tsequence\n0\tq\tACGT\n"],
+        ] {
+            let reader = ReadReader::new(io::BufReader::new(Chunks(chunks.clone())));
+            let records: Result<Vec<_>, _> = reader.collect();
+            assert_eq!(records.unwrap(), [record("q", "ACGT")], "{chunks:?}");
+        }
     }
 
     #[test]

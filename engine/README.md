@@ -137,7 +137,9 @@ fraction. It writes `PREFIX.fasta` and `PREFIX.truth.tsv`.
 detected from the first non-blank character (`>`, `@`, anything else a
 table). A table is tab-separated, or comma-separated without quoting when
 its header holds no tab, and is read from its `sequence`, `sequence_id` and
-`quality` columns: AIRR input is re-annotated from its sequences.
+`quality` columns: AIRR input is re-annotated from its sequences. A header
+that starts with a tab starts with an empty column name, as pandas writes
+its index column.
 Multi-line FASTQ is supported; qualities are validated and kept for the
 `quality` column. FASTQ sequence lines may not hold spaces, tabs or control
 characters (FASTA drops them, but a FASTQ quality counts each base); no-call
