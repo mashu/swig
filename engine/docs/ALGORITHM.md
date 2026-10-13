@@ -560,10 +560,12 @@ stripping column 0 gives the alignment on `C`, which is then clipped to
 `[x, n)` so C explains only bases the J does not. The query window is
 `[x − s − 1, n)` with band `[0, 2s]`; the band is also the drift corridor:
 a C starting at `x + δ` admits `s + δ` net deletions and `s − δ` net
-insertions, beyond which the free end truncates the alignment. C records up
-to about 2 kb keep `B` and every score inside the 16-bit SIMD lanes; a
-longer (genomic) record runs on the exact scalar kernel, and `prepare`
-warns about it.
+insertions, beyond which the free end truncates the alignment. A job stays
+in the 16-bit SIMD lanes while `B + 2·(k − 1) ≤ 30,000`, `k` the shorter of
+its query window and its record, so for C records up to about 15 kb. `B` is
+global: one longer record sends every C job to the exact scalar kernel.
+`prepare` warns about records over 2 kb, which carry introns or UTR (a
+genomic record's base 0 need not follow the J).
 
 **Candidates: reach classes** (`retrieve/reach.rs`). An anchored alignment
 reaches at most `R = (n − x) + s` bases of `C`. Alleles with equal reached

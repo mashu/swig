@@ -22,9 +22,9 @@ use crate::seed::SeedShape;
 use crate::translate::open_frames;
 
 /// Longest plausible coding constant region: human C exons total at most
-/// 1.6 kb, so a longer record carries introns or UTR. Its anchored jobs
-/// would also leave the 16-bit SIMD lanes (anchor bonus `2·|C|` plus up to
-/// `2` per column).
+/// 1.6 kb, so a longer record carries introns or UTR, and its base 0 need
+/// not follow the J. (The SIMD kernel's bound is far above it: anchored C
+/// jobs stay in the 16-bit lanes for records up to about 15 kb.)
 pub const MAX_CODING_C: usize = 2000;
 
 /// The `annotation=` and `uncertain=` tokens of a prepared V or J header:
