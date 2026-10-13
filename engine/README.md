@@ -1275,7 +1275,8 @@ Each is a named field you can change.
    searched from 12 bases before the earliest V end when some V is an
    anchor, and over the whole read when none is; D windows start from the
    best anchoring V, and from the read's start when no V anchors; only
-   anchors choose the locus of the J and D candidates.
+   anchors choose the locus of the J and D candidates. Without a J (or V)
+   the D window reaches 60 bases past the V (before the J), the D and its N.
 6. **Significance.** V and J hits need E ≤ 1, and a call needs a V or J hit
    at E ≤ 10⁻³ (`EvalueGates`). The note has no reporting threshold.
 7. **Tie-breaks.** Equal-score paths go to fewer D, then to more germline

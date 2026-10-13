@@ -40,24 +40,32 @@ pub fn bounding_v(v: &[Placement], anchoring: bool) -> Option<&Placement> {
 
 /// `[b_V − margin, a_J + margin)` of the bounding V and J, clamped to the
 /// read and to V's start; empty (never inverted) when V reaches past the J's
-/// start by more than the margin.
+/// start by more than the margin. Without a J it ends `reach` bases after
+/// V's end, without a V it starts `reach` bases before J's start, and
+/// without either it is the whole read.
 fn residual(
     query_len: usize,
     v: Option<&Placement>,
     j: Option<&Placement>,
     margin: u32,
+    reach: u32,
 ) -> Range<usize> {
-    let floor = v.map_or(0, |p| p.q_start() as usize);
-    let start = v
-        .map_or(0, |p| p.q_end().saturating_sub(margin) as usize)
-        .max(floor);
-    let end = j
-        .map_or(query_len, |p| (p.q_start() + margin) as usize)
-        .min(query_len);
+    let start = match (v, j) {
+        (Some(v), _) => v.q_end().saturating_sub(margin).max(v.q_start()),
+        (None, Some(j)) => j.q_start().saturating_sub(reach),
+        (None, None) => 0,
+    } as usize;
+    let end = match (j, v) {
+        (Some(j), _) => j.q_start().saturating_add(margin),
+        (None, Some(v)) => v.q_end().saturating_add(reach),
+        (None, None) => u32::MAX,
+    };
+    let end = (end as usize).min(query_len);
     start..end.max(start)
 }
 
-/// The ordinary residual `[b_V − margin, a_J + margin)` of the bounding V and J.
+/// The ordinary residual `[b_V − margin, a_J + margin)` of the bounding V and
+/// J, open to the read's start (end) when no V (J) bounds it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResidualWindow {
     pub overlap_margin: u32,
@@ -71,7 +79,7 @@ impl DWindowPolicy for ResidualWindow {
         j: Option<&Placement>,
         out: &mut Vec<Range<usize>>,
     ) {
-        let window = residual(query_len, v, j, self.overlap_margin);
+        let window = residual(query_len, v, j, self.overlap_margin, u32::MAX);
         if !window.is_empty() {
             out.push(window);
         }
@@ -79,7 +87,8 @@ impl DWindowPolicy for ResidualWindow {
 }
 
 /// Residual widened by `reclaim` bases into V and J, searched when it holds
-/// at least `min_width` bases (and at least one).
+/// at least `min_width` bases (and at least one). On a read without a J (V)
+/// it reaches `reach` bases past the V's end (before the J's start).
 ///
 /// This replaces the note's gated *boundary rescue*: D hits that overlap an
 /// over-extended V or J are found up front, and the adjudicator's exact cut
@@ -90,6 +99,7 @@ impl DWindowPolicy for ResidualWindow {
 pub struct ExpandedResidual {
     pub reclaim: u32,
     pub min_width: usize,
+    pub reach: u32,
 }
 
 impl Default for ExpandedResidual {
@@ -98,10 +108,17 @@ impl Default for ExpandedResidual {
     /// hurts as well as costs: a D alignment free to stretch into a V or J
     /// tail can trade its junction core for chance matches that the cut
     /// then removes.
+    ///
+    /// Next to one segment, a D lies within its N and its own length: 60
+    /// bases hold the longest human D (37) after an N of 23, and 99.9 % of
+    /// simulated IGH junctions (N1 + D and D + N2 at most 55). Beyond that,
+    /// on a read that stops before its J (or starts after its V), the window
+    /// would hold only chance D hits, more of them the longer it is.
     fn default() -> Self {
         Self {
             reclaim: 12,
             min_width: 4,
+            reach: 60,
         }
     }
 }
@@ -114,7 +131,7 @@ impl DWindowPolicy for ExpandedResidual {
         j: Option<&Placement>,
         out: &mut Vec<Range<usize>>,
     ) {
-        let window = residual(query_len, v, j, self.reclaim);
+        let window = residual(query_len, v, j, self.reclaim, self.reach);
         if window.len() >= self.min_width.max(1) {
             out.push(window);
         }
@@ -312,6 +329,32 @@ mod tests {
         assert_eq!(bounding_v(&v, false).map(Placement::q_end), Some(117));
     }
 
+    /// A read that stops before its J (or starts after its V) holds no D
+    /// beyond the reach of the segment it has: the window ends `reach`
+    /// bases after the V (starts `reach` bases before the J), not at the
+    /// read's end (start). The ordinary residual stays open.
+    #[test]
+    fn d_window_without_j_or_v_stays_within_reach() {
+        let mut next = crate::testing::rng(10);
+        let query = crate::testing::random_codes(&mut next, 400);
+        let v = crate::testing::placement(SegmentKind::V, &query, &query[..150], 0);
+        let j = crate::testing::placement(SegmentKind::J, &query, &query[300..350], 300);
+        let expanded = ExpandedResidual::default();
+        assert_eq!(expanded.reach, 60);
+        let windows = |policy: &dyn DWindowPolicy, v, j| {
+            let mut out = Vec::new();
+            policy.windows(400, v, j, &mut out);
+            out
+        };
+        assert_eq!(windows(&expanded, Some(&v), None), vec![138..210]);
+        assert_eq!(windows(&expanded, None, Some(&j)), vec![240..312]);
+        assert_eq!(windows(&expanded, None, None), vec![0..400]);
+        assert_eq!(windows(&expanded, Some(&v), Some(&j)), vec![138..312]);
+        let ordinary = ResidualWindow { overlap_margin: 12 };
+        assert_eq!(windows(&ordinary, Some(&v), None), vec![138..400]);
+        assert_eq!(windows(&ordinary, None, Some(&j)), vec![0..312]);
+    }
+
     /// A V that reaches past the J's start by more than the margin makes the
     /// residual empty; no policy may propose an inverted window.
     #[test]
@@ -323,8 +366,8 @@ mod tests {
         for min_width in [0, 1, 4] {
             let mut out = Vec::new();
             ExpandedResidual {
-                reclaim: 12,
                 min_width,
+                ..ExpandedResidual::default()
             }
             .windows(100, Some(&v), Some(&j), &mut out);
             assert!(
