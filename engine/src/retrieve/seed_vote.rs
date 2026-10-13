@@ -323,11 +323,15 @@ impl<B: CandidateBudget> SeedVoteRetriever<B> {
 
     /// `best` spanning `second` too when that is the far side of an indel:
     /// within `max_indel` diagonals, and too strong for a chance cluster
-    /// (3 primary seeds) or a stray repeat (1/8 of the best's votes).
+    /// (3 primary seeds) or a stray repeat (1/8 of the best's votes). The
+    /// best cluster must itself hold `weak_seeds` primary seeds: two chance
+    /// clusters must not add up, or the wrong strand of a hypermutated read
+    /// can outvote the right one (`Assigner` orients such reads by votes).
     fn join_indel(&self, best: ClusterVote, second: ClusterVote) -> ClusterVote {
         let (d_lo, d_hi) = (best.d_lo.min(second.d_lo), best.d_hi.max(second.d_hi));
-        let floor = 3 * u32::from(self.params.primary_weight);
-        if second.votes >= floor
+        let weight = u32::from(self.params.primary_weight);
+        if best.votes >= self.params.weak_seeds.saturating_mul(weight)
+            && second.votes >= 3 * weight
             && second.votes.saturating_mul(8) >= best.votes
             && d_hi - d_lo <= self.params.max_indel
         {
@@ -602,6 +606,34 @@ mod tests {
         let seeds = 60 - 9 + 1;
         assert_eq!(out[0].allele, 0, "{out:?}");
         assert_eq!(out[0].votes, 4 * seeds, "{out:?}");
+    }
+
+    /// Two chance-sized clusters are not joined into one indel-spanning
+    /// cluster; a strong best cluster takes its runner-up.
+    #[test]
+    fn chance_clusters_are_not_joined() {
+        let mut next = crate::testing::rng(5);
+        let mut set = GermlineSet::new(SegmentKind::V);
+        push_codes(
+            &mut set,
+            "IGHV1-1*01",
+            &crate::testing::random_codes(&mut next, 300),
+        );
+        let retriever = retriever(&set);
+        let w = u32::from(retriever.params.primary_weight);
+        let cluster = |seeds: u32, d: i32| ClusterVote {
+            target: 0,
+            votes: seeds * w,
+            d_lo: d,
+            d_hi: d + 2,
+        };
+        // A best cluster below `weak_seeds` is chance-sized: no join.
+        let (weak, runner_up) = (cluster(10, 0), cluster(6, 20));
+        assert_eq!(retriever.join_indel(weak, runner_up), weak);
+        // A strong best cluster takes its indel's far side.
+        let strong = cluster(40, 0);
+        let joined = retriever.join_indel(strong, runner_up);
+        assert_eq!((joined.votes, joined.d_lo, joined.d_hi), (46 * w, 0, 22));
     }
 
     /// A deletion or insertion of 9–30 bases at germline 180 puts the seeds

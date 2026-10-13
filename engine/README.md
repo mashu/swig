@@ -14,7 +14,7 @@ instead of tuned patches. Every component is a replaceable, statically
 dispatched trait, and every search shortcut is either lossless or measured
 on simulated repertoires.
 
-The crate and binary are `swig` 0.39.1. The workspace member `wasm/` (crate
+The crate and binary are `swig` 0.39.2. The workspace member `wasm/` (crate
 `swig_wasm`) is the WebAssembly module. There are no dependencies; Rust ≥
 1.89, edition 2024. The alignment kernel runs on AVX-512BW, AVX2, NEON,
 WebAssembly SIMD or portable lanes, chosen at run time (on WebAssembly, at
@@ -475,9 +475,9 @@ to the motif hit, and the allele reports the annotation's provenance; an
 explicit `anchor=` (or a `SWIGMETA` anchor no motif can replace) is kept but
 flagged and counted in the uncertain-anchor warning. Swig's shipped
 references hold such anchors (TRAJ24*01–03 and TRAJ48*01, among 50 J
-alleles, sit 15–21 bases early; IGLV2-11*03, IGLV2-8*03, IGHV4-30-4*05,
-TRBV5-8*02 and TRBV11-3*03 were given another frame), so reads of those
-alleles used to get a junction several codons short.
+allele records, sit 15–21 bases early; IGLV2-11*03, IGLV2-8*03,
+IGHV4-30-4*05, TRBV5-8*02 and TRBV11-3*03 were given another frame), so
+reads of those alleles used to get a wrong junction.
 A malformed field is an error. The provenance becomes the allele's
 `v_annotation_source` or `j_annotation_source`; an allele without one
 reports the annotation's own source.

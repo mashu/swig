@@ -1,6 +1,6 @@
 # Swig methods index
 
-This index is the implementation-facing methods map for Swig 0.39.1. It covers every runnable analysis block from file intake through phylogenetic UCA inference. The UI may summarize a method in one sentence; the linked document is the specification.
+This index is the implementation-facing methods map for Swig 0.39.2. It covers every runnable analysis block from file intake through phylogenetic UCA inference. The UI may summarize a method in one sentence; the linked document is the specification.
 
 ## Evidence labels used in these documents
 

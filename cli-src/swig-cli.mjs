@@ -58,7 +58,7 @@ import {
 import { annotateAirrBatch, annotateDoubleDBatch, stableDatasetSeed } from "../src/study-design.ts";
 import { ALIGNER_MODES, NativePool, resolveNativeAligner } from "./native-aligner.mjs";
 
-const VERSION="0.39.1";
+const VERSION="0.39.2";
 const CLI_STREAM_HIGH_WATER_MARK=8*1024*1024;
 const CLI_GZIP_CHUNK_SIZE=1024*1024;
 const CLI_DIRECTORY=dirname(fileURLToPath(import.meta.url));
@@ -1171,7 +1171,8 @@ function vdjTuning(options){
   for(const [option,key] of [["-D_penalty","dMismatch"],["-J_penalty","jMismatch"]]){
     if(options[option]===undefined)continue;
     const value=parseFiniteOption(options[option],option);
-    if(!Number.isInteger(value)||value>=0)throw new Error(`${option} must be a negative integer.`);
+    // The aligner bounds mismatch scores at -1000 (engine/src/run.rs MIN_MISMATCH).
+    if(!Number.isInteger(value)||value>=0||value<-1000)throw new Error(`${option} must be a negative integer from -1000 to -1.`);
     tuning[key]=value;
   }
   for(const option of ["-num_alignments_D","-num_alignments_J"]){

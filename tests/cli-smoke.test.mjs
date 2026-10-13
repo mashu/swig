@@ -477,6 +477,21 @@ test("--vdj refuses to accumulate output when no destination is supplied",()=>{
   assert.notEqual(result.status,0);assert.match(result.stderr,/requires -out/);
 });
 
+test("--vdj refuses a D or J penalty outside the aligner's range",async()=>{
+  const root=resolve(import.meta.dirname,"..");
+  const refs=join(root,"public/references/kimdb-1.1/Macaca_mulatta/IGH");
+  const temporary=await mkdtemp(join(root,"tmp-cli-penalty-"));
+  try{
+    for(const option of ["-D_penalty","-J_penalty"]){
+      const args=["--vdj","-query",join(root,"tests/fixtures/kimdb-perfect-d-regression.fasta"),"-germline_db_V",join(refs,"V.fasta"),"-germline_db_D",join(refs,"D.fasta"),"-germline_db_J",join(refs,"J.fasta"),option,"-1001","-out",join(temporary,"out.tsv")];
+      const result=runRawCli(root,args);
+      assert.equal(result.status,1,result.stderr);
+      assert.match(result.stderr,new RegExp(`${option} must be a negative integer from -1000 to -1`));
+      assert.equal(existsSync(join(temporary,"out.tsv")),false);
+    }
+  }finally{await rm(temporary,{recursive:true,force:true});}
+});
+
 test("CLI exposes the embedded IMGT data notice",()=>{
   const root=resolve(import.meta.dirname,"..");
   const result=runRawCli(root,["notices"]);

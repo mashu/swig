@@ -13241,7 +13241,7 @@ var NativePool = class {
 };
 //#endregion
 //#region cli-src/swig-cli.mjs
-const VERSION = "0.39.1";
+const VERSION = "0.39.2";
 const CLI_STREAM_HIGH_WATER_MARK = 8388608;
 const CLI_GZIP_CHUNK_SIZE = 1048576;
 const CLI_DIRECTORY = dirname(fileURLToPath(import.meta.url));
@@ -15059,7 +15059,7 @@ function vdjTuning(options) {
 	for (const [option, key] of [["-D_penalty", "dMismatch"], ["-J_penalty", "jMismatch"]]) {
 		if (options[option] === void 0) continue;
 		const value = parseFiniteOption(options[option], option);
-		if (!Number.isInteger(value) || value >= 0) throw new Error(`${option} must be a negative integer.`);
+		if (!Number.isInteger(value) || value >= 0 || value < -1e3) throw new Error(`${option} must be a negative integer from -1000 to -1.`);
 		tuning[key] = value;
 	}
 	for (const option of ["-num_alignments_D", "-num_alignments_J"]) if (options[option] !== void 0) parseIntegerOption(options[option], option, {
