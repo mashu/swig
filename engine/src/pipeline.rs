@@ -106,9 +106,13 @@ pub trait AlleleCatalog {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct AssignerOptions {
     pub orientation: OrientationPolicy,
-    /// V, D and J hits below this identity (matches over alignment
-    /// columns) are dropped before they shape windows or enter
-    /// adjudication; 0 keeps every hit.
+    /// V, D and J hits whose local alignment has an identity (matches over
+    /// alignment columns) below this are dropped before they shape windows
+    /// or enter adjudication; 0 keeps every hit. The outer flank a stage
+    /// stitches on afterwards ([`crate::flank`]) does not count: it scores
+    /// at most 0, so at `(2, −3)` its identity is at most 3/5, and it would
+    /// drag a hypermutated V or J below a floor near 0.6 that its own
+    /// alignment clears.
     pub min_identity: f64,
 }
 
@@ -235,11 +239,14 @@ impl<A, RV, RJ, RD, W, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj> {
             .fold(Loci::NONE, |loci, &a| loci.union(set.allele(a).loci))
     }
 
-    /// Drop the hits of `placed[from..]` below the identity floor.
+    /// Drop the hits of `placed[from..]` whose local alignment is below the
+    /// identity floor.
     fn drop_dissimilar(&self, placed: &mut Vec<Placement>, from: usize) {
         let floor = self.options.min_identity;
         if floor > 0.0 {
-            retain_from(placed, from, |p| p.evidence.identity() + 1e-9 >= floor);
+            retain_from(placed, from, |p| {
+                p.local_evidence.identity() + 1e-9 >= floor
+            });
         }
     }
 

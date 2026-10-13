@@ -1131,6 +1131,7 @@ mod tests {
             shifted: Vec::new(),
             clip,
             evidence: Evidence::default(),
+            local_evidence: Evidence::default(),
             anchor: Some(Score::MIN),
             alignment,
         });

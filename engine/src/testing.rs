@@ -42,6 +42,7 @@ pub fn placement(kind: SegmentKind, query: &[u8], reference: &[u8], q_start: u32
         shifted: Vec::new(),
         clip: ClipIndex::build(&alignment, query, &profile, scoring.gaps),
         evidence: Evidence::default(),
+        local_evidence: Evidence::default(),
         anchor: Some(Score::MIN),
         alignment,
     }

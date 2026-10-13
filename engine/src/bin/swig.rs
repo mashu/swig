@@ -78,7 +78,8 @@ options:
   --threads N          worker threads (default: all cores)
   --chain TYPE         heavy | light (default: voted per locus from the database)
   --strand S           both (default) | forward | reverse
-  --min-identity F     drop V, D and J hits below identity F (0-1; default none)
+  --min-identity F     drop V, D and J hits whose local alignment (before the
+                       stitched outer flank) is below identity F (0-1; default none)
   --no-anchor-window   do not add the conserved-anchor D window
   --no-posterior       skip posterior probabilities (*_posterior columns; ~30 % faster)
   --calls MODEL        the model the call maximises: per-read (each read's own, the

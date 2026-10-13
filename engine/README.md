@@ -115,7 +115,7 @@ options (`swig --help` prints them):
 | `--threads N` | worker threads (default: all cores) |
 | `--chain heavy\|light` | chain type for annotation (default: voted per locus from the database) |
 | `--strand both\|forward\|reverse` | strands a read is assigned on (default `both`, chosen per read) |
-| `--min-identity F` | drop V, D and J hits below identity F (0–1; default none) |
+| `--min-identity F` | drop V, D and J hits whose local alignment, before the stitched outer flank, is below identity F (0–1; default none) |
 | `--no-anchor-window` | do not add the conserved-anchor D window |
 | `--no-posterior` | skip the V, D, J and D-presence posteriors (~30 % faster) |
 | `--calls per-read\|fixed` | the model the call maximises: each read's own (default; the model its posteriors come from) or the fixed `(2, −3)` scores |
