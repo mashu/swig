@@ -8,8 +8,9 @@ and exports name the route they apply to.
 
 On ordinary reads, the J and C calls do not change and the V and D calls
 barely do. On 25,500 simulated IGH, BCR and TCR reads at ordinary SHM:
-- 44 V calls change, mostly the order of tied IGHV4 alleles; the first V
-  gene changes on 4 reads;
+- 44 V calls change, all but one among IGHV4 alleles. 33 keep their first
+  name and only drop, add or reorder tied alleles. 7 name another allele of
+  the same gene first, 3 name another gene first and 1 loses its call;
 - 3 D calls change.
 
 The changes hit:
@@ -93,11 +94,14 @@ is unchanged.
   - An allele with an indel near one end no longer silences the seeds its
     gene holds past that indel. Exact 3′ fragments of IGHV4-31 were called
     IGHV4-34 at posterior 0.998.
-  - When an allele's seeds tie between two offsets, the offset nearest 0
-    wins. Before, the tie could resolve differently from one run to the
-    next.
-  - V indels of 9 to about 60 bases are aligned across. Before, V was
-    aligned on one side of the indel only:
+  - When an allele's seeds tie between two offsets equally far from 0, the
+    smaller now wins. Before, hash order chose, so the gene frame could
+    differ from one run to the next.
+  - V indels of 9 to about 60 bases are aligned across, when the side
+    holding more seeds has at least 25 of them. Two chance-sized clusters
+    are not joined, so the wrong strand of a hypermutated read cannot
+    outvote the right one. Before, V was aligned on one side of the indel
+    only:
     - when the 5′ side was kept, the rest of V became N region and the
       junction moved by the indel's length;
     - otherwise the V start moved, or a paralog was called.
@@ -109,12 +113,12 @@ is unchanged.
   where the running score falls more than 30 below the alignment's edge.
   Before, every co-linear base up to the germline's or the read's end was
   taken.
-  - This keeps most of an adapter, UMI or random flank off a 5′-truncated V.
-    An 8-base flank is still taken whole, and about 15 bases of a longer
-    one.
+  - This keeps an adapter or random flank off a 5′-truncated V beyond about
+    its first 15 bases. A shorter flank, such as a UMI, is still taken whole
+    in most reads: an 8-base one always, a 12-base one in 85 % of reads.
   - It also cuts some real, divergent V starts. At 30 % SHM, exact V starts
-    fall from 98.26 % to 97.04 % and the mean V start error rises from 0.42
-    to 1.34 bases.
+    fall from 98.26 % to 97.11 % and the mean V start error rises from 0.42
+    to 1.22 bases.
   - Other sets are unchanged or nearly so.
 - **D candidates.** The D stage keeps only admissible D alignments among its
   32: those with an exact run of `--min-d-match` bases or distributed-D
@@ -123,9 +127,10 @@ is unchanged.
 - **`*_support` columns.**
   - V, D and J support is now `K·m·n·e^(−λS)` over the read length `m` and
     the database length `n`, the formula the significance gates use.
-  - Before, support applied BLAST's length adjustment. That takes 10–13
-    bases off every allele, nearly the whole of a D. For example, it shrank
-    the TRB+TRD D set from 74 to about 12 bases.
+  - Before, support applied BLAST's length adjustment. That takes about 19
+    bases off every V allele, 13–15 off every J and 10–13 off every D. It
+    halved the IGH D set and shrank the TRB+TRD D set from 74 to about 12
+    bases.
   - Values change on every row: by about 1.1× for V, 1.3–1.5× for J and
     2.2× for D (7× on the TCR set). `c_support` is unchanged.
   - No call changes because of this.
@@ -142,8 +147,9 @@ is unchanged.
   - IUPAC ambiguity codes of the read (R, Y, K, …) now appear as such in
     every derived column: alignments, regions, junction, N/P and the
     double-D sidecar. Before, they became N there while `sequence` kept
-    them. Any other non-base symbol reads as N everywhere, `sequence`
-    included.
+    them. Any other letter reads as N everywhere, `sequence` included, and
+    so does any other symbol of a FASTQ or AIRR read. FASTA drops
+    non-letters, as before.
   - The `*_alternatives` columns list an allele merged into another's
     alignment at its own germline coordinates.
   - `v_annotation_source` and `j_annotation_source` report a `SWIGMETA`
@@ -200,10 +206,12 @@ is unchanged.
     accepted. In 0.39.1, `--j-mismatch -2147483648` aborted the run. With
     `--j-mismatch -1000000`, two reads took 4 s and one reported a J score of
     −2,999,908.
-  - `--d-allele max-marginal` names the decoded D allele first, with its own
-    germline coordinates. A decoding is kept only when its reported D
+  - `--d-allele max-marginal` (the `swig` binary and the WebAssembly module;
+    Swig Web and `swig-cli` do not set it) names the decoded D allele first,
+    with its own germline coordinates. A decoding is kept only when its reported D
     posterior is at least the call's.
-  - `--calls fixed` reads each presence prior at its own scoring's λ. With
+  - `--calls fixed` (the `swig` binary and the WebAssembly module) reads
+    each presence prior at its own scoring's λ. With
     `--d-mismatch`, `--j-mismatch` or the `igblast` profile, posteriors
     change: at `--d-mismatch -4` the D prior was 6.30 nats instead of 6.62.
     Calls do not change.
@@ -230,13 +238,14 @@ is unchanged.
     with status 1. This covers:
     - assignment without `--v`, `--j` or the reads;
     - `prepare` or `simulate` without `--out`;
-    - `evaluate` without `--truth`;
-    - `--double-d` without `--double-d-out`.
+    - `evaluate` without `--truth` or the calls file;
+    - `--double-d` without `--double-d-out`, or the reverse.
   - `simulate`:
     - keeps each read within one locus;
     - draws no V or J allele without a trusted anchor, and no C allele that
       `prepare` warns about (5′-truncated or genomic);
-    - checks `--rc`, `--shm` and `--dd` against their domains;
+    - checks `--rc`, `--shm` and `--dd` against their domains and refuses
+      `--reads 0`;
     - warns when `--dd` is given for a database with fewer than two D
       alleles.
   - `evaluate`:
@@ -258,21 +267,25 @@ percentage points.
 | IGH easy | 3,000 | +0.00 | +0.00 | +0.00 | +0.00 | −0.25 |
 | IGH mid | 5,000 | +0.02 | +0.00 | +0.00 | +0.00 | −0.13 |
 | IGH hard | 5,000 | +0.06 | +0.02 | +0.00 | +0.00 | −0.18 |
-| IGH 30 % SHM | 3,000 | **+1.80** | −0.03 | −0.43 | −0.46 | +0.04 |
+| IGH 30 % SHM | 3,000 | **+1.83** | −0.10 | −0.43 | −0.50 | +0.09 |
 | BCR (IGH+IGK+IGL) | 7,500 | +0.00 | +0.00 | +0.00 | +0.00 | −0.59 |
 | TCR (TRA and TRB reads, TRA+TRB+TRD+TRG database) | 5,000 | +0.00 | +0.00 | +0.00 | +0.00 | −2.69 |
 
-- **V at 30 % SHM.** The +1.80 points are 69 reads gained and 15 lost
-  (McNemar p 2·10⁻⁹), mostly from the removed 64-allele cap.
-- **J and C at 30 % SHM.** 20 calls are no longer made: their paths hold no
-  significant segment. 15 of them had a wrong or missing V gene, but 16 had
-  the right J gene. With the J presence cost and the shorter stitched
-  flanks, 23 reads lose a right J and 10 gain one, and 25 lose a right C and
-  14 gain one.
+- **V at 30 % SHM.** The +1.83 points are 64 reads gained and 9 lost
+  (McNemar p 2·10⁻¹¹), mostly from the removed 64-allele cap.
+- **J and C at 30 % SHM.** 20 reads lose a right J and 7 gain one; 22 lose
+  a right C and 10 gain one. Most of the losses are one of three kinds:
+  - 16 calls are no longer made because their paths hold no significant
+    segment. All 16 had a wrong or missing V gene in 0.39.1, but 12 had the
+    right J gene.
+  - Some reads now call a short chance J inside the C region, which also
+    costs their C.
+  - A few lose a J too weak to pay the J presence cost, or a C where the
+    J's stitched flank now stops earlier.
 - **Junction losses.** On the IGH easy, mid and hard, BCR and TCR sets,
   every exact junction lost belongs to a read of a corrected-anchor allele.
   The frozen truths were simulated from the misplaced anchors, so they still
-  hold the old junctions. At 30 % SHM, 14 exact junctions are lost and 15
+  hold the old junctions. At 30 % SHM, 11 exact junctions are lost and 13
   gained; 4 of the lost are reads of IGHV4-30-4\*05.
 - **IGK reads against the IGH database.** The 1,000 off-locus reads are not
   scored here; see "No calls without evidence".
@@ -291,7 +304,8 @@ includes database preparation.
 | IGH mid | 4 | 0.87 s | 0.78 s |
 | IGH hard | 4 | 0.84 s | 0.83 s |
 
-Single runs varied by ±10 % on this machine.
+Single runs varied by up to 18 % from the median on this machine (up to
+15 % single-threaded), so the 4-thread differences are within noise.
 
 The D stage now aligns each candidate once instead of scoring all of them
 and then aligning most of them again. Other changes save work too:
@@ -302,9 +316,11 @@ and then aligning most of them again. Other changes save work too:
 
 SIMD lanes now take scores up to 30,000 instead of 8,000. The C anchor bonus
 grows with the longest C record, so one record of about 4 kb sent every C
-alignment to the scalar kernel. The shipped Salmo salar IGH set has two such
-records, IGHD\*01 and IGHDD\*01. Its C alignments run on SIMD again; output is
-unchanged.
+alignment to the scalar kernel. Two shipped sets have such records:
+- Salmo salar IGH: IGHDD\*01 and IGHD\*01;
+- Danio rerio IGH: IGHD\*01.
+
+Their C alignments run on SIMD again; output is unchanged.
 
 ## Still open
 

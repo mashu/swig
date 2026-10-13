@@ -49,8 +49,8 @@ ALGORITHM describe the behaviour they changed. Still open, by priority:
    break "the call is a mode of the posterior", and a constant shift fits as
    well. An N/P and trim-length prior should replace it.
 3. **Anchor gate and wrong V calls.** A call now needs a V or J whose clip
-   on the path is significant on its own. At 30 % SHM, 15 of the 20 calls
-   this drops had a wrong or missing V gene, but 16 had the right J gene. With the J presence
+   on the path is significant on its own. At 30 % SHM, all 16 calls this
+   drops had a wrong or missing V gene, but 12 had the right J gene. With the J presence
    cost, the set loses 0.43 pp of J and 0.46 pp of C accuracy. Keeping J and
    C when only V fails the gate is worth measuring.
 4. **Annotation transfer.** Sibling transfer copies region starts through a
