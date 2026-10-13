@@ -1,6 +1,6 @@
 [package]
 name = "swig"
-version = "0.39.1"
+version = "0.39.2"
 edition = "2024"
 rust-version = "1.89"
 description = "Seeded, banded affine V(D)J germline assignment with placement-DAG adjudication"
