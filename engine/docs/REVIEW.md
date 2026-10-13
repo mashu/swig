@@ -49,14 +49,19 @@ ALGORITHM describe the behaviour they changed. Still open, by priority:
    break "the call is a mode of the posterior", and a constant shift fits as
    well. An N/P and trim-length prior should replace it.
 3. **Anchor gate and wrong V calls.** A call now needs a V or J whose clip
-   on the path is significant on its own. At 30 % SHM, 18 of the 19 calls
-   this drops had the wrong V, but 15 had the right J. With the J presence
+   on the path is significant on its own. At 30 % SHM, 15 of the 20 calls
+   this drops had a wrong or missing V gene, but 16 had the right J gene. With the J presence
    cost, the set loses 0.43 pp of J and 0.46 pp of C accuracy. Keeping J and
    C when only V fails the gate is worth measuring.
 4. **Annotation transfer.** Sibling transfer copies region starts through a
    local alignment with no frame or motif check. The 3′-partial
    IGHV1/OR16-3/-4/-22 alleles get a low-confidence Cys104 in a non-coding
-   frame.
+   frame. Five V alleles keep a misplaced given anchor:
+   - IGHV1/OR15-5\*01 and rhesus IGHV1-197\*02 have no confident motif to
+     replace it;
+   - mouse TRAV7-3\*02 and TRAV9D-4\*03 and sheep TRAV45-3\*02 escape the
+     frame test, since their truncated region starts share the anchor's
+     frame.
 5. **Public fields bypass validation** (3.1.8): literal `GapCosts` with
    positive costs, `Allele` regions, `DistributedEvidence` (and with it
    3.1.6, `lossless_lmer` fixed at 4).
@@ -71,10 +76,11 @@ ALGORITHM describe the behaviour they changed. Still open, by priority:
    public surface is wider than any caller needs (4.6); ALGORITHM.md still
    carries review narrative (4.9).
 9. **Swig's shipped references** (outside the aligner). `SWIGMETA`
-   misplaces the anchors of 50 J alleles (TRAJ24*01–03 and TRAJ48*01
-   among them) and gives 13 5′-partial V alleles the wrong frame. The
-   engine now replaces such anchors with the motif hit at load, but the
-   references should be regenerated.
+   misplaces the anchors of 50 J allele records (TRAJ24*01–03 and
+   TRAJ48*01 among them) and gives several 5′-partial V alleles the wrong
+   frame. At load the engine replaces all 50 J anchors and 8 V anchors with
+   the motif hit; five V alleles keep theirs (item 4). The references
+   should be regenerated.
 
 ## 1. Verdict
 

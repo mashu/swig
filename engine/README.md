@@ -475,9 +475,9 @@ to the motif hit, and the allele reports the annotation's provenance; an
 explicit `anchor=` (or a `SWIGMETA` anchor no motif can replace) is kept but
 flagged and counted in the uncertain-anchor warning. Swig's shipped
 references hold such anchors (TRAJ24*01–03 and TRAJ48*01, among 50 J
-alleles, sit 15–21 bases early; IGLV2-11*03, IGLV2-8*03, IGHV4-30-4*05,
-TRBV5-8*02 and TRBV11-3*03 were given another frame), so reads of those
-alleles used to get a junction several codons short.
+allele records, sit 15–21 bases early; IGLV2-11*03, IGLV2-8*03,
+IGHV4-30-4*05, TRBV5-8*02 and TRBV11-3*03 were given another frame), so
+reads of those alleles used to get a wrong junction.
 A malformed field is an error. The provenance becomes the allele's
 `v_annotation_source` or `j_annotation_source`; an allele without one
 reports the annotation's own source.
