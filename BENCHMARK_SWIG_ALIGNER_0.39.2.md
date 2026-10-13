@@ -57,7 +57,39 @@ validation.
 
 ## Speed
 
-Timing runs are in progress; the next commit fills in this section.
+Reads per second for one WebAssembly worker: the median of three
+interleaved runs on the four sets of the 0.39.0 report, one run on the
+others. Host: a 4-core Intel Xeon at 2.10 GHz (cloud VM), idle, Node.js 22.
+
+| Set | SwiftIG 0.38.11 | Swig 0.39.1 | Swig 0.39.2 | 0.39.2 / SwiftIG |
+| --- | ---: | ---: | ---: | ---: |
+| IGH mid | 327 | 910 | 994 | 3.0× |
+| IGH hard | 268 | 975 | 1,050 | 3.9× |
+| BCR mixed | 350 | 1,381 | 1,457 | 4.2× |
+| TCR mixed | 684 | 1,267 | 1,178 | 1.7× |
+| IGH easy | 351 | 828 | 1,069 | 3.0× |
+| IGH, 30 % SHM | 47 | 746 | 737 | 15.7× |
+| IGK reads against IGH | 21 | 478 | 478 | 22.8× |
+
+- **SwiftIG slows sharply on hard input:** 47 reads/s at 30 % SHM and 21
+  on wrong-locus reads, against 737 and 478 for Swig. Its fallbacks are a
+  likely cause, though this was not profiled:
+  - full annotation of both strands when seed evidence is not lopsided;
+  - a 16-candidate V rerun;
+  - a pass over the complete J database.
+
+  Swig's search costs about the same on any read.
+- **0.39.2 against 0.39.1.** 0.39.2 is 6–8 % faster on IGH and BCR. On TCR
+  it is about 7 % slower, in all three runs (1,159–1,239 against
+  1,264–1,311 reads/s). The cause was not profiled. One candidate is the
+  whole-read J search for reads without an anchoring V, against 101 TCR J
+  alleles.
+
+Database initialization per worker: 35–120 ms for SwiftIG and 120–340 ms
+for Swig, which annotates every allele on load.
+
+The native `swig` binary is not compared: upstream has no native aligner,
+and its `swig-cli` runs SwiftIG in WebAssembly workers.
 
 ## Accuracy
 
