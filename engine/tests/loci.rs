@@ -174,3 +174,70 @@ fn a_chance_v_hit_does_not_choose_the_j_locus() {
     }
     assert!(chance_v > 0, "no read got a chance V hit to test against");
 }
+
+/// A read holding two loci, as an scFv does (VH–JH, a linker, then VL–JL),
+/// anchors a V of each. Its J search covers both, but each locus keeps its
+/// own J alignments: four heavy J alleles of one gene outscore a short
+/// light J, and must not crowd it out of the J stage's top three.
+#[test]
+fn each_anchoring_locus_keeps_its_own_j() {
+    let (heavy, light, light_v, light_j) = databases();
+    let heavy_j = &heavy.j.alleles()[0];
+    let anchor = heavy_j.anchor.expect("synthetic J alleles carry anchors");
+    let mut siblings = String::new();
+    for (k, at) in [1usize, 3, 5].into_iter().enumerate() {
+        assert!(at < anchor as usize, "a SNP before the Trp118 codon");
+        let mut codes = heavy_j.codes.clone();
+        codes[at] = (codes[at] + 1) % 4;
+        let name = heavy_j.name.replace("*01", &format!("*{:02}", k + 5));
+        siblings += &format!(">{name} anchor={anchor}\n{}\n", decode(&codes));
+    }
+    let v = fasta(&heavy.v) + &fasta(&light_v);
+    let j = fasta(&heavy.j) + &siblings + &fasta(&light_j);
+    let d = fasta(&heavy.d);
+    let texts = GermlineTexts {
+        v: &v,
+        d: Some(&d),
+        j: &j,
+        c: None,
+    };
+    let database = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+    let config = CallingProfile::ROptimized.config();
+    let assigner =
+        DefaultAssigner::from_config(&config, database.v, database.d, database.j).unwrap();
+    let j_set = assigner.segment(SegmentKind::J).unwrap().set();
+    let mut ws = assigner.workspace();
+    // Whole V genes of one allele each, so the V stage keeps both V's.
+    let single = |set: &GermlineSet| {
+        let alleles = |gene| set.alleles().iter().filter(|a| a.gene == gene).count();
+        set.alleles()
+            .iter()
+            .filter(|a| alleles(a.gene) == 1)
+            .max_by_key(|a| a.codes.len())
+            .unwrap()
+            .codes
+            .clone()
+    };
+    let (heavy_v, light_v) = (single(&heavy.v), single(&light.v));
+    let linker = encode(b"GGTGGAGGCGGTTCAGGCGGAGGTGGCTCTGGCGGTGGCGGATCG");
+    for light_j in light_j.alleles() {
+        let read: Vec<u8> = [
+            &heavy_v[..],
+            &encode(b"GGTACC"),
+            &heavy_j.codes,
+            &linker,
+            &light_v,
+            &encode(b"TC"),
+            &light_j.codes[..20],
+        ]
+        .concat();
+        let call = assigner.assign(&read, &mut ws);
+        let placed = |locus| {
+            call.placements.iter().any(|p| {
+                p.kind == SegmentKind::J && j_set.allele(p.primary_allele()).loci == Loci::of(locus)
+            })
+        };
+        assert!(placed(Locus::Igh), "no heavy J with {}", light_j.name);
+        assert!(placed(Locus::Igk), "{} lost to the heavy J", light_j.name);
+    }
+}

@@ -151,6 +151,8 @@ struct ReadState {
     query: Vec<u8>,
     v: Vec<Candidate>,
     j: Vec<Candidate>,
+    /// The candidates of each J request, as ranges of `j`.
+    j_requests: Vec<Range<usize>>,
     j_window: Range<usize>,
 }
 
@@ -396,6 +398,12 @@ where
 
     /// Stage 3: per read, the J window right of V and its candidates; then J
     /// placements over the whole chunk.
+    ///
+    /// A J joins an anchoring V of its own locus. When the anchors choose
+    /// several loci (a read holding two chains, as an scFv does), each locus
+    /// is a request of its own: in one request, the J alleles of one chain
+    /// could fill the stage's keep and crowd out the other chain's J. An
+    /// allele of several of these loci is searched with the first.
     fn stage_j(
         &self,
         reads: &mut [ReadState],
@@ -413,18 +421,46 @@ where
                 retrieval,
                 &mut state.j,
             );
-            // A J joins an anchoring V of its own locus.
             let loci = self.anchored_loci(placed);
             state
                 .j
                 .retain(|c| set.allele(c.allele).loci.pairs_with(loci));
+            state.j_requests.clear();
+            if loci == Loci::ANY || loci.single().is_some() {
+                state.j_requests.push(0..state.j.len());
+                continue;
+            }
+            let locus = |c: &Candidate| set.allele(c.allele).loci.intersection(loci).first();
+            state.j.sort_by_key(locus);
+            let mut at = 0;
+            for group in state.j.chunk_by(|a, b| locus(a) == locus(b)) {
+                state.j_requests.push(at..at + group.len());
+                at += group.len();
+            }
         }
         let first: Vec<usize> = placements.iter().map(Vec::len).collect();
-        let requests = read_requests(reads, |r| r.j_window.clone(), |r| &r.j);
+        let requests: Vec<SegmentRequest<'_>> = reads
+            .iter()
+            .enumerate()
+            .flat_map(|(read, state)| {
+                state.j_requests.iter().map(move |range| SegmentRequest {
+                    read,
+                    query: &state.query,
+                    window: state.j_window.clone(),
+                    candidates: &state.j[range.clone()],
+                })
+            })
+            .collect();
         self.j
             .place_many(&self.aligner, &requests, dp, batch, placements);
-        for (placed, from) in placements.iter_mut().zip(first) {
+        for ((placed, from), state) in placements.iter_mut().zip(first).zip(reads.iter()) {
             self.drop_dissimilar(placed, from);
+            // Each request's placements are ranked best first, as the stage
+            // ranks them; so are the read's.
+            if state.j_requests.len() > 1 {
+                placed[from..]
+                    .sort_by_key(|p| std::cmp::Reverse((p.score(), p.evidence.longest_exact_run)));
+            }
         }
     }
 
