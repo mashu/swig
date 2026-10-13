@@ -19,6 +19,13 @@ doc = false
 lto = "thin"
 codegen-units = 1
 
+# The tests' profile (`npm run test:engine`): release code with debug
+# assertions and overflow checks, so the engine's debug invariants run in CI.
+[profile.checked]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true
+
 # Swig's WebAssembly module (`scripts/build-swig-wasm.sh`): whole-program LTO
 # and no symbol names, for a smaller download.
 [profile.wasm]

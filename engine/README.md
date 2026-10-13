@@ -57,9 +57,11 @@ not need the native binary.
 From the root of the Swig repository:
 
 ```sh
-npm run test:engine        # = cargo test --release --workspace --manifest-path engine/Cargo.toml
+npm run test:engine        # = cargo test --profile checked --workspace --manifest-path engine/Cargo.toml
                            #   unit, annotation, loci, robustness, synthetic, simulated-accuracy
-                           #   and WebAssembly-ABI tests (always test the release build)
+                           #   and WebAssembly-ABI tests, on release code with debug assertions
+                           #   and overflow checks (the `checked` profile); then builds
+                           #   engine/target/release/swig for the CLI tests
 cargo test --release --workspace --manifest-path engine/Cargo.toml -- --ignored
                            # only the ignored test: accuracy at scale, 20,000 reads per preset
 cargo build --release --manifest-path engine/Cargo.toml    # engine/target/release/swig
@@ -113,7 +115,7 @@ options (`swig --help` prints them):
 | `--threads N` | worker threads (default: all cores) |
 | `--chain heavy\|light` | chain type for annotation (default: voted per locus from the database) |
 | `--strand both\|forward\|reverse` | strands a read is assigned on (default `both`, chosen per read) |
-| `--min-identity F` | drop V, D and J hits below identity F (0–1; default none) |
+| `--min-identity F` | drop V, D and J hits whose local alignment, before the stitched outer flank, is below identity F (0–1; default none) |
 | `--no-anchor-window` | do not add the conserved-anchor D window |
 | `--no-posterior` | skip the V, D, J and D-presence posteriors (~30 % faster) |
 | `--calls per-read\|fixed` | the model the call maximises: each read's own (default; the model its posteriors come from) or the fixed `(2, −3)` scores |
@@ -205,7 +207,8 @@ read, then the engine's five posterior columns.
 - **Calls.** `v_call`, `d_call`, `j_call` and `c_call` list every
   co-optimal allele, comma-separated: each placement of that kind whose clip
   to the called interval is worth exactly the call under the call's model.
-  The best-supported allele is first. `*_score` is the clipped score,
+  The best-supported allele that spans the called read bases is first, and
+  the segment's coordinates and alignment are its. `*_score` is the clipped score,
   `*_identity` matches over alignment columns (a fraction), and `*_support`
   the Karlin–Altschul E-value `K·m·n·e^{−λS}` of the reported span over the
   read length `m` and the database length `n`, the formula of the V/J gates
@@ -709,19 +712,20 @@ The full description, with the guarantee of each search step, is in
   log-likelihood ratio, in units of 1/λ nats with λ = 0.634, of "templated by
   this germline at 11.2 % divergence" against "random sequence". N and P bases
   score 0 under both hypotheses. Affine gaps price indels.
-- **The path objective** is `Σ clipped segment scores − P_D·#D − P_J·#J`,
+- **The path objective** is `Σ clipped segment scores − P_V·#V − P_D·#D − P_J·#J`,
   maximised exactly over the topologies VJ and VDJ (and the partial V…, …J
   and D…J), over the placements, and over both cuts between neighbours (the
   earlier one exits at `x`, the later enters at `y ≥ x`, and the bases
-  between are N/P). `P_J` prices a J as `P_D` prices a D, over the J genes,
-  so a read that stops before its J does not get one from a few chance
-  bases. Ties go to fewer D, then to more germline support (the summed
-  unclipped scores). An AIRR row holds one D; Swig's double-D screen reports
-  a second one beside the call and leaves the call alone.
+  between are N/P). `P_V` and `P_J` price a V and a J as `P_D` prices a D,
+  over their own genes, so a read that starts after its V or stops before
+  its J does not get one from a few chance bases. Ties go to fewer D, then
+  to more germline support (the summed unclipped scores). An AIRR row holds
+  one D; Swig's double-D screen reports a second one beside the call and
+  leaves the call alone.
 - **Calls come from the read's own model.** Each path is valued at the read's
   divergence `p̂`, estimated before adjudication from the V and J columns no
   path contests: a match is worth `ln 4(1−p̂)` nats, a mismatch `ln(4p̂/3)`, a
-  D costs `P_D/2` matched D columns, a J `P_J/2` matched J columns. Values are integers (1/2¹⁶ nat), so the
+  V, D or J costs `P_k/2` matched columns of its kind. Values are integers (1/2¹⁶ nat), so the
   maximum is exact, and the posterior reads the same integers: the call is a
   mode of the reported distribution. `--calls fixed` keeps the fixed scores,
   of which the per-read model at 11.2 % divergence is an exact multiple.

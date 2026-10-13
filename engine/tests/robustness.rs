@@ -332,3 +332,94 @@ fn reads_that_stop_before_the_j_get_no_j() {
         "{with_j} of {reads} reads without a J got one"
     );
 }
+
+/// Under the fixed-scale call (`--calls fixed`) a row reports the path it
+/// was stitched from: `sequence_alignment` without gaps is the read from
+/// the first segment's start to the last one's end, and np1 and np2 are the
+/// bases between the segments. A placement that ties a called segment on
+/// the fixed scale over fewer of its bases is not reported in its place.
+#[test]
+fn fixed_scale_rows_stitch_their_segments() {
+    let db = database();
+    let config = EngineConfig {
+        calls: CallModel::FixedScale,
+        ..EngineConfig::default()
+    };
+    let assigner = assigner(&db, &config);
+    let params = SimParams::hard().with_shm(0.3);
+    let sim = Simulator::new(&db.v, Some(&db.d), &db.j, params).expect("simulator");
+    let mut ws = assigner.workspace();
+    let mut called = 0;
+    for (i, read) in sim.reads(400, 37).expect("reads").iter().enumerate() {
+        let call = assigner.assign(&encode(&read.sequence), &mut ws);
+        let sequence = String::from_utf8_lossy(&read.sequence);
+        let record = AirrRecord::from_call("r", &sequence, &call, &assigner, &[None, None, None]);
+        let oriented = if record.rev_comp {
+            swig::sim::reverse_complement(record.sequence.as_bytes())
+        } else {
+            record.sequence.clone().into_bytes()
+        };
+        let mut segments: Vec<_> = [(&record.v, 'V'), (&record.d, 'D'), (&record.j, 'J')]
+            .into_iter()
+            .filter_map(|(s, kind)| s.as_ref().map(|s| (s.sequence_start, s.sequence_end, kind)))
+            .collect();
+        segments.sort_unstable();
+        let (Some(first), Some(last)) = (segments.first(), segments.last()) else {
+            continue;
+        };
+        called += 1;
+        let bases = |from: u32, to: u32| {
+            String::from_utf8_lossy(&oriented[from as usize..to as usize]).into_owned()
+        };
+        let stitched: String = record
+            .sequence_alignment
+            .chars()
+            .filter(|&c| c != '-')
+            .collect();
+        assert_eq!(stitched, bases(first.0 - 1, last.1), "read {i}");
+        for pair in segments.windows(2) {
+            let np = if pair[0].2 == 'V' {
+                &record.np1
+            } else {
+                &record.np2
+            };
+            let between = bases(pair[0].1, (pair[1].0 - 1).max(pair[0].1));
+            assert_eq!(np.as_deref(), Some(between.as_str()), "read {i}");
+        }
+    }
+    assert!(called > 350, "{called} reads called");
+}
+
+/// A read that starts after its V (in CDR3, or behind an adapter) gets no
+/// V. A V pays its presence cost like a D and a J, so a few chance bases of
+/// a random 5′ prefix no longer start the path for free: 1.5 % of these
+/// reads get a V, against 3.5 % without the cost.
+#[test]
+fn reads_that_start_after_the_v_get_no_v() {
+    let db = database();
+    let assigner = assigner(&db, &EngineConfig::default());
+    let params = SimParams::mid().with_reverse_complement(0.0);
+    let sim = Simulator::new(&db.v, Some(&db.d), &db.j, params).expect("simulator");
+    let mut rng = Rng::new(43);
+    let mut ws = assigner.workspace();
+    let (mut reads, mut with_v) = (0, 0);
+    for read in sim.reads(500, 47).expect("reads") {
+        let j_start = read.span(Region::J).expect("every read has a J").start;
+        for prefix in [30, 100] {
+            let mut sequence = random(&mut rng, prefix);
+            sequence.extend_from_slice(&read.forward[j_start..]);
+            let call = assigner.assign(&encode(&sequence), &mut ws);
+            reads += 1;
+            with_v += usize::from(
+                call.path
+                    .iter()
+                    .flat_map(|path| &path.segments)
+                    .any(|s| call.placements[s.placement].kind == SegmentKind::V),
+            );
+        }
+    }
+    assert!(
+        with_v * 40 <= reads,
+        "{with_v} of {reads} reads without a V got one"
+    );
+}
