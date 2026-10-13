@@ -47,7 +47,10 @@ like germline: before the column at which its running score falls more than
 UMI or random 5′ flank is not taken as V. Otherwise the alignment is
 end-to-end on its outer side, where the germline must begin (V) or end (J).
 The substitution scores of the extension, mismatches included, count towards
-the ranking.
+the ranking. The stage also keeps its best alignments by local score: a hit
+with no room for a flank, at the read's or the germline's end, pays none, so
+ranked by extended score alone it, or a few alleles sharing it, could take
+every slot from a hit that is stronger locally but pays for a mutated flank.
 
 ### 2.2 Paths
 
@@ -73,7 +76,7 @@ order of their alignment starts.
 
 ```text
 score(path) = Σ_segments S_clip(segment)
-            − P_D · #D − P_J · #J
+            − P_V · #V − P_D · #D − P_J · #J
             + pair_bonus · [path starts with V and ends with J]  (0 by default)
             + insertion_per_base · #N/P bases                    (0 by default)
 ```
@@ -126,7 +129,15 @@ The non-alignment terms are log prior odds in score units:
   clip of positive score completed a path for free, and a read that stops
   before its J got one from a few chance bases: on 3,000 mid and 3,000 hard
   IGH reads cut before the J, spurious J calls were 7.9 % and 9.6 %, and are
-  0.9 % and 1.8 % with it. V pays nothing.
+  0.9 % and 1.8 % with it.
+- **`P_V`, V presence** (`ObjectiveConfig::v_prior`). The same rule over the
+  V database: `P*_V = ln(N·L)/λ_V` (12.69 for the 125 IGHV genes of the
+  frozen suite's database). Without it any V clip of positive value started
+  a path for free, and a read that starts after its V (in CDR3, or behind a
+  random 5′ end) got one from a few chance bases: of 600 mid IGH reads cut
+  at the J behind a random 30- or 100-base prefix, 6 and 17 got a V of 1–49
+  bases, and 1 and 6 do with it. On 27,000 reads cut to their last 8–90 V
+  bases (mid, hard and 30 % SHM) it removes 129 V calls, all of them wrong.
 - **`pair_bonus`**: the prior odds of a complete V…J rearrangement against a
   partial read. It is 0 by default: on full-length reads the J's own clip
   score completes the path, and values 0–48 changed no call.
@@ -144,7 +155,10 @@ either side. The allele with more support admits more cuts that reach the same
 score, so it has the larger likelihood summed over cuts. Co-optimal alleles
 (equal value on the called interval: an equal clipped score, and under a
 per-read call equal matches and mismatches too) are all reported, the
-best-supported first. The reported `path_score` is the fixed-scale score
+best-supported of those that span the called read bases first: on the fixed
+scale a clip that starts later or ends earlier can tie (the bases it leaves
+net 0), and the row's coordinates and alignment, taken from the first, would
+then drop read bases the N/P regions do not hold. The reported `path_score` is the fixed-scale score
 above, whichever model chose the path.
 
 ### 2.4 Significance
@@ -195,9 +209,13 @@ overridden. The other sources, in order:
    parser, and the gapped columns of the five region starts and of Cys104
    are mapped onto bases.
    - The gaps are trusted only when most gapped alleles are codon-aligned
-     and carry C/W/C at IMGT 23/41/104 (human IGH: 97.8 / 95.3 / 98.5 %).
+     and carry C/W/C at IMGT 23/41/104 (human IGH: 97.8 / 95.3 / 98.5 %),
+     counting at each codon the alleles that hold it. A codon none holds
+     (a set of 3′-partials) is not tested; at least one codon must be.
    - Each start is *known*, *before the sequence* (a 5′-partial record; no
-     motif may fill it) or *unknown*.
+     motif may fill it) or *unknown*. `prepare` writes the starts before
+     the sequence (`before=`) and an end before Cys104 (`partial=3`) into
+     the ungapped headers, so a reload keeps both.
    - One- and two-column interior runs are IMGT frameshift markers; the
      mapping stays exact across them.
 2. **Motifs**: Cys23, Trp41 and Cys104 placed jointly (§5), then a second
@@ -308,6 +326,7 @@ column(kind, s)  = s·u_r + v_r     u_r = round(F·λ_r(p̂)),  v_r = round(F·�
 gap, ι, pair bonus scoring k:   k·u0,   u0 = round(F·λ)
 D cost  c_D(p̂)   = (P*_D / m)·ln 4(1 − p̂)  =  ⌊P*_D·(m·u_D + v_D)/m⌋ units
 J cost  c_J(p̂)   = (P*_J / m)·ln 4(1 − p̂), the same with the J scores
+V cost  c_V(p̂)   = (P*_V / m)·ln 4(1 − p̂), the same with the V scores
 ```
 
 with `(λ_r, μ_r)` the per-column log-odds of §4a and `m` the D match score.
@@ -560,10 +579,12 @@ stripping column 0 gives the alignment on `C`, which is then clipped to
 `[x, n)` so C explains only bases the J does not. The query window is
 `[x − s − 1, n)` with band `[0, 2s]`; the band is also the drift corridor:
 a C starting at `x + δ` admits `s + δ` net deletions and `s − δ` net
-insertions, beyond which the free end truncates the alignment. C records up
-to about 2 kb keep `B` and every score inside the 16-bit SIMD lanes; a
-longer (genomic) record runs on the exact scalar kernel, and `prepare`
-warns about it.
+insertions, beyond which the free end truncates the alignment. A job stays
+in the 16-bit SIMD lanes while `B + 2·(k − 1) ≤ 30,000`, `k` the shorter of
+its query window and its record, so for C records up to about 15 kb. `B` is
+global: one longer record sends every C job to the exact scalar kernel.
+`prepare` warns about records over 2 kb, which carry introns or UTR (a
+genomic record's base 0 need not follow the J).
 
 **Candidates: reach classes** (`retrieve/reach.rs`). An anchored alignment
 reaches at most `R = (n − x) + s` bases of `C`. Alleles with equal reached
@@ -621,13 +642,13 @@ step can lose.
 |---|---|---|---|
 | Strand | `orient.rs` | heuristic + fallback | Count read positions whose 11-mer occurs in the V/J germline, per strand. Trusted when the winner exceeds its Poisson null `λ₀ + 3√λ₀` (`λ₀` = k-mers × germline k-mer density); otherwise compare V seed votes on both strands. |
 | V seeds | `seed.rs` | bounded | Every 9-mer (7-mers as below). `SeedSampling` also offers closed syncmers (a seed is kept when the first smallest `s`-mer of its key, `s = k − w`, in a fixed random order, is first or last; context-free; on a contiguous shape any `w` consecutive k-mers hold one, so every unmutated `k + w − 1` bases yield a shared seed), open syncmers (smallest `s`-mer in the middle, the conservation-optimal offset; context-free, no window guarantee) and minimisers (window guarantee, not context-free). Under the gene margin below, closed syncmers (`w = 4`) are 1.1 points of mean V gene behind every k-mer (4.4 at 30 % SHM) for 0.4 % fewer instructions, so every k-mer is the default. |
-| V retrieval | `retrieve/seed_vote.rs`, `retrieve/budget.rs`, `retrieve/frames.rs` | heuristic | Seed votes per gene frame (4 per 9-mer, 1 per 7-mer), best diagonal cluster per frame. 7-mers vote while the leader holds fewer than 25 nine-mer seeds, where a count's Poisson relative error `1/√n` exceeds 20 %. Keep 3 genes, and up to 16 while votes are within `z·√(2·4·L)` of the leader's `L` (z = 2): two standard deviations of the difference between two seed counts near the leader's, so relative to the leader but proportionally wider for weakly supported (mutated) reads. A fixed margin (8 votes, 5 %) or a proportional one (10–30 % of `L`) loses 4–9 points of V gene at 30 % SHM (same seeds and short-seed rule); accuracy saturates at z ≈ 2 (the 16-gene cap binds). Every allele of a kept gene becomes a candidate. |
+| V retrieval | `retrieve/seed_vote.rs`, `retrieve/budget.rs`, `retrieve/frames.rs` | heuristic | Seed votes per gene frame (4 per 9-mer, 1 per 7-mer), best diagonal cluster per frame. 7-mers vote while the leader holds fewer than 25 nine-mer seeds, where a count's Poisson relative error `1/√n` exceeds 20 %. Keep 3 genes, and up to 16 while votes are within `z·√(2·4·L)` of the leader's `L` (z = 2): two standard deviations of the difference between two seed counts near the leader's, so relative to the leader but proportionally wider for weakly supported (mutated) reads. A fixed margin (8 votes, 5 %) or a proportional one (10–30 % of `L`) loses 4–9 points of V gene at 30 % SHM (same seeds and short-seed rule); accuracy saturates at z ≈ 2 (the 16-gene cap binds). Every allele of a kept gene becomes a candidate. A gene is the allele name's part before `*`; a name without one is a gene of its own, so the cap then binds on alleles (preparation warns when more than 16 V names lack it). |
 | V band | `retrieve/seed_vote.rs` | bounded | Cluster's diagonal range, shifted by the allele's frame offset, ± 8 diagonals: holds unless an indel longer than 8 escapes the seeds. |
 | V scoring | `segment.rs`, `family_bound.rs` | lossless | Score-only DP on one representative `R` per gene frame (most votes, then the frame's medoid, then lowest id). A sibling `A` in `R`'s frame diagonals satisfies `L ≤ S*(A) ≤ S*(R) + Δ(R, A)`: `Δ` sums the best profile gain per frame position both cover plus the best score where only `A` does; `L` is a traced representative path clipped to `A`'s span and rescored with `A`'s profile. The cutoff `c` is the 3rd largest of one lower bound per candidate, so `c ≤` the exact 3rd score. `A` is skipped when `U < c`, known when `U = L`, aligned outright when `L ≥ c` (its traceback reused), scored otherwise. The ranking from the 3rd score up is that of full scoring; ties follow an explicit key (gene leaders first, then retrieval order), never the schedule. Under a length or identity floor only `U <` floor prunes. |
 | J scoring | `segment.rs`, `family_bound.rs` | lossless | The same bounds with each gene one frame, its alleles at offset 0 (sound because J is unbanded); ties in allele order. |
-| V/J keep | `segment.rs` | defined | Trace back until the top 3 alignments with E ≤ 1, plus ties. No length or identity floor: a positive `(2, −3)` local alignment has identity > 3/5 and the E-value implies a length. |
-| J | `retrieve/exhaustive.rs`, `window.rs` | bounded | Every J allele, unbanded, in `[min V end − 12, read end)` when some V placement is an anchor (E ≤ 10⁻³), or the whole read when none is: a chance V hit on a read without V (one starting in CDR3) no longer pushes the window past the J, and only anchors choose the locus of the J and D candidates. A J can reach back into V only through chance edge matches. Whole-read J search is 18 % slower and changes a few hard-preset calls (D −0.04 pp, J −0.02 pp), none on mid. The J is not placed jointly with the D, yet it does not "eat" it: the D windows reach 12 bases into J and include the conserved-anchor window, and the DAG orders segments by kind, so a D can precede a J whose alignment reaches back over it and the cuts give any J/D overlap to whichever explains it better. With a D remnant ≥ 8 nt (`examples/d_errors.rs`, human IGH), a missing D whose bases the called J covers is 0.00 % of reads on mid and hard, and a true D outside the windows 0 %; whole-read J lets 0.05 % fall outside. |
-| D windows | `window.rs` | bounded | `[best V end − 12, best J start + 12)` plus the conserved-anchor window `[V Cys104 + 3, J Trp/Phe118)`. |
+| V/J keep | `segment.rs` | defined | Keep the top 3 alignments with E ≤ 1 by extended score and the top 3 by local score, each plus ties; trace back until the next local score is below the 3rd extended one, which bounds the 3rd local one from below. No length or identity floor: a positive `(2, −3)` local alignment has identity > 3/5 and the E-value implies a length. |
+| J | `retrieve/exhaustive.rs`, `window.rs` | bounded | Every J allele, unbanded, in `[min V end − 12, read end)` when some V placement is an anchor (E ≤ 10⁻³), or the whole read when none is: a chance V hit on a read without V (one starting in CDR3) no longer pushes the window past the J, and only anchors choose the locus of the J and D candidates. Each locus the anchors choose is searched and kept on its own (top 3 per locus), so on a read holding two chains (an scFv) one chain's J alleles cannot crowd out the other's: on 800 scFv reads, light-chain calls without a J went from 20 to 0, and the BCR and TCR suite sets are unchanged. A J can reach back into V only through chance edge matches. Whole-read J search is 18 % slower and changes a few hard-preset calls (D −0.04 pp, J −0.02 pp), none on mid. The J is not placed jointly with the D, yet it does not "eat" it: the D windows reach 12 bases into J and include the conserved-anchor window, and the DAG orders segments by kind, so a D can precede a J whose alignment reaches back over it and the cuts give any J/D overlap to whichever explains it better. With a D remnant ≥ 8 nt (`examples/d_errors.rs`, human IGH), a missing D whose bases the called J covers is 0.00 % of reads on mid and hard, and a true D outside the windows 0 %; whole-read J lets 0.05 % fall outside. |
+| D windows | `window.rs` | bounded | `[V end − 12, best J start + 12)` plus the conserved-anchor window `[V Cys104 + 3, J Trp/Phe118)`, where V is the best V placement that is an anchor (E ≤ 10⁻³). As for J, a V hit that is not an anchor may be a chance hit downstream of the real D (a read that starts in CDR3), so without an anchor the residual starts at the read's start and there is no anchor window; a V stage without E-value gates bounds D by its best hit. On 1,913 simulated IGH reads that start after V, this called 209 more D alleles correctly (+10.9 pp, none lost) and lowered the D-presence Brier score from 0.109 to 0.005; the frozen suite changed one read. Without a J the residual ends 60 bases after V's end, and without a V it starts 60 bases before J's start: a D lies within its N and its own length of the segment the read has (N1 + D and D + N2 are at most 55 in 99.9 % of simulated IGH junctions). This bounds where a chance D can lie on a read that stops before its J or starts after its V, not how often one is called: `P_D` is priced for 25 junction positions, so 30 random bases after V still give a D in 72 % of such reads, and 100 bases in 93.5 % (97.2 % unbounded); the D lies at most 73 bases from the called V instead of 94. That rate is open problem 2 (§8): an N/P length prior. When the anchors share no locus (a read holding two chains, as an scFv does), the best V and the first J may belong to different chains, and the window between them holds neither chain's D; each anchored locus with D genes then bounds a window by its own best anchoring V and first J. On 750 simulated heavy-first scFv reads (BCR suite reads joined by a linker), heavy calls with a D went from 412 to 498 and right D calls from 355 to 429; the frozen suite keeps every call. |
 | D prefilter | `retrieve/lmer_mask.rs` | lossless w.r.t. gates | Shares ≥ 1 L-mer, with `L` derived from the gates (`min_d_match`; 4 with the optional distributed-D gate, by pigeonhole). |
 | D floor | `config.rs`, `adjudicate/model.rs` | lossless for the call | Only for a fixed-scale call without posteriors (`--no-posterior --calls fixed`): score ≥ max(gate floor, `P_D + 1`). By Lemma 1 a D at or below `P_D` adds ≤ 0, and dropping it leaves its neighbours' cuts valid (exit ≤ entry), so the no-D path is at least as good (requires `ι = 0`, the default). With posteriors every admissible D is kept: a D below the floor cannot be called but carries mass `e^{s − P_D}`, and dropping it would bias `d_presence_posterior` down; a per-read call can call it. With several loci the floor is the lowest `P_D` of a locus that has D genes. |
 | C | `constant.rs`, `retrieve/reach.rs` | exact for `\|δ\| ≤ s` | One anchored job per reach class, window `[x − s − 1, n)`, band `[0, 2s]`; the anchor column makes the local optimum the anchored one. Net indel drift inside C beyond `s ∓ δ` truncates the alignment. |

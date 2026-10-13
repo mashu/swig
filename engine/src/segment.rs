@@ -8,6 +8,7 @@
 //! candidates ─► score-only DP ─► (V, J) sibling bounds ─► rank by local score
 //!            ─► traceback in waves ─► acceptance ─► outer flank extension
 //!               until `top` extended scores are kept (+ ties)
+//!            ─► keep the top by extended and by local score
 //!            ─► rank by extended score ─► merge identical alignments
 //! ```
 //!
@@ -15,7 +16,9 @@
 //! its co-linear 5′ (3′) flank stitched on, as adjudication values it. The
 //! extension never raises a score, so the local score bounds the extended
 //! one, and the waves walk the local ranking until it falls below the
-//! `top`-th extended score kept.
+//! `top`-th extended score kept. The `top` best local alignments are kept
+//! as well: a hit with no room for a flank pays none, so ranked by extended
+//! score alone it could push out a stronger hit with a mutated flank.
 //!
 //! Every request of a batch is processed in the same waves, so a SIMD
 //! aligner sees one score batch and one traceback batch per wave for the
@@ -130,11 +133,12 @@ impl PreparedSegment {
 ///
 /// The stage keeps the `top` best *accepted* alignments by extended score
 /// (the local score when the stage extends no flank) and every alignment
-/// tied with the last of them. A high score that the stage's acceptance
-/// predicate rejects does not take a slot, so traceback proceeds in waves down the
-/// local-score ranking until `top` alignments are accepted and the next
-/// local score is below the `top`-th extended score, the list is exhausted,
-/// or `cap` candidates were traced.
+/// tied with the last of them, and likewise the `top` best by local score.
+/// A high score that the stage's acceptance predicate rejects does not take
+/// a slot, so traceback proceeds in waves down the local-score ranking
+/// until `top` alignments are accepted and the next local score is below
+/// the `top`-th extended score (so below the `top`-th local one too), the
+/// list is exhausted, or `cap` candidates were traced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeepPolicy {
     pub top: usize,
@@ -404,6 +408,12 @@ const NONE: u32 = u32::MAX;
 /// A request whose traceback waves have ended.
 const DONE: usize = usize::MAX;
 
+/// A stage's ranking key, best first: the score with the outer flank, then
+/// the longest exact run.
+pub(crate) fn rank(p: &Placement) -> std::cmp::Reverse<(Score, u32)> {
+    std::cmp::Reverse((p.score(), p.evidence.longest_exact_run))
+}
+
 /// Whether a local score enters the ranking: positive (an alignment exists)
 /// and at least the request's floor.
 #[inline]
@@ -523,7 +533,7 @@ impl<R: Retriever, Acc: Admission> SegmentStage<R, Acc> {
             let out = &mut outs[request.read];
             let first = out.len();
             out.append(&mut batch.pending[index]);
-            self.finish(out, first);
+            self.finish(out, first, &mut batch.scores);
         }
     }
 
@@ -1126,19 +1136,32 @@ impl<R: Retriever, Acc: Admission> SegmentStage<R, Acc> {
         }
     }
 
-    /// Keep the top accepted alignments and their ties by extended score,
-    /// rank them, and merge identical alignments. Equal keys keep the
-    /// traceback order: local score, then the stage's [`TieOrder`].
-    fn finish(&self, out: &mut Vec<Placement>, first: usize) {
-        let rank = |p: &Placement| std::cmp::Reverse((p.score(), p.evidence.longest_exact_run));
+    /// Keep the top accepted alignments and their ties by extended score
+    /// and those by local score, rank them by extended score, and merge
+    /// identical alignments. Equal keys keep the traceback order: local
+    /// score, then the stage's [`TieOrder`]. `scores` is scratch.
+    ///
+    /// The local top guards the extended ranking's blind spot: a hit with no
+    /// room for a flank (at the read's or the germline's end) pays none,
+    /// and a few alleles sharing one such hit could take every slot from a
+    /// hit that is stronger locally but pays for its mutated flank. The
+    /// waves have traced the local top: the `top`-th local score bounds the
+    /// `top`-th extended one from above, and they stop below the latter.
+    fn finish(&self, out: &mut Vec<Placement>, first: usize, scores: &mut Vec<Score>) {
         out[first..].sort_by_key(rank);
         if self.keep.top > 0 && out.len() - first > self.keep.top {
-            let cutoff = out[first + self.keep.top - 1].score();
-            let kept = out[first..]
-                .iter()
-                .take_while(|p| p.score() >= cutoff)
-                .count();
-            out.truncate(first + kept);
+            let extended = out[first + self.keep.top - 1].score();
+            scores.clear();
+            scores.extend(out[first..].iter().map(|p| p.local_score));
+            let local = nth_largest(scores, self.keep.top).expect("more than `top` placements");
+            let mut kept = first;
+            for i in first..out.len() {
+                if out[i].score() >= extended || out[i].local_score >= local {
+                    out.swap(kept, i);
+                    kept += 1;
+                }
+            }
+            out.truncate(kept);
         }
         merge_identical(out, first);
     }
@@ -1346,6 +1369,59 @@ mod tests {
             assert_eq!(placed(&stage, &candidates, &query)[0], (vec![1], 96));
             // Two candidates are traced unranked.
             assert_eq!(placed(&stage, &candidates[..2], &query)[0], (vec![1], 96));
+        }
+    }
+
+    /// The top local alignments are kept too. Three J alleles share a hit at
+    /// the read's end, which has no room for a flank, so its extended score
+    /// is its local one; the real J scores higher locally but pays its
+    /// mutated 3′ flank. By extended score alone the copies would fill every
+    /// slot and drop it; the local ranking keeps it.
+    #[test]
+    fn top_cut_keeps_the_best_local_alignments() {
+        let scoring = AffineScoring::new(2, -3, -17, -2);
+        let mut next = crate::testing::rng(13);
+        let real = crate::testing::random_codes(&mut next, 40);
+        let shared = crate::testing::random_codes(&mut next, 12);
+        let mut set = GermlineSet::new(SegmentKind::J);
+        set.push("IGHJ1*01", decode(&real).as_bytes(), None)
+            .unwrap();
+        for name in ["IGHJ2*01", "IGHJ2*02", "IGHJ2*03"] {
+            // The copies differ only past the read's end.
+            let tail = crate::testing::random_codes(&mut next, 20);
+            let copy = [shared.clone(), tail].concat();
+            set.push(name, decode(&copy).as_bytes(), None).unwrap();
+        }
+        let segment = Arc::new(PreparedSegment::new(set, &scoring, scoring.gaps));
+        // The real J's first 25 bases exact (local 50), then 15 mutated
+        // flank bases but at offsets 5 and 10: stitched over 13 bases at
+        // −29, extended 21. Then the shared hit, 12 bases at 24.
+        let mut query = real[..25].to_vec();
+        query.extend((25..40).map(|k| {
+            let base = real[k];
+            if [30, 35].contains(&k) {
+                base
+            } else {
+                (base + 1) % 4
+            }
+        }));
+        query.extend(&shared);
+        let keep = KeepPolicy {
+            top: 3,
+            min_score: 1,
+            cap: 64,
+        };
+        for family_delta in [false, true] {
+            let mut stage = SegmentStage::new(Arc::clone(&segment), EmptyRetriever, keep);
+            stage.outer = OuterExtend::Suffix;
+            stage.family_delta = family_delta.then(|| FamilyBoundTable::build(&segment));
+            let candidates = [0, 1, 2, 3].map(|allele| Candidate {
+                allele,
+                band: Band::Full,
+                votes: 0,
+            });
+            let kept = placed(&stage, &candidates, &query);
+            assert_eq!(kept, [(vec![1, 2, 3], 24), (vec![0], 21)]);
         }
     }
 
@@ -1746,11 +1822,11 @@ mod tests {
     /// more candidates than `top + 1` (and some with fewer), shifted frame
     /// bands with either edge moved, unbanded requests, siblings with an
     /// inconsistent band, every `top` and `cap`, both acceptance kinds and
-    /// every outer extension; and it skips the DP of some siblings entirely
-    /// and aligns others without scoring them (known exactly, or traced
-    /// early). Without a binding `cap`, both keep the `top` accepted
-    /// alignments and their ties by extended score, as aligning every
-    /// candidate does.
+    /// every outer extension over windows that hold its flank; and it skips
+    /// the DP of some siblings entirely and aligns others without scoring
+    /// them (known exactly, or traced early). Without a binding `cap`, both
+    /// keep the `top` accepted alignments and their ties by extended score
+    /// and those by local score, as aligning every candidate does.
     #[test]
     fn bounded_ranking_equals_brute_force() {
         let (segment, frames) = frame_family();
@@ -1833,7 +1909,13 @@ mod tests {
                 queries.push(query);
                 candidates.push(request);
             }
-            let starts: Vec<usize> = (0..3).map(|_| (next() % 4) as usize).collect();
+            // The stage's precondition: the outer flank lies in the window,
+            // so a V (prefix) window starts at the read's start.
+            let prefix = outer == OuterExtend::Prefix;
+            let starts: Vec<usize> = (0..3)
+                .map(|_| (next() % 4) as usize)
+                .map(|start| if prefix { 0 } else { start })
+                .collect();
             let run = |bounded: bool, aligner: &Recording| {
                 let mut stage = SegmentStage::new(Arc::clone(&segment), EmptyRetriever, keep);
                 stage.accept = accept;
@@ -1885,15 +1967,22 @@ mod tests {
                         Placement::new(SegmentKind::V, allele, alignment, &queries[read], &segment);
                     if accept.allows(&placement.evidence) {
                         let mut alignment = placement.alignment;
-                        let reference = segment.reference(allele);
+                        let (local, reference) = (alignment.score, segment.reference(allele));
                         extend_outer(&mut alignment, &queries[read], reference, profile, outer);
-                        kept.push((allele, alignment.score));
+                        kept.push((allele, alignment.score, local));
                     }
                 }
-                let mut scores: Vec<Score> = kept.iter().map(|&(_, s)| s).collect();
-                if let Some(cutoff) = nth_largest(&mut scores, keep.top) {
-                    kept.retain(|&(_, s)| s >= cutoff);
-                }
+                // The top by extended score and the top by local score.
+                let cutoff = |score: fn(&(AlleleId, Score, Score)) -> Score| {
+                    let mut scores: Vec<Score> = kept.iter().map(score).collect();
+                    nth_largest(&mut scores, keep.top).unwrap_or(Score::MIN)
+                };
+                let (extended, local) = (cutoff(|k| k.1), cutoff(|k| k.2));
+                let mut kept: Vec<(AlleleId, Score)> = kept
+                    .iter()
+                    .filter(|k| k.1 >= extended || k.2 >= local)
+                    .map(|k| (k.0, k.1))
+                    .collect();
                 kept.sort_unstable();
                 let mut stage: Vec<(AlleleId, Score)> = expected[read]
                     .iter()

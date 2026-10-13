@@ -165,6 +165,48 @@ fn evaluate_reports_a_failed_write() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// `text` in Latin-1, as some editors save it: `é` is one byte, no UTF-8.
+fn latin1(text: &str) -> Vec<u8> {
+    text.chars()
+        .map(|c| u8::try_from(u32::from(c)).unwrap())
+        .collect()
+}
+
+/// Germline files are read as the reads are, and as Swig Web reads them: a
+/// UTF-8 byte-order mark is skipped, and a byte that is no UTF-8 (a Latin-1
+/// header description) reads as U+FFFD. So are evaluate's truth and calls.
+#[test]
+fn files_are_read_as_utf8_with_replacement() {
+    let dir = workspace("encoding");
+    let prepare = |out: &str| {
+        let args = ["prepare", "--v", "V.fasta", "--j", "J.fasta", "--out", out];
+        let output = run(&dir, &args);
+        assert!(output.status.success(), "{}", stderr(&output));
+        fs::read(dir.join(out).join("V.fasta")).unwrap()
+    };
+    let plain = prepare("plain");
+    let marked = [&b"\xef\xbb\xbf"[..], V.as_bytes()].concat();
+    fs::write(dir.join("V.fasta"), marked).unwrap();
+    let described = J.replacen("anchor=15", "anchor=15 café", 1);
+    fs::write(dir.join("J.fasta"), latin1(&described)).unwrap();
+    assert_eq!(prepare("encoded"), plain);
+    let args = [
+        "simulate", "--v", "V.fasta", "--j", "J.fasta", "--reads", "2",
+    ];
+    let output = run(&dir, &[&args[..], &["--out", "sim"]].concat());
+    assert!(output.status.success(), "{}", stderr(&output));
+    let truth = fs::read_to_string(dir.join("sim.truth.tsv")).unwrap();
+    let truth = truth.replacen("\nsim0\t", "\nsimé\t", 1);
+    fs::write(dir.join("truth.tsv"), latin1(&truth)).unwrap();
+    let calls = "sequence_id\tv_call\nsimé\tIGHV1-1*01\n";
+    fs::write(dir.join("calls.tsv"), latin1(calls)).unwrap();
+    let output = run(&dir, &["evaluate", "--truth", "truth.tsv", "calls.tsv"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    // The Latin-1 identifiers match: only sim1 has no row.
+    assert!(stderr(&output).contains("1 simulated reads have no row"));
+    fs::remove_dir_all(dir).unwrap();
+}
+
 /// A command line without an input its mode needs is a usage error (exit 2
 /// with the usage), like any other bad command line.
 #[test]

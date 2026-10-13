@@ -14,7 +14,7 @@ instead of tuned patches. Every component is a replaceable, statically
 dispatched trait, and every search shortcut is either lossless or measured
 on simulated repertoires.
 
-The crate and binary are `swig` 0.39.2. The workspace member `wasm/` (crate
+The crate and binary are `swig` 0.39.3. The workspace member `wasm/` (crate
 `swig_wasm`) is the WebAssembly module. There are no dependencies; Rust ≥
 1.89, edition 2024. The alignment kernel runs on AVX-512BW, AVX2, NEON,
 WebAssembly SIMD or portable lanes, chosen at run time (on WebAssembly, at
@@ -57,9 +57,11 @@ not need the native binary.
 From the root of the Swig repository:
 
 ```sh
-npm run test:engine        # = cargo test --release --workspace --manifest-path engine/Cargo.toml
+npm run test:engine        # = cargo test --profile checked --workspace --manifest-path engine/Cargo.toml
                            #   unit, annotation, loci, robustness, synthetic, simulated-accuracy
-                           #   and WebAssembly-ABI tests (always test the release build)
+                           #   and WebAssembly-ABI tests, on release code with debug assertions
+                           #   and overflow checks (the `checked` profile); then builds
+                           #   engine/target/release/swig for the CLI tests
 cargo test --release --workspace --manifest-path engine/Cargo.toml -- --ignored
                            # only the ignored test: accuracy at scale, 20,000 reads per preset
 cargo build --release --manifest-path engine/Cargo.toml    # engine/target/release/swig
@@ -113,7 +115,7 @@ options (`swig --help` prints them):
 | `--threads N` | worker threads (default: all cores) |
 | `--chain heavy\|light` | chain type for annotation (default: voted per locus from the database) |
 | `--strand both\|forward\|reverse` | strands a read is assigned on (default `both`, chosen per read) |
-| `--min-identity F` | drop V, D and J hits below identity F (0–1; default none) |
+| `--min-identity F` | drop V, D and J hits whose local alignment, before the stitched outer flank, is below identity F (0–1; default none) |
 | `--no-anchor-window` | do not add the conserved-anchor D window |
 | `--no-posterior` | skip the V, D, J and D-presence posteriors (~30 % faster) |
 | `--calls per-read\|fixed` | the model the call maximises: each read's own (default; the model its posteriors come from) or the fixed `(2, −3)` scores |
@@ -137,7 +139,9 @@ fraction. It writes `PREFIX.fasta` and `PREFIX.truth.tsv`.
 detected from the first non-blank character (`>`, `@`, anything else a
 table). A table is tab-separated, or comma-separated without quoting when
 its header holds no tab, and is read from its `sequence`, `sequence_id` and
-`quality` columns: AIRR input is re-annotated from its sequences.
+`quality` columns: AIRR input is re-annotated from its sequences. A header
+that starts with a tab starts with an empty column name, as pandas writes
+its index column.
 Multi-line FASTQ is supported; qualities are validated and kept for the
 `quality` column. FASTQ sequence lines may not hold spaces, tabs or control
 characters (FASTA drops them, but a FASTQ quality counts each base); no-call
@@ -162,6 +166,14 @@ headers (`accession|allele|species|…`) are read as the allele name, and
 identical sequences are merged and reported under all their names. Anchors
 and V region boundaries come from the headers where present and are
 detected otherwise, on every start (see *Germline annotation and regions*).
+Names must read `GENE*ALLELE`, as IMGT's do: the part before `*` is the
+gene, and a name without `*` is a gene of its own. V retrieval keeps
+candidates by gene (3 genes, up to 16 within the leader's vote noise), so
+without `*` that budget caps alleles: on human IGH at 30 % SHM, renaming
+`*` to `_a` costs 8.2 points of V allele accuracy. `prepare` and
+assignment warn when more than 16 V names hold no `*`.
+As with the reads, a leading UTF-8 byte-order mark is skipped and a byte
+that is no UTF-8 (a Latin-1 description) reads as U+FFFD.
 
 ## Output: Swig's AIRR schema
 
@@ -184,10 +196,13 @@ read, then the engine's five posterior columns.
 
 - **Reads.** `sequence` is the read as given, upper-cased, `U` as `T`, any
   symbol that is no IUPAC nucleotide as `N`; `quality` holds its FASTQ (or
-  AIRR) qualities as given. A read without an identifier is `sequence_N`
-  (its 1-based position in the input). A read without a significant V or J
-  (see *Significance* below) keeps these columns and `rev_comp`, with empty
-  calls.
+  AIRR) qualities as given. A read without an identifier is `sequence_N`,
+  N its 1-based position among the reads the run has read: in the input for
+  `swig`, but in a WebAssembly instance among those of all its
+  `swig_annotate` calls. Swig Web and swig-cli, which spread an input over
+  several instances, therefore name such reads by input position before
+  batching. A read without a significant V or J (see *Significance* below)
+  keeps these columns and `rev_comp`, with empty calls.
 - **Coordinates** are 1-based closed intervals on the *oriented* query (the
   reverse complement of `sequence` when `rev_comp` is `T`) and on the
   germline. CIGARs use `S`/`N` for unaligned query and germline bases and
@@ -195,7 +210,8 @@ read, then the engine's five posterior columns.
 - **Calls.** `v_call`, `d_call`, `j_call` and `c_call` list every
   co-optimal allele, comma-separated: each placement of that kind whose clip
   to the called interval is worth exactly the call under the call's model.
-  The best-supported allele is first. `*_score` is the clipped score,
+  The best-supported allele that spans the called read bases is first, and
+  the segment's coordinates and alignment are its. `*_score` is the clipped score,
   `*_identity` matches over alignment columns (a fraction), and `*_support`
   the Karlin–Altschul E-value `K·m·n·e^{−λS}` of the reported span over the
   read length `m` and the database length `n`, the formula of the V/J gates
@@ -402,12 +418,19 @@ allele whose locus cannot be read belongs to every locus, so a database of
 unrecognised names is assigned as a single locus (`locus.rs`).
 
 - **One locus per rearrangement.** J candidates must share a locus with the
-  read's V placements, and D candidates with the V and J. When every
-  placement of a read shares a locus, the read is adjudicated once.
-  Otherwise each locus is adjudicated over its own placements, and the call
-  is the path of the locus with the largest likelihood `Z` (the best path
-  without posteriors); the posteriors are the mixture over loci weighted by
-  `Z`. C joins a J of its own locus. `locus` reports the locus the path's
+  read's anchoring V placements (every locus when no V placement anchors),
+  and D candidates with the anchoring V and J. When the anchors hold
+  several loci, as on an scFv read, the J alleles of each locus are searched
+  and kept on their own, so one chain's J cannot crowd out the other's. When
+  every placement of a read shares a locus, the read is adjudicated once.
+  Otherwise each locus is adjudicated over its own placements, all at the
+  divergence of the whole read, and the call is the best of their paths in
+  the model the call maximises (`--calls`), with or without posteriors; an
+  exact tie goes to the path whose last segment comes first in the read (by
+  kind, then position), as within one locus. The posteriors are
+  the mixture over loci weighted by their likelihoods `Z`, so under
+  `--calls fixed` the called locus can hold less than half of the posterior.
+  C joins a J of its own locus. `locus` reports the locus the path's
   alleles share, empty when it is unknown.
 - **Per-locus annotation.** The V and J alleles of each locus are annotated
   on their own: chain type, FR3 length model and Cys23 priors differ between
@@ -489,11 +512,16 @@ numbered from its gap columns. The FR1, CDR1, FR2, CDR2 and FR3 starts are
 IMGT columns 1, 79, 115, 166 and 196, and Cys104 is column 310.
 
 - The gaps are used only when most gapped alleles are codon-aligned and
-  carry Cys, Trp and Cys at IMGT 23, 41 and 104. Otherwise they are ignored
-  (a codon alignment in other columns) and the summary line says why.
+  most of those that hold IMGT codon 23, 41 or 104 carry Cys, Trp or Cys
+  there. A codon that no gapped allele holds (Cys104 when all are
+  3′-partial) is not tested, but one of the three must be. Otherwise the
+  gaps are ignored (a codon alignment in other columns) and the summary
+  line says why.
 - A region that the numbering places before a 5′-partial sequence stays
   empty; a motif hit cannot fill it.
 - An allele whose numbering ends before Cys104 gets no anchor (`3′-partial`).
+- `prepare` writes both facts into the ungapped headers (`before=fr1,cdr1`,
+  `partial=3`), so a reloaded database keeps them.
 - A one- or two-column interior gap (an IMGT frameshift marker) is noted, and
   the columns after it still map exactly.
 - Header keys and `SWIGMETA` win over the gap columns.
@@ -613,8 +641,9 @@ Synthetic genes are built from heavy and light framework templates:
 
 `swig prepare` writes `V.fasta`, `D.fasta` and `J.fasta` with every
 anchor, frame and region start in the headers as keys (plus
-`annotation=SOURCE`), `C.fasta` with `--c`, and `annotation.tsv` with one
-row per allele:
+`annotation=SOURCE`, and for a partial IMGT-gapped record `before=` the
+starts before its first base and `partial=3` an end before Cys104),
+`C.fasta` with `--c`, and `annotation.tsv` with one row per allele:
 
 - frame, anchor and its residue;
 - region starts, CDR1 and CDR2 lengths in codons;
@@ -640,7 +669,7 @@ no FR3 start, so that every FR3 start rests on one chain default.
 ```text
  chunk of reads ─► per read: strand from germline k-mer support; V candidates (gene frames)
                 ─► V stage, whole chunk: score batch, sibling bounds, traceback waves
-                ─► per read: J window right of V, J alleles of the V's locus ─► J stage, whole chunk
+                ─► per read: J window right of V, J alleles of each anchoring V's locus ─► J stage, whole chunk
                 ─► per read: D windows from V/J geometry, D candidates of the locus (L-mer bitsets)
                 ─► D stage, whole chunk ─► per read: admission gates
                 ─► per read: placement DAG over VJ / VDJ, per locus ─► anchor check ─► Call
@@ -686,19 +715,20 @@ The full description, with the guarantee of each search step, is in
   log-likelihood ratio, in units of 1/λ nats with λ = 0.634, of "templated by
   this germline at 11.2 % divergence" against "random sequence". N and P bases
   score 0 under both hypotheses. Affine gaps price indels.
-- **The path objective** is `Σ clipped segment scores − P_D·#D − P_J·#J`,
+- **The path objective** is `Σ clipped segment scores − P_V·#V − P_D·#D − P_J·#J`,
   maximised exactly over the topologies VJ and VDJ (and the partial V…, …J
   and D…J), over the placements, and over both cuts between neighbours (the
   earlier one exits at `x`, the later enters at `y ≥ x`, and the bases
-  between are N/P). `P_J` prices a J as `P_D` prices a D, over the J genes,
-  so a read that stops before its J does not get one from a few chance
-  bases. Ties go to fewer D, then to more germline support (the summed
-  unclipped scores). An AIRR row holds one D; Swig's double-D screen reports
-  a second one beside the call and leaves the call alone.
+  between are N/P). `P_V` and `P_J` price a V and a J as `P_D` prices a D,
+  over their own genes, so a read that starts after its V or stops before
+  its J does not get one from a few chance bases. Ties go to fewer D, then
+  to more germline support (the summed unclipped scores). An AIRR row holds
+  one D; Swig's double-D screen reports a second one beside the call and
+  leaves the call alone.
 - **Calls come from the read's own model.** Each path is valued at the read's
   divergence `p̂`, estimated before adjudication from the V and J columns no
   path contests: a match is worth `ln 4(1−p̂)` nats, a mismatch `ln(4p̂/3)`, a
-  D costs `P_D/2` matched D columns, a J `P_J/2` matched J columns. Values are integers (1/2¹⁶ nat), so the
+  V, D or J costs `P_k/2` matched columns of its kind. Values are integers (1/2¹⁶ nat), so the
   maximum is exact, and the posterior reads the same integers: the call is a
   mode of the reported distribution. `--calls fixed` keeps the fixed scores,
   of which the per-read model at 11.2 % divergence is an exact multiple.
@@ -1268,13 +1298,19 @@ Each is a named field you can change.
    kept gene is a candidate. J is exhaustive. D uses the lossless L-mer
    prefilter instead of the note's k = 5/3 seeds.
 4. **Keep.** V and J trace until the top 3 alignments that pass the E-value
-   gate (plus ties); D keeps up to 32 admissible alignments.
+   gate (plus ties), J per locus of the read's anchors; D keeps up to 32
+   admissible alignments.
 5. **Windows.** D windows reclaim 12 bases into V and J (the note's rescue of
    24/10 is realised by this window and the DAG's exact cut choice). The
    conserved-anchor window is always added when anchors are present. J is
    searched from 12 bases before the earliest V end when some V is an
-   anchor, and over the whole read when none is; only anchors choose the
-   locus of the J and D candidates.
+   anchor, and over the whole read when none is; D windows start from the
+   best anchoring V, and from the read's start when no V anchors; only
+   anchors choose the locus of the J and D candidates. Without a J (or V)
+   the D window reaches 60 bases past the V (before the J), the D and its N.
+   When the anchors share no locus (a read holding two chains, as an scFv
+   does), each of their loci with D genes bounds a D window by its own V
+   and J.
 6. **Significance.** V and J hits need E ≤ 1, and a call needs a V or J hit
    at E ≤ 10⁻³ (`EvalueGates`). The note has no reporting threshold.
 7. **Tie-breaks.** Equal-score paths go to fewer D, then to more germline

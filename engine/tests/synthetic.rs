@@ -264,6 +264,43 @@ fn junctions_without_d_do_not_invent_one() {
     );
 }
 
+/// The identity floor (`--min-identity`) judges a hit's local alignment, not
+/// the outer flank the J stage stitches on. On a read at 30 % SHM, the J's
+/// local alignment is 80 % identical (20 of 25 columns); its stitched 3′
+/// flank (2 of 13) puts the whole J at 22 of 38, below the hosts' floor of
+/// 0.6, yet the read's model calls it. The floor keeps that call.
+#[test]
+fn the_identity_floor_judges_the_local_alignment() {
+    let db = Db::new();
+    let mut rng = Rng::new(31);
+    let (_, v) = &db.v[0];
+    let (j_name, j) = &db.j[0];
+    let mutated = |bases: &str, at: &[usize], rng: &mut Rng| -> String {
+        let mut bases: Vec<char> = bases.chars().collect();
+        for &k in at {
+            bases[k] = substitute(bases[k], rng);
+        }
+        bases.into_iter().collect()
+    };
+    let shm: Vec<usize> = (10..V_LEN).filter(|_| rng.below(10) < 3).collect();
+    let v_part = mutated(v, &shm, &mut rng)[10..].to_string();
+    // Matches at flank offsets 5 and 10: every flank prefix scores below 0
+    // and its running score bottoms out at −29, within the X-drop.
+    let flank: Vec<usize> = (25..38).filter(|k| ![30, 35].contains(k)).collect();
+    let local = [3, 8, 13, 18, 21];
+    let at: Vec<usize> = local.iter().copied().chain(flank).collect();
+    let j_part = mutated(&j[..38], &at, &mut rng);
+    let query = format!("{v_part}{}{j_part}", bases(&mut rng, 6));
+    for floor in [0.0, 0.6] {
+        let mut config = EngineConfig::default();
+        config.options.min_identity = floor;
+        let rec = record(&db.assigner(&config), &query);
+        let called = rec.j.as_ref().expect("J is called");
+        assert_eq!(first_label(&rec.j).as_deref(), Some(j_name.as_str()));
+        assert!(called.identity < 0.6, "identity {}", called.identity);
+    }
+}
+
 /// AIRR names N/P regions by their neighbours: `np1` follows V and `np2`
 /// the D, so a read without V reports its D–J bases as `np2`.
 #[test]

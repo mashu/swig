@@ -246,6 +246,24 @@ test("AIRR rows whose sequence is only whitespace are no records, as for the ali
   assert.ok(!result.batches.some((batch) => batch.text.includes("blank")));
 });
 
+test("records without an identifier are named sequence_N by their input position before batching", async () => {
+  // Each WebAssembly worker would number them within its own run, repeating names across workers.
+  const fasta = await collect(">\nACGT\n>a\nTTGG\n> \t\nGGCC\n", 1, 1);
+  assert.deepEqual(fasta.batches.map((batch) => batch.text), [">sequence_1\nACGT\n", ">a\nTTGG\n", ">sequence_3\nGGCC\n"]);
+  // A FASTQ read is named by its position among all reads, before the quality filter.
+  const fastq = await filteredFastq("@\nACGT\n+\n!!!!\n@\nACGT\n+\nIIII\n@b\nACGT\n+\nIIII\n", qualityFilter());
+  assert.equal(fastq.batches[0].text, "@sequence_2\nACGT\n+\nIIII\n@b\nACGT\n+\nIIII\n");
+  // A blank sequence_id is filled; a row with a blank sequence is no record and takes no position.
+  const airr = await collect("sequence_id\tsequence\n\tACGT\na\tTTGG\nblank\t \n  \tGGCC\n", 3, 10);
+  assert.equal(airr.batches[0].text, "sequence_id\tsequence\nsequence_1\tACGT\na\tTTGG\nsequence_3\tGGCC\n");
+  // A table without the column gains one after its last, in the table's own delimiter.
+  const csv = await collect("sequence,note\nACGT,x\nTTGG\nGGCC,y,z\n", 3, 2);
+  assert.deepEqual(csv.batches.map((batch) => batch.text), [
+    "sequence,note,sequence_id\nACGT,x,sequence_1\nTTGG,,sequence_2\n",
+    "sequence,note,sequence_id\nGGCC,y,sequence_3\n",
+  ]);
+});
+
 test("seeded reservoir subsampling is exact, reproducible, and input-order stable", async () => {
   const source = Array.from({ length: 100 }, (_, index) => `>read_${index}\nACGT${index % 10}\n`).join("");
   const first = await sampledIds(source, 10, 73);

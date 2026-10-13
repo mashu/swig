@@ -665,6 +665,80 @@ fn imgt_gapped_input_numbers_every_region() {
     }
 }
 
+/// A database whose only gapped alleles are partial is still numbered from
+/// its gaps: a codon no gapped allele holds (Cys104 after a 3′-partial
+/// record, Cys23 before a 5′-partial one) is no evidence against IMGT
+/// columns. A record that holds none of the three codons tests nothing, and
+/// its gaps stay ignored.
+#[test]
+fn partial_gapped_alleles_alone_are_numbered() {
+    let mut rng = Rng::new(34);
+    let genes: Vec<SyntheticV> = (0..40)
+        .map(|_| synthetic_v(ChainType::Heavy, &mut rng, 0))
+        .collect();
+    let gapped: Vec<Vec<u8>> = genes
+        .iter()
+        .map(|g| imgt_gapped(g, ChainType::Heavy))
+        .collect();
+    let mut plain = String::new();
+    for (g, gene) in genes.iter().enumerate() {
+        plain += &record(&format!("V{g}*01"), "", &gene.sequence);
+    }
+    let j = j_set(ChainType::Heavy, &mut rng);
+    // The plain set and one gapped record: the record's allele, its
+    // annotation and the summary.
+    let run = |name: &str, columns: &[u8]| {
+        let text = plain.clone() + &record(name, "", columns);
+        let mut v = GermlineSet::from_fasta(SegmentKind::V, &text).unwrap();
+        let report = annotate(&mut v, Some(&mut j.clone()), AnnotateOptions::default());
+        let annotation = report.v.last().unwrap().clone();
+        (
+            v.alleles().last().unwrap().clone(),
+            annotation,
+            report.summary(),
+        )
+    };
+    let used = "IMGT numbering read from 1 gapped V alleles";
+
+    let (allele, annotation, summary) = run("V1*02", &gapped[1][..250]);
+    assert!(summary.contains(used), "{summary}");
+    assert_eq!(allele.anchor, None);
+    assert_eq!(allele.regions.values(), genes[1].starts.map(Some));
+    assert_eq!(annotation.uncertain, [false; 5]);
+    assert!(
+        annotation.notes.contains(&Note::ImgtEndsBeforeCys104),
+        "{annotation:?}"
+    );
+
+    let mut late = gapped[2].clone();
+    late[..84].fill(b'.');
+    let lost = gapped[2][..84].iter().filter(|&&c| c != b'.').count() as u32;
+    let (allele, annotation, summary) = run("V2*02", &late);
+    assert!(summary.contains(used), "{summary}");
+    let [_, _, fr2, cdr2, fr3] = genes[2].starts;
+    assert_eq!(allele.anchor, Some(genes[2].anchor - lost));
+    assert_eq!(annotation.source, AnchorSource::ImgtGaps);
+    assert_eq!(
+        allele.regions.values(),
+        [
+            None,
+            None,
+            Some(fr2 - lost),
+            Some(cdr2 - lost),
+            Some(fr3 - lost)
+        ]
+    );
+
+    // From inside FR2 (after Trp41) to inside FR3 (before Cys104).
+    let mut middle = gapped[1][..250].to_vec();
+    middle[..126].fill(b'.');
+    let (_, _, summary) = run("V1*03", &middle);
+    assert!(
+        summary.contains("no gapped V allele holds IMGT codon 23, 41 or 104"),
+        "{summary}"
+    );
+}
+
 /// A codon alignment written with `.` but not in IMGT columns (one extra
 /// gap codon in FR1 moves Cys23, Trp41 and Cys104 off IMGT 23, 41 and
 /// 104) is not read as IMGT numbering: annotation equals the ungapped run.

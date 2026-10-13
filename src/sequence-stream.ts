@@ -371,6 +371,63 @@ export async function* airrRecords(source: AsyncIterable<string>): AsyncGenerato
   }
 }
 
+/**
+ * The name of a record without an identifier: `sequence_N`, N its 1-based
+ * position among the input's records. The aligner would number such a record
+ * within its own run, one per WebAssembly worker, so the name would depend on
+ * the worker count and the batch's route; Swig Web and swig-cli therefore name
+ * it before batching.
+ */
+function unnamedSequenceId(position: number): string {
+  return `sequence_${position}`;
+}
+
+/** A FASTA record as fastaRecords yields it, its blank header named for `position`. */
+export function namedFastaRecord(record: string, position: number): string {
+  const newline = record.indexOf("\n");
+  return isBlank(record.slice(1, newline)) ? `>${unnamedSequenceId(position)}${record.slice(newline)}` : record;
+}
+
+/** A FASTQ record, its blank header named for `position`. */
+export function namedFastqRecord(record: FastqRecord, position: number): FastqRecord {
+  return isBlank(record.header.slice(1)) ? { ...record, header: `@${unnamedSequenceId(position)}` } : record;
+}
+
+export interface AirrRowNamer {
+  /** The table's header, with a `sequence_id` column after its last when it had none. */
+  header: string;
+  /** `row` with its blank or missing `sequence_id` named for `position`. */
+  name(row: string, position: number): string;
+}
+
+/**
+ * Names the rows of an AIRR table with header line `header`, whose fields are
+ * split at `delimiter` (by default as the aligner splits them).
+ */
+export function airrRowNamer(header: string, delimiter = header.includes("\t") ? "\t" : ","): AirrRowNamer {
+  const columns = header.split(delimiter);
+  // Column names as the aligner matches them: trimmed.
+  const column = columns.findIndex((name) => name.trim() === "sequence_id");
+  return {
+    header: column < 0 ? `${header}${delimiter}sequence_id` : header,
+    name(row, position) {
+      const values = row.split(delimiter);
+      if (column < 0) {
+        // The new column follows the header's last one, whatever the row's length (join
+        // writes the holes of a short row as empty fields).
+        values.length = columns.length;
+        values.push(unnamedSequenceId(position));
+      } else if (isBlank(values[column])) {
+        while (values.length <= column) values.push("");
+        values[column] = unnamedSequenceId(position);
+      } else {
+        return row;
+      }
+      return values.join(delimiter);
+    },
+  };
+}
+
 interface StreamRecord {
   ordinal: number;
   text: string;
@@ -537,9 +594,11 @@ export async function* streamSequenceBatches(options: SequenceStreamOptions): As
 
   const parsedRecords = async function* (): AsyncGenerator<StreamRecord> {
     if (options.format === 3) {
+      let namer: AirrRowNamer | undefined;
       for await (const record of airrRecords(inputLines)) {
         abortIfNeeded(options.signal);
         recordsRead += 1;
+        namer ??= airrRowNamer(record.header);
         recordsEligible += 1;
         if (filterOptions.enabled) {
           fastqFilter.recordsRetained += 1;
@@ -547,7 +606,7 @@ export async function* streamSequenceBatches(options: SequenceStreamOptions): As
         }
         recordsSelected = subsampleSize ? Math.min(recordsEligible, subsampleSize) : recordsEligible;
         if (recordsRead % 1000 === 0) report();
-        yield { ordinal: recordsRead - 1, text: `${record.row}\n`, header: record.header };
+        yield { ordinal: recordsRead - 1, text: `${namer.name(record.row, recordsRead)}\n`, header: namer.header };
       }
       return;
     }
@@ -562,13 +621,14 @@ export async function* streamSequenceBatches(options: SequenceStreamOptions): As
         }
         recordsSelected = subsampleSize ? Math.min(recordsEligible, subsampleSize) : recordsEligible;
         if (recordsRead % 1000 === 0) report();
-        yield { ordinal: recordsRead - 1, text: record };
+        yield { ordinal: recordsRead - 1, text: namedFastaRecord(record, recordsRead) };
       }
       return;
     }
-    for await (const record of fastqRecords(inputLines)) {
+    for await (const read of fastqRecords(inputLines)) {
       abortIfNeeded(options.signal);
       recordsRead += 1;
+      const record = namedFastqRecord(read, recordsRead);
       const text = filterOptions.enabled
         ? filterFastqRecord(record, filterOptions, fastqFilter)
         : canonicalFastq(record);

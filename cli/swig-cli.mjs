@@ -11213,6 +11213,50 @@ async function* airrRecords(source) {
 		};
 	}
 }
+/**
+* The name of a record without an identifier: `sequence_N`, N its 1-based
+* position among the input's records. The aligner would number such a record
+* within its own run, one per WebAssembly worker, so the name would depend on
+* the worker count and the batch's route; Swig Web and swig-cli therefore name
+* it before batching.
+*/
+function unnamedSequenceId(position) {
+	return `sequence_${position}`;
+}
+/** A FASTA record as fastaRecords yields it, its blank header named for `position`. */
+function namedFastaRecord(record, position) {
+	const newline = record.indexOf("\n");
+	return isBlank(record.slice(1, newline)) ? `>${unnamedSequenceId(position)}${record.slice(newline)}` : record;
+}
+/** A FASTQ record, its blank header named for `position`. */
+function namedFastqRecord(record, position) {
+	return isBlank(record.header.slice(1)) ? {
+		...record,
+		header: `@${unnamedSequenceId(position)}`
+	} : record;
+}
+/**
+* Names the rows of an AIRR table with header line `header`, whose fields are
+* split at `delimiter` (by default as the aligner splits them).
+*/
+function airrRowNamer(header, delimiter = header.includes("	") ? "	" : ",") {
+	const columns = header.split(delimiter);
+	const column = columns.findIndex((name) => name.trim() === "sequence_id");
+	return {
+		header: column < 0 ? `${header}${delimiter}sequence_id` : header,
+		name(row, position) {
+			const values = row.split(delimiter);
+			if (column < 0) {
+				values.length = columns.length;
+				values.push(unnamedSequenceId(position));
+			} else if (isBlank(values[column])) {
+				while (values.length <= column) values.push("");
+				values[column] = unnamedSequenceId(position);
+			} else return row;
+			return values.join(delimiter);
+		}
+	};
+}
 function expectedErrorTable(offset) {
 	const table = /* @__PURE__ */ new Float64Array(127);
 	for (let code = offset; code < table.length; code += 1) table[code] = 10 ** (-(code - offset) / 10);
@@ -13241,7 +13285,7 @@ var NativePool = class {
 };
 //#endregion
 //#region cli-src/swig-cli.mjs
-const VERSION = "0.39.2";
+const VERSION = "0.39.3";
 const CLI_STREAM_HIGH_WATER_MARK = 8388608;
 const CLI_GZIP_CHUNK_SIZE = 1048576;
 const CLI_DIRECTORY = dirname(fileURLToPath(import.meta.url));
@@ -13259,7 +13303,7 @@ function prepareReferenceUsage() {
 	return `swig-cli ${VERSION} prepare-reference\n\nInfer, validate, and persist reusable SWIGMETA germline annotations.\n\nRequired:\n  -germline_db_V FASTA  -germline_db_J FASTA  --out-prefix PREFIX\n\nOptional references and exact metadata:\n  -germline_db_D FASTA  -c_region_db FASTA\n  -custom_internal_data FILE  -auxiliary_data FILE  -d_frame_data FILE\n  -organism NAME (default human)  -ig_seqtype Ig|TCR (default Ig)\n\nMatching controls:\n  --match-mode strict|permissive|best-guess  (default strict)\n  --best-guess             Alias for --match-mode best-guess; disables identity floors\n  --nearest-candidates N   Non-gene candidates aligned after named candidates fail\n  --v-same-gene-min-identity X  --v-nearest-min-identity X\n  --j-same-gene-min-identity X  --j-nearest-min-identity X\n  --require-complete       Exit nonzero if any V/J record remains unresolved\n\nOutputs are PREFIX.V/D/J/C.fasta, PREFIX.swig-reference.json, and\nPREFIX.annotation-diagnostics.tsv. The manifest can be passed directly to\nswig-cli --vdj with --prepared-reference.`;
 }
 function vdjUsage() {
-	return `swig-cli ${VERSION} --vdj\n\nLow-overhead, streaming V(D)J assignment by the Swig aligner with IgBLAST-style option names.\n\nRequired:\n  -out AIRR_TSV, plus either --prepared-reference MANIFEST or\n  -germline_db_V FASTA and -germline_db_J FASTA\n\nInput and optional references:\n  -query FASTA            Query FASTA or '-' for stdin (default '-')\n  -germline_db_D FASTA    D germline FASTA\n  -c_region_db FASTA      Constant-region FASTA\n\nAnnotation modes (default: the aligner's own annotation from conserved motifs and annotated\nrelatives of the ungapped FASTA; v_annotation_source and j_annotation_source name each source):\n  -custom_internal_data FILE  IgBLAST V .ndm.imgt data (1-based inclusive intervals)\n  -auxiliary_data FILE        IgBLAST J .aux data (0-based frame/CDR3 stop)\n  -d_frame_data FILE          IgBLAST D frame-one starts\n  --swigannots                Infer/validate metadata as in Swig Web\n\n  --prepared-reference FILE   Reuse a prepare-reference manifest and its FASTAs\n  --match-mode MODE           Metadata transfer only: strict, permissive, best-guess\n  --best-guess                Disable metadata-transfer identity floors (not read mapping)\nExecution:\n  -num_threads N          Exact thread count; --workers N overrides it\n  --workers N             Exact threads (or WebAssembly workers); 0 or omitted uses every core\n  --aligner MODE          auto (default): the native aligner this executable carries, else\n                          WebAssembly; native: fail instead of falling back; wasm: WebAssembly\n  --batch-records N       Records per bounded batch; 0/omitted selects 2000, 1000,\n                          or 500 according to worker count\n  --calling-profile NAME  r_optimized (default), sensitive_d, truth_optimized or igblast_compatible\n    r_optimized: 4-nt D exact-run floor; a D pays its prior cost, derived from the D genes of\n                 the read's locus (10.55 score units for human IGH)\n    sensitive_d: the same scores with a D twice as likely a priori (9.45 for human IGH)\n  C is anchored at the called J's end and called at an anchored E-value of at most 1e-3\n  --minimum-c-prefix-identity X  Optional 0..1 identity gate over the complete covered C prefix\n  --minimum-identity X    Drop V, D and J hits below identity X (default 0.6)\n  -min_D_match N  -D_penalty S  -J_penalty S  -min_J_length N   override the profile's D/J settings\n  -num_alignments_D/J N   accepted for IgBLAST compatibility; every admissible D and the best J\n                          alignments enter adjudication, and near-tied alleles are in *_alternatives\n  -strand both|plus|minus -outfmt 19 -organism NAME -ig_seqtype Ig|TCR\n\nThe germline options take FASTA files, not makeblastdb binary prefixes. Output is Swig AIRR,\nnot IgBLAST pairwise/tabular formatting. The output path is mandatory and is written incrementally;\na path ending in .gz is gzip-compressed.`;
+	return `swig-cli ${VERSION} --vdj\n\nLow-overhead, streaming V(D)J assignment by the Swig aligner with IgBLAST-style option names.\n\nRequired:\n  -out AIRR_TSV, plus either --prepared-reference MANIFEST or\n  -germline_db_V FASTA and -germline_db_J FASTA\n\nInput and optional references:\n  -query FASTA            Query FASTA or '-' for stdin (default '-')\n  -germline_db_D FASTA    D germline FASTA\n  -c_region_db FASTA      Constant-region FASTA\n\nAnnotation modes (default: the aligner's own annotation from conserved motifs and annotated\nrelatives of the ungapped FASTA; v_annotation_source and j_annotation_source name each source):\n  -custom_internal_data FILE  IgBLAST V .ndm.imgt data (1-based inclusive intervals)\n  -auxiliary_data FILE        IgBLAST J .aux data (0-based frame/CDR3 stop)\n  -d_frame_data FILE          IgBLAST D frame-one starts\n  --swigannots                Infer/validate metadata as in Swig Web\n\n  --prepared-reference FILE   Reuse a prepare-reference manifest and its FASTAs\n  --match-mode MODE           Metadata transfer only: strict, permissive, best-guess\n  --best-guess                Disable metadata-transfer identity floors (not read mapping)\nExecution:\n  -num_threads N          Exact thread count; --workers N overrides it\n  --workers N             Exact threads (or WebAssembly workers); 0 or omitted uses every core\n  --aligner MODE          auto (default): the native aligner this executable carries, else\n                          WebAssembly; native: fail instead of falling back; wasm: WebAssembly\n  --batch-records N       Records per bounded batch; 0/omitted selects 2000, 1000,\n                          or 500 according to worker count\n  --calling-profile NAME  r_optimized (default), sensitive_d, truth_optimized or igblast_compatible\n    r_optimized: 4-nt D exact-run floor; a D pays its prior cost, derived from the D genes of\n                 the read's locus (10.55 score units for human IGH)\n    sensitive_d: the same scores with a D twice as likely a priori (9.45 for human IGH)\n  C is anchored at the called J's end and called at an anchored E-value of at most 1e-3\n  --minimum-c-prefix-identity X  Optional 0..1 identity gate over the complete covered C prefix\n  --minimum-identity X    Drop V, D and J hits whose local alignment identity is below X (default 0.6)\n  -min_D_match N  -D_penalty S  -J_penalty S  -min_J_length N   override the profile's D/J settings\n  -num_alignments_D/J N   accepted for IgBLAST compatibility; every admissible D and the best J\n                          alignments enter adjudication, and near-tied alleles are in *_alternatives\n  -strand both|plus|minus -outfmt 19 -organism NAME -ig_seqtype Ig|TCR\n\nThe germline options take FASTA files, not makeblastdb binary prefixes. Output is Swig AIRR,\nnot IgBLAST pairwise/tabular formatting. The output path is mandatory and is written incrementally;\na path ending in .gz is gzip-compressed.`;
 }
 function thirdPartyNotices() {
 	return "Bundled IMGT/GENE-DB reference data\n\nSource: IMGT/GENE-DB release 202632-7, retrieved 2026-08-08.\nCopyright © 1995-2026 IMGT®, the international ImMunoGeneTics information system®.\nAttribution: IMGT®, the international ImMunoGeneTics information system®, https://www.imgt.org/, Institute of Human Genetics, Université de Montpellier and CNRS.\nLicense: CC BY 4.0, https://creativecommons.org/licenses/by/4.0/\nTerms: https://www.imgt.org/about/termsofuse.php\nCitation: Giudicelli V, Chaume D, Lefranc M-P. Nucleic Acids Research. 2005;33:D593-D597. https://doi.org/10.1093/nar/gki010\n\nSwig modifies the source data by selecting and reorganizing IG/TR V/D/J/C records, normalizing and ungapping nucleotide sequences, deriving compact coordinate metadata, selecting one source sequence per allele identifier, and joining selected coding IGH/TR constant exons. Membrane-only and untranslated constant exons are omitted. IMGT, Université de Montpellier, and CNRS do not endorse Swig or warrant the modified pack or its use.";
@@ -13456,10 +13500,9 @@ async function* sequenceBatches(input, batchRecords, preprocessing, airrMode, da
 	const filter = preprocessing.fastqFilter;
 	validateFastqQualityFilter(filter);
 	state.fastqFilter = emptyFastqQualityFilterStats(filter.enabled, filter.enabled && format === "fastq");
-	const unnamed = () => `sequence_${state.inputRecords}`;
 	const parsed = async function* () {
 		if (format === "airr") {
-			let identifiers = null;
+			let namer = null;
 			for await (const record of airrRecords(lines)) {
 				state.inputRecords += 1;
 				state.eligibleRecords += 1;
@@ -13471,27 +13514,9 @@ async function* sequenceBatches(input, batchRecords, preprocessing, airrMode, da
 				let header = delimiter === "	" ? record.header : record.header.split(delimiter).join("	");
 				let row = delimiter === "	" ? record.row : record.row.split(delimiter).map((value) => value.replace(/\t/g, " ")).join("	");
 				if (airrMode !== "preserve") {
-					if (identifiers?.source !== header) {
-						const columns = header.split("	");
-						const column = columns.findIndex((name) => name.trim() === "sequence_id");
-						identifiers = {
-							source: header,
-							columns: columns.length,
-							column,
-							header: column < 0 ? `${header}\tsequence_id` : header
-						};
-					}
-					const values = row.split("	");
-					if (identifiers.column < 0) {
-						values.length = identifiers.columns;
-						values.push(unnamed());
-						row = values.join("	");
-					} else if (isBlank(values[identifiers.column])) {
-						while (values.length <= identifiers.column) values.push("");
-						values[identifiers.column] = unnamed();
-						row = values.join("	");
-					}
-					header = identifiers.header;
+					namer ??= airrRowNamer(header, "	");
+					row = namer.name(row, state.inputRecords);
+					header = namer.header;
 				}
 				yield {
 					ordinal: state.inputRecords - 1,
@@ -13509,18 +13534,16 @@ async function* sequenceBatches(input, batchRecords, preprocessing, airrMode, da
 					state.fastqFilter.recordsRetained += 1;
 					state.fastqFilter.recordsPassedThrough += 1;
 				}
-				const newline = record.indexOf("\n");
-				const text = isBlank(record.slice(1, newline)) ? `>${unnamed()}${record.slice(newline)}` : record;
 				yield {
 					ordinal: state.inputRecords - 1,
-					text
+					text: namedFastaRecord(record, state.inputRecords)
 				};
 			}
 			return;
 		}
-		for await (const record of fastqRecords(lines)) {
+		for await (const read of fastqRecords(lines)) {
 			state.inputRecords += 1;
-			if (isBlank(record.header.slice(1))) record.header = `@${unnamed()}`;
+			const record = namedFastqRecord(read, state.inputRecords);
 			const text = filter.enabled ? filterFastqRecord(record, filter, state.fastqFilter) : canonicalFastq(record);
 			if (text !== null) {
 				state.eligibleRecords += 1;
@@ -13946,6 +13969,9 @@ function serializeRowBody(headers, rows) {
 function addHeaders(headers, names) {
 	for (const name of names) if (!headers.includes(name)) headers.push(name);
 }
+function decodeText(bytes) {
+	return new TextDecoder().decode(bytes);
+}
 async function loadReferences(config, base, referencePackPath) {
 	const packed = JSON.parse(gunzipSync(readFileSync(referencePackPath)).toString("utf8"));
 	const species = packed.species.find((entry) => entry.name === config.references.species);
@@ -13962,7 +13988,7 @@ async function loadReferences(config, base, referencePackPath) {
 	]) {
 		const path = config.references.files?.[segment];
 		if (!path) continue;
-		const raw = (await readFile(resolveFrom(base, path))).toString("utf8");
+		const raw = decodeText(await readFile(resolveFrom(base, path)));
 		if (config.references.prepareMetadata) {
 			process.stderr.write(`Preparing custom ${segment} reference metadata from ${basename(path)}…\n`);
 			const report = preprocessGermlineFastaAcrossTiers(raw, segment, germlineTemplateTiers(packed, species, config.references.scope, segment), allowedLoci);
@@ -13994,7 +14020,7 @@ async function readMaybeCompressedText(path, label) {
 		throw error;
 	}
 	if (bytes[0] === 31 && bytes[1] === 139) bytes = gunzipSync(bytes);
-	return bytes.toString("utf8");
+	return decodeText(bytes);
 }
 async function readVdjFasta(path, label) {
 	const text = await readMaybeCompressedText(path, label);
