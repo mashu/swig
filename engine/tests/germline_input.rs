@@ -9,6 +9,23 @@ const TRAV1_2: &str = ">TRAV1-2*01 SWIGMETA=0,-1,0,75,75,93,93,144,144,162,162,2
 GGACAAAACATTGACCAGCCCACTGAGATGACAGCTACGGAAGGTGCCATTGTCCAGATCAACTGCACGTACCAGACATCTGGGTTCAACGGGCTGTTCTGGTACCAGCAACATGCTGGCGAAGCACCCACATTTCTGTCTTACAATGTTCTGGATGGTTTGGAGGAGAAAGGTCGTTTTTCTTCATTCCTTAGTCGGTCTAAAGGGTACAGTTACCTCCTTTTGAAGGAGCTCCAGATGAAAGACTCTGCCTCTTACCTCTGTGCTGTGAGAGA
 ";
 
+/// IMGT gap runs `(bases before, run)` that put TRAV1-2*01 on IMGT columns
+/// (one FR1 gap codon at IMGT 10, CDR1 and CDR2 gaps in the middle, FR3
+/// gaps at 73 and 81–84): Cys23, Trp41 and Cys104 at IMGT 23, 41 and 104.
+const TRAV1_2_GAPS: [(usize, usize); 5] = [(27, 3), (84, 18), (153, 12), (183, 3), (204, 12)];
+
+/// `sequence` with the gap runs `gaps` inserted.
+fn imgt_gapped(sequence: &str, gaps: &[(usize, usize)]) -> String {
+    let mut out = String::new();
+    let mut at = 0;
+    for &(before, run) in gaps {
+        out += &sequence[at..before];
+        out += &".".repeat(run);
+        at = before;
+    }
+    out + &sequence[at..]
+}
+
 /// Human TRAJ48*01 and TRAJ24*01 with Swig's shipped SWIGMETA, whose
 /// anchors (8: `FGNE`, 14: `WGKF`) precede each allele's `FGXG` (29).
 const TRAJ: &str = ">TRAJ48*01 SWIGMETA=2,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,4
@@ -147,7 +164,10 @@ fn header_words_name_no_locus() {
 /// A prepared database read back keeps what its annotation knew: values
 /// annotation derived stay as trusted as they were (a transferred anchor is
 /// no donor and still counts as uncertain), doubtful starts stay flagged,
-/// and every allele reports the provenance it had.
+/// every allele reports the provenance it had, and what the IMGT numbering
+/// of an ungapped copy no longer shows stays known: the region starts
+/// before a 5′-partial sequence stay empty, and a 3′-partial one stays
+/// without Cys104.
 #[test]
 fn a_prepared_database_reloads_with_its_annotation() {
     let v = TRAV1_2.lines().nth(1).unwrap();
@@ -155,9 +175,13 @@ fn a_prepared_database_reloads_with_its_annotation() {
     broken[99..102].copy_from_slice(b"TTG"); // Trp41
     broken[261..264].copy_from_slice(b"AGT"); // Cys104
     let broken = String::from_utf8(broken).unwrap();
+    let gapped = imgt_gapped(v, &TRAV1_2_GAPS);
+    // *04 starts inside CDR1 (IMGT column 85), *05 ends inside FR3 (270).
+    let late = ".".repeat(84) + &gapped[84..];
     let v_text = format!(
-        "{TRAV1_2}>TRAV1-2*02\n{broken}\n>TRAV1-2*03\n{}\n",
-        &v[..240]
+        "{TRAV1_2}>TRAV1-2*02\n{broken}\n>TRAV1-2*03\n{}\n>TRAV1-2*04\n{late}\n>TRAV1-2*05\n{}\n",
+        &v[..240],
+        &gapped[..270]
     );
     let prepare = |v: &str, j: &str| {
         let texts = GermlineTexts {
@@ -178,6 +202,7 @@ fn a_prepared_database_reloads_with_its_annotation() {
             .map(|(a, allele)| (a.source.label(), a.uncertain, allele.source.clone()))
             .collect()
     };
+    let partial_notes = |db: &PreparedDatabase| db.annotation.v[4].notes_field();
     let expected = labels(&first);
     assert_eq!(expected[1].0, "transfer:TRAV1-2*01");
     assert_eq!(
@@ -185,9 +210,25 @@ fn a_prepared_database_reloads_with_its_annotation() {
         ("missing", [true; 5])
     );
     assert_eq!(expected[0].2.as_deref(), Some("IMGT-gapped"));
+    let lost = 81; // FR1 and the first two CDR1 codons
+    let late = first.v.allele(3);
+    assert_eq!(expected[3].0, "imgt-gaps");
+    assert_eq!(late.anchor, Some(261 - lost));
+    let starts = [
+        None,
+        None,
+        Some(93 - lost),
+        Some(144 - lost),
+        Some(162 - lost),
+    ];
+    assert_eq!(late.regions.values(), starts);
+    assert_eq!(first.v.allele(4).anchor, None);
+    let note = "3′-partial: the IMGT numbering ends before Cys104";
+    assert_eq!(partial_notes(&first), note);
     let files: std::collections::HashMap<&str, String> = first.files().into_iter().collect();
     let again = prepare(&files["V.fasta"], &files["J.fasta"]);
     assert_eq!(labels(&again), expected);
+    assert_eq!(partial_notes(&again), note);
     assert_eq!(again.annotation.uncertain(), first.annotation.uncertain());
     assert_eq!(again.warnings(3), first.warnings(3));
     for (allele, before) in again.v.alleles().iter().zip(first.v.alleles()) {

@@ -14,6 +14,9 @@
 //!
 //! Header keys win over gap columns; if their union fails
 //! [`RegionStarts::check`], the gaps of that allele are ignored with a note.
+//! A prepared database, written without gaps, keeps what they showed of a
+//! partial record in its header: `before=` the starts before a 5′-partial
+//! sequence, `partial=3` a sequence that ends before Cys104.
 
 use crate::germline::{
     Allele, GermlineSet, IMGT_CONSERVED_CODONS, ImgtNumbering, RegionSlot, RegionStarts,
@@ -103,23 +106,38 @@ pub struct Given {
     /// Header region starts a prepared database marks uncertain
     /// ([`Allele::uncertain`]).
     pub uncertain: [bool; 5],
-    /// The IMGT numbering ends before Cys104: the allele holds no anchor,
-    /// and none may be searched for or transferred.
+    /// The IMGT numbering (or a header's `partial=3`) ends before Cys104:
+    /// the allele holds no anchor, and none may be searched for or
+    /// transferred.
     pub ends_before_cys104: bool,
 }
 
 impl Given {
-    /// Header keys, then (with `use_gaps`) the allele's IMGT numbering in
-    /// the slots and anchor the header leaves open. Notes go to `notes`.
+    /// Header keys (a prepared database's `before=` and `partial=3`
+    /// included), then (with `use_gaps`) the allele's IMGT numbering in the
+    /// slots and anchor the header leaves open. Notes go to `notes`.
     pub fn read(allele: &Allele, use_gaps: bool, notes: &mut Vec<Note>) -> Self {
+        let given = Self::merge(allele, use_gaps, notes);
+        if given.ends_before_cys104 {
+            notes.push(Note::ImgtEndsBeforeCys104);
+        }
+        given
+    }
+
+    /// [`Self::read`] but for its 3′-partial note.
+    fn merge(allele: &Allele, use_gaps: bool, notes: &mut Vec<Note>) -> Self {
         let regions = allele.regions.values();
         let header = Self {
             anchor: allele.anchor,
             source: allele.anchor.map(|_| AnchorSource::given(allele)),
             from_meta: allele.anchor_from_meta,
-            regions: regions.map(|v| v.map_or(RegionSlot::Unknown, RegionSlot::Known)),
+            regions: [0, 1, 2, 3, 4].map(|i| match regions[i] {
+                Some(start) => RegionSlot::Known(start),
+                None if allele.before_start[i] => RegionSlot::BeforeStart,
+                None => RegionSlot::Unknown,
+            }),
             uncertain: [0, 1, 2, 3, 4].map(|i| allele.uncertain[i] && regions[i].is_some()),
-            ends_before_cys104: false,
+            ends_before_cys104: allele.ends_before_cys104 && allele.anchor.is_none(),
         };
         let Some(imgt) = allele.imgt.as_deref().filter(|_| use_gaps) else {
             return header;
@@ -130,7 +148,7 @@ impl Given {
                 *slot = numbered;
             }
         }
-        if merged.anchor.is_none() {
+        if merged.anchor.is_none() && !merged.ends_before_cys104 {
             merged.anchor = imgt.anchor;
             merged.source = imgt.anchor.map(|_| AnchorSource::ImgtGaps);
             merged.ends_before_cys104 = imgt.ends_before_cys104;
@@ -146,9 +164,6 @@ impl Given {
                     codon: column / 3 + 1,
                 }),
         );
-        if merged.ends_before_cys104 {
-            notes.push(Note::ImgtEndsBeforeCys104);
-        }
         merged
     }
 

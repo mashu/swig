@@ -501,6 +501,8 @@ IMGT columns 1, 79, 115, 166 and 196, and Cys104 is column 310.
 - A region that the numbering places before a 5′-partial sequence stays
   empty; a motif hit cannot fill it.
 - An allele whose numbering ends before Cys104 gets no anchor (`3′-partial`).
+- `prepare` writes both facts into the ungapped headers (`before=fr1,cdr1`,
+  `partial=3`), so a reloaded database keeps them.
 - A one- or two-column interior gap (an IMGT frameshift marker) is noted, and
   the columns after it still map exactly.
 - Header keys and `SWIGMETA` win over the gap columns.
@@ -620,8 +622,9 @@ Synthetic genes are built from heavy and light framework templates:
 
 `swig prepare` writes `V.fasta`, `D.fasta` and `J.fasta` with every
 anchor, frame and region start in the headers as keys (plus
-`annotation=SOURCE`), `C.fasta` with `--c`, and `annotation.tsv` with one
-row per allele:
+`annotation=SOURCE`, and for a partial IMGT-gapped record `before=` the
+starts before its first base and `partial=3` an end before Cys104),
+`C.fasta` with `--c`, and `annotation.tsv` with one row per allele:
 
 - frame, anchor and its residue;
 - region starts, CDR1 and CDR2 lengths in codons;

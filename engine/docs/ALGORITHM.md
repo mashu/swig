@@ -199,7 +199,9 @@ overridden. The other sources, in order:
      counting at each codon the alleles that hold it. A codon none holds
      (a set of 3′-partials) is not tested; at least one codon must be.
    - Each start is *known*, *before the sequence* (a 5′-partial record; no
-     motif may fill it) or *unknown*.
+     motif may fill it) or *unknown*. `prepare` writes the starts before
+     the sequence (`before=`) and an end before Cys104 (`partial=3`) into
+     the ungapped headers, so a reload keeps both.
    - One- and two-column interior runs are IMGT frameshift markers; the
      mapping stays exact across them.
 2. **Motifs**: Cys23, Trp41 and Cys104 placed jointly (§5), then a second

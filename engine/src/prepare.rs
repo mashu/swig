@@ -27,16 +27,23 @@ use crate::translate::open_frames;
 /// `2` per column).
 pub const MAX_CODING_C: usize = 2000;
 
-/// The `annotation=` and `uncertain=` tokens of a prepared V or J header:
-/// the allele's provenance ([`crate::germline::Allele::source`]) and the
-/// region starts its annotation doubts, which a reload reads back.
+/// The `annotation=`, `uncertain=`, `before=` and `partial=3` tokens of a
+/// prepared V or J header: the allele's provenance
+/// ([`crate::germline::Allele::source`]), the region starts its annotation
+/// doubts and what the IMGT numbering showed of a partial record, which a
+/// reload reads back.
 fn annotation_tokens(
     set: &GermlineSet,
     annotations: &[AlleleAnnotation],
     id: u32,
 ) -> Option<String> {
     let mut tokens = format!("annotation={}", set.allele(id).source.as_deref()?);
-    if let Some(field) = annotations.get(id as usize)?.uncertain_field() {
+    let annotation = annotations.get(id as usize)?;
+    for field in annotation
+        .uncertain_field()
+        .into_iter()
+        .chain(annotation.partial_fields())
+    {
         tokens += &format!(" {field}");
     }
     Some(tokens)
