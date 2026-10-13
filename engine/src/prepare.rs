@@ -92,7 +92,8 @@ pub struct GermlineTexts<'a> {
 
 /// Parse one germline set, rejecting reads given in its place.
 fn parse_set(kind: SegmentKind, text: &str) -> Result<GermlineSet, DatabaseError> {
-    if text.trim_start().starts_with('@') {
+    let start = text.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    if start.starts_with('@') {
         return Err(DatabaseError::Fastq(kind));
     }
     GermlineSet::from_fasta(kind, text).map_err(|e| DatabaseError::Germline(kind, e))

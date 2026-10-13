@@ -164,6 +164,8 @@ headers (`accession|allele|species|…`) are read as the allele name, and
 identical sequences are merged and reported under all their names. Anchors
 and V region boundaries come from the headers where present and are
 detected otherwise, on every start (see *Germline annotation and regions*).
+As with the reads, a leading UTF-8 byte-order mark is skipped and a byte
+that is no UTF-8 (a Latin-1 description) reads as U+FFFD.
 
 ## Output: Swig's AIRR schema
 

@@ -317,14 +317,22 @@ impl Args {
     }
 }
 
+/// The text of the file at `path`, a byte that is no UTF-8 read as U+FFFD,
+/// as the reads are ([`swig::reads`]) and as Swig Web reads every file: a
+/// Latin-1 header description does not stop a run.
+fn read_text(path: &str) -> Result<String, String> {
+    let bytes = fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    Ok(String::from_utf8(bytes)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
+}
+
 /// Read the germline FASTA files and prepare the database, logging its
 /// summary and warnings.
 fn load_database(files: &Files, options: &RunOptions) -> Result<PreparedDatabase, Box<dyn Error>> {
-    let read = |path: &str| fs::read_to_string(path).map_err(|e| format!("{path}: {e}"));
-    let v = read(files.v.as_deref().expect("checked by Args::check"))?;
-    let j = read(files.j.as_deref().expect("checked by Args::check"))?;
-    let d = files.d.as_deref().map(read).transpose()?;
-    let c = files.c.as_deref().map(read).transpose()?;
+    let v = read_text(files.v.as_deref().expect("checked by Args::check"))?;
+    let j = read_text(files.j.as_deref().expect("checked by Args::check"))?;
+    let d = files.d.as_deref().map(read_text).transpose()?;
+    let c = files.c.as_deref().map(read_text).transpose()?;
     let texts = GermlineTexts {
         v: &v,
         d: d.as_deref(),
@@ -504,7 +512,7 @@ fn run_simulate(args: &Args) -> Result<(), Box<dyn Error>> {
 
 /// The rows of an AIRR TSV of calls, by `sequence_id`.
 fn read_calls(path: &str) -> Result<HashMap<String, Assignment>, Box<dyn Error>> {
-    let text = fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    let text = read_text(path)?;
     let mut lines = text.lines();
     let header: Vec<&str> = lines
         .next()
@@ -522,7 +530,7 @@ fn run_evaluate(args: &Args) -> Result<(), Box<dyn Error>> {
     let calls_path = args.input.as_deref().expect("checked by Args::check");
     let calls = read_calls(calls_path)?;
     let other = args.other.as_deref().map(read_calls).transpose()?;
-    let truth_text = fs::read_to_string(truth_path).map_err(|e| format!("{truth_path}: {e}"))?;
+    let truth_text = read_text(truth_path)?;
     let mut lines = truth_text.lines();
     let header: Vec<&str> = lines
         .next()
