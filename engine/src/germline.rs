@@ -548,7 +548,9 @@ impl GermlineSet {
         Ok(())
     }
 
-    /// Gene part of an allele label (`IGHV1-2*02` → `IGHV1-2`).
+    /// Gene part of an allele label (`IGHV1-2*02` → `IGHV1-2`); a label
+    /// without `*` is a gene of its own. Retrieval keeps its candidates by
+    /// gene ([`crate::retrieve`]).
     pub fn gene_of_name(name: &str) -> &str {
         name.split('*').next().unwrap_or(name)
     }
