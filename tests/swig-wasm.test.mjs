@@ -6,6 +6,7 @@ import zlib from "node:zlib";
 import { AlignerEngine } from "../src/aligner-engine.ts";
 import { preprocessGermlineFasta } from "../src/germline-preprocess.ts";
 import { inferLineageGermline, lineageInputFasta } from "../src/lineage-alignment.ts";
+import { streamSequenceBatches } from "../src/sequence-stream.ts";
 import {
   generateVdjDataset,
   parseFasta as parseSimulatorFasta,
@@ -696,6 +697,23 @@ test("rows do not depend on how reads are batched", { timeout: 45_000 }, async (
   separate.initialize(references);
   const parts = records.map((record) => separate.annotate(record, 1).tsv.split("\n").slice(1).join("\n"));
   assert.equal(`${whole.split("\n")[0]}\n${parts.join("")}`, whole);
+});
+
+test("unnamed reads keep their input position across WebAssembly workers", async () => {
+  const human = pack.species.find((entry) => entry.name === "Homo sapiens").loci.IGH;
+  const references = { V: asFasta(human.V.slice(0, 4)), D: asFasta(human.D.slice(0, 4)), J: asFasta(human.J), C: "" };
+  const sequence = `${human.V[0][1]}AACCGG${human.D[0][1]}TTG${human.J[0][1]}`;
+  const query = [">", ">named", ">", ">"].map((header) => `${header}\n${sequence}\n`).join("");
+  const module = await WebAssembly.compile(wasmBytes);
+  const settings = { callingProfile: "r_optimized", minimumIdentity: 0.6, strand: 0 };
+  const engines = await Promise.all([0, 1].map(async () => (await AlignerEngine.create(module, settings, references)).engine));
+  const ids = [];
+  // Swig Web's pool hands each batch to a free worker, each with its own engine.
+  for await (const batch of streamSequenceBatches({ source: query, format: 1, batchSize: 2 })) {
+    const { body } = engines[batch.index % 2].annotate(encoder.encode(batch.text), batch.count, false);
+    ids.push(...decoder.decode(body).trimEnd().split("\n").map((row) => row.split("\t", 1)[0]));
+  }
+  assert.deepEqual(ids, ["sequence_1", "named", "sequence_3", "sequence_4"]);
 });
 
 test("the bounded repeated-sequence cache preserves identifiers and FASTQ qualities exactly", async () => {
