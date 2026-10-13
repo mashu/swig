@@ -1,7 +1,7 @@
 # Swig 0.39.3
 
 Swig 0.39.3 fixes the defects that a third review of the Swig aligner, made
-after 0.39.2, found: 2 major and 14 minor. Fourteen are fixed outright and
+after 0.39.2, found: 2 major and 13 minor. Thirteen are fixed outright and
 two in part. Each fix has a regression test that fails on 0.39.2. The
 aligner runs in Swig Web, in `swig-cli` (native and WebAssembly) and in the
 `swig` binary. Every change to calls and AIRR columns below applies to all

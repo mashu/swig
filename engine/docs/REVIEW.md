@@ -82,8 +82,8 @@ ALGORITHM describe the behaviour they changed. Still open, by priority:
    the motif hit; five V alleles keep theirs (item 4). The references
    should be regenerated.
 
-A third review, after Swig 0.39.2, found 2 major and 14 minor defects. Swig
-0.39.3 fixes 14 of them outright and 2 in part, each with a regression test
+A third review, after Swig 0.39.2, found 2 major and 13 minor defects. Swig
+0.39.3 fixes 13 of them outright and 2 in part, each with a regression test
 that fails on 0.39.2; `RELEASE_NOTES_0.39.3.md` lists them. Still open from
 that review:
 
