@@ -193,8 +193,10 @@ test("CLI prepares local V/J metadata by default and honors the config opt-out",
     const d=human.loci.IGH.D[0];
     const j=human.loci.IGH.J.find((entry)=>entry[2]?.[0]>=0&&entry[2]?.[1]>=0);
     assert.ok(v&&d&&j);
-    await writeFile(join(temporary,"custom-v.fasta"),`>${v[0]}\n${v[1]}\n`);
-    await writeFile(join(temporary,"custom-j.fasta"),`>${j[0]}\n${j[1]}\n`);
+    // Saved as some editors save them, V with a UTF-8 byte-order mark and J with a Latin-1
+    // description: both read as Swig Web reads them.
+    await writeFile(join(temporary,"custom-v.fasta"),`\uFEFF>${v[0]}\n${v[1]}\n`);
+    await writeFile(join(temporary,"custom-j.fasta"),Buffer.concat([Buffer.from(`>${j[0]} caf`),Buffer.from([0xe9]),Buffer.from(`\n${j[1]}\n`)]));
     const input=join(temporary,"read.fasta");
     await writeFile(input,`>custom-read\n${v[1]}${d[1]}${j[1]}\n`);
     for(const prepareMetadata of [true,false]){
@@ -207,6 +209,7 @@ test("CLI prepares local V/J metadata by default and honors the config opt-out",
       const summary=JSON.parse(result.stdout);
       assert.equal(summary.references.metadataPreparation.enabled,prepareMetadata);
       const manifest=JSON.parse(gunzipSync(await readFile(join(output,`${label}.swig-lineage-study.json.gz`))).toString("utf8"));
+      assert.match(manifest.analysis.references.V,/^>/);
       if(prepareMetadata){
         assert.equal(summary.references.metadataPreparation.segments.V.annotated,1);
         assert.equal(summary.references.metadataPreparation.segments.J.annotated,1);
