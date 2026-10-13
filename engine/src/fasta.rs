@@ -56,8 +56,10 @@ impl fmt::Display for FastaError {
 
 impl std::error::Error for FastaError {}
 
-/// Parse FASTA text.
+/// Parse FASTA text. A leading byte-order mark (U+FEFF), which Windows
+/// editors write, is skipped, as for the reads ([`crate::reads`]).
 pub fn parse_fasta(text: &str) -> Result<Vec<FastaRecord>, FastaError> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut records: Vec<FastaRecord> = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let line = line.trim_end();
@@ -137,6 +139,15 @@ mod tests {
         let records = parse_fasta(">a\r\nACGT\r\n>b\r\nTT\r\n").unwrap();
         assert_eq!(records[0].sequence, b"ACGT");
         assert_eq!(records[1].sequence, b"TT");
+    }
+
+    #[test]
+    fn skips_a_utf8_byte_order_mark() {
+        // Windows editors write one; the Swig app's TextDecoder drops it,
+        // swig-cli's Buffer decoding keeps it.
+        let records = parse_fasta("\u{feff}>a x\nACGT\n").unwrap();
+        assert_eq!(records[0].id(), "a");
+        assert_eq!(records[0].sequence, b"ACGT");
     }
 
     #[test]

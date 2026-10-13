@@ -28,7 +28,8 @@
 //! 1. `anchor=` / `fr1=` … `fr3=` in the FASTA header, then the IMGT
 //!    numbering of an IMGT-gapped V set ([`ImgtGaps`]). A region the
 //!    numbering places before a 5′-partial sequence stays empty, and an
-//!    allele whose numbering ends before Cys104 gets no anchor. A header
+//!    allele whose numbering ends before Cys104 gets no anchor (a prepared
+//!    database's `before=` and `partial=3` keys say the same). A header
 //!    anchor is contradicted ([`Conflict`]) when a J anchor is off
 //!    `[WF]G.G` while a confident motif lies elsewhere in its frame, or a V
 //!    anchor with weak motifs lies in another frame than all of its given
@@ -189,6 +190,12 @@ pub struct AlleleAnnotation {
     /// values are never uncertain. An error in a start not flagged here is
     /// a silent error.
     pub uncertain: [bool; 5],
+    /// Region starts that lie before the first base of a 5′-partial V
+    /// sequence (IMGT numbering, or a prepared database's `before=`).
+    pub before_start: [bool; 5],
+    /// The V sequence ends before Cys104 (IMGT numbering, or a prepared
+    /// database's `partial=3`): it holds no anchor.
+    pub ends_before_cys104: bool,
 }
 
 impl AlleleAnnotation {
@@ -197,6 +204,8 @@ impl AlleleAnnotation {
             source,
             notes,
             uncertain: [false; 5],
+            before_start: [false; 5],
+            ends_before_cys104: false,
         }
     }
 
@@ -214,12 +223,18 @@ impl AlleleAnnotation {
     /// `uncertain=` and the keys of the uncertain starts (`uncertain=cdr1,fr3`),
     /// `None` when every start is certain.
     pub fn uncertain_field(&self) -> Option<String> {
-        let keys: Vec<&str> = RegionStarts::KEYS
-            .iter()
-            .zip(self.uncertain)
-            .filter_map(|(&key, uncertain)| uncertain.then_some(key))
-            .collect();
-        (!keys.is_empty()).then(|| format!("uncertain={}", keys.join(",")))
+        region_field("uncertain", self.uncertain)
+    }
+
+    /// The header keys a prepared database records for a partial V record,
+    /// which its IMGT gaps showed and its ungapped copy no longer shows:
+    /// `before=` and the starts before the sequence (`before=fr1,cdr1`),
+    /// and `partial=3` for a sequence that ends before Cys104.
+    pub fn partial_fields(&self) -> impl Iterator<Item = String> {
+        let ends = self.ends_before_cys104.then(|| "partial=3".to_string());
+        region_field("before", self.before_start)
+            .into_iter()
+            .chain(ends)
     }
 
     /// The notes, then [`Self::uncertain_field`], as one `; `-separated field.
@@ -258,6 +273,16 @@ pub struct DatabaseAnnotation {
     /// its nearest relative of known locus, `None` for those without one.
     /// `v` and `j` above then hold every allele's annotation.
     pub parts: Vec<(Option<Locus>, DatabaseAnnotation)>,
+}
+
+/// `key=` and the keys of the `marked` region starts, `None` when none is.
+fn region_field(key: &str, marked: [bool; 5]) -> Option<String> {
+    let keys: Vec<&str> = RegionStarts::KEYS
+        .iter()
+        .zip(marked)
+        .filter_map(|(&key, marked)| marked.then_some(key))
+        .collect();
+    (!keys.is_empty()).then(|| format!("{key}={}", keys.join(",")))
 }
 
 fn mode(values: impl Iterator<Item = u32>) -> Option<u32> {
@@ -919,6 +944,8 @@ pub fn annotate(
             let given = Given::read(allele, imgt_gaps.used(), &mut notes);
             result.push(AlleleAnnotation {
                 uncertain: given.uncertain,
+                before_start: given.regions.map(|slot| slot == RegionSlot::BeforeStart),
+                ends_before_cys104: given.ends_before_cys104,
                 ..AlleleAnnotation::new(AnchorSource::Missing, notes)
             });
             given

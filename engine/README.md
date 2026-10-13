@@ -137,7 +137,9 @@ fraction. It writes `PREFIX.fasta` and `PREFIX.truth.tsv`.
 detected from the first non-blank character (`>`, `@`, anything else a
 table). A table is tab-separated, or comma-separated without quoting when
 its header holds no tab, and is read from its `sequence`, `sequence_id` and
-`quality` columns: AIRR input is re-annotated from its sequences.
+`quality` columns: AIRR input is re-annotated from its sequences. A header
+that starts with a tab starts with an empty column name, as pandas writes
+its index column.
 Multi-line FASTQ is supported; qualities are validated and kept for the
 `quality` column. FASTQ sequence lines may not hold spaces, tabs or control
 characters (FASTA drops them, but a FASTQ quality counts each base); no-call
@@ -162,6 +164,14 @@ headers (`accession|allele|species|…`) are read as the allele name, and
 identical sequences are merged and reported under all their names. Anchors
 and V region boundaries come from the headers where present and are
 detected otherwise, on every start (see *Germline annotation and regions*).
+Names must read `GENE*ALLELE`, as IMGT's do: the part before `*` is the
+gene, and a name without `*` is a gene of its own. V retrieval keeps
+candidates by gene (3 genes, up to 16 within the leader's vote noise), so
+without `*` that budget caps alleles: on human IGH at 30 % SHM, renaming
+`*` to `_a` costs 8.2 points of V allele accuracy. `prepare` and
+assignment warn when more than 16 V names hold no `*`.
+As with the reads, a leading UTF-8 byte-order mark is skipped and a byte
+that is no UTF-8 (a Latin-1 description) reads as U+FFFD.
 
 ## Output: Swig's AIRR schema
 
@@ -489,11 +499,16 @@ numbered from its gap columns. The FR1, CDR1, FR2, CDR2 and FR3 starts are
 IMGT columns 1, 79, 115, 166 and 196, and Cys104 is column 310.
 
 - The gaps are used only when most gapped alleles are codon-aligned and
-  carry Cys, Trp and Cys at IMGT 23, 41 and 104. Otherwise they are ignored
-  (a codon alignment in other columns) and the summary line says why.
+  most of those that hold IMGT codon 23, 41 or 104 carry Cys, Trp or Cys
+  there. A codon that no gapped allele holds (Cys104 when all are
+  3′-partial) is not tested, but one of the three must be. Otherwise the
+  gaps are ignored (a codon alignment in other columns) and the summary
+  line says why.
 - A region that the numbering places before a 5′-partial sequence stays
   empty; a motif hit cannot fill it.
 - An allele whose numbering ends before Cys104 gets no anchor (`3′-partial`).
+- `prepare` writes both facts into the ungapped headers (`before=fr1,cdr1`,
+  `partial=3`), so a reloaded database keeps them.
 - A one- or two-column interior gap (an IMGT frameshift marker) is noted, and
   the columns after it still map exactly.
 - Header keys and `SWIGMETA` win over the gap columns.
@@ -613,8 +628,9 @@ Synthetic genes are built from heavy and light framework templates:
 
 `swig prepare` writes `V.fasta`, `D.fasta` and `J.fasta` with every
 anchor, frame and region start in the headers as keys (plus
-`annotation=SOURCE`), `C.fasta` with `--c`, and `annotation.tsv` with one
-row per allele:
+`annotation=SOURCE`, and for a partial IMGT-gapped record `before=` the
+starts before its first base and `partial=3` an end before Cys104),
+`C.fasta` with `--c`, and `annotation.tsv` with one row per allele:
 
 - frame, anchor and its residue;
 - region starts, CDR1 and CDR2 lengths in codons;

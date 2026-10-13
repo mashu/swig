@@ -17,7 +17,7 @@ use crate::annotate::{
     AlleleAnnotation, AnnotateOptions, DatabaseAnnotation, Note, annotate_by_locus,
 };
 use crate::germline::{GermlineError, GermlineSet, MergedDuplicate, SegmentKind};
-use crate::retrieve::GeneFrames;
+use crate::retrieve::{AmbiguityBudget, GeneFrames};
 use crate::seed::SeedShape;
 use crate::translate::open_frames;
 
@@ -27,16 +27,23 @@ use crate::translate::open_frames;
 /// `2` per column).
 pub const MAX_CODING_C: usize = 2000;
 
-/// The `annotation=` and `uncertain=` tokens of a prepared V or J header:
-/// the allele's provenance ([`crate::germline::Allele::source`]) and the
-/// region starts its annotation doubts, which a reload reads back.
+/// The `annotation=`, `uncertain=`, `before=` and `partial=3` tokens of a
+/// prepared V or J header: the allele's provenance
+/// ([`crate::germline::Allele::source`]), the region starts its annotation
+/// doubts and what the IMGT numbering showed of a partial record, which a
+/// reload reads back.
 fn annotation_tokens(
     set: &GermlineSet,
     annotations: &[AlleleAnnotation],
     id: u32,
 ) -> Option<String> {
     let mut tokens = format!("annotation={}", set.allele(id).source.as_deref()?);
-    if let Some(field) = annotations.get(id as usize)?.uncertain_field() {
+    let annotation = annotations.get(id as usize)?;
+    for field in annotation
+        .uncertain_field()
+        .into_iter()
+        .chain(annotation.partial_fields())
+    {
         tokens += &format!(" {field}");
     }
     Some(tokens)
@@ -92,7 +99,8 @@ pub struct GermlineTexts<'a> {
 
 /// Parse one germline set, rejecting reads given in its place.
 fn parse_set(kind: SegmentKind, text: &str) -> Result<GermlineSet, DatabaseError> {
-    if text.trim_start().starts_with('@') {
+    let start = text.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    if start.starts_with('@') {
         return Err(DatabaseError::Fastq(kind));
     }
     GermlineSet::from_fasta(kind, text).map_err(|e| DatabaseError::Germline(kind, e))
@@ -159,6 +167,12 @@ pub enum DatabaseWarning {
     Uncertain(usize),
     /// A convention that keeps C from being called.
     Constant(ConstantWarning),
+    /// More V allele names than retrieval keeps genes per read hold no `*`.
+    /// A gene is the name's part before `*` ([`GermlineSet::gene_of_name`]),
+    /// so each of them is a gene of its own, and the gene budget
+    /// ([`AmbiguityBudget::max`]) caps alleles instead: V calls on mutated
+    /// reads lose accuracy.
+    NoGeneNames(usize),
 }
 
 impl fmt::Display for DatabaseWarning {
@@ -173,6 +187,11 @@ impl fmt::Display for DatabaseWarning {
                 "{count} alleles have transferred, low-confidence, missing or contradicted anchors; review them in the prepared annotation.tsv"
             ),
             Self::Constant(warning) => write!(f, "{warning}"),
+            Self::NoGeneNames(count) => write!(
+                f,
+                "{count} V allele names hold no '*', so each counts as a gene of its own: retrieval keeps at most {} V genes per read, which then caps alleles, and V calls on mutated reads lose accuracy. Name alleles GENE*ALLELE, as IMGT does",
+                AmbiguityBudget::default().max
+            ),
         }
     }
 }
@@ -270,6 +289,11 @@ impl PreparedDatabase {
         }
         if self.annotation.uncertain() > 0 {
             warnings.push(DatabaseWarning::Uncertain(self.annotation.uncertain()));
+        }
+        let names = self.v.alleles().iter().map(|a| a.name.as_str());
+        let no_gene = names.filter(|name| !name.contains('*')).count();
+        if no_gene > AmbiguityBudget::default().max {
+            warnings.push(DatabaseWarning::NoGeneNames(no_gene));
         }
         warnings.extend(
             self.constant_warnings(spread)
@@ -502,6 +526,40 @@ mod tests {
         assert_eq!((merged.anchor, merged.frame), (Some(7), Some(1)));
         assert_eq!(merged.source.as_deref(), Some("validated-J-motif"));
         assert_eq!(db.j.allele(3).source.as_deref(), Some("validated-J-motif"));
+    }
+
+    /// Gene identity comes from `GENE*ALLELE` names: a V name without `*` is
+    /// a gene of its own, so with more such names than retrieval keeps
+    /// genes, its budget caps alleles. That is warned about; a few names
+    /// without `*` are not.
+    #[test]
+    fn v_names_without_a_gene_are_warned_about() {
+        let mut next = rng(14);
+        let sequences: Vec<String> = (0..17)
+            .map(|_| decode(&random_codes(&mut next, 300)))
+            .collect();
+        let mut j = GermlineSet::new(SegmentKind::J);
+        let germline = decode(&random_codes(&mut next, 50));
+        j.push("J1*01", germline.as_bytes(), Some(20)).unwrap();
+        let warned = |count: usize, name: fn(usize) -> String| {
+            let mut v = GermlineSet::new(SegmentKind::V);
+            for (i, sequence) in sequences.iter().take(count).enumerate() {
+                v.push(&name(i), sequence.as_bytes(), None).unwrap();
+            }
+            let database = prepare(v, None, j.clone(), AnnotateOptions::default()).unwrap();
+            let warnings = database.warnings(3);
+            let ungrouped = |w: &&DatabaseWarning| matches!(w, DatabaseWarning::NoGeneNames(_));
+            warnings.iter().find(ungrouped).cloned()
+        };
+        assert_eq!(
+            warned(17, |i| format!("IGHV{i}_a01")),
+            Some(DatabaseWarning::NoGeneNames(17))
+        );
+        assert_eq!(warned(16, |i| format!("IGHV{i}_a01")), None);
+        assert_eq!(
+            warned(17, |i| format!("IGHV{}*0{}", i / 2, i % 2 + 1)),
+            None
+        );
     }
 
     #[test]

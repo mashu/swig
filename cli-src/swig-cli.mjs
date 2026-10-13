@@ -521,6 +521,10 @@ function trimAuxiliaryFwr4(headerText,bodyText,endOffsets,jLengths){
 function serializeRowBody(headers,rows){return `${rows.map((row)=>headers.map((header)=>cleanCell(row[header])).join("\t")).join("\n")}${rows.length?"\n":""}`;}
 function addHeaders(headers,names){for(const name of names)if(!headers.includes(name))headers.push(name);}
 
+// A user's file reads as Swig Web reads it (TextDecoder): a UTF-8 byte-order mark is dropped,
+// a byte that is no UTF-8 reads as U+FFFD. Buffer's toString keeps the mark before the first header.
+function decodeText(bytes){return new TextDecoder().decode(bytes);}
+
 async function loadReferences(config,base,referencePackPath){
   const packed=JSON.parse(gunzipSync(readFileSync(referencePackPath)).toString("utf8"));
   const species=packed.species.find((entry)=>entry.name===config.references.species);
@@ -531,7 +535,7 @@ async function loadReferences(config,base,referencePackPath){
   if(!allowedLoci.length)throw new Error(`The bundled reference pack has no ${config.references.scope} loci for ${config.references.species}.`);
   for(const segment of ["V","D","J","C"]){
     const path=config.references.files?.[segment];if(!path)continue;
-    const raw=(await readFile(resolveFrom(base,path))).toString("utf8");
+    const raw=decodeText(await readFile(resolveFrom(base,path)));
     if(config.references.prepareMetadata){
       process.stderr.write(`Preparing custom ${segment} reference metadata from ${basename(path)}…\n`);
       const report=preprocessGermlineFastaAcrossTiers(raw,segment,germlineTemplateTiers(packed,species,config.references.scope,segment),allowedLoci);
@@ -556,7 +560,7 @@ async function readMaybeCompressedText(path,label){
     throw error;
   }
   if(bytes[0]===0x1f&&bytes[1]===0x8b)bytes=gunzipSync(bytes);
-  return bytes.toString("utf8");
+  return decodeText(bytes);
 }
 
 async function readVdjFasta(path,label){

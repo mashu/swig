@@ -321,6 +321,16 @@ pub struct Allele {
     /// `uncertain=`: given, but derived by the annotation of a prepared
     /// database, which doubted them ([`crate::prepare`]).
     pub uncertain: [bool; 5],
+    /// Region starts the header marks `before=`: they lie before the first
+    /// base of a 5′-partial V sequence, as a prepared database records from
+    /// its IMGT numbering ([`RegionSlot::BeforeStart`]), so nothing fills
+    /// them.
+    pub before_start: [bool; 5],
+    /// The header marks the V allele `partial=3`: it ends before Cys104, as
+    /// a prepared database records from its IMGT numbering
+    /// ([`ImgtNumbering::ends_before_cys104`]), so without an `anchor=` it
+    /// holds no anchor, and none is searched for or transferred.
+    pub ends_before_cys104: bool,
     /// The anchor was read from `SWIGMETA=`, not from an `anchor=` key:
     /// a coordinate Swig transferred from IMGT-annotated relatives, which
     /// annotation drops when the allele's own motifs confidently contradict
@@ -358,8 +368,10 @@ impl Allele {
         {
             self.regions = copy.regions;
             self.uncertain = copy.uncertain;
+            self.before_start = copy.before_start;
             taken = true;
         }
+        self.ends_before_cys104 |= copy.ends_before_cys104;
         self.imgt = self.imgt.take().or(copy.imgt);
         self.loci = self.loci.union(copy.loci);
         self.frame = self.frame.or(copy.frame);
@@ -536,7 +548,9 @@ impl GermlineSet {
         Ok(())
     }
 
-    /// Gene part of an allele label (`IGHV1-2*02` → `IGHV1-2`).
+    /// Gene part of an allele label (`IGHV1-2*02` → `IGHV1-2`); a label
+    /// without `*` is a gene of its own. Retrieval keeps its candidates by
+    /// gene ([`crate::retrieve`]).
     pub fn gene_of_name(name: &str) -> &str {
         name.split('*').next().unwrap_or(name)
     }
@@ -593,6 +607,8 @@ impl GermlineSet {
             frame: None,
             source: None,
             uncertain: [false; 5],
+            before_start: [false; 5],
+            ends_before_cys104: false,
             anchor_from_meta: false,
         });
         Ok(id)
@@ -600,11 +616,14 @@ impl GermlineSet {
 
     /// Load from FASTA. Header: `>NAME [anchor=POS] [fr1= cdr1= fr2= cdr2= fr3=]
     /// [frame=F] [aliases=A,B] [locus=L,…] [annotation=SOURCE]
-    /// [uncertain=fr1,…] [SWIGMETA=…]` (0-based positions; unknown keys are
-    /// ignored). Swig's `SWIGMETA=` field ([`crate::metadata`]) fills what
-    /// the keys leave open. `annotation=` and `uncertain=`, as a prepared
-    /// database writes them, give the provenance of the header's values
-    /// ([`Allele::source`]) and the starts it doubts ([`Allele::uncertain`]).
+    /// [uncertain=fr1,…] [before=fr1,…] [partial=3] [SWIGMETA=…]` (0-based
+    /// positions; unknown keys are ignored). Swig's `SWIGMETA=` field
+    /// ([`crate::metadata`]) fills what the keys leave open. `annotation=`,
+    /// `uncertain=`, `before=` and `partial=3`, as a prepared database
+    /// writes them, give the provenance of the header's values
+    /// ([`Allele::source`]), the starts it doubts ([`Allele::uncertain`]),
+    /// and what the IMGT numbering of a partial V record showed
+    /// ([`Allele::before_start`], [`Allele::ends_before_cys104`]).
     /// A gapped V record keeps its IMGT numbering in [`Allele::imgt`]; the
     /// loci come from `locus=` (as [`Self::write_fasta`] writes them), else
     /// the label, else the header ([`Loci::infer`]).
@@ -634,20 +653,27 @@ impl GermlineSet {
                 *slot = position(key)?;
             }
             let regions = RegionStarts::from_values(values);
-            let mut uncertain = [false; 5];
-            for key in record
-                .attribute("uncertain")
-                .into_iter()
-                .flat_map(|l| l.split(','))
-            {
-                let slot = RegionStarts::KEYS.iter().position(|&k| k == key);
-                let slot = slot.ok_or_else(|| GermlineError::BadAttribute {
-                    name: name.to_string(),
-                    key: "uncertain".to_string(),
-                    value: key.to_string(),
-                })?;
-                uncertain[slot] = true;
-            }
+            let bad = |key: &str, value: &str| GermlineError::BadAttribute {
+                name: name.to_string(),
+                key: key.to_string(),
+                value: value.to_string(),
+            };
+            // The starts a list of region keys names (`uncertain=fr1,fr3`).
+            let marked = |key: &str| -> Result<[bool; 5], GermlineError> {
+                let mut marked = [false; 5];
+                for value in record.attribute(key).into_iter().flat_map(|l| l.split(',')) {
+                    let slot = RegionStarts::KEYS.iter().position(|&k| k == value);
+                    marked[slot.ok_or_else(|| bad(key, value))?] = true;
+                }
+                Ok(marked)
+            };
+            let uncertain = marked("uncertain")?;
+            let before_start = marked("before")?;
+            let ends_before_cys104 = match record.attribute("partial") {
+                None => false,
+                Some("3") => true,
+                Some(value) => return Err(bad("partial", value)),
+            };
             let len = record.sequence.len();
             regions
                 .check(anchor, len)
@@ -688,6 +714,8 @@ impl GermlineSet {
                 .or(record.attribute("annotation"))
                 .map(str::to_string);
             allele.uncertain = uncertain;
+            allele.before_start = before_start;
+            allele.ends_before_cys104 = ends_before_cys104;
             allele.anchor_from_meta = anchor_from_meta;
             allele.loci = match record.attribute("locus") {
                 Some(list) => {
@@ -790,6 +818,8 @@ impl GermlineSet {
             target.frame = allele.frame;
             target.source = allele.source;
             target.uncertain = allele.uncertain;
+            target.before_start = allele.before_start;
+            target.ends_before_cys104 = allele.ends_before_cys104;
             target.anchor_from_meta = allele.anchor_from_meta;
         }
         *self = rebuilt;
@@ -1042,6 +1072,28 @@ mod tests {
             GermlineSet::from_fasta(SegmentKind::V, ">V1*01 uncertain=fr9\nACGT\n"),
             Err(GermlineError::BadAttribute { key, .. }) if key == "uncertain"
         ));
+    }
+
+    /// A prepared header's `before=` and `partial=3` are read back as what
+    /// the IMGT numbering showed of a partial record.
+    #[test]
+    fn prepared_headers_give_what_partial_records_lack() {
+        let text = ">V1*01 fr2=3 before=fr1,cdr1\nACGTACGT\n>V2*01 fr1=0 partial=3\nACGT\n";
+        let set = GermlineSet::from_fasta(SegmentKind::V, text).unwrap();
+        assert_eq!(
+            set.allele(0).before_start,
+            [true, true, false, false, false]
+        );
+        assert!(!set.allele(0).ends_before_cys104);
+        assert!(set.allele(1).ends_before_cys104);
+        for (header, bad) in [("before=fr9", "before"), ("partial=5", "partial")] {
+            let found =
+                GermlineSet::from_fasta(SegmentKind::V, &format!(">V1*01 {header}\nACGT\n"));
+            assert!(
+                matches!(&found, Err(GermlineError::BadAttribute { key, .. }) if key == bad),
+                "{header}: {found:?}"
+            );
+        }
     }
 
     /// The written FASTA keeps every allele's loci, also those read from
