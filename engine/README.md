@@ -1273,8 +1273,9 @@ Each is a named field you can change.
    24/10 is realised by this window and the DAG's exact cut choice). The
    conserved-anchor window is always added when anchors are present. J is
    searched from 12 bases before the earliest V end when some V is an
-   anchor, and over the whole read when none is; only anchors choose the
-   locus of the J and D candidates.
+   anchor, and over the whole read when none is; D windows start from the
+   best anchoring V, and from the read's start when no V anchors; only
+   anchors choose the locus of the J and D candidates.
 6. **Significance.** V and J hits need E ≤ 1, and a call needs a V or J hit
    at E ≤ 10⁻³ (`EvalueGates`). The note has no reporting threshold.
 7. **Tie-breaks.** Equal-score paths go to fewer D, then to more germline

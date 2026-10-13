@@ -2,8 +2,8 @@
 //!
 //! D is never searched on the whole query (the note: no three-way product
 //! search). A [`DWindowPolicy`] proposes one or more query intervals from the
-//! current V and J placements; the pipeline merges overlapping windows so a D
-//! placement is never found twice.
+//! V and J placements that bound the D ([`bounding_v`]); the pipeline merges
+//! overlapping windows so a D placement is never found twice.
 
 use std::ops::Range;
 
@@ -11,33 +11,53 @@ use crate::germline::GermlineSet;
 use crate::placement::Placement;
 
 pub trait DWindowPolicy: Send + Sync {
-    /// `v` and `j` are sorted best-first. Append windows to `out`.
+    /// Append to `out` the windows of a D between the V placement `v` and
+    /// the J placement `j` that bound it; `None`: no V (J) bounds it, and
+    /// the D may lie from the read's start (up to its end).
     fn windows(
         &self,
         query_len: usize,
-        v: &[Placement],
-        j: &[Placement],
+        v: Option<&Placement>,
+        j: Option<&Placement>,
         out: &mut Vec<Range<usize>>,
     );
 }
 
-/// `[b_V − margin, a_J + margin)` of the best V and J, clamped to the read
-/// and to V's start; empty (never inverted) when V reaches past the J's
+/// The V placement that bounds a read's D windows, among its V placements
+/// `v` (best first): the best one, or, when V hits can anchor a call
+/// (`anchoring`: the V stage has E-value gates), the best anchor
+/// ([`Placement::anchor`]). A V hit that is not significant on its own may
+/// be a chance hit downstream of the real D, in a read that starts inside
+/// CDR3, as for the J window ([`DownstreamWindow`]); without an anchor, D
+/// is searched as on a read without V.
+pub fn bounding_v(v: &[Placement], anchoring: bool) -> Option<&Placement> {
+    if anchoring {
+        v.iter().find(|p| p.anchor.is_some())
+    } else {
+        v.first()
+    }
+}
+
+/// `[b_V − margin, a_J + margin)` of the bounding V and J, clamped to the
+/// read and to V's start; empty (never inverted) when V reaches past the J's
 /// start by more than the margin.
-fn residual(query_len: usize, v: &[Placement], j: &[Placement], margin: u32) -> Range<usize> {
-    let v_best = v.first();
-    let j_best = j.first();
-    let floor = v_best.map_or(0, |p| p.q_start() as usize);
-    let start = v_best
+fn residual(
+    query_len: usize,
+    v: Option<&Placement>,
+    j: Option<&Placement>,
+    margin: u32,
+) -> Range<usize> {
+    let floor = v.map_or(0, |p| p.q_start() as usize);
+    let start = v
         .map_or(0, |p| p.q_end().saturating_sub(margin) as usize)
         .max(floor);
-    let end = j_best
+    let end = j
         .map_or(query_len, |p| (p.q_start() + margin) as usize)
         .min(query_len);
     start..end.max(start)
 }
 
-/// The ordinary residual `[b_V − margin, a_J + margin)` of the best V and J.
+/// The ordinary residual `[b_V − margin, a_J + margin)` of the bounding V and J.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResidualWindow {
     pub overlap_margin: u32,
@@ -47,8 +67,8 @@ impl DWindowPolicy for ResidualWindow {
     fn windows(
         &self,
         query_len: usize,
-        v: &[Placement],
-        j: &[Placement],
+        v: Option<&Placement>,
+        j: Option<&Placement>,
         out: &mut Vec<Range<usize>>,
     ) {
         let window = residual(query_len, v, j, self.overlap_margin);
@@ -90,8 +110,8 @@ impl DWindowPolicy for ExpandedResidual {
     fn windows(
         &self,
         query_len: usize,
-        v: &[Placement],
-        j: &[Placement],
+        v: Option<&Placement>,
+        j: Option<&Placement>,
         out: &mut Vec<Range<usize>>,
     ) {
         let window = residual(query_len, v, j, self.reclaim);
@@ -103,8 +123,8 @@ impl DWindowPolicy for ExpandedResidual {
 
 /// Adds the conserved-anchor window `[q(V Cys) + 3, q(J Trp/Phe))` — the
 /// CDR3 interior — as a second location hypothesis for D. Anchors are
-/// projected through the best V and J alignments (extrapolated along their
-/// diagonals when the anchor lies outside the aligned part).
+/// projected through the bounding V and J alignments (extrapolated along
+/// their diagonals when the anchor lies outside the aligned part).
 pub struct WithAnchorWindow<P> {
     pub inner: P,
     v_anchor: Vec<Option<u32>>,
@@ -134,12 +154,12 @@ impl<P: DWindowPolicy> DWindowPolicy for WithAnchorWindow<P> {
     fn windows(
         &self,
         query_len: usize,
-        v: &[Placement],
-        j: &[Placement],
+        v: Option<&Placement>,
+        j: Option<&Placement>,
         out: &mut Vec<Range<usize>>,
     ) {
         self.inner.windows(query_len, v, j, out);
-        let (Some(vb), Some(jb)) = (v.first(), j.first()) else {
+        let (Some(vb), Some(jb)) = (v, j) else {
             return;
         };
         let v_anchor = self
@@ -258,6 +278,40 @@ mod tests {
         assert_eq!(window.window(218, &[anchor, v]), 138..218);
     }
 
+    /// A read that starts inside CDR3 (a D at 5..29, then its J at 36..96)
+    /// may hold a chance V hit downstream of its J. That hit is not
+    /// significant on its own, so it does not bound the D, which is searched
+    /// from the read's start; a V stage that cannot anchor bounds D by its
+    /// best hit.
+    #[test]
+    fn d_window_starts_after_significant_v_only() {
+        let mut next = crate::testing::rng(8);
+        let query = crate::testing::random_codes(&mut next, 192);
+        let mut chance = crate::testing::placement(SegmentKind::V, &query, &query[81..117], 81);
+        chance.anchor = None;
+        let j = crate::testing::placement(SegmentKind::J, &query, &query[36..96], 36);
+        let policy = WithAnchorWindow::disabled(ExpandedResidual::default());
+        let windows = |v: Option<&Placement>| {
+            let mut out = Vec::new();
+            policy.windows(192, v, Some(&j), &mut out);
+            out
+        };
+        let v = std::slice::from_ref(&chance);
+        assert!(bounding_v(v, true).is_none());
+        let d = 5..29;
+        let found = windows(bounding_v(v, true));
+        assert!(
+            found.iter().any(|w| w.start <= d.start && d.end <= w.end),
+            "{found:?}"
+        );
+        assert_eq!(windows(bounding_v(v, false)), Vec::<Range<usize>>::new());
+        let mut anchor = crate::testing::placement(SegmentKind::V, &query, &query[..30], 0);
+        anchor.anchor = Some(0);
+        let v = [chance.clone(), anchor];
+        assert_eq!(bounding_v(&v, true).map(Placement::q_end), Some(30));
+        assert_eq!(bounding_v(&v, false).map(Placement::q_end), Some(117));
+    }
+
     /// A V that reaches past the J's start by more than the margin makes the
     /// residual empty; no policy may propose an inverted window.
     #[test]
@@ -272,12 +326,7 @@ mod tests {
                 reclaim: 12,
                 min_width,
             }
-            .windows(
-                100,
-                std::slice::from_ref(&v),
-                std::slice::from_ref(&j),
-                &mut out,
-            );
+            .windows(100, Some(&v), Some(&j), &mut out);
             assert!(
                 out.iter().all(|w| w.start < w.end),
                 "min_width {min_width}: {out:?}"

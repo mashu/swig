@@ -48,7 +48,7 @@ use crate::retrieve::{
 };
 use crate::segment::{BatchScratch, PreparedSegment, SegmentRequest, SegmentStage};
 use crate::window::{
-    DWindowPolicy, DownstreamWindow, ExpandedResidual, WithAnchorWindow, merge_windows,
+    DWindowPolicy, DownstreamWindow, ExpandedResidual, WithAnchorWindow, bounding_v, merge_windows,
 };
 
 /// Result of assigning one query.
@@ -264,6 +264,31 @@ impl<A, RV, RJ, RD, W, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj> {
     }
 }
 
+impl<A, RV, RJ, RD, W: DWindowPolicy, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj> {
+    /// Set `out` to the merged D windows of a read of `query_len` bases
+    /// with `placements`, its V placements followed by its J placements
+    /// (each kind best first; any D placements after them are ignored).
+    /// The windows lie between the J and the V that bound the D
+    /// ([`bounding_v`]).
+    pub fn d_windows(
+        &self,
+        query_len: usize,
+        placements: &[Placement],
+        out: &mut Vec<Range<usize>>,
+    ) {
+        let v_count = placements
+            .iter()
+            .take_while(|p| p.kind == SegmentKind::V)
+            .count();
+        let (v, rest) = placements.split_at(v_count);
+        let v = bounding_v(v, self.v.significance.is_some());
+        let j = rest.first().filter(|p| p.kind == SegmentKind::J);
+        out.clear();
+        self.d_window.windows(query_len, v, j, out);
+        merge_windows(out);
+    }
+}
+
 /// Requests of one stage: one per read, over `window` with `candidates`.
 fn read_requests<'a>(
     reads: &'a [ReadState],
@@ -425,14 +450,7 @@ where
         } = scratch;
         windows.clear();
         for (k, (state, placed)) in reads.iter().zip(placements.iter()).enumerate() {
-            read_windows.clear();
-            let v_count = placed
-                .iter()
-                .take_while(|p| p.kind == SegmentKind::V)
-                .count();
-            let (v, j) = placed.split_at(v_count);
-            self.d_window.windows(state.query.len(), v, j, read_windows);
-            merge_windows(read_windows);
+            self.d_windows(state.query.len(), placed, read_windows);
             windows.extend(read_windows.drain(..).map(|window| (k, window)));
         }
         if candidates.len() < windows.len() {
