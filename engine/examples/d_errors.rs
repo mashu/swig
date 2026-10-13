@@ -5,7 +5,8 @@
 //! where it arose:
 //!
 //! * **outside windows** — the true D is not inside the D search windows
-//!   (the windows are recomputed from the call's own V and J placements);
+//!   (the windows are recomputed from the call's own V and J placements,
+//!   `Assigner::d_windows`);
 //! * **not found** — inside the windows, but no D placement of an equivalent
 //!   allele overlaps the true D (prefilter, admission, score floor, keep);
 //! * **adjudication** — such a placement exists, but the path took another D
@@ -27,10 +28,8 @@ use std::error::Error;
 use std::ops::Range;
 
 use common::Args;
-use swig::placement::Placement;
 use swig::prelude::*;
 use swig::sim::{SimParams, Simulator, Slot, Truth};
-use swig::window::DWindowPolicy;
 
 fn overlaps(a: &Range<usize>, b: &Range<usize>) -> bool {
     a.start < b.end && b.start < a.end
@@ -122,20 +121,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .iter()
                     .any(|&a| p_names(d_set, a).any(|n| true_d.equivalent.iter().any(|e| e == n)))
         });
-        let kind_of = |k: SegmentKind| -> Vec<Placement> {
-            call.placements
-                .iter()
-                .filter(|p| p.kind == k)
-                .cloned()
-                .collect()
-        };
-        windows.clear();
-        assigner.d_window.windows(
-            call.query.len(),
-            &kind_of(SegmentKind::V),
-            &kind_of(SegmentKind::J),
-            &mut windows,
-        );
+        assigner.d_windows(call.query.len(), &call.placements, &mut windows);
         let inside = windows
             .iter()
             .any(|w| w.start <= true_d.span.start && true_d.span.end <= w.end);

@@ -32,7 +32,7 @@
 
 use std::ops::Range;
 
-use crate::adjudicate::{Adjudicator, CallPath, DagScratch, Marginals, PlacementDag};
+use crate::adjudicate::{Adjudicator, CallPath, DagScratch, Marginals, PlacementDag, divergence};
 use crate::admission::{Admission, DefaultAdmission};
 use crate::align::{Aligner, InterSequenceGotoh, InterSequenceWorkspace};
 use crate::alphabet::reverse_complement_into;
@@ -48,7 +48,7 @@ use crate::retrieve::{
 };
 use crate::segment::{BatchScratch, PreparedSegment, SegmentRequest, SegmentStage};
 use crate::window::{
-    DWindowPolicy, DownstreamWindow, ExpandedResidual, WithAnchorWindow, merge_windows,
+    DWindowPolicy, DownstreamWindow, ExpandedResidual, WithAnchorWindow, bounding_v, merge_windows,
 };
 
 /// Result of assigning one query.
@@ -151,6 +151,8 @@ struct ReadState {
     query: Vec<u8>,
     v: Vec<Candidate>,
     j: Vec<Candidate>,
+    /// The candidates of each J request, as ranges of `j`.
+    j_requests: Vec<Range<usize>>,
     j_window: Range<usize>,
 }
 
@@ -264,6 +266,31 @@ impl<A, RV, RJ, RD, W, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj> {
     }
 }
 
+impl<A, RV, RJ, RD, W: DWindowPolicy, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj> {
+    /// Set `out` to the merged D windows of a read of `query_len` bases
+    /// with `placements`, its V placements followed by its J placements
+    /// (each kind best first; any D placements after them are ignored).
+    /// The windows lie between the J and the V that bound the D
+    /// ([`bounding_v`]).
+    pub fn d_windows(
+        &self,
+        query_len: usize,
+        placements: &[Placement],
+        out: &mut Vec<Range<usize>>,
+    ) {
+        let v_count = placements
+            .iter()
+            .take_while(|p| p.kind == SegmentKind::V)
+            .count();
+        let (v, rest) = placements.split_at(v_count);
+        let v = bounding_v(v, self.v.significance.is_some());
+        let j = rest.first().filter(|p| p.kind == SegmentKind::J);
+        out.clear();
+        self.d_window.windows(query_len, v, j, out);
+        merge_windows(out);
+    }
+}
+
 /// Requests of one stage: one per read, over `window` with `candidates`.
 fn read_requests<'a>(
     reads: &'a [ReadState],
@@ -371,6 +398,12 @@ where
 
     /// Stage 3: per read, the J window right of V and its candidates; then J
     /// placements over the whole chunk.
+    ///
+    /// A J joins an anchoring V of its own locus. When the anchors choose
+    /// several loci (a read holding two chains, as an scFv does), each locus
+    /// is a request of its own: in one request, the J alleles of one chain
+    /// could fill the stage's keep and crowd out the other chain's J. An
+    /// allele of several of these loci is searched with the first.
     fn stage_j(
         &self,
         reads: &mut [ReadState],
@@ -388,18 +421,46 @@ where
                 retrieval,
                 &mut state.j,
             );
-            // A J joins an anchoring V of its own locus.
             let loci = self.anchored_loci(placed);
             state
                 .j
                 .retain(|c| set.allele(c.allele).loci.pairs_with(loci));
+            state.j_requests.clear();
+            if loci == Loci::ANY || loci.single().is_some() {
+                state.j_requests.push(0..state.j.len());
+                continue;
+            }
+            let locus = |c: &Candidate| set.allele(c.allele).loci.intersection(loci).first();
+            state.j.sort_by_key(locus);
+            let mut at = 0;
+            for group in state.j.chunk_by(|a, b| locus(a) == locus(b)) {
+                state.j_requests.push(at..at + group.len());
+                at += group.len();
+            }
         }
         let first: Vec<usize> = placements.iter().map(Vec::len).collect();
-        let requests = read_requests(reads, |r| r.j_window.clone(), |r| &r.j);
+        let requests: Vec<SegmentRequest<'_>> = reads
+            .iter()
+            .enumerate()
+            .flat_map(|(read, state)| {
+                state.j_requests.iter().map(move |range| SegmentRequest {
+                    read,
+                    query: &state.query,
+                    window: state.j_window.clone(),
+                    candidates: &state.j[range.clone()],
+                })
+            })
+            .collect();
         self.j
             .place_many(&self.aligner, &requests, dp, batch, placements);
-        for (placed, from) in placements.iter_mut().zip(first) {
+        for ((placed, from), state) in placements.iter_mut().zip(first).zip(reads.iter()) {
             self.drop_dissimilar(placed, from);
+            // Each request's placements are ranked best first, as the stage
+            // ranks them; so are the read's.
+            if state.j_requests.len() > 1 {
+                placed[from..]
+                    .sort_by_key(|p| std::cmp::Reverse((p.score(), p.evidence.longest_exact_run)));
+            }
         }
     }
 
@@ -425,14 +486,7 @@ where
         } = scratch;
         windows.clear();
         for (k, (state, placed)) in reads.iter().zip(placements.iter()).enumerate() {
-            read_windows.clear();
-            let v_count = placed
-                .iter()
-                .take_while(|p| p.kind == SegmentKind::V)
-                .count();
-            let (v, j) = placed.split_at(v_count);
-            self.d_window.windows(state.query.len(), v, j, read_windows);
-            merge_windows(read_windows);
+            self.d_windows(state.query.len(), placed, read_windows);
             windows.extend(read_windows.drain(..).map(|window| (k, window)));
         }
         if candidates.len() < windows.len() {
@@ -495,10 +549,14 @@ where
     /// One read's path and marginals, each path within one locus. When
     /// every placement shares a locus, the read is adjudicated once (by
     /// that locus' adjudicator). Otherwise each locus is adjudicated over
-    /// the placements that belong to it, and the call is the path of the
-    /// locus with the largest likelihood `Z` (or, without posteriors, the
-    /// best path): the posterior is the mixture over loci, weighted by `Z`,
-    /// as each locus' paths are hypotheses of one model.
+    /// the placements that belong to it, at the divergence of all the
+    /// read's placements, so that every locus' paths are hypotheses of one
+    /// model. The call is the best of their paths in the model the call
+    /// maximises ([`CallPath::value`]), with or without posteriors; an exact
+    /// tie goes to the path whose last segment comes first in the DAG's
+    /// order (by kind, then query start and end), as it would within one
+    /// locus. The posterior is the mixture over loci, weighted by their
+    /// likelihoods `Z`.
     fn adjudicate_loci(
         &self,
         query: &[u8],
@@ -507,9 +565,10 @@ where
     ) -> (Option<CallPath>, Option<Marginals>) {
         let loci: Vec<Loci> = placed.iter().map(|p| self.placement_loci(p)).collect();
         let shared = loci.iter().fold(Loci::ANY, |all, &l| all.intersection(l));
+        let p = divergence(placed);
         if !shared.is_empty() {
             let adjudicator = self.adjudicator_for(shared.single());
-            return self.adjudicate_read(adjudicator, query, placed, scratch);
+            return self.adjudicate_read(adjudicator, query, placed, p, scratch);
         }
         let all = loci.iter().fold(Loci::NONE, |all, &l| all.union(l));
         // Per locus: the placement ids, the path and the marginals.
@@ -524,26 +583,29 @@ where
             let subset: Vec<Placement> = ids.iter().map(|&i| placed[i].clone()).collect();
             let adjudicator = self.adjudicator_for(Some(locus));
             if let (Some(path), marginals) =
-                self.adjudicate_read(adjudicator, query, &subset, scratch)
+                self.adjudicate_read(adjudicator, query, &subset, p, scratch)
             {
                 found.push((ids, path, marginals));
             }
         }
-        let posterior = found.iter().all(|(_, _, m)| m.is_some());
-        let best = if posterior {
-            found.iter().enumerate().max_by(|(_, a), (_, b)| {
-                let z = |m: &Option<Marginals>| m.as_ref().map_or(0.0, |m| m.log_partition);
-                z(&a.2).total_cmp(&z(&b.2))
-            })
-        } else {
-            found
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, (_, path, _))| path.score)
+        let last = |(ids, path, _): &(Vec<usize>, CallPath, _)| {
+            let segment = path.segments.last().expect("a path has a segment");
+            let placement = &placed[ids[segment.placement]];
+            let order = (
+                placement.kind.index(),
+                placement.q_start(),
+                placement.q_end(),
+            );
+            std::cmp::Reverse(order)
         };
-        let Some((best, _)) = best else {
+        let best = (0..found.len()).reduce(|best, k| {
+            let key = |k: usize| (found[k].1.value, last(&found[k]));
+            if key(k) > key(best) { k } else { best }
+        });
+        let Some(best) = best else {
             return (None, None);
         };
+        let posterior = found.iter().all(|(_, _, m)| m.is_some());
         let marginals = posterior.then(|| {
             let log_z: Vec<f64> = found
                 .iter()
@@ -578,7 +640,9 @@ where
         (Some(path), marginals)
     }
 
-    /// A path without an anchor, a segment whose retained clip is
+    /// The call of `placed`, read at the read's divergence `divergence`
+    /// ([`Adjudicator::adjudicate_at`]), and its marginals. A path without
+    /// an anchor, a segment whose retained clip is
     /// significant on its own ([`Placement::anchors`]), is not a call. A
     /// path the adjudicator decodes from the posterior replaces the call
     /// when it keeps an anchor and its D is reported at least as probable
@@ -588,6 +652,7 @@ where
         adjudicator: &Adj,
         query: &[u8],
         placed: &[Placement],
+        divergence: f64,
         scratch: &mut Adj::Scratch,
     ) -> (Option<CallPath>, Option<Marginals>) {
         let anchored = |path: &CallPath| {
@@ -597,7 +662,9 @@ where
                     .iter()
                     .any(|s| placed[s.placement].anchors(&s.span))
         };
-        let mut path = adjudicator.adjudicate(placed, scratch).filter(anchored);
+        let mut path = adjudicator
+            .adjudicate_at(placed, divergence, scratch)
+            .filter(anchored);
         let marginals = path
             .as_ref()
             .and_then(|path| adjudicator.marginals(placed, path, scratch));

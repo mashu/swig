@@ -412,12 +412,19 @@ allele whose locus cannot be read belongs to every locus, so a database of
 unrecognised names is assigned as a single locus (`locus.rs`).
 
 - **One locus per rearrangement.** J candidates must share a locus with the
-  read's V placements, and D candidates with the V and J. When every
-  placement of a read shares a locus, the read is adjudicated once.
-  Otherwise each locus is adjudicated over its own placements, and the call
-  is the path of the locus with the largest likelihood `Z` (the best path
-  without posteriors); the posteriors are the mixture over loci weighted by
-  `Z`. C joins a J of its own locus. `locus` reports the locus the path's
+  read's anchoring V placements (every locus when no V placement anchors),
+  and D candidates with the anchoring V and J. When the anchors hold
+  several loci, as on an scFv read, the J alleles of each locus are searched
+  and kept on their own, so one chain's J cannot crowd out the other's. When
+  every placement of a read shares a locus, the read is adjudicated once.
+  Otherwise each locus is adjudicated over its own placements, all at the
+  divergence of the whole read, and the call is the best of their paths in
+  the model the call maximises (`--calls`), with or without posteriors; an
+  exact tie goes to the path whose last segment comes first in the read (by
+  kind, then position), as within one locus. The posteriors are
+  the mixture over loci weighted by their likelihoods `Z`, so under
+  `--calls fixed` the called locus can hold less than half of the posterior.
+  C joins a J of its own locus. `locus` reports the locus the path's
   alleles share, empty when it is unknown.
 - **Per-locus annotation.** The V and J alleles of each locus are annotated
   on their own: chain type, FR3 length model and Cys23 priors differ between
@@ -656,7 +663,7 @@ no FR3 start, so that every FR3 start rests on one chain default.
 ```text
  chunk of reads ─► per read: strand from germline k-mer support; V candidates (gene frames)
                 ─► V stage, whole chunk: score batch, sibling bounds, traceback waves
-                ─► per read: J window right of V, J alleles of the V's locus ─► J stage, whole chunk
+                ─► per read: J window right of V, J alleles of each anchoring V's locus ─► J stage, whole chunk
                 ─► per read: D windows from V/J geometry, D candidates of the locus (L-mer bitsets)
                 ─► D stage, whole chunk ─► per read: admission gates
                 ─► per read: placement DAG over VJ / VDJ, per locus ─► anchor check ─► Call
@@ -1284,13 +1291,16 @@ Each is a named field you can change.
    kept gene is a candidate. J is exhaustive. D uses the lossless L-mer
    prefilter instead of the note's k = 5/3 seeds.
 4. **Keep.** V and J trace until the top 3 alignments that pass the E-value
-   gate (plus ties); D keeps up to 32 admissible alignments.
+   gate (plus ties), J per locus of the read's anchors; D keeps up to 32
+   admissible alignments.
 5. **Windows.** D windows reclaim 12 bases into V and J (the note's rescue of
    24/10 is realised by this window and the DAG's exact cut choice). The
    conserved-anchor window is always added when anchors are present. J is
    searched from 12 bases before the earliest V end when some V is an
-   anchor, and over the whole read when none is; only anchors choose the
-   locus of the J and D candidates.
+   anchor, and over the whole read when none is; D windows start from the
+   best anchoring V, and from the read's start when no V anchors; only
+   anchors choose the locus of the J and D candidates. Without a J (or V)
+   the D window reaches 60 bases past the V (before the J), the D and its N.
 6. **Significance.** V and J hits need E ≤ 1, and a call needs a V or J hit
    at E ≤ 10⁻³ (`EvalueGates`). The note has no reporting threshold.
 7. **Tie-breaks.** Equal-score paths go to fewer D, then to more germline
