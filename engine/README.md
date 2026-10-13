@@ -184,10 +184,13 @@ read, then the engine's five posterior columns.
 
 - **Reads.** `sequence` is the read as given, upper-cased, `U` as `T`, any
   symbol that is no IUPAC nucleotide as `N`; `quality` holds its FASTQ (or
-  AIRR) qualities as given. A read without an identifier is `sequence_N`
-  (its 1-based position in the input). A read without a significant V or J
-  (see *Significance* below) keeps these columns and `rev_comp`, with empty
-  calls.
+  AIRR) qualities as given. A read without an identifier is `sequence_N`,
+  N its 1-based position among the reads the run has read: in the input for
+  `swig`, but in a WebAssembly instance among those of all its
+  `swig_annotate` calls. Swig Web and swig-cli, which spread an input over
+  several instances, therefore name such reads by input position before
+  batching. A read without a significant V or J (see *Significance* below)
+  keeps these columns and `rev_comp`, with empty calls.
 - **Coordinates** are 1-based closed intervals on the *oriented* query (the
   reverse complement of `sequence` when `rev_comp` is `T`) and on the
   germline. CIGARs use `S`/`N` for unaligned query and germline bases and

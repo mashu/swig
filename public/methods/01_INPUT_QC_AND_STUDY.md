@@ -2,7 +2,7 @@
 
 ## Accepted inputs
 
-Swig accepts FASTA, FASTQ, AIRR rearrangement tables containing a `sequence` column, and gzip-compressed versions of those formats. Parsing is streaming and record aware: wrapped FASTA sequences and wrapped FASTQ sequence/quality blocks are reconstructed and validated before batching. A malformed record stops the run with the record name where available.
+Swig accepts FASTA, FASTQ, AIRR rearrangement tables containing a `sequence` column, and gzip-compressed versions of those formats. Parsing is streaming and record aware: wrapped FASTA sequences and wrapped FASTQ sequence/quality blocks are reconstructed and validated before batching. A malformed record stops the run with the record name where available. A record without an identifier (a blank FASTA or FASTQ header, or a blank or missing AIRR `sequence_id`) is named `sequence_N` by its 1-based position among the input's records before batching, so its name does not depend on the number of workers.
 
 Gzip inspection validates member boundaries before analysis. If one uploaded `.gz` contains multiple independently compressed members, Swig presents those members as multiple recoverable input files and asks whether they are technical pieces of one merged sample or separate samples with independently editable metadata. It does not silently discard bytes after the first member or accept trailing junk as sequence data.
 

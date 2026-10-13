@@ -46,12 +46,14 @@ import { ShmAccumulator } from "../src/shm-analysis.ts";
 import {
   addFastqQualityFilterStats,
   airrRecords,
+  airrRowNamer,
   canonicalFastq,
   emptyFastqQualityFilterStats,
   fastaRecords,
   fastqRecords,
   filterFastqRecord,
-  isBlank,
+  namedFastaRecord,
+  namedFastqRecord,
   seededRandom,
   validateFastqQualityFilter,
 } from "../src/sequence-stream.ts";
@@ -276,12 +278,10 @@ async function* sequenceBatches(input,batchRecords,preprocessing,airrMode,datase
   validateFastqQualityFilter(filter);
   state.fastqFilter=emptyFastqQualityFilterStats(filter.enabled,filter.enabled&&format==="fastq");
   // A record without an identifier is named sequence_N by its position N in the input before it
-  // is batched: the aligner would number it within its own run (per WebAssembly worker), so the
-  // name would depend on the route and the worker count.
-  const unnamed=()=>`sequence_${state.inputRecords}`;
+  // is batched, as Swig Web names it (unnamedSequenceId).
   const parsed=async function*(){
     if(format==="airr"){
-      let identifiers=null;
+      let namer=null;
       for await(const record of airrRecords(lines)){
         state.inputRecords+=1;state.eligibleRecords+=1;
         if(filter.enabled){state.fastqFilter.recordsRetained+=1;state.fastqFilter.recordsPassedThrough+=1;}
@@ -290,22 +290,8 @@ async function* sequenceBatches(input,batchRecords,preprocessing,airrMode,datase
         // A tab inside a CSV value would add a column once the row is tab-separated.
         let row=delimiter==="\t"?record.row:record.row.split(delimiter).map((value)=>value.replace(/\t/g," ")).join("\t");
         if(airrMode!=="preserve"){
-          if(identifiers?.source!==header){
-            // Column names as the aligner matches them: trimmed.
-            const columns=header.split("\t");const column=columns.findIndex((name)=>name.trim()==="sequence_id");
-            identifiers={source:header,columns:columns.length,column,header:column<0?`${header}\tsequence_id`:header};
-          }
-          const values=row.split("\t");
-          if(identifiers.column<0){
-            // The new column follows the header's last one, whatever the row's length (join
-            // writes the holes of a short row as empty fields).
-            values.length=identifiers.columns;
-            values.push(unnamed());row=values.join("\t");
-          }else if(isBlank(values[identifiers.column])){
-            while(values.length<=identifiers.column)values.push("");
-            values[identifiers.column]=unnamed();row=values.join("\t");
-          }
-          header=identifiers.header;
+          namer??=airrRowNamer(header,"\t");
+          row=namer.name(row,state.inputRecords);header=namer.header;
         }
         yield {ordinal:state.inputRecords-1,text:`${row}\n`,header};
       }
@@ -315,15 +301,13 @@ async function* sequenceBatches(input,batchRecords,preprocessing,airrMode,datase
       for await(const record of fastaRecords(lines)){
         state.inputRecords+=1;state.eligibleRecords+=1;
         if(filter.enabled){state.fastqFilter.recordsRetained+=1;state.fastqFilter.recordsPassedThrough+=1;}
-        const newline=record.indexOf("\n");
-        const text=isBlank(record.slice(1,newline))?`>${unnamed()}${record.slice(newline)}`:record;
-        yield {ordinal:state.inputRecords-1,text};
+        yield {ordinal:state.inputRecords-1,text:namedFastaRecord(record,state.inputRecords)};
       }
       return;
     }
-    for await(const record of fastqRecords(lines)){
+    for await(const read of fastqRecords(lines)){
       state.inputRecords+=1;
-      if(isBlank(record.header.slice(1)))record.header=`@${unnamed()}`;
+      const record=namedFastqRecord(read,state.inputRecords);
       const text=filter.enabled?filterFastqRecord(record,filter,state.fastqFilter):canonicalFastq(record);
       if(text!==null){state.eligibleRecords+=1;yield {ordinal:state.inputRecords-1,text};}
     }
