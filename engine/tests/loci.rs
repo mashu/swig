@@ -4,7 +4,7 @@
 use swig::germline::GermlineSet;
 use swig::locus::{Loci, Locus};
 use swig::prelude::*;
-use swig::sim::{SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
+use swig::sim::{Region, SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
 
 fn fasta(set: &GermlineSet) -> String {
     let mut text = Vec::new();
@@ -303,4 +303,78 @@ fn the_called_locus_does_not_depend_on_posteriors() {
             .count()
     });
     assert_eq!(flips, [0, 0], "of {} reads", reads.len());
+}
+
+/// On a read holding two chains, heavy first (VH–D–JH, a linker, then
+/// VL–JL), the best V may be the light one. The D window must still lie
+/// between the heavy chain's own V and J: between the light V and the
+/// heavy J it would be empty, and the heavy D would never be searched.
+#[test]
+fn each_chain_bounds_its_own_d_window() {
+    let (heavy, _, light_v, light_j) = databases();
+    let v = fasta(&heavy.v) + &fasta(&light_v);
+    let j = fasta(&heavy.j) + &fasta(&light_j);
+    let d = fasta(&heavy.d);
+    let texts = GermlineTexts {
+        v: &v,
+        d: Some(&d),
+        j: &j,
+        c: None,
+    };
+    let database = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+    let config = CallingProfile::ROptimized.config();
+    let assigner =
+        DefaultAssigner::from_config(&config, database.v, database.d, database.j).unwrap();
+    let v_set = assigner.segment(SegmentKind::V).unwrap().set();
+    let mut ws = assigner.workspace();
+    // A mutated heavy chain, so that the lightly mutated light V often
+    // scores higher.
+    let heavy_reads = Simulator::new(&heavy.v, Some(&heavy.d), &heavy.j, SimParams::mid())
+        .unwrap()
+        .reads(200, 31)
+        .unwrap();
+    let light_reads = Simulator::new(&light_v, None, &light_j, SimParams::easy())
+        .unwrap()
+        .reads(200, 32)
+        .unwrap();
+    let linker = encode(b"GGTGGAGGCGGTTCAGGCGGAGGTGGCTCTGGCGGTGGCGGATCG");
+    let (mut light_first, mut lost) = (0, Vec::new());
+    let mut windows = Vec::new();
+    for (k, (h, l)) in heavy_reads.iter().zip(&light_reads).enumerate() {
+        let at = |region| h.regions.iter().position(|&r| r == region);
+        let Some(d_start) = at(Region::D) else {
+            continue;
+        };
+        let d_end = h.regions.iter().rposition(|&r| r == Region::D).unwrap() + 1;
+        if d_end - d_start < 8 {
+            continue;
+        }
+        let read = [encode(&h.forward), linker.clone(), encode(&l.forward)].concat();
+        let call = assigner.assign(&read, &mut ws);
+        if call.orientation != Orientation::Forward {
+            continue;
+        }
+        // Reads whose best anchoring V is the light one, with a heavy V
+        // anchoring too (on others the V stage kept light alleles only).
+        let mut anchors = call
+            .placements
+            .iter()
+            .filter(|p| p.kind == SegmentKind::V && p.anchor.is_some())
+            .map(|p| v_set.allele(p.primary_allele()).loci);
+        if anchors.next() != Some(Loci::of(Locus::Igk))
+            || !anchors.any(|loci| loci == Loci::of(Locus::Igh))
+        {
+            continue;
+        }
+        light_first += 1;
+        assigner.d_windows(call.query.len(), &call.placements, &mut windows);
+        if !windows.iter().any(|w| w.start <= d_start && d_end <= w.end) {
+            lost.push(k);
+        }
+    }
+    assert!(light_first > 0, "no read ranks the light V first");
+    assert!(
+        lost.is_empty(),
+        "heavy D outside every window: {lost:?} ({light_first} light-first)"
+    );
 }

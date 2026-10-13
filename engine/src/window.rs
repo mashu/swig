@@ -30,11 +30,15 @@ pub trait DWindowPolicy: Send + Sync {
 /// be a chance hit downstream of the real D, in a read that starts inside
 /// CDR3, as for the J window ([`DownstreamWindow`]); without an anchor, D
 /// is searched as on a read without V.
-pub fn bounding_v(v: &[Placement], anchoring: bool) -> Option<&Placement> {
+pub fn bounding_v<'a>(
+    v: impl IntoIterator<Item = &'a Placement>,
+    anchoring: bool,
+) -> Option<&'a Placement> {
+    let mut v = v.into_iter();
     if anchoring {
-        v.iter().find(|p| p.anchor.is_some())
+        v.find(|p| p.anchor.is_some())
     } else {
-        v.first()
+        v.next()
     }
 }
 

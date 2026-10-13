@@ -408,6 +408,12 @@ const NONE: u32 = u32::MAX;
 /// A request whose traceback waves have ended.
 const DONE: usize = usize::MAX;
 
+/// A stage's ranking key, best first: the score with the outer flank, then
+/// the longest exact run.
+pub(crate) fn rank(p: &Placement) -> std::cmp::Reverse<(Score, u32)> {
+    std::cmp::Reverse((p.score(), p.evidence.longest_exact_run))
+}
+
 /// Whether a local score enters the ranking: positive (an alignment exists)
 /// and at least the request's floor.
 #[inline]
@@ -1142,7 +1148,6 @@ impl<R: Retriever, Acc: Admission> SegmentStage<R, Acc> {
     /// waves have traced the local top: the `top`-th local score bounds the
     /// `top`-th extended one from above, and they stop below the latter.
     fn finish(&self, out: &mut Vec<Placement>, first: usize, scores: &mut Vec<Score>) {
-        let rank = |p: &Placement| std::cmp::Reverse((p.score(), p.evidence.longest_exact_run));
         out[first..].sort_by_key(rank);
         if self.keep.top > 0 && out.len() - first > self.keep.top {
             let extended = out[first + self.keep.top - 1].score();

@@ -1308,6 +1308,9 @@ Each is a named field you can change.
    best anchoring V, and from the read's start when no V anchors; only
    anchors choose the locus of the J and D candidates. Without a J (or V)
    the D window reaches 60 bases past the V (before the J), the D and its N.
+   When the anchors share no locus (a read holding two chains, as an scFv
+   does), each of their loci with D genes bounds a D window by its own V
+   and J.
 6. **Significance.** V and J hits need E ≤ 1, and a call needs a V or J hit
    at E ≤ 10⁻³ (`EvalueGates`). The note has no reporting threshold.
 7. **Tie-breaks.** Equal-score paths go to fewer D, then to more germline

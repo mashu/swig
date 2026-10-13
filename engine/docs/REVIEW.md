@@ -112,7 +112,12 @@ that review:
     `--double-d` are ignored without the database they need, while
     `--c-evalue` is refused; `swig_version` and `AlignerEngine.version()`
     have no caller.
-14. **swig-cli and prepared databases** (outside the aligner). With
+14. **V keep on reads holding two chains.** The V stage keeps the top 3
+    alignments over the whole read, so a lightly mutated light V can crowd
+    every heavy V out (seen on synthetic scFv reads with a mutated heavy
+    chain); the read is then called as its light chain. The J stage keeps a top 3 per locus;
+    the V stage could too.
+15. **swig-cli and prepared databases** (outside the aligner). With
     `prepareMetadata` on, swig-cli rejects a V database written by
     `swig prepare` ("contains invalid SWIGMETA coordinates").
 

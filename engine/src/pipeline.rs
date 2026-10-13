@@ -46,7 +46,7 @@ use crate::report::reported_posterior;
 use crate::retrieve::{
     Candidate, ExhaustiveRetriever, LmerMaskRetriever, RetrievalScratch, Retriever,
 };
-use crate::segment::{BatchScratch, PreparedSegment, SegmentRequest, SegmentStage};
+use crate::segment::{self, BatchScratch, PreparedSegment, SegmentRequest, SegmentStage};
 use crate::window::{
     DWindowPolicy, DownstreamWindow, ExpandedResidual, WithAnchorWindow, bounding_v, merge_windows,
 };
@@ -279,6 +279,12 @@ impl<A, RV, RJ, RD, W: DWindowPolicy, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, 
     /// (each kind best first; any D placements after them are ignored).
     /// The windows lie between the J and the V that bound the D
     /// ([`bounding_v`]).
+    ///
+    /// On a read holding two chains (an scFv's heavy and light chain), the
+    /// best V and the first J may belong to different chains, and the
+    /// window between them holds neither chain's D. Each locus of the
+    /// read's anchors that has D genes then bounds a window of its own, by
+    /// its own V and J.
     pub fn d_windows(
         &self,
         query_len: usize,
@@ -290,11 +296,38 @@ impl<A, RV, RJ, RD, W: DWindowPolicy, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, 
             .take_while(|p| p.kind == SegmentKind::V)
             .count();
         let (v, rest) = placements.split_at(v_count);
-        let v = bounding_v(v, self.v.significance.is_some());
-        let j = rest.first().filter(|p| p.kind == SegmentKind::J);
+        let j_count = rest.iter().take_while(|p| p.kind == SegmentKind::J).count();
+        let j = &rest[..j_count];
+        let anchoring = self.v.significance.is_some();
         out.clear();
-        self.d_window.windows(query_len, v, j, out);
+        match self.chains(v.iter().chain(j)) {
+            None => self
+                .d_window
+                .windows(query_len, bounding_v(v, anchoring), j.first(), out),
+            Some(loci) => {
+                for locus in loci.iter().filter(|l| l.has_d()) {
+                    let of = |p: &&Placement| self.placement_loci(p).contains(locus);
+                    let v = bounding_v(v.iter().filter(of), anchoring);
+                    self.d_window.windows(query_len, v, j.iter().find(of), out);
+                }
+            }
+        }
         merge_windows(out);
+    }
+
+    /// The loci of a read whose anchors belong to more than one chain: no
+    /// locus is shared by all of them, as an scFv's heavy and light V share
+    /// none. `None` for a read of one chain (TRAV/DV alleles and a TRAJ
+    /// share TRA) or with no anchor.
+    fn chains<'a>(&self, placements: impl Iterator<Item = &'a Placement>) -> Option<Loci> {
+        let mut anchors = placements
+            .filter(|p| p.anchor.is_some())
+            .map(|p| self.placement_loci(p));
+        let first = anchors.next()?;
+        let (shared, all) = anchors.fold((first, first), |(shared, all), loci| {
+            (shared.intersection(loci), all.union(loci))
+        });
+        shared.is_empty().then_some(all)
     }
 }
 
@@ -465,8 +498,7 @@ where
             // Each request's placements are ranked best first, as the stage
             // ranks them; so are the read's.
             if state.j_requests.len() > 1 {
-                placed[from..]
-                    .sort_by_key(|p| std::cmp::Reverse((p.score(), p.evidence.longest_exact_run)));
+                placed[from..].sort_by_key(segment::rank);
             }
         }
     }
