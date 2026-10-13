@@ -55,10 +55,14 @@ impl CoOptimal<'_> {
 ///
 /// Tied: worth exactly the call on its interval `[entry, exit)` — an equal
 /// score, and under a per-read call (`per_read`) equal matches and
-/// mismatches. The primary is the one with the most germline support
-/// (unclipped score, the DAG's own tie-break), then the longest exact run
-/// and most matches on the interval, then the lowest allele id; a call
-/// that names its allele stays first, and that allele is reported first.
+/// mismatches. The primary, whose span and alignment a report gives,
+/// explains the called read bases: a tied clip that starts later or ends
+/// earlier (on the fixed scale the bases it leaves can net 0) would drop
+/// read bases the path's N/P regions do not hold. Among those, it is the
+/// one with the most germline support (unclipped score, the DAG's own
+/// tie-break), then the longest exact run and most matches on the
+/// interval, then the lowest allele id; a call that names its allele stays
+/// first, and that allele is reported first.
 ///
 /// Counted by the posterior: the tied placements, and every placement that
 /// explains most of the read bases the call explains (more than half of the
@@ -115,6 +119,7 @@ pub(crate) fn co_optimal<'a>(
             &set.allele(p.primary_allele()).codes,
         );
         (
+            (own.q_lo, own.q_hi) != (called.span.q_lo, called.span.q_hi),
             std::cmp::Reverse(p.score()),
             std::cmp::Reverse(e.longest_exact_run),
             std::cmp::Reverse(e.matches),

@@ -144,7 +144,10 @@ either side. The allele with more support admits more cuts that reach the same
 score, so it has the larger likelihood summed over cuts. Co-optimal alleles
 (equal value on the called interval: an equal clipped score, and under a
 per-read call equal matches and mismatches too) are all reported, the
-best-supported first. The reported `path_score` is the fixed-scale score
+best-supported of those that span the called read bases first: on the fixed
+scale a clip that starts later or ends earlier can tie (the bases it leaves
+net 0), and the row's coordinates and alignment, taken from the first, would
+then drop read bases the N/P regions do not hold. The reported `path_score` is the fixed-scale score
 above, whichever model chose the path.
 
 ### 2.4 Significance

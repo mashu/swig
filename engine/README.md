@@ -197,7 +197,8 @@ read, then the engine's five posterior columns.
 - **Calls.** `v_call`, `d_call`, `j_call` and `c_call` list every
   co-optimal allele, comma-separated: each placement of that kind whose clip
   to the called interval is worth exactly the call under the call's model.
-  The best-supported allele is first. `*_score` is the clipped score,
+  The best-supported allele that spans the called read bases is first, and
+  the segment's coordinates and alignment are its. `*_score` is the clipped score,
   `*_identity` matches over alignment columns (a fraction), and `*_support`
   the Karlin–Altschul E-value `K·m·n·e^{−λS}` of the reported span over the
   read length `m` and the database length `n`, the formula of the V/J gates
