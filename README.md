@@ -229,7 +229,7 @@ The aligner is the Rust workspace in `engine/` (Rust 1.89 or newer). Its module 
 ```bash
 rustup target add wasm32-unknown-unknown
 npm run build:swig-wasm      # public/swig.wasm
-npm run test:engine          # cargo test --release over engine/
+npm run test:engine          # cargo test over engine/ (release code, debug assertions on)
 ```
 
 The separate Alivibe MSA module is C++ built with [WASI SDK 25](https://github.com/WebAssembly/wasi-sdk/releases/tag/wasi-sdk-25) or a compatible newer SDK and a pinned Binaryen `wasm-opt -O4` pass; `npm run build:wasm` rebuilds both:

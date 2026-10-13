@@ -1746,11 +1746,11 @@ mod tests {
     /// more candidates than `top + 1` (and some with fewer), shifted frame
     /// bands with either edge moved, unbanded requests, siblings with an
     /// inconsistent band, every `top` and `cap`, both acceptance kinds and
-    /// every outer extension; and it skips the DP of some siblings entirely
-    /// and aligns others without scoring them (known exactly, or traced
-    /// early). Without a binding `cap`, both keep the `top` accepted
-    /// alignments and their ties by extended score, as aligning every
-    /// candidate does.
+    /// every outer extension over windows that hold its flank; and it skips
+    /// the DP of some siblings entirely and aligns others without scoring
+    /// them (known exactly, or traced early). Without a binding `cap`, both
+    /// keep the `top` accepted alignments and their ties by extended score,
+    /// as aligning every candidate does.
     #[test]
     fn bounded_ranking_equals_brute_force() {
         let (segment, frames) = frame_family();
@@ -1833,7 +1833,13 @@ mod tests {
                 queries.push(query);
                 candidates.push(request);
             }
-            let starts: Vec<usize> = (0..3).map(|_| (next() % 4) as usize).collect();
+            // The stage's precondition: the outer flank lies in the window,
+            // so a V (prefix) window starts at the read's start.
+            let prefix = outer == OuterExtend::Prefix;
+            let starts: Vec<usize> = (0..3)
+                .map(|_| (next() % 4) as usize)
+                .map(|start| if prefix { 0 } else { start })
+                .collect();
             let run = |bounded: bool, aligner: &Recording| {
                 let mut stage = SegmentStage::new(Arc::clone(&segment), EmptyRetriever, keep);
                 stage.accept = accept;

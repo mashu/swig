@@ -57,9 +57,11 @@ not need the native binary.
 From the root of the Swig repository:
 
 ```sh
-npm run test:engine        # = cargo test --release --workspace --manifest-path engine/Cargo.toml
+npm run test:engine        # = cargo test --profile checked --workspace --manifest-path engine/Cargo.toml
                            #   unit, annotation, loci, robustness, synthetic, simulated-accuracy
-                           #   and WebAssembly-ABI tests (always test the release build)
+                           #   and WebAssembly-ABI tests, on release code with debug assertions
+                           #   and overflow checks (the `checked` profile); then builds
+                           #   engine/target/release/swig for the CLI tests
 cargo test --release --workspace --manifest-path engine/Cargo.toml -- --ignored
                            # only the ignored test: accuracy at scale, 20,000 reads per preset
 cargo build --release --manifest-path engine/Cargo.toml    # engine/target/release/swig
