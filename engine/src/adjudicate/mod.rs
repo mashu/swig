@@ -99,6 +99,11 @@ pub struct CallPath {
     pub segments: Vec<CalledSegment>,
     /// The path's fixed-scale objective, whichever model chose it.
     pub score: PathScore,
+    /// The key the call maximised: its value in `model`'s units at
+    /// `divergence` (the fixed scores under [`CallModel::FixedScale`]), then
+    /// fewer D, then support. A path decoded from the posterior keeps its
+    /// call's.
+    pub value: PathScore<Units>,
     /// The read's divergence `p̂` ([`divergence`]): the posterior reads
     /// alignment evidence at it, and so does a [`CallModel::PerRead`] call.
     pub divergence: f64,
@@ -111,6 +116,22 @@ pub trait Adjudicator: Send + Sync {
 
     fn adjudicate(&self, placements: &[Placement], scratch: &mut Self::Scratch)
     -> Option<CallPath>;
+
+    /// [`Adjudicator::adjudicate`] for a read whose divergence `p̂` is
+    /// `divergence` ([`divergence`] of all its placements, of which
+    /// `placements` may be a part): paths of one read's placement subsets
+    /// adjudicated at one divergence are hypotheses of one model, and
+    /// compare by [`CallPath::value`]. Adjudicators without a per-read
+    /// model ignore it.
+    fn adjudicate_at(
+        &self,
+        placements: &[Placement],
+        divergence: f64,
+        scratch: &mut Self::Scratch,
+    ) -> Option<CallPath> {
+        let _ = divergence;
+        self.adjudicate(placements, scratch)
+    }
 
     /// The smallest local score a D placement needs to matter: one that
     /// scores less can be neither called nor given probability, so the D

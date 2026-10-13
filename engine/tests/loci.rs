@@ -241,3 +241,66 @@ fn each_anchoring_locus_keeps_its_own_j() {
         assert!(placed(Locus::Igk), "{} lost to the heavy J", light_j.name);
     }
 }
+
+/// On a read holding two loci, each locus is adjudicated on its own and the
+/// call is the best path over both in the model the call maximises. That
+/// choice must not depend on whether posteriors are computed, under either
+/// call model: every locus is read at the divergence of the whole read.
+#[test]
+fn the_called_locus_does_not_depend_on_posteriors() {
+    let (heavy, _, light_v, light_j) = databases();
+    let v = fasta(&heavy.v) + &fasta(&light_v);
+    let j = fasta(&heavy.j) + &fasta(&light_j);
+    let d = fasta(&heavy.d);
+    let texts = GermlineTexts {
+        v: &v,
+        d: Some(&d),
+        j: &j,
+        c: None,
+    };
+    let database = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+    let assigner = |calls, posterior| {
+        let mut config = CallingProfile::ROptimized.config();
+        (config.calls, config.posterior) = (calls, posterior);
+        DefaultAssigner::from_config(
+            &config,
+            database.v.clone(),
+            database.d.clone(),
+            database.j.clone(),
+        )
+        .unwrap()
+    };
+    // A mutated heavy chain, a linker and a less mutated light chain cut
+    // from its start, so that their paths come close in score.
+    let heavy_reads = Simulator::new(&heavy.v, Some(&heavy.d), &heavy.j, SimParams::mid())
+        .unwrap()
+        .reads(100, 21)
+        .unwrap();
+    let light_reads = Simulator::new(&light_v, None, &light_j, SimParams::easy())
+        .unwrap()
+        .reads(100, 22)
+        .unwrap();
+    let linker = encode(b"GGTGGAGGCGGTTCAGGCGGAGGTGGCTCTGGCGGTGGCGGATCG");
+    let mut reads: Vec<Vec<u8>> = Vec::new();
+    for (h, l) in heavy_reads.iter().zip(&light_reads) {
+        for cut in (0..200).step_by(25) {
+            let light = encode(&l.forward[cut.min(l.forward.len())..]);
+            reads.push([encode(&h.forward), linker.clone(), light].concat());
+        }
+    }
+    let locus = |assigner: &DefaultAssigner, read: &[u8]| {
+        let call = assigner.assign(read, &mut assigner.workspace());
+        let path = call.path?;
+        let last = &call.placements[path.segments.last()?.placement];
+        let set = assigner.segment(last.kind).unwrap().set();
+        Some(set.allele(last.primary_allele()).loci)
+    };
+    let flips = [CallModel::PerRead, CallModel::FixedScale].map(|calls| {
+        let (with, without) = (assigner(calls, true), assigner(calls, false));
+        reads
+            .iter()
+            .filter(|read| locus(&with, read) != locus(&without, read))
+            .count()
+    });
+    assert_eq!(flips, [0, 0], "of {} reads", reads.len());
+}

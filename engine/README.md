@@ -407,10 +407,14 @@ unrecognised names is assigned as a single locus (`locus.rs`).
   several loci, as on an scFv read, the J alleles of each locus are searched
   and kept on their own, so one chain's J cannot crowd out the other's. When
   every placement of a read shares a locus, the read is adjudicated once.
-  Otherwise each locus is adjudicated over its own placements, and the call
-  is the path of the locus with the largest likelihood `Z` (the best path
-  without posteriors); the posteriors are the mixture over loci weighted by
-  `Z`. C joins a J of its own locus. `locus` reports the locus the path's
+  Otherwise each locus is adjudicated over its own placements, all at the
+  divergence of the whole read, and the call is the best of their paths in
+  the model the call maximises (`--calls`), with or without posteriors; an
+  exact tie goes to the path whose last segment comes first in the read (by
+  kind, then position), as within one locus. The posteriors are
+  the mixture over loci weighted by their likelihoods `Z`, so under
+  `--calls fixed` the called locus can hold less than half of the posterior.
+  C joins a J of its own locus. `locus` reports the locus the path's
   alleles share, empty when it is unknown.
 - **Per-locus annotation.** The V and J alleles of each locus are annotated
   on their own: chain type, FR3 length model and Cys23 priors differ between

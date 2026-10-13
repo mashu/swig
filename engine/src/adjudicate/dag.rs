@@ -581,10 +581,19 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
     type Scratch = DagScratch;
 
     fn adjudicate(&self, placements: &[Placement], scratch: &mut DagScratch) -> Option<CallPath> {
-        let divergence = divergence(placements);
-        let (_, segments) = self.viterbi(placements, &self.read_model(divergence), scratch)?;
+        self.adjudicate_at(placements, divergence(placements), scratch)
+    }
+
+    fn adjudicate_at(
+        &self,
+        placements: &[Placement],
+        divergence: f64,
+        scratch: &mut DagScratch,
+    ) -> Option<CallPath> {
+        let (value, segments) = self.viterbi(placements, &self.read_model(divergence), scratch)?;
         Some(CallPath {
             score: self.path_score(placements, &segments),
+            value,
             segments,
             divergence,
             model: self.calls(),
