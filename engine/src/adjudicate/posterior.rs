@@ -1130,6 +1130,7 @@ mod tests {
             alleles: vec![1],
             shifted: Vec::new(),
             clip,
+            local_score: score,
             evidence: Evidence::default(),
             local_evidence: Evidence::default(),
             anchor: Some(Score::MIN),

@@ -47,7 +47,10 @@ like germline: before the column at which its running score falls more than
 UMI or random 5′ flank is not taken as V. Otherwise the alignment is
 end-to-end on its outer side, where the germline must begin (V) or end (J).
 The substitution scores of the extension, mismatches included, count towards
-the ranking.
+the ranking. The stage also keeps its best alignments by local score: a hit
+with no room for a flank, at the read's or the germline's end, pays none, so
+ranked by extended score alone it, or a few alleles sharing it, could take
+every slot from a hit that is stronger locally but pays for a mutated flank.
 
 ### 2.2 Paths
 
@@ -630,7 +633,7 @@ step can lose.
 | V band | `retrieve/seed_vote.rs` | bounded | Cluster's diagonal range, shifted by the allele's frame offset, ± 8 diagonals: holds unless an indel longer than 8 escapes the seeds. |
 | V scoring | `segment.rs`, `family_bound.rs` | lossless | Score-only DP on one representative `R` per gene frame (most votes, then the frame's medoid, then lowest id). A sibling `A` in `R`'s frame diagonals satisfies `L ≤ S*(A) ≤ S*(R) + Δ(R, A)`: `Δ` sums the best profile gain per frame position both cover plus the best score where only `A` does; `L` is a traced representative path clipped to `A`'s span and rescored with `A`'s profile. The cutoff `c` is the 3rd largest of one lower bound per candidate, so `c ≤` the exact 3rd score. `A` is skipped when `U < c`, known when `U = L`, aligned outright when `L ≥ c` (its traceback reused), scored otherwise. The ranking from the 3rd score up is that of full scoring; ties follow an explicit key (gene leaders first, then retrieval order), never the schedule. Under a length or identity floor only `U <` floor prunes. |
 | J scoring | `segment.rs`, `family_bound.rs` | lossless | The same bounds with each gene one frame, its alleles at offset 0 (sound because J is unbanded); ties in allele order. |
-| V/J keep | `segment.rs` | defined | Trace back until the top 3 alignments with E ≤ 1, plus ties. No length or identity floor: a positive `(2, −3)` local alignment has identity > 3/5 and the E-value implies a length. |
+| V/J keep | `segment.rs` | defined | Keep the top 3 alignments with E ≤ 1 by extended score and the top 3 by local score, each plus ties; trace back until the next local score is below the 3rd extended one, which bounds the 3rd local one from below. No length or identity floor: a positive `(2, −3)` local alignment has identity > 3/5 and the E-value implies a length. |
 | J | `retrieve/exhaustive.rs`, `window.rs` | bounded | Every J allele, unbanded, in `[min V end − 12, read end)` when some V placement is an anchor (E ≤ 10⁻³), or the whole read when none is: a chance V hit on a read without V (one starting in CDR3) no longer pushes the window past the J, and only anchors choose the locus of the J and D candidates. A J can reach back into V only through chance edge matches. Whole-read J search is 18 % slower and changes a few hard-preset calls (D −0.04 pp, J −0.02 pp), none on mid. The J is not placed jointly with the D, yet it does not "eat" it: the D windows reach 12 bases into J and include the conserved-anchor window, and the DAG orders segments by kind, so a D can precede a J whose alignment reaches back over it and the cuts give any J/D overlap to whichever explains it better. With a D remnant ≥ 8 nt (`examples/d_errors.rs`, human IGH), a missing D whose bases the called J covers is 0.00 % of reads on mid and hard, and a true D outside the windows 0 %; whole-read J lets 0.05 % fall outside. |
 | D windows | `window.rs` | bounded | `[best V end − 12, best J start + 12)` plus the conserved-anchor window `[V Cys104 + 3, J Trp/Phe118)`. |
 | D prefilter | `retrieve/lmer_mask.rs` | lossless w.r.t. gates | Shares ≥ 1 L-mer, with `L` derived from the gates (`min_d_match`; 4 with the optional distributed-D gate, by pigeonhole). |

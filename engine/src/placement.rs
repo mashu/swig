@@ -26,9 +26,12 @@ pub struct Placement {
     pub clip: ClipIndex,
     /// Evidence of the unclipped alignment.
     pub evidence: Evidence,
-    /// Evidence of the local alignment, before the stage stitched its outer
-    /// flank on ([`crate::flank`]): what the identity floor judges
+    /// Score and evidence of the local alignment, before the stage stitched
+    /// its outer flank on ([`crate::flank`]). The stage keeps its best
+    /// local alignments as well as its best extended ones, and the identity
+    /// floor judges the local evidence
     /// ([`crate::pipeline::AssignerOptions::min_identity`]).
+    pub local_score: Score,
     pub local_evidence: Evidence,
     /// The score a clipped span of this placement must keep to anchor a
     /// call, the anchor gate of its window ([`crate::segment::EvalueGates`]);
@@ -52,6 +55,7 @@ impl Placement {
             kind,
             alleles: vec![allele],
             shifted: Vec::new(),
+            local_score: alignment.score,
             alignment,
             clip,
             evidence,
