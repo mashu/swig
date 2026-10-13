@@ -15,12 +15,22 @@
 //! starting there, then every group that a *live* slot of a predecessor
 //! continues into. Liveness is the pass's own (some exit reachable), so
 //! both passes build their slots by the same rule over the same domain.
+//! Opening a slot records its incoming edges, the live predecessor slots
+//! whose paths continue into it ([`Lattice::incoming`]).
+//!
+//! **Shared index arithmetic.** Every pass values a placement's cuts along
+//! its columns ([`column_steps`]), and joins an edge `b → e` the same way: each
+//! entry of `e` inside `b` meets `b`'s exits up to the same read position
+//! ([`Lattice::inside`]), and every entry at or beyond `b`'s end meets all
+//! of them, so the edge adds them once at its first such entry
+//! ([`Node::beyond`]).
 
 use std::ops::Range;
 
 use super::model::Grammar;
 use crate::germline::SegmentKind;
 use crate::placement::Placement;
+use crate::scoring::Score;
 
 /// Rearranged segment kinds: passes keep one array per successor or
 /// predecessor kind. C never enters a lattice ([`SegmentKind::REARRANGED`]).
@@ -61,6 +71,31 @@ impl Node {
     pub fn slots(&self) -> Range<usize> {
         self.slots.0..self.slots.1
     }
+
+    /// On an edge from this node to `e`: the first offset of `e` at or
+    /// beyond this node's end, from which every entry of `e` follows all of
+    /// this node's exits; `None` when `e` ends before it.
+    pub fn beyond(&self, e: &Node) -> Option<usize> {
+        let beyond = self.q_end().saturating_sub(e.q_start) as usize;
+        (beyond < e.width()).then_some(beyond)
+    }
+}
+
+/// A placement's canonical cuts along its alignment: per `Match` column,
+/// its read position `q`, the score of the gap run since the previous
+/// `Match` column (or the alignment's start) and its substitution score.
+/// A pass accumulates their values once per node: the entry cut at `q` is
+/// worth the prefix through the gap run, the exit cut at `q + 1` the prefix
+/// through the column. Canonical cuts never split a gap run.
+pub(super) fn column_steps(
+    placement: &Placement,
+) -> impl Iterator<Item = (u32, Score, Score)> + '_ {
+    let mut previous = 0;
+    placement.clip.matches().map(move |(q, entry, exit)| {
+        let gap = entry - previous;
+        previous = exit;
+        (q, gap, exit - entry)
+    })
 }
 
 /// D segments up to and including a node, and the path's first kind.
@@ -96,6 +131,8 @@ pub(super) struct Slot {
     /// Start of the slot's `width` values in per-slot arrays; per-kind
     /// arrays start at `KINDS · values` ([`Slot::per_kind`]).
     pub values: usize,
+    /// The slot's incoming edges in [`Lattice::edges`].
+    edges: (u32, u32),
 }
 
 impl Slot {
@@ -117,6 +154,11 @@ pub(super) struct Lattice {
     /// Values of all slots opened so far: the length of per-slot arrays.
     values: usize,
     groups: Vec<Group>,
+    /// Incoming edges of every slot opened so far, `(predecessor node,
+    /// predecessor slot)`, each slot's in DAG order.
+    edges: Vec<(u32, u32)>,
+    /// `(group, predecessor node, predecessor slot)` while a node opens.
+    pending: Vec<(u32, u32, u32)>,
 }
 
 impl Lattice {
@@ -152,6 +194,7 @@ impl Lattice {
             self.nodes.push(node);
         }
         self.slots.clear();
+        self.edges.clear();
         self.values = 0;
     }
 
@@ -181,8 +224,9 @@ impl Lattice {
     }
 
     /// Open node `e`'s slots: `start` (paths starting here), then every group
-    /// a live predecessor slot continues into, in DAG order. Per-slot arrays
-    /// must then hold [`Lattice::values`] values.
+    /// a live predecessor slot continues into, in DAG order, each with its
+    /// incoming edges. Per-slot arrays must then hold [`Lattice::values`]
+    /// values.
     pub fn open<G: Grammar>(
         &mut self,
         e: usize,
@@ -193,24 +237,38 @@ impl Lattice {
         let node = self.nodes[e];
         self.groups.clear();
         self.groups.extend(start);
-        for b in &self.nodes[..self.predecessors(e)] {
-            for t in b.slots() {
+        self.pending.clear();
+        for (b, before) in self.nodes[..self.predecessors(e)].iter().enumerate() {
+            for t in before.slots() {
                 let group = self.slots[t].group;
-                let next = group.then(node.kind);
-                if live(t)
-                    && grammar.can_follow(b.kind, node.kind, group.d_used)
-                    && !self.groups.contains(&next)
-                {
-                    self.groups.push(next);
+                if !(live(t) && grammar.can_follow(before.kind, node.kind, group.d_used)) {
+                    continue;
                 }
+                let next = group.then(node.kind);
+                let g = match self.groups.iter().position(|&known| known == next) {
+                    Some(g) => g,
+                    None => {
+                        self.groups.push(next);
+                        self.groups.len() - 1
+                    }
+                };
+                self.pending.push((g as u32, b as u32, t as u32));
             }
         }
         let first = self.slots.len();
-        for &group in &self.groups {
+        for (g, &group) in self.groups.iter().enumerate() {
+            let from = self.edges.len() as u32;
+            self.edges.extend(
+                self.pending
+                    .iter()
+                    .filter(|&&(of, ..)| of == g as u32)
+                    .map(|&(_, b, t)| (b, t)),
+            );
             self.slots.push(Slot {
                 node: e as u32,
                 group,
                 values: self.values,
+                edges: (from, self.edges.len() as u32),
             });
             self.values += node.width();
         }
@@ -218,28 +276,27 @@ impl Lattice {
         first..self.slots.len()
     }
 
-    /// Live slots of node `e`'s predecessors whose paths continue into
-    /// `group` at `e`, with their node.
-    pub fn incoming<'a, G: Grammar, L: Fn(usize) -> bool>(
-        &'a self,
-        e: usize,
-        grammar: &'a G,
-        group: Group,
-        live: &'a L,
-    ) -> impl Iterator<Item = (Node, usize)> + 'a {
-        let kind = self.nodes[e].kind;
-        self.nodes[..self.predecessors(e)]
+    /// The live predecessor slots whose paths continue into slot `t`, with
+    /// their node, in DAG order (recorded when `t` was opened).
+    pub fn incoming(&self, t: usize) -> impl Iterator<Item = (Node, usize)> + '_ {
+        let (from, to) = self.slots[t].edges;
+        self.edges[from as usize..to as usize]
             .iter()
-            .flat_map(move |b| {
-                b.slots()
-                    .filter(move |&u| {
-                        let before = self.slots[u].group;
-                        live(u)
-                            && before.then(kind) == group
-                            && grammar.can_follow(b.kind, kind, before.d_used)
-                    })
-                    .map(move |u| (*b, u))
-            })
+            .map(|&(b, u)| (self.nodes[b as usize], u as usize))
+    }
+
+    /// On an edge `b → e`: every canonical entry offset `o` of `e` inside
+    /// `b`, with `z`, `b`'s exit offset at the same read position (the exits
+    /// `b`'s paths can leave by for that entry are its offsets `≤ z`). A
+    /// predecessor of another kind may start after `e`: entries before its
+    /// start have no exit to follow.
+    pub fn inside(&self, b: &Node, e: &Node) -> impl Iterator<Item = (usize, usize)> + '_ {
+        let (start, end, at) = (b.q_start, b.q_end(), e.q_start);
+        self.entries(e)
+            .iter()
+            .map(move |&o| (o, at + o))
+            .take_while(move |&(_, y)| y < end)
+            .filter_map(move |(o, y)| y.checked_sub(start).map(|z| (o as usize, z as usize)))
     }
 
     /// The slot of `node` holding `group`, if opened.

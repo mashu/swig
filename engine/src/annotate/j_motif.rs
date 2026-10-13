@@ -28,13 +28,19 @@ impl JHit {
         (3 * self.codon + self.frame) as u32
     }
 
-    /// `+1` heavy (`W`), `−1` light (`F`).
+    /// `+1` heavy (`W`), `−1` light (`F`) (`residue_vote`).
     pub fn chain_vote(&self) -> i8 {
-        match self.residue {
-            b'W' => 1,
-            b'F' => -1,
-            _ => 0,
-        }
+        residue_vote(self.residue)
+    }
+}
+
+/// The chain a J anchor residue votes for: `+1` heavy (`W`), `−1` light
+/// (`F`), `0` otherwise. Motif hits and given anchors vote alike.
+pub fn residue_vote(residue: u8) -> i8 {
+    match residue {
+        b'W' => 1,
+        b'F' => -1,
+        _ => 0,
     }
 }
 

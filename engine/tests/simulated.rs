@@ -3,9 +3,10 @@
 //! Reads come from the IgSim model ([`swig::sim`]) on a synthetic
 //! IGH-like germline database with a family → gene → allele hierarchy, half
 //! of them reverse-complemented. Seeds are fixed, so every run sees the same
-//! reads; the floors sit a little below the measured accuracy, so a change
-//! that loses accuracy fails here. Accuracy is germline-equivalence aware
-//! (see `swig::sim::evaluate`).
+//! reads and reproduces the measured accuracy exactly. Each floor sits three
+//! standard errors below the measured rate ([`at_least`]): a change that
+//! moves a few reads passes, one that loses accuracy fails. Accuracy is
+//! germline-equivalence aware (see `swig::sim::evaluate`).
 
 use swig::prelude::*;
 use swig::sim::{
@@ -24,13 +25,7 @@ impl Setup {
     }
 
     fn assigner(&self, config: &EngineConfig) -> DefaultAssigner {
-        DefaultAssigner::from_config(
-            config,
-            self.db.v.clone(),
-            Some(self.db.d.clone()),
-            self.db.j.clone(),
-        )
-        .expect("synthetic database builds")
+        self.db.assigner(config).expect("synthetic database builds")
     }
 
     fn evaluate(
@@ -70,12 +65,7 @@ impl Setup {
         let simulated = sim.reads(reads, seed).expect("reads");
         let queries: Vec<Vec<u8>> = simulated.iter().map(|r| encode(&r.sequence)).collect();
         let calls = assign_all(&assigner, &queries, 0);
-        let mut evaluation = Evaluation::default();
-        for (read, call) in simulated.iter().zip(&calls) {
-            let record = AirrRecord::from_call("r", "", call, &assigner, &[None, None, None]);
-            let truth = Truth::from_read(&sim, read, "r");
-            evaluation.add(&truth, &Assignment::from_record(&record));
-        }
+        let evaluation = Evaluation::of_calls(&sim, &simulated, &calls, &assigner);
         println!("{evaluation}");
         evaluation
     }
@@ -85,85 +75,53 @@ fn percent(part: usize, whole: usize) -> f64 {
     100.0 * part as f64 / whole as f64
 }
 
+/// Assert that `part` of `whole` reads is no more than three standard
+/// errors below the `measured` percentage: the standard error of a rate
+/// near it on `whole` reads (Agresti–Coull, so that a measured 100 % keeps
+/// a margin too).
+fn at_least(label: &str, part: usize, whole: usize, measured: f64) {
+    let n = whole as f64;
+    let p = (measured / 100.0 * n + 2.0) / (n + 4.0);
+    let floor = measured - 300.0 * (p * (1.0 - p) / (n + 4.0)).sqrt();
+    let rate = percent(part, whole);
+    println!("{label}: {rate:.2} % of {whole} (floor {floor:.2} %)");
+    assert!(
+        rate >= floor,
+        "{label}: {rate:.2} % ({part} of {whole}) is below {floor:.2} % (measured {measured} %)"
+    );
+}
+
+/// [`at_least`] for the V, V gene, D, J and junction rates of `e`, measured
+/// at `measured` (in that order).
+fn segments_at_least(e: &Evaluation, measured: [f64; 5]) {
+    let [v, v_gene, d, j, junction] = measured;
+    at_least("V", e.v.equivalent, e.v.reads, v);
+    at_least("V gene", e.v.gene, e.v.reads, v_gene);
+    at_least("D", e.d.equivalent, e.d.reads, d);
+    at_least("J", e.j.equivalent, e.j.reads, j);
+    at_least("junction", e.junction_exact, e.junction_reads, junction);
+}
+
 #[test]
 fn unmutated_reads_are_assigned_exactly() {
     let e = Setup::new().evaluate(SimParams::easy(), 300, 1, &EngineConfig::default());
     assert_eq!(e.oriented, e.reads, "orientation");
     assert_eq!(e.unassigned, 0);
-    assert!(
-        e.v.equivalent_rate() >= 99.5,
-        "V {:.2}",
-        e.v.equivalent_rate()
-    );
-    assert!(
-        e.j.equivalent_rate() >= 99.5,
-        "J {:.2}",
-        e.j.equivalent_rate()
-    );
-    assert!(
-        e.d.equivalent_rate() >= 97.0,
-        "D {:.2}",
-        e.d.equivalent_rate()
-    );
-    assert!(
-        e.junction_rate() >= 99.5,
-        "junction {:.2}",
-        e.junction_rate()
-    );
+    segments_at_least(&e, [100.00, 100.00, 99.66, 100.00, 100.00]);
 }
 
 #[test]
 fn igm_like_reads_keep_their_accuracy() {
     let e = Setup::new().evaluate(SimParams::mid(), 500, 2, &EngineConfig::default());
-    assert!(percent(e.oriented, e.reads) >= 99.8);
-    assert!(
-        e.v.equivalent_rate() >= 98.5,
-        "V {:.2}",
-        e.v.equivalent_rate()
-    );
-    assert!(e.v.gene_rate() >= 99.5, "V gene {:.2}", e.v.gene_rate());
-    assert!(
-        e.j.equivalent_rate() >= 98.0,
-        "J {:.2}",
-        e.j.equivalent_rate()
-    );
-    assert!(
-        e.d.equivalent_rate() >= 82.5,
-        "D {:.2}",
-        e.d.equivalent_rate()
-    );
-    assert!(
-        e.junction_rate() >= 99.0,
-        "junction {:.2}",
-        e.junction_rate()
-    );
+    at_least("orientation", e.oriented, e.reads, 100.00);
+    segments_at_least(&e, [99.20, 100.00, 83.18, 99.60, 100.00]);
 }
 
 #[test]
 fn igg_like_hypermutated_reads_keep_their_accuracy() {
     let e = Setup::new().evaluate(SimParams::hard(), 500, 3, &EngineConfig::default());
-    assert!(percent(e.oriented, e.reads) >= 99.6);
-    assert!(
-        e.v.equivalent_rate() >= 96.0,
-        "V {:.2}",
-        e.v.equivalent_rate()
-    );
-    assert!(e.v.gene_rate() >= 99.0, "V gene {:.2}", e.v.gene_rate());
-    assert!(
-        e.j.equivalent_rate() >= 95.5,
-        "J {:.2}",
-        e.j.equivalent_rate()
-    );
-    assert!(
-        e.d.equivalent_rate() >= 74.0,
-        "D {:.2}",
-        e.d.equivalent_rate()
-    );
-    assert!(
-        e.junction_rate() >= 98.5,
-        "junction {:.2}",
-        e.junction_rate()
-    );
+    at_least("orientation", e.oriented, e.reads, 100.00);
+    segments_at_least(&e, [97.60, 100.00, 76.04, 97.20, 100.00]);
 }
 
 #[test]
@@ -173,7 +131,7 @@ fn long_d_remnants_are_found() {
     let long: Vec<_> = e.d_presence[4..].iter().collect();
     let reads: usize = long.iter().map(|p| p.reads).sum();
     let correct: usize = long.iter().map(|p| p.correct).sum();
-    assert!(percent(correct, reads) >= 98.0, "long D {correct}/{reads}");
+    at_least("long D", correct, reads, 98.53);
 }
 
 /// Reported V and J posteriors match observed accuracy (expected calibration
@@ -206,19 +164,35 @@ fn posteriors_are_calibrated() {
 fn constant_regions_are_called_from_the_splice() {
     let setup = Setup::new();
     let config = EngineConfig::default();
-    for (params, seed) in [(SimParams::mid(), 21), (SimParams::hard(), 22)] {
+    // (preset, seed, measured 8-15 nt C, 16+ nt C, 16+ nt first gene)
+    let presets = [
+        (SimParams::mid(), 21, [78.26, 99.86, 95.88]),
+        (SimParams::hard(), 22, [91.67, 100.00, 96.03]),
+    ];
+    for (params, seed, [medium_c, longer_c, longer_gene]) in presets {
         let e = setup.evaluate_with(params, 1000, seed, &config, true);
         let [none, short, medium, longer @ ..] = &e.c;
         assert!(none.reads >= 150 && none.called <= 1, "{none:?}");
         assert!(short.called * 10 <= short.reads, "1-7 nt {short:?}");
-        assert!(percent(medium.equivalent, medium.reads) >= 60.0);
+        let label = |what: &str| format!("seed {seed} {what}");
+        at_least(
+            &label("C 8-15 nt"),
+            medium.equivalent,
+            medium.reads,
+            medium_c,
+        );
         let reads: usize = longer.iter().map(|c| c.reads).sum();
         let equivalent: usize = longer.iter().map(|c| c.equivalent).sum();
         let first_gene: usize = longer.iter().map(|c| c.first_gene).sum();
         let calls: usize = longer.iter().map(|c| c.called).sum();
         let over: usize = longer.iter().map(|c| c.over_call).sum();
-        assert!(percent(equivalent, reads) >= 99.0, "{equivalent}/{reads}");
-        assert!(percent(first_gene, reads) >= 85.0, "{first_gene}/{reads}");
+        at_least(&label("C 16+ nt"), equivalent, reads, longer_c);
+        at_least(
+            &label("C 16+ nt first gene"),
+            first_gene,
+            reads,
+            longer_gene,
+        );
         assert!(percent(over, calls) <= 1.0, "{over}/{calls}");
         let c = e.calibration.c;
         assert!(c.ece() <= 0.02, "C ECE {:.3} %", 100.0 * c.ece());
@@ -364,56 +338,39 @@ fn airr_tsv_rows_score_like_the_records_they_were_written_from() {
 
 /// Accuracy at scale: 20,000 reads per IgSim preset. A rate measured on 500
 /// reads has a 95 % interval of ±1–4 pp, which hides most regressions; on
-/// 20,000 reads it is ±0.1–0.6 pp, so these floors sit within ~1 pp of the
-/// measured values. Run with `cargo test --release -- --ignored`.
+/// 20,000 reads three standard errors are 0.1–0.9 pp. Run with
+/// `cargo test --release -- --ignored`.
 #[test]
 #[ignore = "20,000 reads per preset; run with `cargo test --release -- --ignored`"]
 fn accuracy_at_scale() {
     let setup = Setup::new();
-    // (preset, seed, V, V gene, D, J, junction, V ECE, J ECE)
+    // (preset, seed, measured V, V gene, D, J, junction; V and J ECE bounds)
     let presets = [
-        // Measured: 99.99 100 99.53 99.95 100, ECE 0.02 0.25.
         (
             SimParams::easy(),
             21,
-            99.8,
-            99.9,
-            99.2,
-            99.8,
-            99.9,
+            [100.00, 100.00, 99.50, 99.95, 100.00],
             0.2,
             0.5,
         ),
-        // Measured: 99.53 100 84.50 99.40 99.99, ECE 0.04 0.20.
-        (SimParams::mid(), 22, 99.3, 99.9, 83.5, 99.1, 99.9, 0.3, 0.5),
-        // Measured: 97.57 99.85 75.86 95.93 99.71, ECE 0.13 0.40.
+        (
+            SimParams::mid(),
+            22,
+            [99.53, 100.00, 84.08, 99.41, 99.99],
+            0.3,
+            0.5,
+        ),
         (
             SimParams::hard(),
             23,
-            97.0,
-            99.6,
-            74.8,
-            95.3,
-            99.4,
+            [97.62, 99.92, 75.50, 95.95, 99.73],
             0.5,
             0.8,
         ),
     ];
-    for (params, seed, v, v_gene, d, j, junction, v_ece, j_ece) in presets {
+    for (params, seed, measured, v_ece, j_ece) in presets {
         let e = setup.evaluate(params, 20_000, seed, &EngineConfig::default());
-        let checks = [
-            ("V", e.v.equivalent_rate(), v),
-            ("V gene", e.v.gene_rate(), v_gene),
-            ("D", e.d.equivalent_rate(), d),
-            ("J", e.j.equivalent_rate(), j),
-            ("junction", e.junction_rate(), junction),
-        ];
-        for (label, measured, floor) in checks {
-            assert!(
-                measured >= floor,
-                "seed {seed} {label} {measured:.2} < {floor}"
-            );
-        }
+        segments_at_least(&e, measured);
         assert!(100.0 * e.calibration.v.ece() <= v_ece, "seed {seed} V ECE");
         assert!(100.0 * e.calibration.j.ece() <= j_ece, "seed {seed} J ECE");
         let random_calls = e.unassigned;

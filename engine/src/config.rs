@@ -10,9 +10,10 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::adjudicate::{
-    CallModel, DAlleleDecoding, EngineeringObjective, EvidenceModel, PlacementDag, VdjGrammar,
+    Adjudicator, CallModel, DAlleleDecoding, EngineeringObjective, EvidenceModel, Mode,
+    PlacementDag, VdjGrammar,
 };
-use crate::admission::{AnyOf, DistributedEvidence, ExactRunFloor};
+use crate::admission::{AnyOf, DefaultAdmission, DistributedEvidence, ExactRunFloor};
 use crate::align::{Backend, InterSequenceGotoh};
 use crate::constant::ConstantStage;
 use crate::family_bound::FamilyBoundTable;
@@ -91,7 +92,7 @@ pub struct DSegmentConfig {
     pub keep: KeepPolicy,
     /// `min_d_match`.
     pub min_exact_run: u32,
-    /// Distributed-D gate (`None` = disabled; the note makes it AER-R only).
+    /// Distributed-D gate (`None` = disabled, the default).
     pub distributed: Option<DistributedEvidence>,
 }
 
@@ -117,7 +118,9 @@ impl DSegmentConfig {
     /// only has a positive score. Raising the floor to that bound therefore
     /// drops nothing the gates would admit.
     pub fn lossless_min_score(&self) -> Score {
-        let run = self.scoring.matched * self.min_exact_run as Score;
+        // Saturating: a run no alignment score can reach admits nothing.
+        let run = Score::try_from(self.min_exact_run)
+            .map_or(Score::MAX, |k| self.scoring.matched.saturating_mul(k));
         let admissible = match &self.distributed {
             None => run,
             Some(gate) if gate.scoring == self.scoring => run.min(gate.min_rescore),
@@ -154,6 +157,7 @@ impl DSearchSpace {
 }
 
 /// Prior cost of including a D, in score units (see [`EngineeringObjective`]).
+/// The same rules price a J over the J database ([`ObjectiveConfig::j_prior`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DPrior {
     /// A fixed cost (0 = D only has to beat the no-D path).
@@ -226,13 +230,17 @@ impl DPrior {
     }
 }
 
-/// Declarative form of [`EngineeringObjective`]; `d_prior` is resolved
-/// against the D database when the assigner is built.
+/// Declarative form of [`EngineeringObjective`]; `d_prior` and `j_prior` are
+/// resolved against the D and J databases when the assigner is built.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ObjectiveConfig {
     pub pair_bonus: Score,
     pub d_prior: DPrior,
-    pub tandem_d_penalty: Score,
+    /// Prior cost of including a J, by [`DPrior`]'s rules over the J genes
+    /// (with every J offset a search offset). Without it any J clip of
+    /// positive value completes a path for free, so a read that stops
+    /// before its J gets one from a few chance bases.
+    pub j_prior: DPrior,
     pub insertion_per_base: Score,
 }
 
@@ -241,17 +249,21 @@ impl Default for ObjectiveConfig {
         Self {
             pair_bonus: 0,
             d_prior: DPrior::DERIVED,
-            tandem_d_penalty: 12,
+            j_prior: DPrior::DERIVED,
             insertion_per_base: 0,
         }
     }
 }
 
 impl ObjectiveConfig {
+    /// The objective for the D database `d` (none: no D) and the J database
+    /// `j` scored with `j_scoring`.
     pub fn resolve(
         &self,
         d: Option<&GermlineSet>,
         d_config: &DSegmentConfig,
+        j: &GermlineSet,
+        j_scoring: &AffineScoring,
     ) -> EngineeringObjective {
         let space = d.map_or(
             DSearchSpace {
@@ -262,8 +274,11 @@ impl ObjectiveConfig {
         );
         EngineeringObjective {
             pair_bonus: self.pair_bonus,
-            d_presence: self.d_prior.cost(space, &d_config.scoring),
-            tandem_d_penalty: self.tandem_d_penalty,
+            presence: [
+                0.0,
+                self.d_prior.cost(space, &d_config.scoring),
+                self.j_prior.cost(DSearchSpace::of(j, 1), j_scoring),
+            ],
             insertion_per_base: self.insertion_per_base,
         }
     }
@@ -279,25 +294,26 @@ pub struct EngineConfig {
     pub d_window: ExpandedResidual,
     /// Add the conserved-anchor D window when alleles carry `anchor=` positions.
     pub anchor_window: bool,
-    pub grammar: VdjGrammar,
     pub objective: ObjectiveConfig,
     /// Minimum retained query bases after clipping, per rearranged kind
     /// ([`SegmentKind::REARRANGED`]), indexed by [`SegmentKind::index`].
     pub min_retained: [u32; 3],
     /// The model the DAG's call maximises: each read's own (the model its
-    /// posteriors come from) or the fixed scores.
+    /// posteriors come from) or the fixed scores. The read's model needs
+    /// the V scoring's Karlin–Altschul λ ([`BuildError::NoStatistics`]).
     pub calls: CallModel,
     /// How the reported D allele is chosen: the call's, or the one of
-    /// largest posterior marginal given the call's topology. The latter
-    /// needs `posterior`; without it the D allele is the call's.
+    /// largest posterior marginal, aligned in the call's topology. The
+    /// latter needs `posterior`; without it the D allele is the call's.
     pub d_allele: DAlleleDecoding,
     /// Report posterior probabilities (forward–backward over the placement
-    /// DAG, priors at the V scoring's λ, alignment evidence at each read's
-    /// divergence): per called segment and for D presence. With posteriors,
-    /// or with a per-read call, D placements below the objective's floor
-    /// (`P_D + 1`) are kept, since they carry probability and can win a
-    /// per-read call; otherwise they are pruned, which never changes a
-    /// fixed-scale call.
+    /// DAG, priors at the λ they were derived with, alignment evidence at
+    /// each read's divergence): per called segment and for D presence. The
+    /// DAG's [`Mode`] holds the choice. With posteriors, or with a per-read
+    /// call, D placements below the objective's floor (`P_D + 1`) are kept,
+    /// since they carry probability and can win a per-read call; otherwise
+    /// they are pruned, which never changes a fixed-scale call
+    /// ([`Adjudicator::d_score_floor`]).
     pub posterior: bool,
     /// Instruction set of the alignment kernel; `None` picks the fastest
     /// this CPU runs ([`Backend::detect`]).
@@ -378,11 +394,12 @@ impl Default for DSegmentConfig {
         Self {
             scoring: AffineScoring::new(2, -3, -13, -1),
             lmer: None,
-            // Every admissible D hit (up to 32) reaches adjudication.
+            // The 32 best admissible D hits reach adjudication; inadmissible
+            // ones are traced (up to 64 tracebacks) but take no slot.
             keep: KeepPolicy {
                 top: 32,
                 min_score: 0,
-                cap: 32,
+                cap: 64,
             },
             min_exact_run: 4,
             // The note's distributed-D gate admits nothing the exact run and
@@ -401,7 +418,6 @@ impl Default for EngineConfig {
             c: CSegmentConfig::default(),
             d_window: ExpandedResidual::default(),
             anchor_window: true,
-            grammar: VdjGrammar::VDJ,
             objective: ObjectiveConfig::default(),
             // A clipped V or J keeps at least one base, a D `min_d_match`.
             min_retained: [1, 4, 1],
@@ -538,31 +554,27 @@ fn j_stage(set: GermlineSet, config: &JSegmentConfig) -> SegmentStage<Exhaustive
     stage
 }
 
+/// The D stage, keeping no alignment below `floor`, the adjudicators'
+/// [`Adjudicator::d_score_floor`].
 fn d_stage(
     set: GermlineSet,
     config: &DSegmentConfig,
-    objective: &EngineeringObjective,
-    keep_below_floor: bool,
-) -> SegmentStage<LmerMaskRetriever> {
+    floor: Score,
+) -> SegmentStage<LmerMaskRetriever, DefaultAdmission> {
     let lmer = config.lmer.unwrap_or_else(|| config.lossless_lmer());
     let retriever = LmerMaskRetriever::build(&set, lmer, 1);
     let segment = PreparedSegment::new(set, &config.scoring, config.scoring.gaps);
     let keep = KeepPolicy {
-        // The objective's D floor prunes only what cannot win a fixed-scale
-        // call (see `EngineeringObjective::d_floor`).
-        min_score: if keep_below_floor {
-            config.lossless_min_score()
-        } else {
-            config.lossless_min_score().max(objective.d_floor())
-        },
+        min_score: config.lossless_min_score().max(floor),
         ..config.keep
     };
-    let mut stage = SegmentStage::new(Arc::new(segment), retriever, keep);
-    stage.accept = HitAcceptance {
-        min_subst: config.min_exact_run,
-        min_identity: 0.60,
-    };
-    stage
+    let admission = AnyOf(
+        ExactRunFloor {
+            min_run: config.min_exact_run,
+        },
+        config.distributed,
+    );
+    SegmentStage::new(Arc::new(segment), retriever, keep).with_accept(admission)
 }
 
 /// The default engine: batched banded Gotoh (AVX2 inter-sequence kernel when
@@ -588,77 +600,73 @@ impl Assigner {
         } else {
             WithAnchorWindow::disabled(config.d_window)
         };
+        // An AIRR row holds one D: tandem D is the double-D screen's.
         let grammar = if d.is_some() {
-            config.grammar
+            VdjGrammar::VDJ
         } else {
-            VdjGrammar {
-                max_d: 0,
-                ..config.grammar
-            }
+            VdjGrammar::VJ
         };
         let strand = StrandIndex::build([&v, &j], StrandIndex::K);
-        let objective = config.objective.resolve(d.as_ref(), &config.d);
-        let substitution = |s: &AffineScoring| (s.matched, s.mismatch);
-        let evidence = KarlinAltschul::ungapped(&config.v.scoring).map(|ka| EvidenceModel {
-            lambda: ka.lambda,
-            substitution: [
-                substitution(&config.v.scoring),
-                substitution(&config.d.scoring),
-                substitution(&config.j.scoring),
-            ],
-        });
-        let adjudicator = PlacementDag {
-            evidence,
-            calls: config.calls,
-            posterior: config.posterior && evidence.is_some(),
-            d_allele: config.d_allele,
-            ..PlacementDag::new(grammar, objective, config.min_retained)
+        let objective = config
+            .objective
+            .resolve(d.as_ref(), &config.d, &j, &config.j.scoring);
+        let mode = if config.calls == CallModel::FixedScale && !config.posterior {
+            Mode::Fixed
+        } else {
+            Mode::Read {
+                evidence: EvidenceModel::new([
+                    &config.v.scoring,
+                    &config.d.scoring,
+                    &config.j.scoring,
+                ])
+                .ok_or(BuildError::NoStatistics(SegmentKind::V))?,
+                calls: config.calls,
+                posterior: config.posterior.then_some(config.d_allele),
+            }
         };
-        // A D database of several loci: a read of one locus prices a D by
-        // that locus' D genes.
-        let d_loci: Vec<Locus> = d.as_ref().map_or(Vec::new(), |d| {
-            Locus::ALL
-                .into_iter()
-                .filter(|&l| d.alleles().iter().any(|a| a.loci == Loci::of(l)))
-                .collect()
-        });
-        let locus_adjudicators: Vec<(Locus, PlacementDag)> = match &d {
-            Some(d) if d_loci.len() > 1 => d_loci
-                .iter()
+        let dag = |model| PlacementDag::new(grammar, model, config.min_retained, mode);
+        let adjudicator = dag(objective);
+        // A D or J database of several loci: a read of one locus prices a D
+        // and a J by that locus' genes.
+        let loci: Vec<Locus> = Locus::ALL
+            .into_iter()
+            .filter(|&l| {
+                let of = |set: &GermlineSet| set.alleles().iter().any(|a| a.loci == Loci::of(l));
+                of(&j) || d.as_ref().is_some_and(of)
+            })
+            .collect();
+        let locus_adjudicators: Vec<(Locus, PlacementDag)> = if loci.len() > 1 {
+            loci.iter()
                 .map(|&locus| {
-                    let (part, _) = d.subset(|a| a.loci.contains(locus));
-                    let model = config.objective.resolve(Some(&part), &config.d);
-                    (
-                        locus,
-                        PlacementDag {
-                            model,
-                            ..adjudicator
-                        },
-                    )
+                    let part = |set: &GermlineSet| set.subset(|a| a.loci.contains(locus)).0;
+                    let d_part = d.as_ref().map(part).filter(|d| !d.is_empty());
+                    let model = config.objective.resolve(
+                        d_part.as_ref(),
+                        &config.d,
+                        &part(&j),
+                        &config.j.scoring,
+                    );
+                    (locus, dag(model))
                 })
-                .collect(),
-            _ => Vec::new(),
+                .collect()
+        } else {
+            Vec::new()
         };
-        // The D floor must not prune a D any locus would call.
+        // The D floor must not prune a D any locus would call; a locus
+        // without D genes calls none.
+        let has_d = |locus: Locus| {
+            d.as_ref()
+                .is_some_and(|d| d.alleles().iter().any(|a| a.loci.contains(locus)))
+        };
         let floor = locus_adjudicators
             .iter()
-            .map(|(_, a)| a.model)
-            .fold(objective, |low, m| {
-                if m.d_presence < low.d_presence {
-                    m
-                } else {
-                    low
-                }
-            });
+            .filter(|(locus, _)| has_d(*locus))
+            .map(|(_, a)| a.d_score_floor())
+            .fold(adjudicator.d_score_floor(), Score::min);
         Ok(Assigner {
             v: v_stage(v, &config.v)?,
             j: j_stage(j, &config.j),
-            // A D below the objective's floor carries posterior mass, and can
-            // win a per-read call.
-            d: d.map(|set| {
-                let keep = adjudicator.posterior || !adjudicator.calls_on_fixed_scale();
-                d_stage(set, &config.d, &floor, keep)
-            }),
+            d: d.map(|set| d_stage(set, &config.d, floor)),
             strand,
             j_window: config.j.window,
             aligner: match config.simd {
@@ -667,12 +675,6 @@ impl Assigner {
                     .ok_or(BuildError::Unsupported(backend))?,
             },
             d_window,
-            d_admission: AnyOf(
-                ExactRunFloor {
-                    min_run: config.d.min_exact_run,
-                },
-                config.d.distributed,
-            ),
             adjudicator,
             locus_adjudicators,
             c: None,
@@ -710,6 +712,20 @@ mod tests {
         }
     }
 
+    /// An exact-run gate no score can reach raises the D floor to the
+    /// largest score instead of wrapping below the keep floor.
+    #[test]
+    fn an_unreachable_exact_run_saturates_the_d_floor() {
+        let mut d = crate::profiles::CallingProfile::ROptimized.config().d;
+        d.distributed = None;
+        for run in [1 << 30, u32::MAX] {
+            d.min_exact_run = run;
+            assert_eq!(d.lossless_min_score(), Score::MAX, "{run}");
+        }
+        d.min_exact_run = 5;
+        assert_eq!(d.lossless_min_score(), d.keep.min_score.max(10));
+    }
+
     #[test]
     fn d_prior_scales_with_the_d_database() {
         let scoring = AffineScoring::new(2, -3, -13, -1);
@@ -724,11 +740,14 @@ mod tests {
         assert_eq!(cost(more_likely, genes(32)), 8.36);
         // The fixed-scale call charges ⌊P*_D⌋: an integer D score must exceed it.
         let objective = EngineeringObjective {
-            d_presence: DPrior::DERIVED.cost(genes(32), &scoring),
-            ..EngineeringObjective::default()
+            presence: [0.0, DPrior::DERIVED.cost(genes(32), &scoring), 0.0],
+            ..EngineeringObjective::priced([0.0, 11.0, 0.0])
         };
         assert_eq!(
-            (objective.d_presence_score(), objective.d_floor()),
+            (
+                objective.presence_score(SegmentKind::D),
+                objective.d_floor()
+            ),
             (10, 11)
         );
     }
@@ -843,6 +862,173 @@ mod tests {
                 "S = {score}: brute force {brute:.3}, closed form {closed:.3}"
             );
         }
+    }
+
+    /// A J database of two loci prices a J by the genes of the read's
+    /// locus: each locus' adjudicator counts its own J genes, and reads of
+    /// no single locus count them all.
+    #[test]
+    fn a_j_is_priced_by_the_genes_of_its_locus() {
+        let mut next = crate::testing::rng(3);
+        let mut fasta = |names: &[&str], len: usize| -> String {
+            names
+                .iter()
+                .map(|name| {
+                    let codes = crate::testing::random_codes(&mut next, len);
+                    format!(">{name}\n{}\n", crate::alphabet::decode(&codes))
+                })
+                .collect()
+        };
+        let v = fasta(&["IGHV1-1*01", "IGKV1-1*01"], 120);
+        let j = fasta(
+            &["IGHJ1*01", "IGHJ2*01", "IGHJ3*01", "IGKJ1*01", "IGKJ2*01"],
+            40,
+        );
+        let v = GermlineSet::from_fasta(SegmentKind::V, &v).unwrap();
+        let j = GermlineSet::from_fasta(SegmentKind::J, &j).unwrap();
+        let config = EngineConfig::default();
+        let assigner = Assigner::from_config(&config, v, None, j).unwrap();
+        let scoring = &config.j.scoring;
+        let cost = |genes| {
+            let space = DSearchSpace { genes, offsets: 1 };
+            config.objective.j_prior.cost(space, scoring)
+        };
+        let j_cost = |dag: &PlacementDag| dag.model.presence(SegmentKind::J);
+        assert_eq!(j_cost(&assigner.adjudicator), cost(5));
+        let by_locus: Vec<(Locus, f64)> = assigner
+            .locus_adjudicators
+            .iter()
+            .map(|(locus, dag)| (*locus, j_cost(dag)))
+            .collect();
+        assert_eq!(by_locus, [(Locus::Igh, cost(3)), (Locus::Igk, cost(2))]);
+    }
+
+    /// A locus without D genes calls no D, so its adjudicator's placeholder
+    /// D cost does not lower the D stage's floor: an IGH+IGK database prunes
+    /// D hits as an IGH one does.
+    #[test]
+    fn a_locus_without_d_leaves_the_d_floor_alone() {
+        let mut next = crate::testing::rng(5);
+        let mut fasta = |names: &[&str], len: usize| -> String {
+            names
+                .iter()
+                .map(|name| {
+                    let codes = crate::testing::random_codes(&mut next, len);
+                    format!(">{name}\n{}\n", crate::alphabet::decode(&codes))
+                })
+                .collect()
+        };
+        let v = fasta(&["IGHV1-1*01", "IGKV1-1*01"], 120);
+        let d: Vec<String> = (1..=20).map(|g| format!("IGHD{g}-1*01")).collect();
+        let d = fasta(&d.iter().map(String::as_str).collect::<Vec<_>>(), 20);
+        let j = fasta(&["IGHJ1*01", "IGHJ2*01", "IGKJ1*01"], 40);
+        let v = GermlineSet::from_fasta(SegmentKind::V, &v).unwrap();
+        let d = GermlineSet::from_fasta(SegmentKind::D, &d).unwrap();
+        let j = GermlineSet::from_fasta(SegmentKind::J, &j).unwrap();
+        let config = EngineConfig {
+            calls: CallModel::FixedScale,
+            posterior: false,
+            ..EngineConfig::default()
+        };
+        let assigner = Assigner::from_config(&config, v, Some(d), j).unwrap();
+        let floor = |locus| {
+            let (_, dag) = assigner
+                .locus_adjudicators
+                .iter()
+                .find(|(l, _)| *l == locus)
+                .unwrap();
+            dag.d_score_floor()
+        };
+        let heavy = assigner.adjudicator.d_score_floor();
+        assert_eq!(floor(Locus::Igh), heavy);
+        assert!(
+            floor(Locus::Igk) < heavy,
+            "the test needs a lower placeholder"
+        );
+        let stage = assigner.d.as_ref().unwrap();
+        assert_eq!(
+            stage.keep.min_score,
+            config.d.lossless_min_score().max(heavy)
+        );
+    }
+
+    /// The engine's DAG is the configuration's: its mode, and the D stage's
+    /// floor from that mode (pruning only for a fixed-scale call without
+    /// posteriors). A V scoring without log-odds λ cannot read a read's
+    /// evidence, so only the fixed mode builds from it.
+    #[test]
+    fn the_adjudicator_and_its_d_floor_follow_the_configuration() {
+        let db = crate::sim::SyntheticDatabase::generate(&crate::sim::SyntheticSpec::default(), 5);
+        let build = |config: &EngineConfig| {
+            Assigner::from_config(config, db.v.clone(), Some(db.d.clone()), db.j.clone())
+        };
+        let evidence =
+            |c: &EngineConfig| EvidenceModel::new([&c.v.scoring, &c.d.scoring, &c.j.scoring]);
+        let default = EngineConfig::default();
+        let lossless = default.d.lossless_min_score();
+        let objective =
+            default
+                .objective
+                .resolve(Some(&db.d), &default.d, &db.j, &default.j.scoring);
+        for (calls, posterior, d_allele) in [
+            (CallModel::PerRead, true, DAlleleDecoding::Map),
+            (CallModel::PerRead, false, DAlleleDecoding::MaxMarginal),
+            (CallModel::FixedScale, true, DAlleleDecoding::MaxMarginal),
+            (CallModel::FixedScale, false, DAlleleDecoding::MaxMarginal),
+        ] {
+            let config = EngineConfig {
+                calls,
+                posterior,
+                d_allele,
+                ..EngineConfig::default()
+            };
+            let assigner = build(&config).unwrap();
+            let dag = &assigner.adjudicator;
+            let (mode, floor) = if calls == CallModel::FixedScale && !posterior {
+                (Mode::Fixed, objective.d_floor())
+            } else {
+                let mode = Mode::Read {
+                    evidence: evidence(&config).unwrap(),
+                    calls,
+                    posterior: posterior.then_some(d_allele),
+                };
+                (mode, Score::MIN)
+            };
+            assert_eq!((dag.mode(), dag.model), (mode, objective));
+            assert_eq!(dag.min_retained, default.min_retained);
+            assert_eq!(dag.d_score_floor(), floor);
+            let d = assigner.d.as_ref().unwrap();
+            assert_eq!(d.keep.min_score, lossless.max(floor));
+        }
+        let mut config = EngineConfig::default();
+        config.v.scoring = AffineScoring::new(2, 1, -9, -1);
+        assert!(matches!(
+            build(&config),
+            Err(BuildError::NoStatistics(SegmentKind::V))
+        ));
+        config.calls = CallModel::FixedScale;
+        config.posterior = false;
+        assert_eq!(build(&config).unwrap().adjudicator.mode(), Mode::Fixed);
+    }
+
+    /// The fixed-scale posterior reads each presence cost at the λ of the
+    /// scoring it was derived with: the D's, not the V's.
+    #[test]
+    fn presence_costs_are_read_at_their_own_lambda() {
+        let mut config = EngineConfig::default();
+        config.d.scoring = AffineScoring::new(2, -4, -13, -1);
+        let db = crate::sim::SyntheticDatabase::generate(&crate::sim::SyntheticSpec::default(), 5);
+        let assigner = Assigner::from_config(&config, db.v, Some(db.d), db.j).unwrap();
+        let Mode::Read { evidence, .. } = assigner.adjudicator.mode() else {
+            panic!("the default mode reads evidence");
+        };
+        let lambda = |s: &AffineScoring| KarlinAltschul::ungapped(s).unwrap().lambda;
+        assert_eq!(evidence.lambda, lambda(&config.v.scoring));
+        assert_eq!(
+            evidence.presence_lambda,
+            [&config.v.scoring, &config.d.scoring, &config.j.scoring].map(lambda)
+        );
+        assert_ne!(evidence.presence_lambda[1], evidence.lambda);
     }
 
     #[test]

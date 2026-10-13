@@ -44,8 +44,8 @@
 //! ([`crate::segment::EvalueGates::anchor`]): C is not implied by V(D)J, it
 //! depends on the library. For `(2, −3)` scoring
 //! (`λ = 0.634`) that is `S ≥ 18` for the 10 human IGHC genes. `N_C`
-//! counts every gene of the C database, so one database per locus keeps the
-//! gate tight. This is not the K·m·n E-value of V, D and J.
+//! counts the C genes of the read's (J's) locus: a database of several loci
+//! gets one gate per locus. This is not the K·m·n E-value of V, D and J.
 //!
 //! **Posterior.** Among the read's C placements (the best `top` classes and
 //! ties), a placement's weight is the log-odds of its alignment at C's own
@@ -67,7 +67,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::adjudicate::{CalledSegment, EvidenceScale};
+use crate::adjudicate::{CalledSegment, EvidenceScale, co_optimal};
 use crate::align::{Aligner, Alignment, Op};
 use crate::band::Band;
 use crate::clip::ClipIndex;
@@ -76,7 +76,6 @@ use crate::germline::{GermlineSet, SegmentKind};
 use crate::locus::{Loci, Locus};
 use crate::pipeline::Call;
 use crate::placement::{Placement, merge_identical};
-use crate::report::co_optimal;
 use crate::retrieve::{Candidate, ReachClasses, RetrievalScratch};
 use crate::scoring::{AffineScoring, AnchorColumn, GapCosts, Score};
 use crate::segment::{BatchScratch, KeepPolicy, PreparedSegment, SegmentRequest, SegmentStage};
@@ -361,7 +360,7 @@ impl ConstantStage {
             entry: x,
             exit: n,
             span: best.clip.full(),
-            by_marginal: false,
+            allele: None,
         };
         let co = co_optimal(
             &call.constant,

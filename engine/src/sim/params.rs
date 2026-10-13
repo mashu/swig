@@ -8,6 +8,7 @@
 //! crate's, the same in every preset.
 
 use super::random::{Count, GatedRate, Rate};
+use super::simulate::SimError;
 
 /// Instrument substitutions on the V(D)J body, ramping linearly from `p5` at
 /// the first body base to `p3` at the last (IgSim's `IlluminaError`).
@@ -187,6 +188,57 @@ impl SimParams {
             "hard" => Some(Self::hard()),
             _ => None,
         }
+    }
+
+    /// Check that every probability and rate lies in `[0, 1]`, every count
+    /// distribution is well defined and `min_length ≤ max_length`
+    /// ([`super::Simulator::new`] does).
+    pub fn validate(&self) -> Result<(), SimError> {
+        let invalid =
+            |name: &str, problem: String| Err(SimError::Parameter(format!("{name}: {problem}")));
+        for (name, p) in [
+            ("include_d", self.include_d),
+            ("include_dd", self.include_dd),
+            ("include_c", self.include_c),
+            ("c_whole_flank", self.c_whole_flank),
+            ("reverse_complement", self.reverse_complement),
+            ("body_error_rate.p", self.body_error_rate.p),
+            ("indel_rate.p", self.indel_rate.p),
+            ("illumina_error.p5", self.illumina_error.p5),
+            ("illumina_error.p3", self.illumina_error.p3),
+        ] {
+            if !(0.0..=1.0).contains(&p) {
+                return invalid(name, format!("probability {p} outside [0, 1]"));
+            }
+        }
+        for (name, rate) in [
+            ("body_error_rate", self.body_error_rate.rate),
+            ("indel_rate", self.indel_rate.rate),
+        ] {
+            if let Some(problem) = rate.problem() {
+                return invalid(name, format!("{problem} is not a rate in [0, 1]"));
+            }
+        }
+        for (name, count) in [
+            ("v_trim_5p", self.v_trim_5p),
+            ("v_trim_3p", self.v_trim_3p),
+            ("d_trim_5p", self.d_trim_5p),
+            ("d_trim_3p", self.d_trim_3p),
+            ("j_trim_5p", self.j_trim_5p),
+            ("n1_length", self.n1_length),
+            ("n2_length", self.n2_length),
+            ("flank_5p", self.flank_5p),
+            ("flank_3p", self.flank_3p),
+        ] {
+            if let Some(problem) = count.problem() {
+                return invalid(name, problem);
+            }
+        }
+        if self.min_length > self.max_length {
+            let (lo, hi) = (self.min_length, self.max_length);
+            return invalid("min_length", format!("{lo} above max_length {hi}"));
+        }
+        Ok(())
     }
 
     /// Same parameters with a fixed SHM rate on every read (for stratified sweeps).

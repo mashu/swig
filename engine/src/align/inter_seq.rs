@@ -35,7 +35,11 @@
 //! *codes* instead of five interleaved profile rows, and a cell's score is
 //! one load, one comparison and a blend instead of five masked loads. `N`
 //! scores 0 and out-of-matrix cells score `−∞` exactly as in the profile
-//! path, so results are identical.
+//! path, so results are identical. An anchored C profile
+//! ([`crate::scoring::AnchorColumn`]) is uniform but for its first column,
+//! which the layout marks with its own code and a group holding one
+//! (`ANCHORED`, a compile-time switch, so other groups pay nothing) scores
+//! with the lane's bonus.
 //!
 //! **Exact scalar semantics.** Out-of-band and out-of-matrix cells read as
 //! `H = 0, I = D = −∞`, exactly like the scalar kernel's never-written
@@ -49,8 +53,19 @@
 //!
 //! **16-bit safety.** Lanes are 16-bit with saturating arithmetic and
 //! `−∞ = −16384`. A job enters a lane only if its attainable score
-//! ([`SubstitutionProfile::local_bound`] over `min(n, m)` columns) and its
-//! costs stay far from that sentinel; others fall back to the scalar kernel.
+//! ([`SubstitutionProfile::local_bound`] over `min(n, m)` columns) is at
+//! most 30,000 and its costs at least −1,000; others fall back to the
+//! scalar kernel. A real cell then holds `H` in `[0, bound]` and gap states
+//! of at least −1,000 (an `H` plus one cost), and a cell outside the matrix
+//! at most its real neighbour's `H − 16384`, so saturation never clips a
+//! real cell and profile entries narrow to 16 bits exactly. Anchored C jobs
+//! (bonus `2·ℓ + 1`, `ℓ` the longest C record) stay in lanes for records up
+//! to about 15 kb.
+//!
+//! **Bounded traceback memory.** A traceback pass stores one byte per cell
+//! and register lane. A group ends before a job that would take its trace
+//! above 64 MiB, and a job that alone exceeds it runs on the scalar kernel,
+//! whose trace holds only its own band.
 
 use super::gotoh::{BandedGotoh, GotohWorkspace, traceback_with};
 #[cfg(target_arch = "aarch64")]
@@ -60,7 +75,7 @@ use super::lanes::Simd128;
 #[cfg(target_arch = "x86_64")]
 use super::lanes::{Avx2, Avx512};
 use super::lanes::{Kernel, Lanes, Portable};
-use super::{AlignJob, Aligner, Alignment, Op, ScoreHit};
+use super::{AlignJob, Aligner, Alignment, ScoreHit};
 use crate::alphabet::N;
 use crate::band::Band;
 use crate::scoring::{GapCosts, Score, SubstitutionProfile};
@@ -72,13 +87,19 @@ const CODES: usize = N as usize + 1;
 const SENTINEL: i16 = N as i16 + 1;
 /// Reference code for positions past a lane's reference (uniform layout).
 const REF_SENTINEL: i16 = N as i16 + 2;
+/// Reference code of an anchor column (uniform layout); below `N`, so never
+/// outside the matrix.
+const ANCHOR: i16 = -1;
 const NEG: i16 = -16_384;
-/// Largest attainable score admitted into a lane.
-const MAX_SCORE: i64 = 8_000;
+/// Largest attainable score admitted into a lane (see the module's 16-bit
+/// safety): below `i16::MAX`, and `NEG` below `−MAX_SCORE / 2`.
+const MAX_SCORE: i64 = 30_000;
 /// Most negative single-step score or gap cost admitted into a lane.
 const MIN_STEP: i64 = -1_000;
 /// Largest row count / band width admitted into a lane (positions are i16).
 const MAX_DIM: usize = 16_000;
+/// Largest traceback buffer of one lane group, in cells of one byte.
+const MAX_TRACE_CELLS: usize = 1 << 26;
 
 /// Instruction set of the inter-sequence kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -322,9 +343,11 @@ pub(super) struct Shape<const L: usize> {
     extend: [i16; L],
     step: [i16; L],
     lane_width: [i16; L],
-    /// Uniform layout only: per-lane match and mismatch scores.
+    /// Uniform layout only: per-lane match and mismatch scores, and the
+    /// anchor column's bonus (0 without one).
     matched: [i16; L],
     mismatch: [i16; L],
+    anchor: [i16; L],
 }
 
 /// Best cell of each lane in kernel coordinates.
@@ -356,12 +379,10 @@ fn lane_rows<T: Copy, const L: usize>(buffer: &mut Vec<T>, rows: usize, value: T
     buffer.as_chunks_mut::<L>().0
 }
 
-/// Best cell and (for traceback passes) the alignment start and columns.
+/// A lane's best local score and, on a traceback pass, its alignment.
 struct LaneResult {
     score: Score,
-    row: usize,
-    col: usize,
-    start: Option<(usize, usize, Vec<Op>)>,
+    alignment: Option<Alignment>,
 }
 
 /// Reference indices `j0` whose layout position `t = j0 + offset` lies in
@@ -399,6 +420,7 @@ fn build<const DIAG: bool, const UNIFORM: bool, const L: usize>(
         lane_width: [0; L],
         matched: [0; L],
         mismatch: [0; L],
+        anchor: [0; L],
     };
     for (l, lane) in lanes.iter().enumerate() {
         let job = &jobs[lane.job];
@@ -418,8 +440,15 @@ fn build<const DIAG: bool, const UNIFORM: bool, const L: usize>(
             let scores = job.profile.uniform().expect("uniform group");
             shape.matched[l] = scores.matched as i16;
             shape.mismatch[l] = scores.mismatch as i16;
+            let anchored = reach.start == 0 && !reach.is_empty();
             for (t, &code) in (first..).zip(&job.profile.codes()[reach]) {
                 profile[t][l] = i16::from(code);
+            }
+            if let Some(bonus) = scores.anchor {
+                shape.anchor[l] = bonus as i16;
+                if anchored {
+                    profile[first][l] = ANCHOR;
+                }
             }
         } else {
             for code in 0..CODES {
@@ -454,6 +483,7 @@ pub(super) unsafe fn fill<
     const DIAG: bool,
     const TRACE: bool,
     const UNIFORM: bool,
+    const ANCHORED: bool,
 >(
     shape: &Shape<L>,
     query: &[[i16; L]],
@@ -481,6 +511,7 @@ where
         let sentinel = V::splat(SENTINEL);
         let ambiguous_code = V::splat(i16::from(N));
         let (matched, mismatch) = (V::load(&shape.matched), V::load(&shape.mismatch));
+        let (anchor_code, anchor) = (V::splat(ANCHOR), V::load(&shape.anchor));
         let (mut best, mut best_row, mut best_k) = (zero, zero, zero);
 
         for r in 1..=rows {
@@ -525,7 +556,13 @@ where
                     let base = V::select(q.eq(reference), matched, mismatch);
                     let ambiguous = V::mask_or(query_ambiguous, reference.eq(ambiguous_code));
                     let outside = V::mask_or(past_query_lanes, reference.gt(ambiguous_code));
-                    V::select(outside, neg, base.clear(ambiguous))
+                    let base = base.clear(ambiguous);
+                    let base = if ANCHORED {
+                        V::select(reference.eq(anchor_code), anchor, base)
+                    } else {
+                        base
+                    };
+                    V::select(outside, neg, base)
                 } else {
                     let mut s = past_query;
                     for (c, &mask) in code_mask.iter().enumerate() {
@@ -569,10 +606,13 @@ where
                 del = next_del;
                 del_extends = next_extends;
 
-                let improved = score.gt(best);
+                if TRACE {
+                    // The end cell seeds traceback; the score pass needs only the score.
+                    let improved = score.gt(best);
+                    best_row = V::select(improved, row_vector, best_row);
+                    best_k = V::select(improved, k_vector, best_k);
+                }
                 best = best.max(score);
-                best_row = V::select(improved, row_vector, best_row);
-                best_k = V::select(improved, k_vector, best_k);
             }
         }
         let mut out = LaneBest {
@@ -599,6 +639,13 @@ fn run_group<K, const L: usize, const DIAG: bool, const TRACE: bool>(
     let uniform = lanes
         .iter()
         .all(|l| jobs[l.job].profile.uniform().is_some());
+    let anchored = uniform
+        && lanes.iter().any(|l| {
+            jobs[l.job]
+                .profile
+                .uniform()
+                .is_some_and(|u| u.anchor.is_some())
+        });
     let shape = if uniform {
         build::<DIAG, true, L>(jobs, lanes, &mut ws.query, &mut ws.profile)
     } else {
@@ -617,10 +664,16 @@ fn run_group<K, const L: usize, const DIAG: bool, const TRACE: bool>(
     let trace = &mut ws.trace.as_chunks_mut::<L>().0[..cells];
     // SAFETY: `K` was chosen from `Backend::available`.
     let best = unsafe {
-        if uniform {
-            K::fill::<DIAG, TRACE, true>(&shape, query, profile, h, ins, trace)
-        } else {
-            K::fill::<DIAG, TRACE, false>(&shape, query, profile, h, ins, trace)
+        match (uniform, anchored) {
+            (true, true) => {
+                K::fill::<DIAG, TRACE, true, true>(&shape, query, profile, h, ins, trace)
+            }
+            (true, false) => {
+                K::fill::<DIAG, TRACE, true, false>(&shape, query, profile, h, ins, trace)
+            }
+            (false, _) => {
+                K::fill::<DIAG, TRACE, false, false>(&shape, query, profile, h, ins, trace)
+            }
         }
     };
     let trace = &*trace;
@@ -630,24 +683,41 @@ fn run_group<K, const L: usize, const DIAG: bool, const TRACE: bool>(
             emit(lane.job, None);
             continue;
         }
-        let (row, col) = lane.cell_of::<DIAG>(best.row[l] as usize, best.k[l] as usize);
-        let start = TRACE.then(|| {
-            traceback_with(
+        let alignment = TRACE.then(|| {
+            let (row, col) = lane.cell_of::<DIAG>(best.row[l] as usize, best.k[l] as usize);
+            let (q_start, r_start, ops) = traceback_with(
                 |i, j| lane.trace_code::<DIAG, L>(trace, width, l, i, j),
                 row,
                 col,
-            )
-        });
-        emit(
-            lane.job,
-            Some(LaneResult {
+            );
+            Alignment {
+                q_start: q_start as u32,
+                q_end: row as u32,
+                r_start: r_start as u32,
+                r_end: col as u32,
                 score,
-                row,
-                col,
-                start,
-            }),
-        );
+                ops,
+            }
+        });
+        emit(lane.job, Some(LaneResult { score, alignment }));
     }
+}
+
+/// Lanes in the next group of `lanes` (sorted by rows, then width,
+/// descending, so the first has the group's rows): at most `L`, and on a
+/// traceback pass no more than keep its trace (rows × widest width × `L`
+/// bytes) within [`MAX_TRACE_CELLS`]; none when the first alone exceeds it.
+fn group_len<const L: usize>(lanes: &[Lane], trace: bool) -> usize {
+    let rows = lanes.first().map_or(0, |lane| lane.rows);
+    let mut width = 0;
+    lanes
+        .iter()
+        .take(L)
+        .take_while(|lane| {
+            width = width.max(lane.width);
+            !trace || rows.saturating_mul(width).saturating_mul(L) <= MAX_TRACE_CELLS
+        })
+        .count()
 }
 
 /// Run the diagonal and rectangular groups on backend `K`; route
@@ -665,7 +735,10 @@ fn run_groups<K, const L: usize, const TRACE: bool>(
         } else {
             &mut ws.rectangular
         });
-        for group in groups.chunks(L) {
+        let mut rest = &groups[..];
+        while !rest.is_empty() {
+            let (group, tail) = rest.split_at(group_len::<L>(rest, TRACE).max(1));
+            rest = tail;
             match (group.len(), diagonal) {
                 (1, _) => ws.scalar_jobs.push(group[0].job),
                 (_, true) => run_group::<K, L, true, TRACE>(jobs, group, ws, emit),
@@ -756,11 +829,7 @@ impl Aligner for InterSequenceGotoh {
         out.clear();
         out.resize(jobs.len(), None);
         self.simd_groups::<false>(jobs, ws, |job, result| {
-            out[job] = result.map(|r| ScoreHit {
-                score: r.score,
-                q_end: r.row as u32,
-                r_end: r.col as u32,
-            });
+            out[job] = result.map(|r| ScoreHit { score: r.score });
         });
         for &index in &ws.scalar_jobs {
             let job = &jobs[index];
@@ -778,17 +847,7 @@ impl Aligner for InterSequenceGotoh {
         out.clear();
         out.resize(jobs.len(), None);
         self.simd_groups::<true>(jobs, ws, |job, result| {
-            out[job] = result.map(|r| {
-                let (q_start, r_start, ops) = r.start.expect("traceback pass records the start");
-                Alignment {
-                    q_start: q_start as u32,
-                    q_end: r.row as u32,
-                    r_start: r_start as u32,
-                    r_end: r.col as u32,
-                    score: r.score,
-                    ops,
-                }
-            });
+            out[job] = result.map(|r| r.alignment.expect("a traceback pass aligns"));
         });
         for &index in &ws.scalar_jobs {
             let job = &jobs[index];
@@ -1009,12 +1068,13 @@ mod tests {
     }
 
     /// C-like jobs: anchor profiles (one outsized column) on 1.3 kb
-    /// references under 7-diagonal bands, batched with uniform jobs. They
-    /// stay in SIMD lanes and match the scalar kernel.
+    /// references under 7-diagonal bands, batched with uniform jobs, in a
+    /// database whose longest record has 13 kb (bonus 26,001). They stay in
+    /// SIMD lanes and match the scalar kernel.
     #[test]
     fn anchor_profiles_on_long_references_match_the_scalar_kernel() {
         let scoring = AffineScoring::new(2, -3, -9, -1);
-        let model = AnchorColumn::new(scoring, 1300);
+        let model = AnchorColumn::new(scoring, 13_000);
         let mut next = rng(9);
         let mut cases = Vec::new();
         for k in 0..48 {
@@ -1077,9 +1137,66 @@ mod tests {
         }
     }
 
+    /// A traceback group keeps its trace within the budget, splitting
+    /// large jobs into smaller groups or sending one alone to the scalar
+    /// kernel, and the results stay the scalar kernel's.
+    #[test]
+    fn traceback_groups_stay_within_the_trace_budget() {
+        let lane = |rows: usize, width: usize| Lane {
+            job: 0,
+            shift: 0,
+            lo: 0,
+            width,
+            rows,
+            n: rows,
+            m: width,
+        };
+        assert_eq!(group_len::<16>(&vec![lane(500, 300); 40], true), 16);
+        // The group's trace has its first lane's rows and its widest lane's width.
+        let mixed = [lane(4_000, 500), lane(3_000, 1_500), lane(3_000, 100)];
+        assert_eq!(group_len::<16>(&mixed, true), 1);
+        // A 2,100 × 2,100 job needs 70.6 M trace bytes in a 16-lane register.
+        let large = vec![lane(2_100, 2_100); 4];
+        assert_eq!(group_len::<16>(&large, false), 4);
+        assert_eq!(group_len::<16>(&large, true), 0);
+        let scoring = AffineScoring::new(2, -3, -9, -1);
+        let mut next = rng(3);
+        let reference = random_codes(&mut next, 2_100);
+        let mut query = reference.clone();
+        query[700] = (query[700] + 1) % 4;
+        query.remove(1_400);
+        query.push(0);
+        let profile = SubstitutionProfile::build(&scoring, &reference);
+        let job = AlignJob {
+            query: &query,
+            profile: &profile,
+            gaps: scoring.gaps,
+            band: Band::Full,
+        };
+        let jobs = vec![job; 4];
+        let expected = BandedGotoh.align(
+            &query,
+            &profile,
+            scoring.gaps,
+            Band::Full,
+            &mut Default::default(),
+        );
+        let mut alignments = Vec::new();
+        for simd in backends() {
+            let mut ws = InterSequenceWorkspace::default();
+            simd.align_batch(&jobs, &mut ws, &mut alignments);
+            assert!(ws.trace.len() <= MAX_TRACE_CELLS, "{:?}", simd.backend());
+            assert!(
+                alignments.iter().all(|a| *a == expected),
+                "{:?}",
+                simd.backend()
+            );
+        }
+    }
+
     #[test]
     fn oversized_scores_fall_back_to_scalar() {
-        let scoring = AffineScoring::new(100, -3, -5, -1);
+        let scoring = AffineScoring::new(200, -3, -5, -1);
         let reference: Vec<u8> = (0..200).map(|i| (i % 4) as u8).collect();
         let profile = SubstitutionProfile::build(&scoring, &reference);
         assert!(
@@ -1106,13 +1223,24 @@ mod tests {
         let (mut out, mut alignments) = (Vec::new(), Vec::new());
         let mut ws = InterSequenceWorkspace::default();
         InterSequenceGotoh::new().score_batch(&jobs, &mut ws, &mut out);
-        assert!(out.iter().all(|hit| hit.map(|h| h.score) == Some(20_000)));
+        assert!(out.iter().all(|hit| hit.map(|h| h.score) == Some(40_000)));
         // The scalar fallback's traceback reports the same score.
         InterSequenceGotoh::new().align_batch(&jobs, &mut ws, &mut alignments);
         assert!(
             alignments
                 .iter()
-                .all(|a| a.as_ref().map(|a| a.score) == Some(20_000))
+                .all(|a| a.as_ref().map(|a| a.score) == Some(40_000))
         );
+        // Half that score stays in a lane.
+        let half = SubstitutionProfile::build(&AffineScoring::new(100, -3, -5, -1), &reference);
+        let job = AlignJob {
+            query: &reference,
+            profile: &half,
+            gaps: scoring.gaps,
+            band: Band::Full,
+        };
+        assert!(lane_of(0, &job).is_some());
+        InterSequenceGotoh::new().score_batch(&[job; 3], &mut ws, &mut out);
+        assert!(out.iter().all(|hit| hit.map(|h| h.score) == Some(20_000)));
     }
 }

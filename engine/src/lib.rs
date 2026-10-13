@@ -20,8 +20,7 @@
 //! segment / family_bound / flank   retrieve → score-only DP → keep → traceback
 //! clip / evidence / placement      O(1) clip-and-rescore, admission evidence
 //! window / admission               where D is searched, which D hits count
-//! adjudicate                       placement DAG (VJ / VDJ; VDDJ as a grammar)
-//!                                  or residual
+//! adjudicate                       placement DAG (VJ / VDJ)
 //! constant                         C anchored at the J exit, after adjudication
 //! pipeline / config / profiles     stage-wise, chunk-batched composition and the
 //!                                  note's calling profiles
@@ -90,7 +89,7 @@ pub mod window;
 pub mod prelude {
     pub use crate::adjudicate::{
         Adjudicator, CallModel, CallPath, CalledSegment, DAlleleDecoding, EngineeringObjective,
-        Grammar, PathModel, PathScore, PlacementDag, ResidualAdjudicator, VdjGrammar,
+        Grammar, PathModel, PathScore, PlacementDag, VdjGrammar,
     };
     pub use crate::admission::{
         Admission, AdmitAll, AllOf, AnyOf, DistributedEvidence, ExactRunFloor,

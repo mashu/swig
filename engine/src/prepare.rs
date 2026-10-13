@@ -13,7 +13,9 @@ use std::fmt;
 use std::io;
 use std::path::Path;
 
-use crate::annotate::{AlleleAnnotation, AnnotateOptions, DatabaseAnnotation, annotate_by_locus};
+use crate::annotate::{
+    AlleleAnnotation, AnnotateOptions, DatabaseAnnotation, Note, annotate_by_locus,
+};
 use crate::germline::{GermlineError, GermlineSet, MergedDuplicate, SegmentKind};
 use crate::retrieve::GeneFrames;
 use crate::seed::SeedShape;
@@ -25,10 +27,19 @@ use crate::translate::open_frames;
 /// `2` per column).
 pub const MAX_CODING_C: usize = 2000;
 
-fn label(annotations: &[AlleleAnnotation], id: u32) -> Option<String> {
-    annotations
-        .get(id as usize)
-        .map(|a| format!("annotation={}", a.source.label()))
+/// The `annotation=` and `uncertain=` tokens of a prepared V or J header:
+/// the allele's provenance ([`crate::germline::Allele::source`]) and the
+/// region starts its annotation doubts, which a reload reads back.
+fn annotation_tokens(
+    set: &GermlineSet,
+    annotations: &[AlleleAnnotation],
+    id: u32,
+) -> Option<String> {
+    let mut tokens = format!("annotation={}", set.allele(id).source.as_deref()?);
+    if let Some(field) = annotations.get(id as usize)?.uncertain_field() {
+        tokens += &format!(" {field}");
+    }
+    Some(tokens)
 }
 
 /// A germline set that could not be read or deduplicated.
@@ -143,7 +154,8 @@ pub enum DatabaseWarning {
     /// No V allele gives its FR3 start in a locus whose FR3 length varies by
     /// family, so every FR3 start rests on one chain default.
     Fr3Default,
-    /// Alleles whose anchors were transferred, are low-confidence or missing.
+    /// Alleles whose anchors were transferred, are low-confidence, missing
+    /// or contradicted by their sequence.
     Uncertain(usize),
     /// A convention that keeps C from being called.
     Constant(ConstantWarning),
@@ -158,7 +170,7 @@ impl fmt::Display for DatabaseWarning {
             ),
             Self::Uncertain(count) => write!(
                 f,
-                "{count} alleles have transferred, low-confidence or missing anchors; review them in the prepared annotation.tsv"
+                "{count} alleles have transferred, low-confidence, missing or contradicted anchors; review them in the prepared annotation.tsv"
             ),
             Self::Constant(warning) => write!(f, "{warning}"),
         }
@@ -192,12 +204,17 @@ pub fn prepare(
         deduplicate(set, &mut merged)?;
     }
     let annotation = annotate_by_locus(&mut v, Some(&mut j), options);
-    // An allele without a given provenance (`SWIGMETA=`) reports the
-    // annotation's source.
+    // An allele reports the provenance of its given coordinates
+    // (`SWIGMETA=`), unless it has none or annotation dropped its given
+    // anchor: then the annotation's source.
     for (set, annotations) in [(&mut v, &annotation.v), (&mut j, &annotation.j)] {
         for (id, annotation) in (0..).zip(annotations) {
             let source = set.annotation_mut(id).2;
-            if source.is_none() {
+            let dropped = annotation
+                .notes
+                .iter()
+                .any(|n| matches!(n, Note::MetaAnchorDropped { .. }));
+            if source.is_none() || dropped {
                 *source = Some(annotation.source.label());
             }
         }
@@ -344,14 +361,20 @@ impl PreparedDatabase {
         let (v_labels, j_labels) = (&self.annotation.v, &self.annotation.j);
         let mut files = vec![(
             "V.fasta",
-            text(|out| self.v.write_fasta(out, |id| label(v_labels, id))),
+            text(|out| {
+                self.v
+                    .write_fasta(out, |id| annotation_tokens(&self.v, v_labels, id))
+            }),
         )];
         if let Some(d) = &self.d {
             files.push(("D.fasta", text(|out| d.write_fasta(out, |_| None))));
         }
         files.push((
             "J.fasta",
-            text(|out| self.j.write_fasta(out, |id| label(j_labels, id))),
+            text(|out| {
+                self.j
+                    .write_fasta(out, |id| annotation_tokens(&self.j, j_labels, id))
+            }),
         ));
         if let Some(c) = &self.c {
             files.push(("C.fasta", text(|out| c.write_fasta(out, |_| None))));
@@ -377,6 +400,7 @@ impl PreparedDatabase {
 mod tests {
     use super::*;
     use crate::alphabet::decode;
+    use crate::locus::{Loci, Locus};
     use crate::testing::{random_codes, rng};
 
     /// `codons` random sense codons and a stop: open in frame 0.
@@ -389,6 +413,95 @@ mod tests {
             }
         }
         (text + "TGA").into_bytes()
+    }
+
+    /// Labels without a locus code (the code only in the header text, which
+    /// the written FASTA drops) keep their loci through `prepare` → reload:
+    /// the database is still annotated, and paired, per locus.
+    #[test]
+    fn a_prepared_database_keeps_the_loci_of_its_alleles() {
+        let mut next = rng(12);
+        let mut record = |label: &str, gene: &str, len: usize| {
+            format!(
+                ">{label} {gene}\n{}\n",
+                decode(&random_codes(&mut next, len))
+            )
+        };
+        let v = record("h1*01", "IGHV1-2*01", 290) + &record("k1*01", "IGKV1-5*01", 280);
+        let j = record("hj1*01", "IGHJ4*02", 48) + &record("kj1*01", "IGKJ1*01", 38);
+        let texts = GermlineTexts {
+            v: &v,
+            d: None,
+            j: &j,
+            c: None,
+        };
+        let first = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+        let files: HashMap<&str, String> = first.files().into_iter().collect();
+        let texts = GermlineTexts {
+            v: &files["V.fasta"],
+            d: None,
+            j: &files["J.fasta"],
+            c: None,
+        };
+        let again = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+        let loci = |set: &GermlineSet| set.alleles().iter().map(|a| a.loci).collect::<Vec<_>>();
+        for (before, after) in [(&first.v, &again.v), (&first.j, &again.j)] {
+            assert_eq!(loci(after), loci(before));
+            assert!(!loci(after).contains(&Loci::ANY));
+        }
+        let parts = |db: &PreparedDatabase| -> Vec<Option<Locus>> {
+            db.annotation
+                .parts
+                .iter()
+                .map(|(locus, _)| *locus)
+                .collect()
+        };
+        assert_eq!(parts(&again), [Some(Locus::Igh), Some(Locus::Igk)]);
+    }
+
+    /// An allele reports a `SWIGMETA` provenance only for coordinates the
+    /// field supplied: a field with none (`unclassified`, all −1) or one
+    /// the keys override leaves the annotation's source, and a merged copy
+    /// passes its provenance on with its anchor.
+    #[test]
+    fn the_swigmeta_provenance_names_the_coordinates_it_supplied() {
+        let mut next = rng(13);
+        let none = |provenance: u32| format!("SWIGMETA=-1{},{provenance}", ",-1".repeat(11));
+        let v = format!(
+            ">V1*01 {}\n{}\n",
+            none(1),
+            decode(&random_codes(&mut next, 300))
+        );
+        let traj16 = "GGTTTTCAGATGGCCAGAAGCTGCTCTTTGCAAGGGGAACCATGTTAAAGGTGGATCTTA";
+        let iglj2 = "TGTGGTATTCGGCGGAGGGACCAAGCTGACCGTCCTAG";
+        let given = "SWIGMETA=1,6,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,4";
+        let j = [
+            format!(">TRAJ16*01 SWIGMETA=2{},0\n{traj16}\n", ",-1".repeat(11)),
+            format!(">J2*01 anchor=7 {}\n{iglj2}CC\n", none(4)),
+            format!(">IGLJ2A*02 SWIGMETA=0{},0\n{iglj2}\n", ",-1".repeat(11)),
+            format!(">IGLJ2B*01 {given}\n{iglj2}A\n"),
+            format!(">IGLJ2B*02 {given}\n{iglj2}\n"),
+        ]
+        .concat();
+        let texts = GermlineTexts {
+            v: &v,
+            d: None,
+            j: &j,
+            c: None,
+        };
+        let db = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+        let label = |annotations: &[AlleleAnnotation], id: usize| annotations[id].source.label();
+        assert_eq!(db.v.allele(0).source, Some(label(&db.annotation.v, 0)));
+        let traj16 = db.j.allele(0);
+        assert_eq!(traj16.frame, Some(2));
+        assert_eq!(traj16.source, Some(label(&db.annotation.j, 0)));
+        assert_eq!(db.j.allele(1).source.as_deref(), Some("header"));
+        // IGLJ2B*02 merges into IGLJ2A*02 and gives it anchor and provenance.
+        let merged = db.j.allele(2);
+        assert_eq!(merged.aliases, ["IGLJ2B*02"]);
+        assert_eq!((merged.anchor, merged.frame), (Some(7), Some(1)));
+        assert_eq!(merged.source.as_deref(), Some("validated-J-motif"));
+        assert_eq!(db.j.allele(3).source.as_deref(), Some("validated-J-motif"));
     }
 
     #[test]

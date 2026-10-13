@@ -9,8 +9,27 @@
 //! column. An AIRR table is tab-separated, or comma-separated when its
 //! header line holds no tab, and is read from its `sequence`, `sequence_id`
 //! and `quality` columns: Swig re-annotates AIRR input from its sequences.
-//! Gzip input is recognised by its magic bytes and rejected with a hint to
-//! decompress on the fly (the crate has no dependencies).
+//!
+//! Symbols follow the format. FASTA sequence lines keep only letters:
+//! whitespace, digits, `*` and the gap symbols `.` and `-` (IMGT-gapped or
+//! aligned FASTA) are dropped, so a read and its coordinates are the
+//! sequence without them. FASTQ sequence lines and AIRR `sequence` values
+//! (the unaligned read) keep every symbol, because a quality counts each
+//! one: no-call symbols such as `.` and `-` read as N. Their symbols and
+//! qualities are printable ASCII (`!` to `~`), one byte each, so whitespace,
+//! a control character or a non-ASCII character is an error; qualities
+//! (optional in a table) must match the sequence in length.
+//!
+//! Input is read as UTF-8, a byte that is no valid UTF-8 as U+FFFD (as the
+//! Swig app's `TextDecoder` reads it): a Latin-1 header description, which
+//! is dropped anyway, does not stop a run, and an identifier keeps its
+//! readable part, while in a sequence the symbol is dropped (FASTA) or an
+//! error (FASTQ, AIRR). A leading UTF-8 byte-order mark is skipped. Lines
+//! end in `\n` or `\r\n`; a carriage return inside a line (CR-only line
+//! endings) is an error rather than one long line. Gzip input is recognised
+//! by its magic bytes and rejected with a hint to decompress on the fly (the
+//! crate has no dependencies). The reads end at the end of the input or
+//! at the first error.
 
 use std::fmt;
 use std::io::{self, BufRead};
@@ -23,7 +42,8 @@ pub enum ReadFormat {
     Airr,
 }
 
-/// One read: its identifier, raw sequence symbols and FASTQ qualities.
+/// One read: its identifier, sequence symbols (see the module doc) and
+/// qualities.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReadRecord {
     /// The first whitespace-delimited token of a FASTA/FASTQ header, or an
@@ -34,9 +54,40 @@ pub struct ReadRecord {
     pub quality: String,
 }
 
+/// The UTF-8 encoding of U+FEFF, which Windows editors and spreadsheet
+/// "CSV UTF-8" exports put before the text. It is no symbol of the input:
+/// the Swig app's `TextDecoder` drops it as well.
+const BYTE_ORDER_MARK: &[u8] = "\u{feff}".as_bytes();
+
 /// The identifier of a FASTA/FASTQ header line (without `>`/`@`).
 fn header_id(header: &str) -> String {
     header.split_whitespace().next().unwrap_or("").to_string()
+}
+
+/// The first symbol of `text` that is not printable ASCII (`!` to `~`).
+/// FASTQ and AIRR sequences and qualities hold only those, so that one
+/// symbol is one byte and a quality counts one base.
+fn unprintable(text: &str) -> Option<char> {
+    text.chars().find(|c| !c.is_ascii_graphic())
+}
+
+/// The symbols of a FASTQ sequence line or an AIRR `sequence` value at
+/// `line`, every one kept: their qualities count them, so nothing can be
+/// dropped. No-call symbols such as `.` and `-` read as N.
+fn sequence_symbols(text: &str, line: usize) -> Result<&[u8], ReadError> {
+    match unprintable(text) {
+        Some(found) => Err(ReadError::InvalidSymbol { line, found }),
+        None => Ok(text.as_bytes()),
+    }
+}
+
+/// The qualities of a FASTQ quality line or an AIRR `quality` value at
+/// `line`.
+fn quality_symbols(text: &str, line: usize) -> Result<&str, ReadError> {
+    match unprintable(text) {
+        Some(found) => Err(ReadError::InvalidQuality { line, found }),
+        None => Ok(text),
+    }
 }
 
 /// Where an AIRR table keeps what a read needs.
@@ -65,19 +116,34 @@ pub enum ReadError {
     MissingSeparator {
         header: String,
     },
-    /// A FASTQ sequence line holds whitespace or a control character, which
-    /// would split an output column.
+    /// A FASTQ sequence line or an AIRR `sequence` value holds a symbol
+    /// that is not printable ASCII: whitespace or a control character, or a
+    /// non-ASCII character, whose bytes would each count as a base.
     InvalidSymbol {
         line: usize,
         found: char,
     },
+    /// A FASTQ quality line or an AIRR `quality` value holds a symbol that
+    /// is not printable ASCII (`!` to `~`, the Phred+33 range).
+    InvalidQuality {
+        line: usize,
+        found: char,
+    },
+    /// FASTQ qualities, or an AIRR row's non-empty `quality`, that do not
+    /// count the sequence's symbols.
     QualityLength {
+        line: usize,
         header: String,
         sequence: usize,
         quality: usize,
     },
     /// A table (neither FASTA nor FASTQ) without a `sequence` column.
     NoSequenceColumn {
+        line: usize,
+    },
+    /// A carriage return inside a line: CR-only (classic Mac) line endings,
+    /// which would otherwise read the whole input as one line.
+    CarriageReturn {
         line: usize,
     },
 }
@@ -109,16 +175,26 @@ impl fmt::Display for ReadError {
             Self::MissingSeparator { header } => {
                 write!(f, "FASTQ record '{header}' has no '+' separator line")
             }
-            Self::InvalidSymbol { line, found } => {
-                write!(f, "line {line}: {found:?} in a FASTQ sequence line")
-            }
+            Self::InvalidSymbol { line, found } => write!(
+                f,
+                "line {line}: {found:?} in a sequence (FASTQ and AIRR sequences are printable ASCII)"
+            ),
+            Self::InvalidQuality { line, found } => write!(
+                f,
+                "line {line}: {found:?} in a quality (qualities are printable ASCII, '!' to '~')"
+            ),
             Self::QualityLength {
+                line,
                 header,
                 sequence,
                 quality,
             } => write!(
                 f,
-                "FASTQ record '{header}': {quality} quality characters for {sequence} bases"
+                "line {line}: read '{header}' has {quality} quality characters for {sequence} bases"
+            ),
+            Self::CarriageReturn { line } => write!(
+                f,
+                "line {line}: carriage return inside a line (CR-only line endings?); convert them, e.g. `tr '\\r' '\\n'`"
             ),
         }
     }
@@ -143,6 +219,9 @@ pub struct ReadReader<R> {
     input: R,
     format: Option<ReadFormat>,
     started: bool,
+    /// The input ended, or an error ended it (where the next record starts
+    /// is then unknown): no record follows.
+    ended: bool,
     line: usize,
     buffer: String,
     /// FASTA header already read while finishing the previous record.
@@ -157,6 +236,7 @@ impl<R: BufRead> ReadReader<R> {
             input,
             format: None,
             started: false,
+            ended: false,
             line: 0,
             buffer: String::new(),
             pending_header: None,
@@ -164,13 +244,8 @@ impl<R: BufRead> ReadReader<R> {
         }
     }
 
-    /// The underlying input, for instance to see how far a reader over an
-    /// in-memory cursor has got.
-    pub fn get_ref(&self) -> &R {
-        &self.input
-    }
-
-    /// Detected format, `None` for empty input.
+    /// Detected format, `None` for empty input (or after an error on
+    /// detection).
     pub fn format(&mut self) -> Result<Option<ReadFormat>, ReadError> {
         if !self.started {
             self.started = true;
@@ -180,7 +255,8 @@ impl<R: BufRead> ReadReader<R> {
     }
 
     /// Append up to `max` records to `out`; returns how many were appended
-    /// (0 at end of input).
+    /// (0 at end of input). On an error, the records read before it stay in
+    /// `out`.
     pub fn read_batch(
         &mut self,
         max: usize,
@@ -199,7 +275,21 @@ impl<R: BufRead> ReadReader<R> {
         Ok(count)
     }
 
+    /// The next record, `None` at the end of the input. The end is final,
+    /// even if the input has more data later (a terminal after Ctrl-D, a
+    /// growing file), and so is an error: later calls return `None`, since
+    /// where the next record starts is unknown (a FASTQ quality line may
+    /// start with `@`).
     pub fn next_record(&mut self) -> Result<Option<ReadRecord>, ReadError> {
+        if self.ended {
+            return Ok(None);
+        }
+        let next = self.read_record();
+        self.ended = !matches!(next, Ok(Some(_)));
+        next
+    }
+
+    fn read_record(&mut self) -> Result<Option<ReadRecord>, ReadError> {
         match self.format()? {
             None => Ok(None),
             Some(ReadFormat::Fasta) => self.next_fasta(),
@@ -208,18 +298,21 @@ impl<R: BufRead> ReadReader<R> {
         }
     }
 
-    /// Skip leading blank space, reject gzip, and classify the first symbol.
+    /// Reject gzip, skip a UTF-8 byte-order mark and leading blank space,
+    /// and classify the first symbol.
     fn detect(&mut self) -> Result<Option<ReadFormat>, ReadError> {
-        let mut first_chunk = true;
+        let start = self.input.fill_buf()?;
+        if start.starts_with(&[0x1f, 0x8b]) {
+            return Err(ReadError::Gzip);
+        }
+        if start.starts_with(BYTE_ORDER_MARK) {
+            self.input.consume(BYTE_ORDER_MARK.len());
+        }
         loop {
             let chunk = self.input.fill_buf()?;
             if chunk.is_empty() {
                 return Ok(None);
             }
-            if first_chunk && chunk.starts_with(&[0x1f, 0x8b]) {
-                return Err(ReadError::Gzip);
-            }
-            first_chunk = false;
             let blank = chunk.iter().take_while(|b| b.is_ascii_whitespace()).count();
             let newlines = chunk[..blank].iter().filter(|&&b| b == b'\n').count();
             if blank == chunk.len() {
@@ -273,27 +366,45 @@ impl<R: BufRead> ReadReader<R> {
             if sequence.is_empty() {
                 continue;
             }
+            let sequence = sequence_symbols(sequence, self.line)?;
+            let quality = quality_symbols(value(columns.quality), self.line)?;
+            if !quality.is_empty() && quality.len() != sequence.len() {
+                return Err(ReadError::QualityLength {
+                    line: self.line,
+                    header: value(columns.id).to_string(),
+                    sequence: sequence.len(),
+                    quality: quality.len(),
+                });
+            }
             return Ok(Some(ReadRecord {
                 id: value(columns.id).to_string(),
-                sequence: sequence
-                    .bytes()
-                    .filter(|b| b.is_ascii_alphabetic())
-                    .collect(),
-                quality: value(columns.quality).to_string(),
+                sequence: sequence.to_vec(),
+                quality: quality.to_string(),
             }));
         }
         Ok(None)
     }
 
-    /// Read one line into `self.buffer` without its line terminator.
+    /// Read one line into `self.buffer` without its line terminator (`\n`
+    /// or `\r\n`). Bytes that are not UTF-8 read as U+FFFD. A carriage
+    /// return left inside the line is an error: no FASTA/FASTQ line or
+    /// unquoted table field holds one, and with CR-only line endings the
+    /// whole input would read as one line.
     fn next_line(&mut self) -> Result<bool, ReadError> {
-        self.buffer.clear();
-        if self.input.read_line(&mut self.buffer)? == 0 {
+        let mut bytes = std::mem::take(&mut self.buffer).into_bytes();
+        bytes.clear();
+        let read = self.input.read_until(b'\n', &mut bytes);
+        self.buffer = String::from_utf8(bytes)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+        if read? == 0 {
             return Ok(false);
         }
         self.line += 1;
         let trimmed = self.buffer.trim_end_matches(['\n', '\r']).len();
         self.buffer.truncate(trimmed);
+        if self.buffer.contains('\r') {
+            return Err(ReadError::CarriageReturn { line: self.line });
+        }
         Ok(true)
     }
 
@@ -347,26 +458,18 @@ impl<R: BufRead> ReadReader<R> {
             if self.buffer.starts_with('+') {
                 break;
             }
-            let line = self.buffer.trim();
-            // Unlike FASTA, nothing can be dropped: qualities count the
-            // bases. No-call symbols such as `.` and `-` read as N.
-            if let Some(found) = line.chars().find(|c| c.is_whitespace() || c.is_control()) {
-                return Err(ReadError::InvalidSymbol {
-                    line: self.line,
-                    found,
-                });
-            }
-            sequence.extend(line.bytes());
+            sequence.extend_from_slice(sequence_symbols(self.buffer.trim(), self.line)?);
         }
         let mut quality = String::new();
         while quality.len() < sequence.len() {
             if !self.next_line()? {
                 break;
             }
-            quality.push_str(self.buffer.trim());
+            quality.push_str(quality_symbols(self.buffer.trim(), self.line)?);
         }
         if quality.len() != sequence.len() {
             return Err(ReadError::QualityLength {
+                line: self.line,
                 header,
                 sequence: sequence.len(),
                 quality: quality.len(),
@@ -387,6 +490,9 @@ impl<R: BufRead> Iterator for ReadReader<R> {
         self.next_record().transpose()
     }
 }
+
+/// After the end of the input or an error, every call returns `None`.
+impl<R: BufRead> std::iter::FusedIterator for ReadReader<R> {}
 
 #[cfg(test)]
 mod tests {
@@ -417,6 +523,11 @@ mod tests {
         assert_eq!(
             records,
             vec![record("r1", "ACGTacgt"), record("r2", "TTTT")]
+        );
+        // FASTA keeps letters only; FASTQ (below) keeps every symbol.
+        assert_eq!(
+            read_all(b">r\nAC.G-T*1 2\t\n").unwrap(),
+            [record("r", "ACGT")]
         );
     }
 
@@ -478,6 +589,162 @@ mod tests {
     }
 
     #[test]
+    fn rejects_cr_only_line_endings() {
+        // Classic Mac line endings would read the whole file as one line:
+        // one FASTA read with an empty sequence, or no AIRR row at all.
+        for text in [
+            &b">r1\rACGT\r>r2\rTTTT\r"[..],
+            b"@r1\rACGT\r+\rIIII\r",
+            b"sequence_id\tsequence\tv_call\rq1\tACGT\t\r",
+            b"\r\r>r1\rACGT\r",
+        ] {
+            assert!(
+                matches!(read_all(text), Err(ReadError::CarriageReturn { line: 1 })),
+                "{:?}",
+                String::from_utf8_lossy(text)
+            );
+        }
+        assert!(matches!(
+            read_all(b">r1\nAC\rGT\n"),
+            Err(ReadError::CarriageReturn { line: 2 })
+        ));
+    }
+
+    #[test]
+    fn skips_a_utf8_byte_order_mark() {
+        // Windows editors and spreadsheet "CSV UTF-8" exports start with one;
+        // the Swig app's TextDecoder drops it too.
+        assert_eq!(
+            read_all(b"\xef\xbb\xbf>r\nACGT\n").unwrap(),
+            [record("r", "ACGT")]
+        );
+        assert_eq!(
+            read_all(b"\xef\xbb\xbfsequence_id,sequence\nq,ACGT\n").unwrap(),
+            [record("q", "ACGT")]
+        );
+        assert_eq!(
+            read_all(b"\xef\xbb\xbf\n\n@r\nAC\n+\nII\n").unwrap(),
+            [fastq("r", "AC", "II")]
+        );
+        assert!(read_all(b"\xef\xbb\xbf").unwrap().is_empty());
+    }
+
+    #[test]
+    fn reads_bytes_that_are_not_utf8_as_replacement_characters() {
+        assert_eq!(
+            read_all(b">r1 caf\xe9\nAC\xffGT\n>r\xe92\nGG\n").unwrap(),
+            [record("r1", "ACGT"), record("r\u{fffd}2", "GG")]
+        );
+        assert_eq!(
+            read_all(b"@r1 \xe9\nAC\n+\nII\n").unwrap(),
+            [fastq("r1", "AC", "II")]
+        );
+    }
+
+    #[test]
+    fn an_error_ends_the_input() {
+        // Where the next record starts is unknown after an error: read on,
+        // the FASTQ quality line "@IIII" would become a read named IIII.
+        let text = b"@r1\nAC GT\n+\n@IIII\n+\nIIIII\n@r2\nACGT\n+\nIIII\n";
+        let mut reader = ReadReader::new(&text[..]);
+        assert!(matches!(
+            reader.next(),
+            Some(Err(ReadError::InvalidSymbol { line: 2, .. }))
+        ));
+        assert!(reader.next().is_none());
+        let mut out = Vec::new();
+        assert_eq!(reader.read_batch(10, &mut out).unwrap(), 0);
+        assert_eq!(ReadReader::new(&text[..]).flatten().count(), 0);
+        // So does one found on detection.
+        let mut reader = ReadReader::new(&b"\x01>r\nACGT\n"[..]);
+        assert!(matches!(
+            reader.next(),
+            Some(Err(ReadError::UnknownFormat { .. }))
+        ));
+        assert!(reader.next().is_none());
+    }
+
+    /// A `Read` that returns its chunks one per call: an empty chunk ends
+    /// the input as stdin does after Ctrl-D, while more data may follow.
+    struct Chunks(Vec<&'static [u8]>);
+
+    impl io::Read for Chunks {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.0.is_empty() {
+                return Ok(0);
+            }
+            let chunk = self.0.remove(0);
+            buf[..chunk.len()].copy_from_slice(chunk);
+            Ok(chunk.len())
+        }
+    }
+
+    #[test]
+    fn the_end_of_the_input_is_final() {
+        let chunks = Chunks(vec![b">a\nACGT\n", b"", b"", b">b\nGGGG\n"]);
+        let mut reader = ReadReader::new(io::BufReader::new(chunks));
+        assert_eq!(reader.next().unwrap().unwrap(), record("a", "ACGT"));
+        assert!(reader.next().is_none());
+        assert!(reader.next().is_none());
+    }
+
+    #[test]
+    fn sequence_symbols_are_printable_ascii() {
+        // One symbol is one byte is one quality: a non-ASCII symbol, or a
+        // byte that is no UTF-8 (read as U+FFFD), would count as 2 or 3
+        // bases and read as as many Ns.
+        assert!(matches!(
+            read_all(b"sequence_id\tsequence\nq\tAC\xe9GT\n"),
+            Err(ReadError::InvalidSymbol {
+                line: 2,
+                found: '\u{fffd}'
+            })
+        ));
+        assert!(matches!(
+            read_all("@q\nAC\u{e9}GT\n+\nIIIII\n".as_bytes()),
+            Err(ReadError::InvalidSymbol {
+                line: 2,
+                found: '\u{e9}'
+            })
+        ));
+        // FASTA keeps letters only, and so drops them.
+        assert_eq!(
+            read_all(b">r\nAC\xe9G\xc3\xa9T\n").unwrap(),
+            [record("r", "ACGT")]
+        );
+    }
+
+    #[test]
+    fn qualities_are_printable_ascii() {
+        // "I\u{fffd}" is 4 bytes for 4 bases, but 2 qualities.
+        assert!(matches!(
+            read_all(b"@q\nACGT\n+\nI\xe9\n"),
+            Err(ReadError::InvalidQuality {
+                line: 4,
+                found: '\u{fffd}'
+            })
+        ));
+        assert!(matches!(
+            read_all("sequence,quality\nACG,I\u{e9}\n".as_bytes()),
+            Err(ReadError::InvalidQuality {
+                line: 2,
+                found: '\u{e9}'
+            })
+        ));
+        assert!(matches!(
+            read_all(b"@q\nACGTA\n+\nII II\n"),
+            Err(ReadError::InvalidQuality {
+                line: 4,
+                found: ' '
+            })
+        ));
+        assert_eq!(
+            read_all(b"@q\nACGT\n+\n!~?I\n").unwrap(),
+            [fastq("q", "ACGT", "!~?I")]
+        );
+    }
+
+    #[test]
     fn batches_resume_where_they_stopped() {
         let text = b">a\nA\n>b\nC\n>c\nG\n";
         let mut reader = ReadReader::new(&text[..]);
@@ -497,7 +764,7 @@ mod tests {
         let records = read_all(tsv).unwrap();
         assert_eq!(
             records,
-            vec![fastq("q1", "ACGT", "IIII"), record("q3", "ACgt")]
+            vec![fastq("q1", "ACGT", "IIII"), record("q3", "AC-gt")]
         );
         let csv = b"sequence,sequence_id\nTTTT,c1\nGG,\n";
         assert_eq!(
@@ -506,5 +773,33 @@ mod tests {
         );
         let mut reader = ReadReader::new(&csv[..]);
         assert_eq!(reader.format().unwrap(), Some(ReadFormat::Airr));
+    }
+
+    #[test]
+    fn airr_sequences_keep_every_symbol_their_qualities_count() {
+        // An AIRR `sequence` is the unaligned read, and `quality` counts its
+        // bases: like a FASTQ sequence line, nothing is dropped.
+        let dotted = b"sequence_id\tsequence\tquality\nq\tAC.G-T\tIIIIII\n";
+        assert_eq!(read_all(dotted).unwrap(), [fastq("q", "AC.G-T", "IIIIII")]);
+        assert_eq!(
+            read_all(dotted).unwrap(),
+            read_all(b"@q\nAC.G-T\n+\nIIIIII\n").unwrap()
+        );
+        assert!(matches!(
+            read_all(b"sequence_id\tsequence\tquality\nq\tACGT\tII\n"),
+            Err(ReadError::QualityLength {
+                line: 2,
+                sequence: 4,
+                quality: 2,
+                ..
+            })
+        ));
+        assert!(matches!(
+            read_all(b"sequence,quality\nAC GT,IIIII\n"),
+            Err(ReadError::InvalidSymbol {
+                line: 2,
+                found: ' '
+            })
+        ));
     }
 }

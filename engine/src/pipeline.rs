@@ -5,7 +5,7 @@
 //!                 ─► V stage over the whole chunk     score batch + traceback waves
 //!                 ─► per read: J window right of V; J stage over the whole chunk
 //!                 ─► per read: D windows from V/J geometry, D candidates
-//!                 ─► D stage over the whole chunk ─► per read: admission gates
+//!                 ─► D stage over the whole chunk (admission gates as acceptance)
 //!                 ─► per read: adjudicator (placement DAG) ─► Call
 //!                 ─► C stage over the whole chunk (optional; reads finished
 //!                    calls only, see [`crate::constant`])
@@ -26,8 +26,8 @@
 //!
 //! ```ignore
 //! let experimental = assigner
-//!     .with_adjudicator(ResidualAdjudicator::default())
-//!     .with_d_window(ResidualWindow { overlap_margin: 2 });
+//!     .with_d_window(ExpandedResidual::default())
+//!     .with_d_admission(ExactRunFloor { min_run: 5 });
 //! ```
 
 use std::ops::Range;
@@ -42,6 +42,7 @@ use crate::germline::SegmentKind;
 use crate::locus::{Loci, Locus};
 use crate::orient::{Orientation, OrientationPolicy, StrandIndex};
 use crate::placement::Placement;
+use crate::report::reported_posterior;
 use crate::retrieve::{
     Candidate, ExhaustiveRetriever, LmerMaskRetriever, RetrievalScratch, Retriever,
 };
@@ -122,19 +123,19 @@ pub struct Assigner<
 > {
     pub v: SegmentStage<RV>,
     pub j: SegmentStage<RJ>,
-    /// `None` for loci without D (light chains).
-    pub d: Option<SegmentStage<RD>>,
+    /// `None` for loci without D (light chains). Its acceptance predicate
+    /// is the D admission gate, so an inadmissible hit takes no slot.
+    pub d: Option<SegmentStage<RD, Adm>>,
     /// Germline k-mer presence for orientation.
     pub strand: StrandIndex,
     /// Where J is searched relative to V.
     pub j_window: DownstreamWindow,
     pub aligner: A,
     pub d_window: W,
-    pub d_admission: Adm,
     pub adjudicator: Adj,
     /// Adjudicators for reads of one locus, where it differs from
-    /// `adjudicator`: a D database of several loci prices a D by its own
-    /// locus' D genes ([`crate::config::DPrior`]).
+    /// `adjudicator`: a D or J database of several loci prices a D and a J
+    /// by its own locus' genes ([`crate::config::DPrior`]).
     pub locus_adjudicators: Vec<(Locus, Adj)>,
     /// Constant-region assignment after adjudication; `None` without a C
     /// database ([`Assigner::with_constant`]).
@@ -204,49 +205,20 @@ macro_rules! replace {
 /// monomorphises again around it.
 impl<A, RV, RJ, RD, W, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj> {
     pub fn with_aligner<A2>(self, aligner: A2) -> Assigner<A2, RV, RJ, RD, W, Adm, Adj> {
-        replace!(self { v, j, d, strand, j_window, d_window, d_admission, adjudicator, locus_adjudicators, c, options } aligner: aligner)
+        replace!(self { v, j, d, strand, j_window, d_window, adjudicator, locus_adjudicators, c, options } aligner: aligner)
     }
 
     pub fn with_d_window<W2>(self, d_window: W2) -> Assigner<A, RV, RJ, RD, W2, Adm, Adj> {
-        replace!(self { v, j, d, strand, j_window, aligner, d_admission, adjudicator, locus_adjudicators, c, options } d_window: d_window)
+        replace!(self { v, j, d, strand, j_window, aligner, adjudicator, locus_adjudicators, c, options } d_window: d_window)
     }
 
+    /// Swap the D stage's admission gate (its acceptance predicate).
     pub fn with_d_admission<Adm2>(
         self,
         d_admission: Adm2,
     ) -> Assigner<A, RV, RJ, RD, W, Adm2, Adj> {
-        replace!(self { v, j, d, strand, j_window, aligner, d_window, adjudicator, locus_adjudicators, c, options } d_admission: d_admission)
-    }
-
-    /// Swap the adjudicator, for reads of every locus. The D stage keeps
-    /// the D placements the original one needed: built with posteriors, it
-    /// keeps those below the DAG's D floor, so pair an adjudicator without
-    /// its own D significance floor (such as
-    /// [`crate::adjudicate::ResidualAdjudicator`]) with `posterior: false`.
-    pub fn with_adjudicator<Adj2>(
-        self,
-        adjudicator: Adj2,
-    ) -> Assigner<A, RV, RJ, RD, W, Adm, Adj2> {
-        let assigner = self;
-        Assigner {
-            adjudicator,
-            locus_adjudicators: Vec::new(),
-            v: assigner.v,
-            j: assigner.j,
-            d: assigner.d,
-            strand: assigner.strand,
-            j_window: assigner.j_window,
-            aligner: assigner.aligner,
-            d_window: assigner.d_window,
-            d_admission: assigner.d_admission,
-            c: assigner.c,
-            options: assigner.options,
-        }
-    }
-
-    pub fn with_options(mut self, options: AssignerOptions) -> Self {
-        self.options = options;
-        self
+        let d = self.d.map(|stage| stage.with_accept(d_admission));
+        replace!(self { v, j, strand, j_window, aligner, d_window, adjudicator, locus_adjudicators, c, options } d: d)
     }
 }
 
@@ -271,14 +243,17 @@ impl<A, RV, RJ, RD, W, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj> {
         }
     }
 
-    /// The loci of `placements` together; [`Loci::ANY`] when there are none.
-    fn placed_loci(&self, placements: &[Placement]) -> Loci {
-        if placements.is_empty() {
-            return Loci::ANY;
-        }
+    /// The loci of the anchors among `placements` together; [`Loci::ANY`]
+    /// when none is an anchor. A chance hit does not choose the locus of
+    /// the next segment, as it does not bound the J window
+    /// ([`DownstreamWindow`]).
+    fn anchored_loci(&self, placements: &[Placement]) -> Loci {
         placements
             .iter()
-            .fold(Loci::NONE, |loci, p| loci.union(self.placement_loci(p)))
+            .filter(|p| p.anchor.is_some())
+            .map(|p| self.placement_loci(p))
+            .reduce(Loci::union)
+            .unwrap_or(Loci::ANY)
     }
 
     /// The adjudicator for reads of `locus` (`None`: unknown or several).
@@ -413,8 +388,8 @@ where
                 retrieval,
                 &mut state.j,
             );
-            // A J joins a V of its own locus.
-            let loci = self.placed_loci(placed);
+            // A J joins an anchoring V of its own locus.
+            let loci = self.anchored_loci(placed);
             state
                 .j
                 .retain(|c| set.allele(c.allele).loci.pairs_with(loci));
@@ -428,12 +403,13 @@ where
         }
     }
 
-    /// Stage 4: D windows from V/J geometry and their candidates per read, D
-    /// placements over the whole chunk, then the admission gates per read.
+    /// Stage 4: D windows from V/J geometry and their candidates per read,
+    /// then D placements over the whole chunk (the stage applies the
+    /// admission gates).
     #[allow(clippy::too_many_arguments)]
     fn stage_d(
         &self,
-        d: &SegmentStage<RD>,
+        d: &SegmentStage<RD, Adm>,
         reads: &[ReadState],
         placements: &mut [Vec<Placement>],
         scratch: &mut DScratch,
@@ -465,8 +441,8 @@ where
         let set = d.segment.set();
         for ((k, window), found) in windows.iter().zip(candidates.iter_mut()) {
             d.retrieve(&reads[*k].query, window.clone(), retrieval, found);
-            // A D joins the V and J of its own locus.
-            let loci = self.placed_loci(&placements[*k]);
+            // A D joins the anchoring V and J of its own locus.
+            let loci = self.anchored_loci(&placements[*k]);
             found.retain(|c| set.allele(c.allele).loci.pairs_with(loci));
         }
         let requests: Vec<SegmentRequest<'_>> = windows
@@ -482,11 +458,7 @@ where
         start.clear();
         start.extend(placements.iter().map(Vec::len));
         d.place_many(&self.aligner, &requests, dp, batch, placements);
-        for ((state, placed), &first) in reads.iter().zip(placements.iter_mut()).zip(start.iter()) {
-            retain_from(placed, first, |p| {
-                self.d_admission
-                    .admit(p, &state.query, d.segment.reference(p.primary_allele()))
-            });
+        for (placed, &first) in placements.iter_mut().zip(start.iter()) {
             self.drop_dissimilar(placed, first);
         }
     }
@@ -507,8 +479,7 @@ where
     ) {
         out.reserve(reads.len());
         for (state, placed) in reads.iter().zip(placements.iter_mut()) {
-            let len = state.query.len();
-            let (path, marginals) = self.adjudicate_loci(len, placed, adjudication);
+            let (path, marginals) = self.adjudicate_loci(&state.query, placed, adjudication);
             out.push(Call {
                 orientation: state.orientation.expect("stage 1 orients every read"),
                 query: state.query.clone(),
@@ -530,7 +501,7 @@ where
     /// as each locus' paths are hypotheses of one model.
     fn adjudicate_loci(
         &self,
-        query_len: usize,
+        query: &[u8],
         placed: &[Placement],
         scratch: &mut Adj::Scratch,
     ) -> (Option<CallPath>, Option<Marginals>) {
@@ -538,7 +509,7 @@ where
         let shared = loci.iter().fold(Loci::ANY, |all, &l| all.intersection(l));
         if !shared.is_empty() {
             let adjudicator = self.adjudicator_for(shared.single());
-            return self.adjudicate_read(adjudicator, query_len, placed, scratch);
+            return self.adjudicate_read(adjudicator, query, placed, scratch);
         }
         let all = loci.iter().fold(Loci::NONE, |all, &l| all.union(l));
         // Per locus: the placement ids, the path and the marginals.
@@ -553,7 +524,7 @@ where
             let subset: Vec<Placement> = ids.iter().map(|&i| placed[i].clone()).collect();
             let adjudicator = self.adjudicator_for(Some(locus));
             if let (Some(path), marginals) =
-                self.adjudicate_read(adjudicator, query_len, &subset, scratch)
+                self.adjudicate_read(adjudicator, query, &subset, scratch)
             {
                 found.push((ids, path, marginals));
             }
@@ -607,32 +578,65 @@ where
         (Some(path), marginals)
     }
 
-    /// A path without an anchor ([`Placement::anchor`]) is not a call. A
+    /// A path without an anchor, a segment whose retained clip is
+    /// significant on its own ([`Placement::anchors`]), is not a call. A
     /// path the adjudicator decodes from the posterior replaces the call
-    /// when it keeps an anchor.
+    /// when it keeps an anchor and its D is reported at least as probable
+    /// ([`Self::keeps_the_d_posterior`]).
     fn adjudicate_read(
         &self,
         adjudicator: &Adj,
-        query_len: usize,
+        query: &[u8],
         placed: &[Placement],
         scratch: &mut Adj::Scratch,
     ) -> (Option<CallPath>, Option<Marginals>) {
         let anchored = |path: &CallPath| {
-            !self.requires_anchor() || path.segments.iter().any(|s| placed[s.placement].anchor)
+            !self.requires_anchor()
+                || path
+                    .segments
+                    .iter()
+                    .any(|s| placed[s.placement].anchors(&s.span))
         };
-        let mut path = adjudicator
-            .adjudicate(query_len, placed, scratch)
-            .filter(anchored);
+        let mut path = adjudicator.adjudicate(placed, scratch).filter(anchored);
         let marginals = path
             .as_ref()
             .and_then(|path| adjudicator.marginals(placed, path, scratch));
         if let (Some(called), Some(m)) = (&path, &marginals)
             && let Some(decoded) = adjudicator.decode(placed, called, m, scratch)
             && anchored(&decoded)
+            && self.keeps_the_d_posterior(query, placed, called, &decoded, m)
         {
             path = Some(decoded);
         }
         (path, marginals)
+    }
+
+    /// Whether the report rates `decoded`'s D at least as probable as
+    /// `called`'s. The decoder maximises one allele's posterior marginal;
+    /// the report's probability is that its names include the read's allele
+    /// ([`crate::report::reported_posterior`]), which also counts shorter
+    /// placements whose germline the first allele carries. A switch the
+    /// report rates less probable would contradict the reason for it.
+    fn keeps_the_d_posterior(
+        &self,
+        query: &[u8],
+        placed: &[Placement],
+        called: &CallPath,
+        decoded: &CallPath,
+        marginals: &Marginals,
+    ) -> bool {
+        let Some(d) = self.segment(SegmentKind::D) else {
+            return false;
+        };
+        let posterior = |path: &CallPath| {
+            path.segments
+                .iter()
+                .find(|s| placed[s.placement].kind == SegmentKind::D)
+                .map_or(0.0, |s| {
+                    reported_posterior(placed, query, d.set(), path, s, marginals)
+                })
+        };
+        posterior(decoded) >= posterior(called)
     }
 }
 
@@ -725,6 +729,69 @@ impl<A, RV, RJ, RD, W, Adm, Adj> AlleleCatalog for Assigner<A, RV, RJ, RD, W, Ad
             SegmentKind::D => self.d.as_ref().map(|stage| &*stage.segment),
             SegmentKind::J => Some(&self.j.segment),
             SegmentKind::C => self.c.as_ref().map(|stage| &*stage.plain),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::admission::AdmitAll;
+    use crate::alphabet::encode;
+    use crate::annotate::AnnotateOptions;
+    use crate::batch::assign_all;
+    use crate::config::DefaultAssigner;
+    use crate::prepare::prepare;
+    use crate::profiles::CallingProfile;
+    use crate::sim::{SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
+
+    /// Swapping a component rebuilds the assigner around it and moves the
+    /// others across: the D window and admission of an identical assigner,
+    /// swapped in, give the same calls; admitting every D hit keeps at
+    /// least as many D placements per read.
+    #[test]
+    fn swapped_components_keep_the_others() {
+        let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 5);
+        let assigner = || {
+            let database = prepare(
+                db.v.clone(),
+                Some(db.d.clone()),
+                db.j.clone(),
+                AnnotateOptions::default(),
+            )
+            .unwrap();
+            let config = CallingProfile::ROptimized.config();
+            DefaultAssigner::from_config(&config, database.v, database.d, database.j).unwrap()
+        };
+        let sim = Simulator::new(&db.v, Some(&db.d), &db.j, SimParams::mid()).unwrap();
+        let queries: Vec<Vec<u8>> = sim
+            .reads(60, 4)
+            .unwrap()
+            .iter()
+            .map(|read| encode(&read.sequence))
+            .collect();
+        let shown = |calls: &[Call]| -> Vec<String> {
+            calls
+                .iter()
+                .map(|c| format!("{:?} {:?}", c.path, c.placements.len()))
+                .collect()
+        };
+        let base = assign_all(&assigner(), &queries, 1);
+        let donor = assigner();
+        let swapped = assigner()
+            .with_d_window(donor.d_window)
+            .with_d_admission(donor.d.expect("the test database has D").accept);
+        assert_eq!(shown(&assign_all(&swapped, &queries, 1)), shown(&base));
+        let d_count = |call: &Call| {
+            call.placements
+                .iter()
+                .filter(|p| p.kind == SegmentKind::D)
+                .count()
+        };
+        let admitted = assign_all(&assigner().with_d_admission(AdmitAll), &queries, 1);
+        assert!(base.iter().any(|call| d_count(call) > 0));
+        for (all, gated) in admitted.iter().zip(&base) {
+            assert!(d_count(all) >= d_count(gated));
         }
     }
 }

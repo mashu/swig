@@ -1,4 +1,4 @@
-import { t as AlignerEngine } from "./chunks/aligner-engine-DEa3stHz.mjs";
+import { t as AlignerEngine } from "./chunks/aligner-engine-BHdxJCoP.mjs";
 import { readFileSync } from "node:fs";
 import { parentPort } from "node:worker_threads";
 //#region cli-src/swig-worker.mjs

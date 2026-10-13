@@ -1,7 +1,8 @@
 //! Column-level evidence summaries of an alignment (or a clipped span of one).
 //!
-//! Admission gates (exact-run floor, distributed-D), D-presence priors and
-//! reports all read the same [`Evidence`], computed in one pass over columns.
+//! Admission gates (exact-run floor, distributed-D), hit acceptance, the
+//! identity floor, reports and the constant region's ranking all read the
+//! same [`Evidence`], computed in one pass over columns.
 
 use crate::align::Op;
 use crate::alphabet::N;
@@ -17,10 +18,6 @@ pub struct Evidence {
     pub matches: u32,
     /// Differing canonical bases.
     pub mismatches: u32,
-    /// Number of gap runs.
-    pub gap_opens: u32,
-    /// Gap columns (insertions + deletions).
-    pub gap_columns: u32,
     /// Longest run of consecutive identical canonical bases (`N` and gaps break runs).
     pub longest_exact_run: u32,
 }
@@ -33,7 +30,6 @@ impl Evidence {
     ) -> Self {
         let mut evidence = Evidence::default();
         let mut run = 0u32;
-        let mut previous: Option<Op> = None;
         for (op, q, r) in columns {
             evidence.columns += 1;
             match op {
@@ -51,15 +47,8 @@ impl Evidence {
                         run = 0;
                     }
                 }
-                gap => {
-                    evidence.gap_columns += 1;
-                    if previous != Some(gap) {
-                        evidence.gap_opens += 1;
-                    }
-                    run = 0;
-                }
+                Op::Ins | Op::Del => run = 0,
             }
-            previous = Some(op);
         }
         evidence
     }
@@ -100,7 +89,7 @@ mod tests {
     use crate::alphabet::encode;
 
     #[test]
-    fn counts_runs_mismatches_and_gaps() {
+    fn counts_runs_mismatches_and_columns() {
         let query = encode(b"ACGTAACGG");
         let reference = encode(b"ACGTTACG");
         // 4 matches, 1 mismatch, 3 matches, 1 insertion
@@ -110,10 +99,7 @@ mod tests {
         }
         cols.push((Op::Ins, 8, 8));
         let e = Evidence::from_columns(cols.iter().copied(), &query, &reference);
-        assert_eq!(
-            (e.matches, e.mismatches, e.gap_columns, e.gap_opens),
-            (7, 1, 1, 1)
-        );
+        assert_eq!((e.matches, e.mismatches, e.columns), (7, 1, 9));
         assert_eq!(e.longest_exact_run, 4);
         let s = rescore(
             cols.iter().copied(),

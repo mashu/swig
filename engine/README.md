@@ -127,7 +127,6 @@ options (`swig --help` prints them):
 | `--double-d off\|all\|long-span` | Swig's double-D screen (default off); needs `--double-d-out FILE` |
 | `--double-d-min-span N`, `--double-d-seed-length N`, `--double-d-pseudo-trim N`, `--double-d-pseudo-mismatches N`, `--double-d-min-gain S` | the screen's evidence rules (defaults 40, 11, 5, 3, 8) |
 | `--simd NAME` | alignment kernel: `avx512`, `avx2`, `neon`, `portable` or `scalar` (default: the fastest this CPU runs, AVX-512 excepted) |
-| `--residual` | commit V and J, then search D in the residual, instead of the DAG (no posteriors) |
 
 `simulate` presets are those of IgSim.jl: `easy`, `mid` (alias `train`) and
 `hard`. `--rc` reverse-complements that fraction of reads (default 0.5),
@@ -198,7 +197,9 @@ read, then the engine's five posterior columns.
   to the called interval is worth exactly the call under the call's model.
   The best-supported allele is first. `*_score` is the clipped score,
   `*_identity` matches over alignment columns (a fraction), and `*_support`
-  a Karlin–Altschul E-value (`c_support` is C's anchored E-value instead).
+  the Karlin–Altschul E-value `K·m·n·e^{−λS}` of the reported span over the
+  read length `m` and the database length `n`, the formula of the V/J gates
+  (`c_support` is C's anchored E-value instead).
 - **N/P and stitched alignments.** `np1` follows V and `np2` follows D, as
   AIRR names an N/P region by the segment it follows.
   `sequence_alignment` and `germline_alignment` stitch V, D and J in read
@@ -339,7 +340,7 @@ the message in the error buffer. Results stay readable until the next call.
 | Export | Does |
 |---|---|
 | `swig_alloc(len) → ptr`, `swig_free(ptr, len)` | buffers for the host to fill and free |
-| `swig_set_option(name, name_len, value, value_len) → 0 \| −1` | set an option by its command-line name without `--` (a flag with an empty value); the run is rebuilt at the next use. `swig_reset_options()` restores the defaults |
+| `swig_set_option(name, name_len, value, value_len) → 0 \| −1` | set an option by its command-line name without `--` (a flag with an empty value); the run is rebuilt at the next use; a host that wants the defaults back starts a new instance |
 | `swig_init_database(v, v_len, d, d_len, j, j_len, c, c_len) → records \| −1` | load the germline FASTA texts (V and J required, D and C empty when absent) and prepare them; the result buffer holds `{"summary": …, "warnings": […]}` as JSON |
 | `swig_annotate(reads, len) → reads \| −1` | assign FASTA, FASTQ or AIRR-table text; the result buffer holds the AIRR TSV, header first, then one row per input record in input order |
 | `swig_result_ptr()`, `swig_result_len()` | the result buffer |
@@ -465,7 +466,18 @@ region coordinates transferred from IMGT-annotated relatives
 FWR3 ends after the Cys104 codon, so a V anchor is FWR3's end − 3, and a J
 anchor is one past CDR3's last base. `SWIGMETA` values are given values,
 like header keys: they fill what the explicit keys leave open (when the
-result stays consistent) and win over everything the engine would derive.
+result stays consistent) and win over everything the engine would derive,
+with one exception. A given anchor is checked against the allele's own
+motifs: a J anchor off `[WF]G.G` while a confident motif lies elsewhere in
+its frame, or a V anchor with weak motifs in another frame than all of its
+given region starts, is *contradicted*. A `SWIGMETA` anchor then gives way
+to the motif hit, and the allele reports the annotation's provenance; an
+explicit `anchor=` (or a `SWIGMETA` anchor no motif can replace) is kept but
+flagged and counted in the uncertain-anchor warning. Swig's shipped
+references hold such anchors (TRAJ24*01–03 and TRAJ48*01, among 50 J
+alleles, sit 15–21 bases early; IGLV2-11*03, IGLV2-8*03, IGHV4-30-4*05,
+TRBV5-8*02 and TRBV11-3*03 were given another frame), so reads of those
+alleles used to get a junction several codons short.
 A malformed field is an error. The provenance becomes the allele's
 `v_annotation_source` or `j_annotation_source`; an allele without one
 reports the annotation's own source.
@@ -657,7 +669,7 @@ stages are the methods `stage_orient`, `stage_v`, `stage_j`, `stage_d` and
 | `clip`, `evidence`, `placement` | O(1) clip-and-rescore at any cut; exact-run / identity evidence |
 | `window`, `admission` | Where J and D are searched; D evidence gates |
 | `constant`, `retrieve/reach` | Constant region after adjudication: splice window, anchor-column DP, anchored E-value and posterior; one candidate per class of alleles the read cannot reach apart |
-| `adjudicate/{lattice,dag,posterior,units,model,decode,residual}` | The placement lattice; Viterbi and forward–backward over it; the per-read model in integer units both read; grammar and log-odds path model; max-marginal D decoding; residual baseline |
+| `adjudicate/{lattice,dag,posterior,units,model,decode,ties,oracle}` | The placement lattice; Viterbi and forward–backward over it; the per-read model in integer units both read; grammar and log-odds path model; max-marginal D decoding; the co-optimal alleles a call reports; the exhaustive oracle the tests check the DAG against |
 | `flank` | Outer-flank extension of V and J alignments |
 | `pipeline`, `config`, `profiles` | Stage-wise composition with per-locus adjudication, declarative configuration, calling profiles |
 | `run` | A whole run, shared by the command line and the WebAssembly module: options by their command-line names, the assigner they build, the repeated-sequence cache, reads streamed to AIRR TSV |
@@ -674,18 +686,19 @@ The full description, with the guarantee of each search step, is in
   log-likelihood ratio, in units of 1/λ nats with λ = 0.634, of "templated by
   this germline at 11.2 % divergence" against "random sequence". N and P bases
   score 0 under both hypotheses. Affine gaps price indels.
-- **The path objective** is `Σ clipped segment scores − P_D·#D`, maximised
-  exactly over the topologies VJ and VDJ, over the placements, and over both
-  cuts between neighbours (the earlier one exits at `x`, the later enters at
-  `y ≥ x`, and the bases between are N/P). Ties go to fewer D, then to more
-  germline support (the summed unclipped scores). The library's tandem
-  grammar (`VdjGrammar::TANDEM_D`) adds VDDJ, where a second D also pays
-  `tandem_d_penalty` (12); Swig's double-D screen is separate and leaves the
-  call alone.
+- **The path objective** is `Σ clipped segment scores − P_D·#D − P_J·#J`,
+  maximised exactly over the topologies VJ and VDJ (and the partial V…, …J
+  and D…J), over the placements, and over both cuts between neighbours (the
+  earlier one exits at `x`, the later enters at `y ≥ x`, and the bases
+  between are N/P). `P_J` prices a J as `P_D` prices a D, over the J genes,
+  so a read that stops before its J does not get one from a few chance
+  bases. Ties go to fewer D, then to more germline support (the summed
+  unclipped scores). An AIRR row holds one D; Swig's double-D screen reports
+  a second one beside the call and leaves the call alone.
 - **Calls come from the read's own model.** Each path is valued at the read's
   divergence `p̂`, estimated before adjudication from the V and J columns no
   path contests: a match is worth `ln 4(1−p̂)` nats, a mismatch `ln(4p̂/3)`, a
-  D costs `P_D/2` matched D columns. Values are integers (1/2¹⁶ nat), so the
+  D costs `P_D/2` matched D columns, a J `P_J/2` matched J columns. Values are integers (1/2¹⁶ nat), so the
   maximum is exact, and the posterior reads the same integers: the call is a
   mode of the reported distribution. `--calls fixed` keeps the fixed scores,
   of which the per-read model at 11.2 % divergence is an exact multiple.
@@ -706,7 +719,8 @@ The full description, with the guarantee of each search step, is in
   (ASSESSMENT §9.9).
 - **Significance.** A V or J hit is kept at E ≤ 1 against its database and
   window. A read is called only when its path contains an *anchor*, a V or J
-  hit at E ≤ 10⁻³, so random sequence receives no call.
+  hit at E ≤ 10⁻³ whose clip on the path still scores that much, so random
+  sequence receives no call.
 - **Constant region.** C is spliced to J at a fixed phase, so C's base 0
   lies within `s = 3` bases of the J's exit. A bonus column in front of C
   turns every local aligner into an exact anchored one, and C is called at
@@ -738,13 +752,12 @@ no runtime type checks.
 | `SubstitutionModel` | `AffineScoring` | `HotspotScoring` (position-specific; the kernel's profile path) |
 | `DWindowPolicy` | `WithAnchorWindow<ExpandedResidual>` | `ResidualWindow`, `ExpandedResidual` |
 | `Admission` | `AnyOf<ExactRunFloor, Option<DistributedEvidence>>` (distributed-D off by default) | `AdmitAll`, `AllOf`, any `Option<A>` |
-| `Adjudicator` | `PlacementDag<VdjGrammar, EngineeringObjective>` | `ResidualAdjudicator` |
-| `Grammar`, `PathModel` | `VdjGrammar::VDJ`, `EngineeringObjective` | `VdjGrammar::{TANDEM_D, VJ}`; your own path grammar / objective |
+| `Adjudicator` | `PlacementDag<VdjGrammar, EngineeringObjective>` | your own |
+| `Grammar`, `PathModel` | `VdjGrammar::VDJ`, `EngineeringObjective` | `VdjGrammar::VJ` (or any `max_d`); your own path grammar / objective |
 | `VdjAssigner` (+ `assign_many`) | chunk-staged `Assigner` | default `assign_many` loops `assign` |
 
 ```rust
 let experiment = DefaultAssigner::from_config(&config, v, Some(d), j)?
-    .with_adjudicator(ResidualAdjudicator::default())
     .with_d_window(ResidualWindow { overlap_margin: 2 })
     .with_d_admission(AllOf(ExactRunFloor { min_run: 5 }, MyNewGate));
 ```
@@ -868,7 +881,8 @@ gap state satisfies `D' = max(t + g_o, D + max(g_o, g_e))`.
 **Score first, traceback in waves.** Score-only DP ranks candidates. Traceback
 then runs in waves down the ranking until `top` alignments pass acceptance
 (plus ties), so a high score that fails the length/identity floor does not
-take a slot. With at most `top + 1` candidates the scoring pass is skipped.
+take a slot. With at most `min(top + 1, cap)` candidates the scoring pass is
+skipped (tracing all of them is cheaper).
 
 **Sibling bounds along the gene frame (`family_bound`).** The alleles of a
 gene share a frame (`frame position = allele position + offset`), and V and J
@@ -939,7 +953,7 @@ therefore exact for a fixed-scale call. A D below it still carries posterior
 mass and can win a per-read call, so the floor applies only to fixed-scale
 calls without posteriors (`--no-posterior --calls fixed`): posteriors keep
 every admissible D (+1 % of instructions), and so do per-read calls. With
-several loci the floor is the lowest locus' `P_D`.
+several loci the floor is the lowest `P_D` of a locus that has D genes.
 
 ### Adjudication
 
@@ -1012,7 +1026,6 @@ expose both, so other callers can be scored on identical reads.
   trimmed, pre-mutation germline body (no read can separate such alleles);
 - *gene*, *listed* (truth among the reported names) and *exact*;
 - boundary errors, D presence by remnant length, junction exactness;
-- a random-read negative control;
 - with C, by C length: calls on reads without C, the primary name's
   *anchored* equivalence (the allele reads the simulated bases from its own
   splice offset; containment anywhere would make almost any allele
@@ -1027,9 +1040,9 @@ right. D allele accuracy alone rewards calling D everywhere, so the D-free
 column belongs next to it. D is also split by the true remnant's length
 (1–3, 4–7, 8+ nt; below `min_d_match` = 4 a remnant cannot be found), and the
 D allele and D-presence posteriors are compared by Brier score with a paired
-t statistic. On 20,000 reads per preset, for example, the
-residual adjudicator gains +0.4–0.6 pp of D accuracy (p < 10⁻⁴) only by
-giving 21–25 pp more D-free reads a D; see
+t statistic. On 20,000 reads per preset, for example, the residual
+adjudicator (removed since) gained +0.4–0.6 pp of D accuracy (p < 10⁻⁴) only
+by giving 21–25 pp more D-free reads a D; see
 [docs/ASSESSMENT.md §9.5](docs/ASSESSMENT.md) for the full table.
 
 The measurements below were made on the standalone engine, on single-locus
@@ -1075,7 +1088,9 @@ synthetic database:
 
 ```sh
 # accuracy and throughput on simulated reads (also --shm, --seed, --rc, --profile,
-# --simd, --tandem-d and the ablation switches listed in examples/benchmark.rs)
+# --simd, --tail and the ablation switches listed in examples/benchmark.rs);
+# --random N adds a negative control: N random reads with the simulated length
+# distribution, reported as the share with a path, a V call and a J call
 cargo run --release --manifest-path engine/Cargo.toml --example benchmark -- \
     [--v V.fasta --d D.fasta --j J.fasta] [--preset easy|mid|hard] [--reads N] [--threads N] [--random N]
 # search errors vs model errors against an exhaustive oracle
@@ -1205,7 +1220,7 @@ window; searching J over the whole read lets 0.05 % fall outside.
   light and TR loci, strands, constant regions, independence from batching,
   the repeated-sequence cache and the double-D screen).
 - **Synthetic calling (`tests/synthetic.rs`):** D genes, D-free junctions,
-  tandem VDDJ, hypermutated V, reverse complements, residual adjudicator.
+  hypermutated V, reverse complements, reads that stop before their J.
 - **Batch consistency:** chunk-batched parallel output equals per-read
   sequential output.
 - **Input parsing:** multi-line FASTA/FASTQ, `@`/`+` at the start of quality
@@ -1243,8 +1258,9 @@ Each is a named field you can change.
 1. **D presence.** `P_D` is derived from the D database (`DPrior::Derived`)
    instead of the note's 12-relaxed-to-10 rule. A sweep of constant costs put
    the relaxed rule on the same precision/recall curve as a single constant.
-2. **Tandem D.** Off by default; under `VdjGrammar::TANDEM_D` a second D
-   pays its own `P_D` plus 12 (`tandem_d_penalty`).
+2. **Tandem D.** Not part of the call: an AIRR row holds one D. Swig's
+   double-D screen reports a supported second D in a sidecar. The DAG itself
+   handles any `max_d`, each D paying its own `P_D`.
 3. **Retrieval.** Every 9-mer votes, and 7-mers too while the leader holds
    fewer than 25 seeds. V keeps 3 genes and walks up to 16 while gene votes
    stay within two standard deviations of the leader's (`z·√(2·4·L)` votes
@@ -1256,7 +1272,9 @@ Each is a named field you can change.
 5. **Windows.** D windows reclaim 12 bases into V and J (the note's rescue of
    24/10 is realised by this window and the DAG's exact cut choice). The
    conserved-anchor window is always added when anchors are present. J is
-   searched from 12 bases before the earliest V end.
+   searched from 12 bases before the earliest V end when some V is an
+   anchor, and over the whole read when none is; only anchors choose the
+   locus of the J and D candidates.
 6. **Significance.** V and J hits need E ≤ 1, and a call needs a V or J hit
    at E ≤ 10⁻³ (`EvalueGates`). The note has no reporting threshold.
 7. **Tie-breaks.** Equal-score paths go to fewer D, then to more germline

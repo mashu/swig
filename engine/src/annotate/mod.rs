@@ -22,12 +22,19 @@
 //! Every start that may be wrong is marked in
 //! [`AlleleAnnotation::uncertain`].
 //!
-//! Sources, in order of trust (a given value is never overridden):
+//! Sources, in order of trust (a given value is never overridden, except a
+//! `SWIGMETA` anchor its allele's own sequence confidently contradicts):
 //!
 //! 1. `anchor=` / `fr1=` … `fr3=` in the FASTA header, then the IMGT
 //!    numbering of an IMGT-gapped V set ([`ImgtGaps`]). A region the
 //!    numbering places before a 5′-partial sequence stays empty, and an
-//!    allele whose numbering ends before Cys104 gets no anchor.
+//!    allele whose numbering ends before Cys104 gets no anchor. A header
+//!    anchor is contradicted ([`Conflict`]) when a J anchor is off
+//!    `[WF]G.G` while a confident motif lies elsewhere in its frame, or a V
+//!    anchor with weak motifs lies in another frame than all of its given
+//!    CDR1–FR3 starts. A `SWIGMETA` anchor (coordinates Swig transferred,
+//!    with known misplacements) then gives way to a confident motif hit;
+//!    any other is kept, noted and not trusted.
 //! 2. Motif search on a one-pass three-frame translation ([`find_v`], [`find_j`]).
 //! 3. The same search with a database-consensus prior on the anchor's
 //!    distance from the 3′ end, for alleles whose motifs were weak.
@@ -47,6 +54,7 @@ mod cys23;
 mod fr3;
 mod given;
 mod j_motif;
+mod note;
 mod transfer;
 mod v_motif;
 
@@ -57,13 +65,14 @@ pub use cys23::Cys23Model;
 pub use fr3::Fr3Model;
 pub use given::ImgtGaps;
 pub use j_motif::{JHit, find_j};
+pub use note::{Conflict, Cys23Choice, Note};
 pub use transfer::{
     MIN_SHARED_FRACTION, MIN_SHARED_KMERS, RelativeIndex, kmers, shared, transfer, transfer_aligned,
 };
 pub use v_motif::{VHit, VSearch, find_v};
 
 use crate::align::GotohWorkspace;
-use crate::germline::{Allele, GermlineSet, RegionSlot, RegionStarts};
+use crate::germline::{Allele, AlleleId, GermlineSet, RegionSlot, RegionStarts};
 use crate::locus::{Loci, Locus};
 use crate::translate::{codon, translate};
 use given::Given;
@@ -128,6 +137,35 @@ impl AnchorSource {
         }
     }
 
+    /// The source a label names ([`Self::label`]), if any.
+    pub fn from_label(label: &str) -> Option<Self> {
+        Some(match label {
+            "header" => Self::Header,
+            "imgt-gaps" => Self::ImgtGaps,
+            "motif" => Self::Motif,
+            "consensus" => Self::Consensus,
+            "low-confidence" => Self::LowConfidence,
+            "missing" => Self::Missing,
+            _ => Self::Transfer {
+                from: label.strip_prefix("transfer:")?.to_string(),
+            },
+        })
+    }
+
+    /// The source of `allele`'s header anchor: the one a prepared database
+    /// records for it (`annotation=`, [`Allele::source`]), so values an
+    /// earlier annotation derived stay as trusted as they were; else
+    /// [`Self::Header`]. A record for an anchor annotation found missing
+    /// names none: such an anchor was added by hand.
+    fn given(allele: &Allele) -> Self {
+        allele
+            .source
+            .as_deref()
+            .and_then(Self::from_label)
+            .filter(|source| *source != Self::Missing)
+            .unwrap_or(Self::Header)
+    }
+
     /// Reliable enough to serve as a transfer donor.
     fn trusted(&self) -> bool {
         matches!(
@@ -140,7 +178,7 @@ impl AnchorSource {
 #[derive(Clone, Debug)]
 pub struct AlleleAnnotation {
     pub source: AnchorSource,
-    pub notes: Vec<String>,
+    pub notes: Vec<Note>,
     /// Region starts (FR1, CDR1, FR2, CDR2, FR3) that may be wrong: derived
     /// for an allele whose anchor is low-confidence or missing; a CDR1
     /// start placed without a Cys23 codon, or from an ambiguous Cys23 that
@@ -154,7 +192,7 @@ pub struct AlleleAnnotation {
 }
 
 impl AlleleAnnotation {
-    fn new(source: AnchorSource, notes: Vec<String>) -> Self {
+    fn new(source: AnchorSource, notes: Vec<Note>) -> Self {
         Self {
             source,
             notes,
@@ -162,18 +200,32 @@ impl AlleleAnnotation {
         }
     }
 
-    /// The notes, then `uncertain=` and the keys of the uncertain starts
-    /// (`uncertain=cdr1,fr3`), as one `; `-separated field.
-    pub fn notes_field(&self) -> String {
+    /// The anchor is reliable enough to serve as a transfer donor and to
+    /// inform the database's consensus: from a header (unless the allele's
+    /// sequence contradicts it), IMGT gaps, a motif or the consensus.
+    pub fn trusted(&self) -> bool {
+        self.source.trusted()
+            && !self
+                .notes
+                .iter()
+                .any(|n| matches!(n, Note::AnchorContradicted { .. }))
+    }
+
+    /// `uncertain=` and the keys of the uncertain starts (`uncertain=cdr1,fr3`),
+    /// `None` when every start is certain.
+    pub fn uncertain_field(&self) -> Option<String> {
         let keys: Vec<&str> = RegionStarts::KEYS
             .iter()
             .zip(self.uncertain)
             .filter_map(|(&key, uncertain)| uncertain.then_some(key))
             .collect();
-        let mut fields = self.notes.clone();
-        if !keys.is_empty() {
-            fields.push(format!("uncertain={}", keys.join(",")));
-        }
+        (!keys.is_empty()).then(|| format!("uncertain={}", keys.join(",")))
+    }
+
+    /// The notes, then [`Self::uncertain_field`], as one `; `-separated field.
+    pub fn notes_field(&self) -> String {
+        let mut fields: Vec<String> = self.notes.iter().map(Note::to_string).collect();
+        fields.extend(self.uncertain_field());
         fields.join("; ")
     }
 }
@@ -197,12 +249,14 @@ pub struct DatabaseAnnotation {
     pub imgt_gaps: ImgtGaps,
     /// FR3 lengths learned from the alleles whose FR3 start is given.
     pub fr3_model: Option<Fr3Model>,
-    /// Most V allele names are TR or IGL ones: loci whose FR3 length IMGT
-    /// varies by gene family, so one chain default is wrong for some.
+    /// Most V alleles of known locus belong to one whose FR3 length IMGT
+    /// varies by gene family ([`Locus::fr3_varies_by_family`]), so one
+    /// chain default is wrong for some.
     pub fr3_varies: bool,
     /// For a database of several loci, each locus annotated on its own
-    /// ([`annotate_by_locus`]); `None` for alleles of unknown locus. `v` and
-    /// `j` above then hold every allele's annotation.
+    /// ([`annotate_by_locus`]): an allele of unknown locus with the locus of
+    /// its nearest relative of known locus, `None` for those without one.
+    /// `v` and `j` above then hold every allele's annotation.
     pub parts: Vec<(Option<Locus>, DatabaseAnnotation)>,
 }
 
@@ -224,12 +278,6 @@ fn mode_with_share(values: impl Iterator<Item = u32>) -> (Option<u32>, f64) {
         .map_or((None, 0.0), |(value, count)| {
             (Some(value), count as f64 / total as f64)
         })
-}
-
-/// A probability for a note, rounded down to two decimals so that only a
-/// certain choice reads `1.00`.
-fn probability(p: f64) -> String {
-    format!("{:.2}", (p * 100.0).floor() / 100.0)
 }
 
 fn residue_at(codes: &[u8], anchor: u32) -> u8 {
@@ -355,19 +403,19 @@ fn merge_regions(
             .rev()
             .find(|&i| merged.values()[i].is_some() && given[i].known().is_none())
         else {
-            notes.push(format!("header regions inconsistent: {reason}"));
+            notes.push(Note::HeaderRegionsInconsistent { reason });
             break;
         };
-        notes.push(format!(
-            "dropped derived {}: {reason}",
-            RegionStarts::KEYS[index]
-        ));
+        notes.push(Note::DroppedDerived {
+            region: index,
+            reason,
+        });
         let mut values = merged.values();
         values[index] = None;
         merged = RegionStarts::from_values(values);
     }
     let values = merged.values();
-    for (region, [start, end], usual) in [("CDR1", [1, 2], 4..=14), ("CDR2", [3, 4], 0..=12)] {
+    for (cdr, [start, end], usual) in [(1, [1, 2], 4..=14), (2, [3, 4], 0..=12)] {
         let Some(codons) = values[start]
             .zip(values[end])
             .map(|(a, b)| (i64::from(b) - i64::from(a)) / 3)
@@ -375,7 +423,7 @@ fn merge_regions(
             continue;
         };
         if !usual.contains(&codons) {
-            notes.push(format!("unusual {region} length {codons} codons"));
+            notes.push(Note::UnusualCdrLength { cdr, codons });
             for bound in [start, end] {
                 annotation.uncertain[bound] |= given[bound].known().is_none();
             }
@@ -469,21 +517,20 @@ impl Fr3Notes<'_> {
         let Some(choice) = choice else { return };
         let (note, uncertain) = match choice {
             Fr3Choice::Relative(donor) => (
-                Some(format!("FR3 start from {}", self.set.alleles()[donor].name)),
+                Some(Note::Fr3FromRelative {
+                    relative: self.set.alleles()[donor].name.clone(),
+                }),
                 false,
             ),
             Fr3Choice::Model { codons, p } => (
-                Some(format!(
-                    "FR3 length {codons} codons from the database model (n={}, p={})",
-                    self.model.map_or(0, Fr3Model::labels),
-                    probability(p)
-                )),
+                Some(Note::Fr3FromModel {
+                    codons,
+                    labels: self.model.map_or(0, Fr3Model::labels),
+                    p,
+                }),
                 p < FR3_CONFIDENT,
             ),
-            Fr3Choice::OutsideModel => (
-                Some("FR3 length outside the database model; chain default".into()),
-                true,
-            ),
+            Fr3Choice::OutsideModel => (Some(Note::Fr3OutsideModel), true),
             Fr3Choice::ChainDefault => (None, self.default_doubtful),
         };
         annotation.notes.extend(note);
@@ -492,7 +539,7 @@ impl Fr3Notes<'_> {
 }
 
 /// For every trusted allele (`hits`) whose FR3 start is open, the FR3 start
-/// of its nearest relative with a given FR3 start and an anchor, and that
+/// of its nearest trusted relative with a certain given FR3 start, and that
 /// relative: the relative's Cys104 → FR3 distance when the two share a
 /// Trp41 → Cys104 spacing, else its FR3 start mapped by alignment. The FR3
 /// start is a homologous position, so an indel between the two falls in
@@ -506,7 +553,11 @@ fn fr3_from_relatives(
     index: &mut Option<RelativeIndex>,
     workspace: &mut GotohWorkspace,
 ) -> Vec<Option<(u32, usize)>> {
-    let fr3_of = |i: usize| given[i].regions[4].known().filter(|_| anchors[i].is_some());
+    let fr3_of = |i: usize| {
+        given[i]
+            .certain(4)
+            .filter(|_| anchors[i].is_some() && hits[i].is_some())
+    };
     let eligible: Vec<bool> = (0..set.len()).map(|i| fr3_of(i).is_some()).collect();
     let mut found = vec![None; set.len()];
     if !eligible.contains(&true) {
@@ -564,12 +615,36 @@ fn annotate_j(
     let mut vote = 0i32;
     for allele in j.alleles() {
         let mut notes = Vec::new();
-        if let Some(anchor) = allele.anchor {
+        let mut given = allele.anchor;
+        if let Some(anchor) = given
+            && let Some(motif) = j_motif_against(&allele.codes, anchor, frames)
+        {
+            let (conflict, motif) = (Conflict::NotJMotif, motif.anchor());
+            if allele.anchor_from_meta {
+                notes.push(Note::MetaAnchorDropped {
+                    anchor,
+                    conflict,
+                    motif,
+                });
+                given = None;
+            } else {
+                notes.push(Note::AnchorContradicted {
+                    anchor,
+                    conflict,
+                    motif: Some(motif),
+                });
+            }
+        }
+        if let Some(anchor) = given {
             let residue = residue_at(&allele.codes, anchor);
             if !matches!(residue, b'W' | b'F') {
-                notes.push(format!("header anchor codon is {}", char::from(residue)));
+                notes.push(Note::HeaderResidue(residue));
             }
-            result.push(AlleleAnnotation::new(AnchorSource::Header, notes));
+            let annotation = AlleleAnnotation::new(AnchorSource::given(allele), notes);
+            if annotation.trusted() {
+                vote += 2 * i32::from(j_motif::residue_vote(residue));
+            }
+            result.push(annotation);
             anchors.push(Some(anchor));
             weak.push(None);
             continue;
@@ -593,7 +668,9 @@ fn annotate_j(
         j.alleles()
             .iter()
             .zip(&anchors)
-            .filter_map(|(a, &x)| x.map(|x| a.codes.len() as u32 - x)),
+            .zip(&result)
+            .filter(|(_, r)| r.trusted())
+            .filter_map(|((a, &x), _)| x.map(|x| a.codes.len() as u32 - x)),
     );
     // Consensus prior for weak alleles.
     for (index, allele) in j.alleles().iter().enumerate() {
@@ -608,7 +685,7 @@ fn annotate_j(
     }
     // Sibling transfer, then low-confidence motif hits. K-mer profiles are
     // built only if some allele needs a relative.
-    let trusted: Vec<bool> = result.iter().map(|r| r.source.trusted()).collect();
+    let trusted: Vec<bool> = result.iter().map(AlleleAnnotation::trusted).collect();
     let mut relative_index = None;
     let any_donor = trusted.iter().any(|&t| t);
     for index in 0..j.len() {
@@ -639,9 +716,7 @@ fn annotate_j(
                 let anchor = mapped[0].expect("checked above");
                 let residue = residue_at(&j.alleles()[index].codes, anchor);
                 if !matches!(residue, b'W' | b'F') {
-                    result[index]
-                        .notes
-                        .push(format!("conserved residue is {}", char::from(residue)));
+                    result[index].notes.push(Note::TransferredResidue(residue));
                 }
                 result[index].source = AnchorSource::Transfer {
                     from: j.alleles()[donor].name.clone(),
@@ -651,50 +726,128 @@ fn annotate_j(
             // A partial allele: the relative's anchor codon maps outside it,
             // and the allele ends while still aligned to the relative.
             Some(r) if !fits(&r) && partial(&r) => {
-                result[index].notes.push(format!(
-                    "partial: the anchor codon of {} maps outside the sequence",
-                    j.alleles()[r.donor].name
-                ));
+                result[index].notes.push(Note::PartialJ {
+                    relative: j.alleles()[r.donor].name.clone(),
+                });
             }
             _ => {
                 if let Some(h) = weak[index] {
                     result[index].source = AnchorSource::LowConfidence;
                     result[index]
                         .notes
-                        .push(format!("weak motif {}G.G", char::from(h.residue)));
+                        .push(Note::WeakJMotif { residue: h.residue });
                     anchors[index] = Some(h.anchor());
                 }
             }
         }
     }
     for ((_, anchor, _), found) in j.annotate_mut().zip(anchors) {
-        *anchor = anchor.or(found);
+        *anchor = found;
     }
     (result, tail, vote)
 }
 
-/// The locus an allele is annotated with: its first, `None` if unknown.
+/// The confident `[WF]G.G` motif that contradicts the given J anchor
+/// `anchor`: one in the anchor's reading frame at another codon, while the
+/// anchor codon does not start `[WF]G.G` itself.
+fn j_motif_against(codes: &[u8], anchor: u32, frames: &mut [Vec<u8>; 3]) -> Option<JHit> {
+    let on_motif = matches!(residue_at(codes, anchor), b'W' | b'F')
+        && residue_at(codes, anchor + 3) == b'G'
+        && residue_at(codes, anchor + 9) == b'G';
+    if on_motif {
+        return None;
+    }
+    find_j(codes, None, frames)
+        .filter(|h| h.confident && h.anchor() != anchor && h.frame == anchor as usize % 3)
+}
+
+/// A header anchor whose own motifs are weak (`fixed`, the motif search at
+/// it) and whose codon lies in another reading frame than every given
+/// CDR1, FR2, CDR2 and FR3 start contradicts them. FR1 is left out: Swig's
+/// preprocessor starts a 5′-partial allele's FR1 at 0 whatever its frame.
+/// A `SWIGMETA` anchor is dropped, with a note, when the free motif search
+/// confidently places Cys104 in the starts' frame: `given` then holds no
+/// anchor, and that motif hit is returned. Any other contradicted anchor is
+/// kept with a note that makes it untrusted.
+fn check_given_v_anchor(
+    codes: &[u8],
+    given: &mut Given,
+    fixed: Option<VHit>,
+    notes: &mut Vec<Note>,
+    frames: &mut [Vec<u8>; 3],
+) -> Option<VHit> {
+    let anchor = given
+        .anchor
+        .filter(|_| given.source == Some(AnchorSource::Header))?;
+    if fixed.is_some_and(|h| h.confident) {
+        return None;
+    }
+    let mut starts = given.regions[1..].iter().filter_map(|slot| slot.known());
+    let frame = starts.next()? % 3;
+    if frame == anchor % 3 || !starts.all(|start| start % 3 == frame) {
+        return None;
+    }
+    let conflict = Conflict::OutOfFrame;
+    let motif = find_v(codes, VSearch::default(), frames)
+        .filter(|h| h.confident && h.anchor() % 3 == frame);
+    match motif {
+        Some(hit) if given.from_meta => {
+            notes.push(Note::MetaAnchorDropped {
+                anchor,
+                conflict,
+                motif: hit.anchor(),
+            });
+            (given.anchor, given.source, given.from_meta) = (None, None, false);
+            Some(hit)
+        }
+        _ => {
+            notes.push(Note::AnchorContradicted {
+                anchor,
+                conflict,
+                motif: motif.map(|h| h.anchor()),
+            });
+            None
+        }
+    }
+}
+
+/// The locus an allele's name gives: its first, `None` if unknown.
 fn annotation_locus(allele: &Allele) -> Option<Locus> {
     (allele.loci != Loci::ANY)
         .then(|| allele.loci.first())
         .flatten()
 }
 
-/// [`annotate`] each locus of the database on its own: V and J alleles of
-/// one locus share a chain type, an FR3 length model and Cys23 priors,
-/// which differ between loci (heavy and light chains, TR loci). A
-/// database of one locus is annotated as a whole.
+/// The locus each allele of `set` is annotated with: the one its name gives
+/// ([`annotation_locus`]), else that of its nearest relative whose name
+/// gives one. An allele of unknown locus pairs with every locus when reads
+/// are assigned, so it is annotated in the context of the locus it
+/// resembles; `None` only when no allele of known locus is related.
+fn annotation_loci(set: &GermlineSet) -> Vec<Option<Locus>> {
+    let named: Vec<Option<Locus>> = set.alleles().iter().map(annotation_locus).collect();
+    if named.iter().all(Option::is_some) || named.iter().all(Option::is_none) {
+        return named;
+    }
+    let eligible: Vec<bool> = named.iter().map(Option::is_some).collect();
+    let mut index = RelativeIndex::build(set.alleles().iter().map(|a| a.codes.as_slice()));
+    (0..set.len())
+        .map(|i| named[i].or_else(|| index.nearest(i, &eligible).and_then(|d| named[d])))
+        .collect()
+}
+
+/// [`annotate`] each locus of the database on its own
+/// (`annotation_loci`): V and J alleles of one locus share a chain type,
+/// an FR3 length model and Cys23 priors, which differ between loci (heavy
+/// and light chains, TR loci). A database of one locus is annotated as a
+/// whole.
 pub fn annotate_by_locus(
     v: &mut GermlineSet,
     mut j: Option<&mut GermlineSet>,
     options: AnnotateOptions,
 ) -> DatabaseAnnotation {
-    let mut loci: Vec<Option<Locus>> = v
-        .alleles()
-        .iter()
-        .chain(j.iter().flat_map(|j| j.alleles()))
-        .map(annotation_locus)
-        .collect();
+    let v_loci = annotation_loci(v);
+    let j_loci = j.as_deref().map(annotation_loci).unwrap_or_default();
+    let mut loci: Vec<Option<Locus>> = v_loci.iter().chain(&j_loci).copied().collect();
     loci.sort_unstable();
     loci.dedup();
     if loci.len() <= 1 {
@@ -709,10 +862,18 @@ pub fn annotate_by_locus(
         ..DatabaseAnnotation::default()
     };
     for locus in loci {
-        let of_locus = |a: &Allele| annotation_locus(a) == locus;
-        let (mut v_part, v_ids) = v.subset(of_locus);
-        let mut j_part = j.as_deref().map(|j| j.subset(of_locus));
-        let part = annotate(&mut v_part, j_part.as_mut().map(|(set, _)| set), options);
+        let of_locus = |loci: &[Option<Locus>]| -> Vec<AlleleId> {
+            (0..)
+                .zip(loci)
+                .filter(|&(_, &l)| l == locus)
+                .map(|(id, _)| id)
+                .collect()
+        };
+        let v_ids = of_locus(&v_loci);
+        let mut v_part = v.select(&v_ids);
+        let j_ids = of_locus(&j_loci);
+        let mut j_part = j.as_deref().map(|j| j.select(&j_ids));
+        let part = annotate(&mut v_part, j_part.as_mut(), options);
         for (copy, &id) in v_part.alleles().iter().zip(&v_ids) {
             let (anchor, regions, _) = v.annotation_mut(id);
             (*anchor, *regions) = (copy.anchor, copy.regions);
@@ -720,11 +881,11 @@ pub fn annotate_by_locus(
         for (annotation, &id) in part.v.iter().zip(&v_ids) {
             merged.v[id as usize] = annotation.clone();
         }
-        if let (Some(j), Some((j_part, j_ids))) = (j.as_deref_mut(), &j_part) {
-            for (copy, &id) in j_part.alleles().iter().zip(j_ids) {
+        if let (Some(j), Some(j_part)) = (j.as_deref_mut(), &j_part) {
+            for (copy, &id) in j_part.alleles().iter().zip(&j_ids) {
                 *j.annotation_mut(id).0 = copy.anchor;
             }
-            for (annotation, &id) in part.j.iter().zip(j_ids) {
+            for (annotation, &id) in part.j.iter().zip(&j_ids) {
                 merged.j[id as usize] = annotation.clone();
             }
         }
@@ -750,21 +911,25 @@ pub fn annotate(
     // database's gaps follow the IMGT numbering.
     let imgt_gaps = ImgtGaps::check(v);
     let mut result: Vec<AlleleAnnotation> = Vec::with_capacity(v.len());
-    let given: Vec<Given> = v
+    let mut given: Vec<Given> = v
         .alleles()
         .iter()
         .map(|allele| {
             let mut notes = Vec::new();
             let given = Given::read(allele, imgt_gaps.used(), &mut notes);
-            result.push(AlleleAnnotation::new(AnchorSource::Missing, notes));
+            result.push(AlleleAnnotation {
+                uncertain: given.uncertain,
+                ..AlleleAnnotation::new(AnchorSource::Missing, notes)
+            });
             given
         })
         .collect();
 
-    // V pass 1: given anchors fix the frame; otherwise free motif search. An
-    // allele whose IMGT numbering ends before Cys104 is not searched.
+    // V pass 1: given anchors fix the frame, unless the allele's sequence
+    // contradicts a SWIGMETA one; otherwise free motif search. An allele
+    // whose IMGT numbering ends before Cys104 is not searched.
     let mut hits: Vec<Option<VHit>> = Vec::with_capacity(v.len());
-    for ((allele, given), annotation) in v.alleles().iter().zip(&given).zip(&mut result) {
+    for ((allele, given), annotation) in v.alleles().iter().zip(&mut given).zip(&mut result) {
         let hit = if given.ends_before_cys104 {
             None
         } else {
@@ -772,7 +937,15 @@ pub fn annotate(
                 fixed_anchor: given.anchor,
                 ..VSearch::default()
             };
-            find_v(&allele.codes, search, &mut frames)
+            let fixed = find_v(&allele.codes, search, &mut frames);
+            check_given_v_anchor(
+                &allele.codes,
+                given,
+                fixed,
+                &mut annotation.notes,
+                &mut frames,
+            )
+            .or(fixed)
         };
         annotation.source = match (&given.source, hit) {
             (Some(source), _) => source.clone(),
@@ -780,15 +953,15 @@ pub fn annotate(
             _ => AnchorSource::Missing,
         };
         if let (Some(anchor), Some(source)) = (given.anchor, &given.source) {
-            let residue = char::from(residue_at(&allele.codes, anchor));
-            if residue != 'C' {
+            let residue = residue_at(&allele.codes, anchor);
+            if residue != b'C' {
                 annotation.notes.push(match source {
-                    AnchorSource::ImgtGaps => format!("IMGT 104 codon is {residue}"),
-                    _ => format!("header anchor codon is {residue}"),
+                    AnchorSource::ImgtGaps => Note::ImgtResidue(residue),
+                    _ => Note::HeaderResidue(residue),
                 });
             }
         }
-        if annotation.source.trusted() {
+        if annotation.trusted() {
             vote += hit.map_or(0, |h| i32::from(h.chain_vote));
         }
         hits.push(hit);
@@ -799,27 +972,35 @@ pub fn annotate(
         _ => None,
     });
 
-    // FR3 and CDR2 lengths of the alleles whose FR3 start is given.
-    let fr3_varies = 2 * v
-        .alleles()
-        .iter()
-        .filter(|a| a.name.starts_with("TR") || a.name.starts_with("IGL"))
-        .count()
-        > v.len();
-    let fr3_model = Fr3Model::learn((0..v.len()).filter_map(|i| {
-        let fr3 = given[i].regions[4].known()?;
-        let hit = hits[i].filter(|_| result[i].source.trusted());
-        let anchor = given[i].anchor.or(hit.map(|h| h.anchor()))?;
-        let codons = anchor.checked_sub(fr3).filter(|d| d.is_multiple_of(3))? / 3 + 1;
-        let cdr2 = given[i].regions[3]
-            .known()
-            .or(hit.and_then(|h| h.trp41_nt()).map(|w| w + 45));
-        let cdr2_codons = cdr2
-            .and_then(|c| fr3.checked_sub(c))
-            .filter(|d| d.is_multiple_of(3))
-            .map(|d| d / 3);
-        Some((codons, cdr2_codons))
-    }));
+    // FR3 and CDR2 lengths of the trusted alleles whose FR3 start is given
+    // and certain.
+    let (varying, named) =
+        v.alleles()
+            .iter()
+            .filter_map(annotation_locus)
+            .fold((0, 0), |(varying, named), locus| {
+                (
+                    varying + usize::from(locus.fr3_varies_by_family()),
+                    named + 1,
+                )
+            });
+    let fr3_varies = 2 * varying > named;
+    let fr3_model = Fr3Model::learn((0..v.len()).filter(|&i| result[i].trusted()).filter_map(
+        |i| {
+            let fr3 = given[i].certain(4)?;
+            let hit = hits[i];
+            let anchor = given[i].anchor.or(hit.map(|h| h.anchor()))?;
+            let codons = anchor.checked_sub(fr3).filter(|d| d.is_multiple_of(3))? / 3 + 1;
+            let cdr2 = given[i]
+                .certain(3)
+                .or(hit.and_then(|h| h.trp41_nt()).map(|w| w + 45));
+            let cdr2_codons = cdr2
+                .and_then(|c| fr3.checked_sub(c))
+                .filter(|d| d.is_multiple_of(3))
+                .map(|d| d / 3);
+            Some((codons, cdr2_codons))
+        },
+    ));
     // The Trp41 search covers every FR3 length the chain or the model admits.
     let fr3_range = match (chain.map(ChainType::fr3_codons), fr3_model.as_ref()) {
         (Some(l), Some(model)) => {
@@ -833,12 +1014,12 @@ pub fn annotate(
     // Database consensus from pass 1: the 3′ tail after Cys104, the frame of
     // full-length alleles and the codon index of their Cys23.
     let trusted: Vec<VHit> = (0..v.len())
-        .filter(|&i| result[i].source.trusted())
+        .filter(|&i| result[i].trusted())
         .filter_map(|i| hits[i])
         .collect();
     let (tail, tail_share) = mode_with_share(
         (0..v.len())
-            .filter(|&i| result[i].source.trusted())
+            .filter(|&i| result[i].trusted())
             .filter_map(|i| {
                 given[i]
                     .anchor
@@ -865,7 +1046,7 @@ pub fn annotate(
         if given[index].ends_before_cys104 {
             continue;
         }
-        let was_confident = result[index].source.trusted();
+        let was_confident = result[index].trusted();
         let search = VSearch {
             fixed_anchor: given[index].anchor,
             tail_prior: tail.filter(|_| !was_confident || tail_share >= 0.5),
@@ -873,8 +1054,13 @@ pub fn annotate(
             fr3_codons: fr3_range,
         };
         let refined = find_v(&allele.codes, search, &mut frames);
+        if given[index].anchor.is_some() {
+            if let Some(h) = refined {
+                hits[index] = Some(h);
+            }
+            continue;
+        }
         match (&result[index].source, refined) {
-            (AnchorSource::Header | AnchorSource::ImgtGaps, Some(h)) => hits[index] = Some(h),
             (AnchorSource::Motif, Some(h)) if h.confident => hits[index] = Some(h),
             (AnchorSource::Missing, Some(h)) if h.confident => {
                 hits[index] = Some(h);
@@ -882,9 +1068,7 @@ pub fn annotate(
             }
             (AnchorSource::Motif, _) => {
                 result[index].source = AnchorSource::Missing;
-                result[index]
-                    .notes
-                    .push("motifs inconsistent with the database consensus".into());
+                result[index].notes.push(Note::InconsistentMotifs);
             }
             _ => {}
         }
@@ -892,7 +1076,7 @@ pub fn annotate(
     // Final anchors and regions for trusted alleles.
     let len_of = |set: &GermlineSet, i: usize| set.alleles()[i].codes.len();
     let trusted_hits: Vec<Option<VHit>> = (0..v.len())
-        .map(|i| hits[i].filter(|_| result[i].source.trusted()))
+        .map(|i| hits[i].filter(|_| result[i].trusted()))
         .collect();
     let mut anchors: Vec<Option<u32>> = given
         .iter()
@@ -921,10 +1105,10 @@ pub fn annotate(
             (Some(anchor), Some(hit)) => {
                 let annotation = &mut result[index];
                 if hit.cys23_alternatives > 0 && given.regions[1] == RegionSlot::Unknown {
-                    annotation.notes.push(format!(
-                        "Cys23 ambiguous ({} other C in window); CDR1 start from the best-scoring one",
-                        hit.cys23_alternatives
-                    ));
+                    annotation.notes.push(Note::Cys23Ambiguous {
+                        others: hit.cys23_alternatives,
+                        choice: Cys23Choice::BestScoring,
+                    });
                     annotation.uncertain[1] = true;
                 }
                 let (merged, choice) = merge_hit(
@@ -961,6 +1145,7 @@ pub fn annotate(
             .map(|i| {
                 regions[i].cdr1.is_some()
                     && trusted_hits[i].is_some()
+                    && !given[i].uncertain[1]
                     && (given[i].regions[1].known().is_some() || open_cys23[i].is_none())
             })
             .collect();
@@ -1018,20 +1203,16 @@ pub fn annotate(
                 if let Some(cdr1) = lands
                     && set_cdr1(&mut regions[index], cdr1)
                 {
-                    let name = &v.alleles()[donor].name;
+                    let relative = v.alleles()[donor].name.clone();
                     let annotation = &mut result[index];
                     if missing {
-                        annotation
-                            .notes
-                            .push(format!("no Cys23; CDR1 start from {name}"));
+                        annotation.notes.push(Note::NoCys23 { relative });
                         annotation.uncertain[1] = true;
                     } else {
                         annotation
                             .notes
-                            .retain(|n| !n.starts_with("Cys23 ambiguous"));
-                        annotation
-                            .notes
-                            .push(format!("ambiguous Cys23 resolved from {name}"));
+                            .retain(|n| !matches!(n, Note::Cys23Ambiguous { .. }));
+                        annotation.notes.push(Note::Cys23Resolved { relative });
                         annotation.uncertain[1] = false;
                     }
                     continue;
@@ -1059,25 +1240,21 @@ pub fn annotate(
             }
             let annotation = &mut result[index];
             annotation.uncertain[1] = true;
+            let from_model = Cys23Choice::Model {
+                labels: model.labels(),
+                p,
+            };
             if missing {
-                annotation.notes.push(format!(
-                    "no Cys23 ({} at its position); CDR1 start from the database model (n={}, p={})",
-                    char::from(aa[k]),
-                    model.labels(),
-                    probability(p)
-                ));
+                annotation.notes.push(Note::NoCys23Model {
+                    residue: aa[k],
+                    labels: model.labels(),
+                    p,
+                });
             } else {
-                for note in annotation
-                    .notes
-                    .iter_mut()
-                    .filter(|n| n.starts_with("Cys23 ambiguous"))
-                {
-                    *note = format!(
-                        "Cys23 ambiguous ({} other C in window); CDR1 start from the database model (n={}, p={})",
-                        hit.cys23_alternatives,
-                        model.labels(),
-                        probability(p)
-                    );
+                for note in &mut annotation.notes {
+                    if let Note::Cys23Ambiguous { choice, .. } = note {
+                        *choice = from_model.clone();
+                    }
                 }
             }
         }
@@ -1087,7 +1264,7 @@ pub fn annotate(
     let trusted: Vec<bool> = result
         .iter()
         .zip(&anchors)
-        .map(|(r, a)| r.source.trusted() && a.is_some())
+        .map(|(r, a)| r.trusted() && a.is_some())
         .collect();
     let any_donor = trusted.iter().any(|&t| t);
     for index in 0..v.len() {
@@ -1119,9 +1296,7 @@ pub fn annotate(
                 let annotation = &mut result[index];
                 let residue = residue_at(&v.alleles()[index].codes, anchor);
                 if residue != b'C' {
-                    annotation
-                        .notes
-                        .push(format!("conserved residue is {}", char::from(residue)));
+                    annotation.notes.push(Note::TransferredResidue(residue));
                 }
                 regions[index] = merge_regions(
                     &given[index].regions,
@@ -1151,10 +1326,9 @@ pub fn annotate(
                 ]);
                 let donor_uncertain = result[r.donor].uncertain;
                 let annotation = &mut result[index];
-                annotation.notes.push(format!(
-                    "3′-partial: the anchor codon of {} maps past the 3′ end",
-                    v.alleles()[r.donor].name
-                ));
+                annotation.notes.push(Note::ThreePrimePartial {
+                    relative: v.alleles()[r.donor].name.clone(),
+                });
                 regions[index] =
                     merge_regions(&given[index].regions, derived, None, len, annotation);
                 inherit_uncertain(annotation, &given[index].regions, donor_uncertain);
@@ -1162,12 +1336,8 @@ pub fn annotate(
             relative => {
                 if let Some(hit) = hits[index] {
                     let annotation = &mut result[index];
-                    annotation.notes.push(match relative {
-                        Some(r) => format!(
-                            "weak motifs; the anchor of {} does not fit and their alignment stops short",
-                            v.alleles()[r.donor].name
-                        ),
-                        None => "weak motifs; no similar annotated allele".into(),
+                    annotation.notes.push(Note::WeakMotifs {
+                        relative: relative.map(|r| v.alleles()[r.donor].name.clone()),
                     });
                     let (merged, choice) = merge_hit(
                         &given[index].regions,
@@ -1189,8 +1359,7 @@ pub fn annotate(
     }
     // Every derived start of an allele without a trusted anchor is uncertain.
     for ((annotation, given), regions) in result.iter_mut().zip(&given).zip(&regions) {
-        if annotation.source.trusted() || matches!(annotation.source, AnchorSource::Transfer { .. })
-        {
+        if annotation.trusted() || matches!(annotation.source, AnchorSource::Transfer { .. }) {
             continue;
         }
         let derived = given.regions.iter().zip(regions.values());
@@ -1201,7 +1370,7 @@ pub fn annotate(
     for ((_, anchor, slot), (found, merged)) in
         v.annotate_mut().zip(anchors.into_iter().zip(regions))
     {
-        *anchor = anchor.or(found);
+        *anchor = found;
         *slot = merged;
     }
     DatabaseAnnotation {
@@ -1271,10 +1440,10 @@ impl DatabaseAnnotation {
         text
     }
 
-    /// No V allele has a given FR3 start, and the names are those of a
-    /// locus (TR, IGL) whose FR3 length varies by gene family: one chain
-    /// default places some FR3 starts wrong, and every such start is
-    /// marked uncertain.
+    /// No V allele has a given FR3 start, and the alleles belong to a locus
+    /// (TR, IGL) whose FR3 length varies by gene family: one chain default
+    /// places some FR3 starts wrong, and every such start is marked
+    /// uncertain.
     pub fn fr3_warning(&self) -> bool {
         if !self.parts.is_empty() {
             return self.parts.iter().any(|(_, part)| part.fr3_warning());
@@ -1282,12 +1451,14 @@ impl DatabaseAnnotation {
         self.fr3_model.is_none() && self.fr3_varies && self.chain.is_some()
     }
 
-    /// Alleles whose anchor is not from a header, IMGT gaps, motif or consensus.
+    /// Alleles whose anchor is not trusted ([`AlleleAnnotation::trusted`]):
+    /// transferred, low-confidence, missing, or a header anchor the
+    /// allele's sequence contradicts.
     pub fn uncertain(&self) -> usize {
         self.v
             .iter()
             .chain(&self.j)
-            .filter(|a| !a.source.trusted())
+            .filter(|a| !a.trusted())
             .count()
     }
 
@@ -1335,5 +1506,234 @@ impl DatabaseAnnotation {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::germline::SegmentKind;
+
+    /// Human TRAJ48*01: `F` at 8 starts `FGNE`; `FGTG` starts at 29.
+    const TRAJ48: &str = "TATCTAACTTTGGAAATGAGAAATTAACCTTTGGGACTGGAACAAGACTCACCATCATACCCA";
+    /// Human TRAJ51*01: its Phe118 at 29 starts `FGKE`, no `[WF]G.G`.
+    const TRAJ51: &str = "AGATGCGTGACAGCTATGAGAAGCTGATATTTGGAAAGGAGACATGACTAACTGTGAAGCCAA";
+    /// Human IGLV2-11*03, 5′-partial: Cys104 at 244 (frame 1).
+    const IGLV2_11: &str = "CTCAGTGTCCGGGTCTCCTGGACAGTCAGTCACCATCTCCTGCACTGGAACCAGCAGTGATGTTGGTGGTTATAACTATGTCTCCTGGTACCAACAACACCCAGGCAAAGCCCCCAAACTCATGATTTATGATGTCAGTAAGCGGCCCTCAGGGGTCCCTGATCGCTTCTCTGGCTCCAAGTCTGGCAACACGGCCTCCCTGACCATCTCTGGGCTCCAGGCTGAGGATGAGGCTGATTATTACTGCTGCTCATATGCAGGCAGCTACACTTTC";
+    /// Human IGHV1/OR15-5*01, 5′-partial: its region starts lie in frame 2,
+    /// and no Cys104 there has confident motifs.
+    const IGHV1_OR15_5: &str = "AGAAGCCTGGGGCCTCAGTGAAGGTCTCCTGCAAGGCTTCTGGATACACCTTCACCAGCTACTGTATGCACTGGGTGCACCAGGTCCATGCACAAGGGCTTGAGTGGATGGGATTGGTGTGCCCTAGTGATGGCAGCACAAGCTATGCACAGAAGTTCCAGGCCAGAGTCACCATAACCAGGGACACATCCATGAGCACAGCCTACATGGAGCTAAGCAGTCTGAGATCTGAGGACACGGCCATGTATTACTGTGTGAGA";
+
+    /// Human TRAV1-2*01: Cys104 at 261.
+    const TRAV1_2: &str = "GGACAAAACATTGACCAGCCCACTGAGATGACAGCTACGGAAGGTGCCATTGTCCAGATCAACTGCACGTACCAGACATCTGGGTTCAACGGGCTGTTCTGGTACCAGCAACATGCTGGCGAAGCACCCACATTTCTGTCTTACAATGTTCTGGATGGTTTGGAGGAGAAAGGTCGTTTTTCTTCATTCCTTAGTCGGTCTAAAGGGTACAGTTACCTCCTTTTGAAGGAGCTCCAGATGAAAGACTCTGCCTCTTACCTCTGTGCTGTGAGAGA";
+
+    /// Whether a locus varies its FR3 length by family comes from the
+    /// alleles' loci, so a lowercase label or a locus named only in the
+    /// header raises the warning and flags the chain-default FR3 start as
+    /// the IMGT name does.
+    #[test]
+    fn the_fr3_default_is_doubted_by_locus_not_by_label_case() {
+        for header in ["TRAV1-2*01", "trav1-2*01", "V1 TRAV1-2*01"] {
+            let (_, report) = annotate_v(&format!(">{header}\n{TRAV1_2}\n"), ChainType::Light);
+            assert!(report.fr3_varies && report.fr3_warning(), "{header}");
+            assert!(report.v[0].uncertain[4], "{header}: {:?}", report.v[0]);
+        }
+        let (_, report) = annotate_v(&format!(">V1\n{TRAV1_2}\n"), ChainType::Light);
+        assert!(!report.fr3_varies && !report.v[0].uncertain[4]);
+    }
+
+    /// Human IGHJ4*02: Trp118 at 14 starts `WGQG`.
+    const IGHJ4: &str = "ACTACTTTGACTACTGGGGCCAGGGAACCCTGGTCACCGTCTCCTCAG";
+
+    /// A J anchor given in the header votes the chain with its residue,
+    /// as the motif search's does: the chain no longer depends on whether a
+    /// database states its J anchors.
+    #[test]
+    fn given_j_anchors_vote_the_chain_as_motif_hits_do() {
+        for (allele, sequence, anchor, chain) in [
+            ("IGHJ4*02", IGHJ4, 14, ChainType::Heavy),
+            ("TRAJ48*01", TRAJ48, 29, ChainType::Light),
+        ] {
+            for keys in [String::new(), format!(" anchor={anchor}")] {
+                let (j, report) = annotate_j(&format!(">{allele}{keys}\n{sequence}\n"));
+                assert_eq!(j.allele(0).anchor, Some(anchor), "{allele}{keys}");
+                assert_eq!(report.chain, Some(chain), "{allele}{keys}");
+            }
+        }
+    }
+
+    /// Human IGHV3-23*01, IGKV1-5*01 and IGLV2-14*01 (`swig` 0.7 reference).
+    const IGHV3_23: &str = "GAGGTGCAGCTGTTGGAGTCTGGGGGAGGCTTGGTACAGCCTGGGGGGTCCCTGAGACTCTCCTGTGCAGCCTCTGGATTCACCTTTAGCAGCTATGCCATGAGCTGGGTCCGCCAGGCTCCAGGGAAGGGGCTGGAGTGGGTCTCAGCTATTAGTGGTAGTGGTGGTAGCACATACTACGCAGACTCCGTGAAGGGCCGGTTCACCATCTCCAGAGACAATTCCAAGAACACGCTGTATCTGCAAATGAACAGCCTGAGAGCCGAGGACACGGCCGTATATTACTGTGCGAAAGA";
+    const IGKV1_5: &str = "GACATCCAGATGACCCAGTCTCCTTCCACCCTGTCTGCATCTGTAGGAGACAGAGTCACCATCACTTGCCGGGCCAGTCAGAGTATTAGTAGCTGGTTGGCCTGGTATCAGCAGAAACCAGGGAAAGCCCCTAAGCTCCTGATCTATGATGCCTCCAGTTTGGAAAGTGGGGTCCCATCAAGGTTCAGCGGCAGTGGATCTGGGACAGAATTCACTCTCACCATCAGCAGCCTGCAGCCTGATGATTTTGCAACTTATTACTGCCAACAGTATAATAGTTATTCTCC";
+    const IGLV2_14: &str = "CAGTCTGCCCTGACTCAGCCTGCCTCCGTGTCTGGGTCTCCTGGACAGTCGATCACCATCTCCTGCACTGGAACCAGCAGTGACGTTGGTGGTTATAACTATGTCTCCTGGTACCAACAGCACCCAGGCAAAGCCCCCAAACTCATGATTTATGAGGTCAGTAATCGGCCCTCAGGGGTTTCTAATCGCTTCTCTGGCTCCAAGTCTGGCAACACGGCCTCCCTGACCATCTCTGGGCTCCAGGCTGAGGACGAGGCTGATTATTACTGCAGCTCATATACAAGCAGCAGCACTCTC";
+
+    /// `sequence` with base `at` changed: a new allele of the same gene.
+    fn variant(sequence: &str, at: usize) -> String {
+        let mut bases = sequence.as_bytes().to_vec();
+        bases[at] = if bases[at] == b'A' { b'C' } else { b'A' };
+        String::from_utf8(bases).unwrap()
+    }
+
+    /// Alleles whose names give no locus (`novel_*`) in a heavy + kappa +
+    /// lambda database join the locus of their nearest named relative:
+    /// novel_h1 takes IGHV3-23*01's FR3 start (174, CDR2 8 codons), where a
+    /// group of its own, voted light, gave it the light FR3 length (180).
+    #[test]
+    fn alleles_of_unknown_locus_are_annotated_with_their_relatives_locus() {
+        let keys = |cdr1: u32, fr2: u32, cdr2: u32, fr3: u32, anchor: u32| {
+            format!("anchor={anchor} fr1=0 cdr1={cdr1} fr2={fr2} cdr2={cdr2} fr3={fr3}")
+        };
+        let text = [
+            (
+                ">IGHV3-23*01",
+                keys(75, 99, 150, 174, 285),
+                IGHV3_23.to_string(),
+            ),
+            (
+                ">IGKV1-5*01",
+                keys(78, 96, 147, 156, 261),
+                IGKV1_5.to_string(),
+            ),
+            (
+                ">IGLV2-14*01",
+                keys(75, 102, 153, 162, 267),
+                IGLV2_14.to_string(),
+            ),
+            (">novel_h1", String::new(), variant(IGHV3_23, 30)),
+            (">novel_k1", String::new(), variant(IGKV1_5, 30)),
+            (">novel_l1", String::new(), variant(IGLV2_14, 30)),
+        ]
+        .map(|(name, header, sequence)| format!("{name} {header}\n{sequence}\n"))
+        .concat();
+        let mut v = GermlineSet::from_fasta(SegmentKind::V, &text).unwrap();
+        let mut j = GermlineSet::from_fasta(
+            SegmentKind::J,
+            ">IGHJ4*02\nACTACTTTGACTACTGGGGCCAGGGAACCCTGGTCACCGTCTCCTCAG\n\
+             >IGKJ1*01\nGTGGACGTTCGGCCAAGGGACCAAGGTGGAAATCAAAC\n\
+             >IGLJ2*01\nTGTGGTATTCGGCGGAGGGACCAAGCTGACCGTCCTAG\n",
+        )
+        .unwrap();
+        let report = annotate_by_locus(&mut v, Some(&mut j), AnnotateOptions::default());
+        let parts: Vec<Option<Locus>> = report.parts.iter().map(|(l, _)| *l).collect();
+        assert_eq!(
+            parts,
+            [Some(Locus::Igh), Some(Locus::Igk), Some(Locus::Igl)]
+        );
+        let novel = v.allele(3);
+        assert_eq!(novel.anchor, Some(285));
+        assert_eq!(novel.regions.fr3, Some(174), "{:?}", report.v[3]);
+        let relative = Note::Fr3FromRelative {
+            relative: "IGHV3-23*01".into(),
+        };
+        assert!(report.v[3].notes.contains(&relative), "{:?}", report.v[3]);
+        // Each keeps the unknown locus it pairs with.
+        assert_eq!(novel.loci, Loci::ANY);
+    }
+
+    fn annotate_j(text: &str) -> (GermlineSet, DatabaseAnnotation) {
+        let mut j = GermlineSet::from_fasta(SegmentKind::J, text).unwrap();
+        let mut v = GermlineSet::new(SegmentKind::V);
+        let report = annotate(&mut v, Some(&mut j), AnnotateOptions::default());
+        (j, report)
+    }
+
+    fn annotate_v(text: &str, chain: ChainType) -> (GermlineSet, DatabaseAnnotation) {
+        let mut v = GermlineSet::from_fasta(SegmentKind::V, text).unwrap();
+        let options = AnnotateOptions { chain: Some(chain) };
+        let report = annotate(&mut v, None, options);
+        (v, report)
+    }
+
+    /// Swig's shipped human TRAJ48*01 carries a SWIGMETA anchor on `FGNE`:
+    /// the confident `FGTG` in its frame replaces it. An explicit `anchor=`
+    /// key is kept, but noted and not trusted. TRAJ51*01's anchor is off
+    /// `[WF]G.G` too, but nothing confident contradicts it.
+    #[test]
+    fn a_j_anchor_off_its_motif_is_contradicted_by_the_motif_search() {
+        let meta = |stop: u32| format!("SWIGMETA=2,{stop},-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,4");
+        let text = format!(
+            ">TRAJ48*01 {}\n{TRAJ48}\n>TRAJ51*01 {}\n{TRAJ51}\n",
+            meta(7),
+            meta(28)
+        );
+        let (j, report) = annotate_j(&text);
+        assert_eq!(j.allele(0).anchor, Some(29));
+        assert_eq!(report.j[0].source, AnchorSource::Motif);
+        let dropped = Note::MetaAnchorDropped {
+            anchor: 8,
+            conflict: Conflict::NotJMotif,
+            motif: 29,
+        };
+        assert_eq!(report.j[0].notes, [dropped]);
+        assert_eq!(j.allele(1).anchor, Some(29));
+        assert_eq!(report.j[1].source, AnchorSource::Header);
+        assert!(report.j[1].notes.is_empty());
+        assert_eq!(report.uncertain(), 0);
+
+        let (j, report) = annotate_j(&format!(">TRAJ48*01 anchor=8\n{TRAJ48}\n"));
+        assert_eq!(j.allele(0).anchor, Some(8));
+        assert_eq!(report.j[0].source, AnchorSource::Header);
+        let contradicted = Note::AnchorContradicted {
+            anchor: 8,
+            conflict: Conflict::NotJMotif,
+            motif: Some(29),
+        };
+        assert_eq!(report.j[0].notes, [contradicted]);
+        assert!(!report.j[0].trusted());
+        assert_eq!(report.uncertain(), 1);
+    }
+
+    /// Swig's shipped IGLV2-11*03 gives its region starts in frame 1 but its
+    /// anchor in frame 0, where the V has stop codons: the confident Cys104
+    /// at 244 replaces it, and the given starts stay. IGHV1/OR15-5*01's
+    /// anchor is as contradicted, with no confident Cys104 to take its
+    /// place: kept, noted and not trusted.
+    #[test]
+    fn a_v_anchor_out_of_frame_with_its_region_starts_is_contradicted() {
+        let text =
+            format!(">IGLV2-11*03 SWIGMETA=0,-1,0,52,52,79,79,130,130,139,139,258,1\n{IGLV2_11}\n");
+        let (v, report) = annotate_v(&text, ChainType::Light);
+        let allele = v.allele(0);
+        assert_eq!(allele.anchor, Some(244));
+        assert_eq!(
+            allele.regions.values(),
+            [Some(0), Some(52), Some(79), Some(130), Some(139)]
+        );
+        assert_eq!(report.v[0].source, AnchorSource::Motif);
+        let dropped = Note::MetaAnchorDropped {
+            anchor: 255,
+            conflict: Conflict::OutOfFrame,
+            motif: 244,
+        };
+        assert!(report.v[0].notes.contains(&dropped), "{report:?}");
+        assert_eq!(report.uncertain(), 0);
+
+        let keys = "anchor=255 fr1=0 cdr1=52 fr2=79 cdr2=130 fr3=139";
+        let (v, report) = annotate_v(
+            &format!(">IGLV2-11*03 {keys}\n{IGLV2_11}\n"),
+            ChainType::Light,
+        );
+        assert_eq!(v.allele(0).anchor, Some(255));
+        let contradicted = Note::AnchorContradicted {
+            anchor: 255,
+            conflict: Conflict::OutOfFrame,
+            motif: Some(244),
+        };
+        assert!(report.v[0].notes.contains(&contradicted), "{report:?}");
+        assert_eq!(report.uncertain(), 1);
+
+        let text = format!(
+            ">IGHV1/OR15-5*01 SWIGMETA=0,-1,0,41,41,65,65,116,116,140,140,246,1\n{IGHV1_OR15_5}\n"
+        );
+        let (v, report) = annotate_v(&text, ChainType::Heavy);
+        assert_eq!(v.allele(0).anchor, Some(243));
+        assert_eq!(report.v[0].source, AnchorSource::Header);
+        let contradicted = Note::AnchorContradicted {
+            anchor: 243,
+            conflict: Conflict::OutOfFrame,
+            motif: None,
+        };
+        assert!(report.v[0].notes.contains(&contradicted), "{report:?}");
+        assert_eq!(report.uncertain(), 1);
     }
 }
