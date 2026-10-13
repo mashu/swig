@@ -2,7 +2,8 @@
 
 Swig 0.39.3 fixes the defects that a third review of the Swig aligner, made
 after 0.39.2, found: 2 major and 13 minor. Thirteen are fixed outright and
-two in part. Each fix has a regression test that fails on 0.39.2. The
+two in part. A review of the combined fixes found one more minor defect,
+also fixed. Each fix has a regression test that fails without it. The
 aligner runs in Swig Web, in `swig-cli` (native and WebAssembly) and in the
 `swig` binary. Every change to calls and AIRR columns below applies to all
 three. Changes to reading files, options and exports name the route they
@@ -12,7 +13,7 @@ On ordinary reads almost nothing changes. On 28,500 simulated IGH, BCR and
 TCR reads, with default settings:
 - 1,000 IGK reads run against the IGH database give byte-identical
   output;
-- the TCR set keeps every call. On 378 reads whose candidates span more
+- the TCR set keeps every call. On 377 reads whose candidates span more
   than one locus, the posteriors move by at most 0.006;
 - on the IGH easy, mid and hard and BCR sets, 22 rows change `v_call`.
   21 keep their first name and add full-length alleles tied with it. One
@@ -66,7 +67,8 @@ The changes matter for:
   each locus' placements, each under its own estimate of the read's
   divergence, or by the best fixed-scale path. Each locus is now
   adjudicated at the divergence of the whole read, and the call takes the
-  best path in the model that `--calls` names. On 800 simulated scFv reads:
+  best path in the model that `--calls` names. On 800 simulated scFv reads
+  (heavy chain, linker, light chain):
 
   | | 0.39.2 | 0.39.3 |
   |---|---|---|
@@ -76,10 +78,23 @@ The changes matter for:
   | locus differs with `--no-posterior` (`--calls fixed`) | 17 | 0 |
 
   `--calls fixed` now takes effect on these reads: the default and fixed
-  calls differ in locus, V or J on 32 of them instead of 13. Under `--calls fixed` with
-  posteriors, 20 calls hold a V posterior below 0.5, because the
-  fixed-scale call need not be the posterior's mode. Default calls hold
-  none.
+  calls differ in locus, V or J on 26 of them instead of 13. Under
+  `--calls fixed` with posteriors, 16 calls hold a V posterior below 0.5,
+  because the fixed-scale call need not be the posterior's mode. Default
+  calls hold none.
+
+  The D window of such a read lay between its best V and its first J. When
+  the light V scored best on a heavy-first read, that window held no D at
+  all, and the heavy D was never searched. When the read's anchors share
+  no locus, each of their loci with D genes now bounds a window of its
+  own, by its own V and J. On 750 heavy-first scFv reads joined from BCR
+  suite reads:
+
+  | Heavy-first scFv reads (750) | 0.39.2 | 0.39.3 |
+  |---|---|---|
+  | called IGH | 504 | 506 |
+  | IGH calls with a D | 412 | 498 |
+  | IGH calls with the right D | 355 | 429 |
 - **Identity floor.** `--min-identity` (default 0.6 in Swig Web and
   `swig-cli`; off in the `swig` binary) was measured on the alignment
   including its stitched outer flank. A heavily mutated J whose local
