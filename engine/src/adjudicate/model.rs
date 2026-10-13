@@ -140,8 +140,8 @@ impl<M: PathModel> PathModel for &M {
     }
 }
 
-/// The path objective, `Σ S_clip − P_D·#D − P_J·#J + pair_bonus·[V…J] +
-/// per-base N/P cost`, read as a log-likelihood ratio.
+/// The path objective, `Σ S_clip − P_V·#V − P_D·#D − P_J·#J +
+/// pair_bonus·[V…J] + per-base N/P cost`, read as a log-likelihood ratio.
 ///
 /// Substitution scores are log-odds (in units of `1/λ` nats) of "templated by
 /// this germline" against "random sequence"; N/P bases score 0 under both.
@@ -151,13 +151,15 @@ impl<M: PathModel> PathModel for &M {
 ///   positions of the junction, so its prior is spread over `N·L`
 ///   hypotheses: including the best one is worth it when
 ///   `λ·S_D > ln(N·L) − ln(prior odds of D)`. A J is one of the J genes at
-///   one of `L` positions after the V, so the same rule prices it: without
-///   that cost any J clip of positive value would complete a path for free,
-///   and a read that stops before its J would get one from a few bases of a
-///   J's outer flank or of whatever follows. [`crate::config::DPrior`]
-///   derives both from the databases at build time; V pays nothing. They
-///   are kept unrounded: the posterior uses them as they are, and the
-///   fixed-scale call as `⌊P*_k⌋` ([`PathModel::presence_score`]).
+///   one of `L` positions after the V, and a V one of the V genes at one of
+///   `L` positions before the J, so the same rule prices them: without that
+///   cost any J (V) clip of positive value would complete (start) a path
+///   for free, and a read that stops before its J (starts after its V)
+///   would get one from a few chance bases of an outer flank or of a
+///   random end. [`crate::config::DPrior`] derives all three from the
+///   databases at build time. They are kept unrounded: the posterior uses
+///   them as they are, and the fixed-scale call as `⌊P*_k⌋`
+///   ([`PathModel::presence_score`]).
 /// * `pair_bonus` — prior odds of a complete V…J rearrangement over a partial
 ///   read. 0 by default: on full-length reads the J's own clip score already
 ///   completes the path, and 0–48 changed no call.

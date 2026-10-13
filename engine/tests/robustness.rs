@@ -389,3 +389,37 @@ fn fixed_scale_rows_stitch_their_segments() {
     }
     assert!(called > 350, "{called} reads called");
 }
+
+/// A read that starts after its V (in CDR3, or behind an adapter) gets no
+/// V. A V pays its presence cost like a D and a J, so a few chance bases of
+/// a random 5′ prefix no longer start the path for free: 1.5 % of these
+/// reads get a V, against 3.5 % without the cost.
+#[test]
+fn reads_that_start_after_the_v_get_no_v() {
+    let db = database();
+    let assigner = assigner(&db, &EngineConfig::default());
+    let params = SimParams::mid().with_reverse_complement(0.0);
+    let sim = Simulator::new(&db.v, Some(&db.d), &db.j, params).expect("simulator");
+    let mut rng = Rng::new(43);
+    let mut ws = assigner.workspace();
+    let (mut reads, mut with_v) = (0, 0);
+    for read in sim.reads(500, 47).expect("reads") {
+        let j_start = read.span(Region::J).expect("every read has a J").start;
+        for prefix in [30, 100] {
+            let mut sequence = random(&mut rng, prefix);
+            sequence.extend_from_slice(&read.forward[j_start..]);
+            let call = assigner.assign(&encode(&sequence), &mut ws);
+            reads += 1;
+            with_v += usize::from(
+                call.path
+                    .iter()
+                    .flat_map(|path| &path.segments)
+                    .any(|s| call.placements[s.placement].kind == SegmentKind::V),
+            );
+        }
+    }
+    assert!(
+        with_v * 40 <= reads,
+        "{with_v} of {reads} reads without a V got one"
+    );
+}

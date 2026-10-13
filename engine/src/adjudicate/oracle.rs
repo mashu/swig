@@ -229,9 +229,14 @@ fn dag_equals_brute_force_on_hypermutated_igsim_reads() {
     let assigner =
         DefaultAssigner::from_config(&config, db.v.clone(), Some(db.d.clone()), db.j.clone())
             .unwrap();
-    let base = config
-        .objective
-        .resolve(Some(&db.d), &config.d, &db.j, &config.j.scoring);
+    let base = config.objective.resolve(
+        &db.v,
+        &config.v.scoring,
+        Some(&db.d),
+        &config.d,
+        &db.j,
+        &config.j.scoring,
+    );
     let sim = Simulator::new(&db.v, Some(&db.d), &db.j, SimParams::hard()).unwrap();
     let mut ws = assigner.workspace();
     let mut scratch = DagScratch::default();
@@ -283,9 +288,14 @@ fn per_read_dag_equals_exhaustive_enumeration() {
     let assigner =
         DefaultAssigner::from_config(&config, db.v.clone(), Some(db.d.clone()), db.j.clone())
             .unwrap();
-    let base = config
-        .objective
-        .resolve(Some(&db.d), &config.d, &db.j, &config.j.scoring);
+    let base = config.objective.resolve(
+        &db.v,
+        &config.v.scoring,
+        Some(&db.d),
+        &config.d,
+        &db.j,
+        &config.j.scoring,
+    );
     let evidence =
         EvidenceModel::new([&config.v.scoring, &config.d.scoring, &config.j.scoring]).unwrap();
     let delta0 = evidence.log_odds_divergence(SegmentKind::D);
@@ -366,9 +376,14 @@ fn conditioned_dag_equals_exhaustive_enumeration() {
     let assigner =
         DefaultAssigner::from_config(&config, db.v.clone(), Some(db.d.clone()), db.j.clone())
             .unwrap();
-    let objective = config
-        .objective
-        .resolve(Some(&db.d), &config.d, &db.j, &config.j.scoring);
+    let objective = config.objective.resolve(
+        &db.v,
+        &config.v.scoring,
+        Some(&db.d),
+        &config.d,
+        &db.j,
+        &config.j.scoring,
+    );
     let evidence =
         EvidenceModel::new([&config.v.scoring, &config.d.scoring, &config.j.scoring]).unwrap();
     let dag = PlacementDag::new(VdjGrammar::VDJ, objective, config.min_retained, Mode::Fixed);
@@ -439,9 +454,14 @@ fn dag_equals_brute_force_over_all_paths_and_cuts() {
             .unwrap();
     let model = EngineeringObjective {
         insertion_per_base: -1,
-        ..config
-            .objective
-            .resolve(Some(&db.d), &config.d, &db.j, &config.j.scoring)
+        ..config.objective.resolve(
+            &db.v,
+            &config.v.scoring,
+            Some(&db.d),
+            &config.d,
+            &db.j,
+            &config.j.scoring,
+        )
     };
     let dag = PlacementDag::new(TANDEM_D, model, [10, 3, 6], Mode::Fixed);
     let params = SimParams {

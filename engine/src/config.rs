@@ -157,7 +157,8 @@ impl DSearchSpace {
 }
 
 /// Prior cost of including a D, in score units (see [`EngineeringObjective`]).
-/// The same rules price a J over the J database ([`ObjectiveConfig::j_prior`]).
+/// The same rules price a V and a J over their databases
+/// ([`ObjectiveConfig::v_prior`], [`ObjectiveConfig::j_prior`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DPrior {
     /// A fixed cost (0 = D only has to beat the no-D path).
@@ -230,11 +231,17 @@ impl DPrior {
     }
 }
 
-/// Declarative form of [`EngineeringObjective`]; `d_prior` and `j_prior` are
-/// resolved against the D and J databases when the assigner is built.
+/// Declarative form of [`EngineeringObjective`]; the priors are resolved
+/// against the V, D and J databases when the assigner is built.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ObjectiveConfig {
     pub pair_bonus: Score,
+    /// Prior cost of including a V, by [`DPrior`]'s rules over the V genes
+    /// (with every V offset a search offset). Without it any V clip of
+    /// positive value starts a path for free, so a read that starts after
+    /// its V (in CDR3, or behind an adapter) gets one from a few chance
+    /// bases before the J.
+    pub v_prior: DPrior,
     pub d_prior: DPrior,
     /// Prior cost of including a J, by [`DPrior`]'s rules over the J genes
     /// (with every J offset a search offset). Without it any J clip of
@@ -248,6 +255,7 @@ impl Default for ObjectiveConfig {
     fn default() -> Self {
         Self {
             pair_bonus: 0,
+            v_prior: DPrior::DERIVED,
             d_prior: DPrior::DERIVED,
             j_prior: DPrior::DERIVED,
             insertion_per_base: 0,
@@ -256,10 +264,13 @@ impl Default for ObjectiveConfig {
 }
 
 impl ObjectiveConfig {
-    /// The objective for the D database `d` (none: no D) and the J database
-    /// `j` scored with `j_scoring`.
+    /// The objective for the V database `v` scored with `v_scoring`, the D
+    /// database `d` (none: no D) and the J database `j` scored with
+    /// `j_scoring`.
     pub fn resolve(
         &self,
+        v: &GermlineSet,
+        v_scoring: &AffineScoring,
         d: Option<&GermlineSet>,
         d_config: &DSegmentConfig,
         j: &GermlineSet,
@@ -275,7 +286,7 @@ impl ObjectiveConfig {
         EngineeringObjective {
             pair_bonus: self.pair_bonus,
             presence: [
-                0.0,
+                self.v_prior.cost(DSearchSpace::of(v, 1), v_scoring),
                 self.d_prior.cost(space, &d_config.scoring),
                 self.j_prior.cost(DSearchSpace::of(j, 1), j_scoring),
             ],
@@ -607,9 +618,14 @@ impl Assigner {
             VdjGrammar::VJ
         };
         let strand = StrandIndex::build([&v, &j], StrandIndex::K);
-        let objective = config
-            .objective
-            .resolve(d.as_ref(), &config.d, &j, &config.j.scoring);
+        let objective = config.objective.resolve(
+            &v,
+            &config.v.scoring,
+            d.as_ref(),
+            &config.d,
+            &j,
+            &config.j.scoring,
+        );
         let mode = if config.calls == CallModel::FixedScale && !config.posterior {
             Mode::Fixed
         } else {
@@ -626,13 +642,13 @@ impl Assigner {
         };
         let dag = |model| PlacementDag::new(grammar, model, config.min_retained, mode);
         let adjudicator = dag(objective);
-        // A D or J database of several loci: a read of one locus prices a D
-        // and a J by that locus' genes.
+        // A V, D or J database of several loci: a read of one locus prices
+        // each segment by that locus' genes.
         let loci: Vec<Locus> = Locus::ALL
             .into_iter()
             .filter(|&l| {
                 let of = |set: &GermlineSet| set.alleles().iter().any(|a| a.loci == Loci::of(l));
-                of(&j) || d.as_ref().is_some_and(of)
+                of(&v) || of(&j) || d.as_ref().is_some_and(of)
             })
             .collect();
         let locus_adjudicators: Vec<(Locus, PlacementDag)> = if loci.len() > 1 {
@@ -641,6 +657,8 @@ impl Assigner {
                     let part = |set: &GermlineSet| set.subset(|a| a.loci.contains(locus)).0;
                     let d_part = d.as_ref().map(part).filter(|d| !d.is_empty());
                     let model = config.objective.resolve(
+                        &part(&v),
+                        &config.v.scoring,
                         d_part.as_ref(),
                         &config.d,
                         &part(&j),
@@ -864,11 +882,11 @@ mod tests {
         }
     }
 
-    /// A J database of two loci prices a J by the genes of the read's
-    /// locus: each locus' adjudicator counts its own J genes, and reads of
-    /// no single locus count them all.
+    /// V and J databases of two loci price a V and a J by the genes of the
+    /// read's locus: each locus' adjudicator counts its own genes, and reads
+    /// of no single locus count them all.
     #[test]
-    fn a_j_is_priced_by_the_genes_of_its_locus() {
+    fn v_and_j_are_priced_by_the_genes_of_their_locus() {
         let mut next = crate::testing::rng(3);
         let mut fasta = |names: &[&str], len: usize| -> String {
             names
@@ -879,7 +897,10 @@ mod tests {
                 })
                 .collect()
         };
-        let v = fasta(&["IGHV1-1*01", "IGKV1-1*01"], 120);
+        let v = fasta(
+            &["IGHV1-1*01", "IGHV1-2*01", "IGHV3-1*01", "IGKV1-1*01"],
+            120,
+        );
         let j = fasta(
             &["IGHJ1*01", "IGHJ2*01", "IGHJ3*01", "IGKJ1*01", "IGKJ2*01"],
             40,
@@ -888,19 +909,26 @@ mod tests {
         let j = GermlineSet::from_fasta(SegmentKind::J, &j).unwrap();
         let config = EngineConfig::default();
         let assigner = Assigner::from_config(&config, v, None, j).unwrap();
-        let scoring = &config.j.scoring;
-        let cost = |genes| {
+        let cost = |kind: SegmentKind, genes| {
             let space = DSearchSpace { genes, offsets: 1 };
-            config.objective.j_prior.cost(space, scoring)
+            match kind {
+                SegmentKind::V => config.objective.v_prior.cost(space, &config.v.scoring),
+                _ => config.objective.j_prior.cost(space, &config.j.scoring),
+            }
         };
-        let j_cost = |dag: &PlacementDag| dag.model.presence(SegmentKind::J);
-        assert_eq!(j_cost(&assigner.adjudicator), cost(5));
-        let by_locus: Vec<(Locus, f64)> = assigner
-            .locus_adjudicators
-            .iter()
-            .map(|(locus, dag)| (*locus, j_cost(dag)))
-            .collect();
-        assert_eq!(by_locus, [(Locus::Igh, cost(3)), (Locus::Igk, cost(2))]);
+        for (kind, all, igh, igk) in [(SegmentKind::V, 4, 3, 1), (SegmentKind::J, 5, 3, 2)] {
+            let priced = |dag: &PlacementDag| dag.model.presence(kind);
+            assert_eq!(priced(&assigner.adjudicator), cost(kind, all));
+            let by_locus: Vec<(Locus, f64)> = assigner
+                .locus_adjudicators
+                .iter()
+                .map(|(locus, dag)| (*locus, priced(dag)))
+                .collect();
+            assert_eq!(
+                by_locus,
+                [(Locus::Igh, cost(kind, igh)), (Locus::Igk, cost(kind, igk))]
+            );
+        }
     }
 
     /// A locus without D genes calls no D, so its adjudicator's placeholder
@@ -966,10 +994,14 @@ mod tests {
             |c: &EngineConfig| EvidenceModel::new([&c.v.scoring, &c.d.scoring, &c.j.scoring]);
         let default = EngineConfig::default();
         let lossless = default.d.lossless_min_score();
-        let objective =
-            default
-                .objective
-                .resolve(Some(&db.d), &default.d, &db.j, &default.j.scoring);
+        let objective = default.objective.resolve(
+            &db.v,
+            &default.v.scoring,
+            Some(&db.d),
+            &default.d,
+            &db.j,
+            &default.j.scoring,
+        );
         for (calls, posterior, d_allele) in [
             (CallModel::PerRead, true, DAlleleDecoding::Map),
             (CallModel::PerRead, false, DAlleleDecoding::MaxMarginal),

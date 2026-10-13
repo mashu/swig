@@ -689,19 +689,20 @@ The full description, with the guarantee of each search step, is in
   log-likelihood ratio, in units of 1/λ nats with λ = 0.634, of "templated by
   this germline at 11.2 % divergence" against "random sequence". N and P bases
   score 0 under both hypotheses. Affine gaps price indels.
-- **The path objective** is `Σ clipped segment scores − P_D·#D − P_J·#J`,
+- **The path objective** is `Σ clipped segment scores − P_V·#V − P_D·#D − P_J·#J`,
   maximised exactly over the topologies VJ and VDJ (and the partial V…, …J
   and D…J), over the placements, and over both cuts between neighbours (the
   earlier one exits at `x`, the later enters at `y ≥ x`, and the bases
-  between are N/P). `P_J` prices a J as `P_D` prices a D, over the J genes,
-  so a read that stops before its J does not get one from a few chance
-  bases. Ties go to fewer D, then to more germline support (the summed
-  unclipped scores). An AIRR row holds one D; Swig's double-D screen reports
-  a second one beside the call and leaves the call alone.
+  between are N/P). `P_V` and `P_J` price a V and a J as `P_D` prices a D,
+  over their own genes, so a read that starts after its V or stops before
+  its J does not get one from a few chance bases. Ties go to fewer D, then
+  to more germline support (the summed unclipped scores). An AIRR row holds
+  one D; Swig's double-D screen reports a second one beside the call and
+  leaves the call alone.
 - **Calls come from the read's own model.** Each path is valued at the read's
   divergence `p̂`, estimated before adjudication from the V and J columns no
   path contests: a match is worth `ln 4(1−p̂)` nats, a mismatch `ln(4p̂/3)`, a
-  D costs `P_D/2` matched D columns, a J `P_J/2` matched J columns. Values are integers (1/2¹⁶ nat), so the
+  V, D or J costs `P_k/2` matched columns of its kind. Values are integers (1/2¹⁶ nat), so the
   maximum is exact, and the posterior reads the same integers: the call is a
   mode of the reported distribution. `--calls fixed` keeps the fixed scores,
   of which the per-read model at 11.2 % divergence is an exact multiple.

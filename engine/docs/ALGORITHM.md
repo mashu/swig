@@ -76,7 +76,7 @@ order of their alignment starts.
 
 ```text
 score(path) = Σ_segments S_clip(segment)
-            − P_D · #D − P_J · #J
+            − P_V · #V − P_D · #D − P_J · #J
             + pair_bonus · [path starts with V and ends with J]  (0 by default)
             + insertion_per_base · #N/P bases                    (0 by default)
 ```
@@ -129,7 +129,15 @@ The non-alignment terms are log prior odds in score units:
   clip of positive score completed a path for free, and a read that stops
   before its J got one from a few chance bases: on 3,000 mid and 3,000 hard
   IGH reads cut before the J, spurious J calls were 7.9 % and 9.6 %, and are
-  0.9 % and 1.8 % with it. V pays nothing.
+  0.9 % and 1.8 % with it.
+- **`P_V`, V presence** (`ObjectiveConfig::v_prior`). The same rule over the
+  V database: `P*_V = ln(N·L)/λ_V` (12.69 for the 125 IGHV genes of the
+  frozen suite's database). Without it any V clip of positive value started
+  a path for free, and a read that starts after its V (in CDR3, or behind a
+  random 5′ end) got one from a few chance bases: of 600 mid IGH reads cut
+  at the J behind a random 30- or 100-base prefix, 6 and 17 got a V of 1–49
+  bases, and 1 and 6 do with it. On 27,000 reads cut to their last 8–90 V
+  bases (mid, hard and 30 % SHM) it removes 129 V calls, all of them wrong.
 - **`pair_bonus`**: the prior odds of a complete V…J rearrangement against a
   partial read. It is 0 by default: on full-length reads the J's own clip
   score completes the path, and values 0–48 changed no call.
@@ -314,6 +322,7 @@ column(kind, s)  = s·u_r + v_r     u_r = round(F·λ_r(p̂)),  v_r = round(F·�
 gap, ι, pair bonus scoring k:   k·u0,   u0 = round(F·λ)
 D cost  c_D(p̂)   = (P*_D / m)·ln 4(1 − p̂)  =  ⌊P*_D·(m·u_D + v_D)/m⌋ units
 J cost  c_J(p̂)   = (P*_J / m)·ln 4(1 − p̂), the same with the J scores
+V cost  c_V(p̂)   = (P*_V / m)·ln 4(1 − p̂), the same with the V scores
 ```
 
 with `(λ_r, μ_r)` the per-column log-odds of §4a and `m` the D match score.
