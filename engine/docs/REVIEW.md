@@ -11,7 +11,7 @@ quoted. Findings marked *suspected* were reasoned about but not
 reproduced. File and function names are given rather than line numbers,
 since the fixes moved lines.
 
-## 0. Status after the 0.39.1 audit
+## 0. Status after the 0.39.1 audit and the 0.39.2 review
 
 A second audit, made after Swig 0.39.1, covered the input layer, retrieval,
 alignment, adjudication, the pipeline, the interfaces and the simulator. It
@@ -81,6 +81,36 @@ ALGORITHM describe the behaviour they changed. Still open, by priority:
    frame. At load the engine replaces all 50 J anchors and 8 V anchors with
    the motif hit; five V alleles keep theirs (item 4). The references
    should be regenerated.
+
+A third review, after Swig 0.39.2, found 2 major and 14 minor defects. Swig
+0.39.3 fixes 14 of them outright and 2 in part, each with a regression test
+that fails on 0.39.2; `RELEASE_NOTES_0.39.3.md` lists them. Still open from
+that review:
+
+10. **Chance D on reads without a J or a V.** The D window of such a read now
+    ends 60 bases after the V (or starts 60 bases before the J), but `P*_D`
+    is priced for 25 junction positions, so 30 random bases after the V still
+    give a D in 72 % of D-free reads. Needs the N/P length prior of item 2.
+11. **Gene identity from allele names.** A gene is the name's part before
+    `*`. A database without `*` names now gets a warning, but it still loses
+    V accuracy at high SHM: 8.2 pp of V allele at 30 % SHM on the suite's IGH
+    set with every `*` replaced. Grouping alleles by sequence would change
+    the gene ids that gene frames, the retrieval budget, tie order and the
+    family bounds key on.
+12. **Junk V by circular divergence.** With the V presence cost, 7 of 1,200
+    V-less test reads still get a V: the read's divergence is estimated
+    partly from the junk V's own columns, which raises its per-read value.
+13. **Smaller items.** `write_batches` drops the valid reads that precede a
+    malformed record in the same batch; locus inference misses the IGHT,
+    IGHZ and IGHO isotypes, so those constant alleles are `Loci::ANY`;
+    `join_indel` compares weighted votes after the 7-mer fallback, not the
+    primary seed counts its guard describes; `--c-prefix-identity` and
+    `--double-d` are ignored without the database they need, while
+    `--c-evalue` is refused; `swig_version` and `AlignerEngine.version()`
+    have no caller.
+14. **swig-cli and prepared databases** (outside the aligner). With
+    `prepareMetadata` on, swig-cli rejects a V database written by
+    `swig prepare` ("contains invalid SWIGMETA coordinates").
 
 ## 1. Verdict
 

@@ -60,7 +60,7 @@ import {
 import { annotateAirrBatch, annotateDoubleDBatch, stableDatasetSeed } from "../src/study-design.ts";
 import { ALIGNER_MODES, NativePool, resolveNativeAligner } from "./native-aligner.mjs";
 
-const VERSION="0.39.2";
+const VERSION="0.39.3";
 const CLI_STREAM_HIGH_WATER_MARK=8*1024*1024;
 const CLI_GZIP_CHUNK_SIZE=1024*1024;
 const CLI_DIRECTORY=dirname(fileURLToPath(import.meta.url));
@@ -148,7 +148,7 @@ function vdjUsage(){
     `    sensitive_d: the same scores with a D twice as likely a priori (9.45 for human IGH)\n`+
     `  C is anchored at the called J's end and called at an anchored E-value of at most 1e-3\n`+
     `  --minimum-c-prefix-identity X  Optional 0..1 identity gate over the complete covered C prefix\n`+
-    `  --minimum-identity X    Drop V, D and J hits below identity X (default 0.6)\n`+
+    `  --minimum-identity X    Drop V, D and J hits whose local alignment identity is below X (default 0.6)\n`+
     `  -min_D_match N  -D_penalty S  -J_penalty S  -min_J_length N   override the profile's D/J settings\n`+
     `  -num_alignments_D/J N   accepted for IgBLAST compatibility; every admissible D and the best J\n`+
     `                          alignments enter adjudication, and near-tied alleles are in *_alternatives\n`+
