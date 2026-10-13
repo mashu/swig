@@ -82,7 +82,7 @@ Swig-specific `--batch-records`, `--minimum-identity` (the V/D/J identity floor,
 Four IgBLAST options override the selected profile's D/J settings:
 
 - `-min_D_match` (at least 4) sets the D exact-run floor;
-- `-D_penalty` and `-J_penalty` (negative integers) set the D and J mismatch scores; and
+- `-D_penalty` and `-J_penalty` (integers from −1000 to −1) set the D and J mismatch scores; and
 - `-min_J_length` sets the fewest aligned J columns.
 
 The profile's other settings stay in force, including the rule from which its D prior is derived. `-num_alignments_D` and `-num_alignments_J` are validated and accepted for IgBLAST compatibility, but they do not limit the search: every admissible D and the best J alignments enter adjudication, and near-tied alleles are reported in `*_alternatives`. `-strand` accepts `both`, `plus`, or `minus`, and `-domain_system` accepts only `imgt`. Unsupported BLAST scoring, search, or report options fail rather than being silently ignored.
