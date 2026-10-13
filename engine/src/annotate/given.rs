@@ -8,7 +8,9 @@
 //! IMGT's: a majority of gapped alleles is codon-aligned, and at each of
 //! IMGT codons 23, 41 and 104 a majority of the gapped alleles holding the
 //! codon have the conserved Cys, Trp, Cys there (IMGT human IGH: 97.8, 95.3
-//! and 98.5 %). Another alignment's columns put other residues there.
+//! and 98.5 %). Another alignment's columns put other residues there. A
+//! codon no gapped allele holds (Cys104 when every gapped allele is
+//! 3′-partial) is not tested, but at least one of the three must be.
 //!
 //! Header keys win over gap columns; if their union fails
 //! [`RegionStarts::check`], the gaps of that allele are ignored with a note.
@@ -53,10 +55,15 @@ impl ImgtGaps {
                 reason: format!("{aligned} of {gapped} gapped V alleles are codon-aligned"),
             };
         }
+        let mut tested = false;
         for (index, (codon, residue)) in IMGT_CONSERVED_CODONS.iter().zip(CONSERVED).enumerate() {
             let held = numbered.iter().filter_map(|n| n.conserved[index]);
             let (total, conserved) =
                 held.fold((0, 0), |(t, c), r| (t + 1, c + usize::from(r == residue)));
+            if total == 0 {
+                continue;
+            }
+            tested = true;
             if 2 * conserved <= total {
                 return Self::Ignored {
                     gapped,
@@ -66,6 +73,12 @@ impl ImgtGaps {
                     ),
                 };
             }
+        }
+        if !tested {
+            return Self::Ignored {
+                gapped,
+                reason: "no gapped V allele holds IMGT codon 23, 41 or 104".to_string(),
+            };
         }
         Self::Used { gapped }
     }

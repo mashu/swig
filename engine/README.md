@@ -493,8 +493,11 @@ numbered from its gap columns. The FR1, CDR1, FR2, CDR2 and FR3 starts are
 IMGT columns 1, 79, 115, 166 and 196, and Cys104 is column 310.
 
 - The gaps are used only when most gapped alleles are codon-aligned and
-  carry Cys, Trp and Cys at IMGT 23, 41 and 104. Otherwise they are ignored
-  (a codon alignment in other columns) and the summary line says why.
+  most of those that hold IMGT codon 23, 41 or 104 carry Cys, Trp or Cys
+  there. A codon that no gapped allele holds (Cys104 when all are
+  3′-partial) is not tested, but one of the three must be. Otherwise the
+  gaps are ignored (a codon alignment in other columns) and the summary
+  line says why.
 - A region that the numbering places before a 5′-partial sequence stays
   empty; a motif hit cannot fill it.
 - An allele whose numbering ends before Cys104 gets no anchor (`3′-partial`).

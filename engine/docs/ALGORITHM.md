@@ -195,7 +195,9 @@ overridden. The other sources, in order:
    parser, and the gapped columns of the five region starts and of Cys104
    are mapped onto bases.
    - The gaps are trusted only when most gapped alleles are codon-aligned
-     and carry C/W/C at IMGT 23/41/104 (human IGH: 97.8 / 95.3 / 98.5 %).
+     and carry C/W/C at IMGT 23/41/104 (human IGH: 97.8 / 95.3 / 98.5 %),
+     counting at each codon the alleles that hold it. A codon none holds
+     (a set of 3′-partials) is not tested; at least one codon must be.
    - Each start is *known*, *before the sequence* (a 5′-partial record; no
      motif may fill it) or *unknown*.
    - One- and two-column interior runs are IMGT frameshift markers; the
