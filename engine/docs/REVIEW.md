@@ -90,7 +90,11 @@ that review:
 10. **Chance D on reads without a J or a V.** The D window of such a read now
     ends 60 bases after the V (or starts 60 bases before the J), but `P*_D`
     is priced for 25 junction positions, so 30 random bases after the V still
-    give a D in 72 % of D-free reads. Needs the N/P length prior of item 2.
+    give a D in 72 % of D-free reads. Reads that start in CDR3 now search
+    for a D from their start, which recovers real Ds (+11 pp of D allele on
+    reads cut after V) but also raises chance Ds on D-free ones: 79.8 %
+    instead of 68.7 % behind 30 random bases. Needs the N/P length prior of
+    item 2.
 11. **Gene identity from allele names.** A gene is the name's part before
     `*`. A database without `*` names now gets a warning, but it still loses
     V accuracy at high SHM: 8.2 pp of V allele at 30 % SHM on the suite's IGH
