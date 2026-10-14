@@ -384,6 +384,10 @@ pub struct Allele {
     /// annotation drops when the allele's own motifs confidently contradict
     /// it ([`crate::annotate`]).
     pub anchor_from_meta: bool,
+    /// The gene of an allele whose name holds no `*`, when a close relative
+    /// or cluster gives one (`gene=`): its [`Self::gene`] is that gene's,
+    /// not the name's ([`crate::locus_infer::group_genes`]).
+    pub gene_key: Option<String>,
 }
 
 impl Allele {
@@ -395,6 +399,14 @@ impl Allele {
             LocusSource::Fallback if self.loci.single().is_none() => Loci::ANY,
             _ => self.loci,
         }
+    }
+
+    /// The name of the allele's gene: its [`Self::gene_key`], else the name's
+    /// part before `*` ([`GermlineSet::gene_of_name`]).
+    pub fn gene_label(&self) -> &str {
+        self.gene_key
+            .as_deref()
+            .unwrap_or_else(|| GermlineSet::gene_of_name(&self.name))
     }
 
     /// The name followed by its aliases.
@@ -653,6 +665,17 @@ impl GermlineSet {
         codes: Vec<u8>,
         anchor: Option<u32>,
     ) -> Result<AlleleId, GermlineError> {
+        self.push_in_gene(name, Self::gene_of_name(name), codes, anchor)
+    }
+
+    /// [`Self::push_codes`] into gene `gene_name`.
+    fn push_in_gene(
+        &mut self,
+        name: &str,
+        gene_name: &str,
+        codes: Vec<u8>,
+        anchor: Option<u32>,
+    ) -> Result<AlleleId, GermlineError> {
         self.check_name(name)?;
         // In u64: on 32-bit targets `a as usize + 3` can wrap.
         if anchor.is_some_and(|a| u64::from(a) + 3 > codes.len() as u64) {
@@ -661,7 +684,6 @@ impl GermlineSet {
                 reason: "the anchor codon runs past the sequence end".to_string(),
             });
         }
-        let gene_name = Self::gene_of_name(name);
         let next_gene = GeneId::try_from(self.genes.len()).expect("gene count fits u32");
         let gene = *self
             .gene_ids
@@ -689,6 +711,7 @@ impl GermlineSet {
             before_start: [false; 5],
             ends_before_cys104: false,
             anchor_from_meta: false,
+            gene_key: (gene_name != Self::gene_of_name(name)).then(|| gene_name.to_string()),
         });
         Ok(id)
     }
@@ -784,7 +807,16 @@ impl GermlineSet {
                 }
                 None => meta.and_then(|m| m.frame),
             };
-            let id = set.push(name, &record.sequence, anchor)?;
+            if record.sequence.is_empty() {
+                return Err(GermlineError::EmptySequence {
+                    name: name.to_string(),
+                });
+            }
+            let gene = record
+                .attribute("gene")
+                .unwrap_or_else(|| Self::gene_of_name(name));
+            let codes = alphabet::encode(&record.sequence);
+            let id = set.push_in_gene(name, gene, codes, anchor)?;
             let allele = &mut set.alleles[id as usize];
             allele.regions = regions;
             allele.frame = frame;
@@ -841,7 +873,7 @@ impl GermlineSet {
             let codes = std::iter::once(alphabet::N)
                 .chain(allele.codes.iter().copied())
                 .collect();
-            set.push_codes(&allele.name, codes, None)
+            set.push_in_gene(&allele.name, allele.gene_label(), codes, None)
                 .expect("a copied allele is valid");
             let copy = set.alleles.last_mut().expect("just pushed");
             copy.aliases = allele.aliases.clone();
@@ -895,7 +927,8 @@ impl GermlineSet {
         }
         let mut rebuilt = Self::new(self.kind);
         for allele in kept {
-            let id = rebuilt.push_codes(&allele.name, allele.codes, allele.anchor)?;
+            let gene = allele.gene_label().to_string();
+            let id = rebuilt.push_in_gene(&allele.name, &gene, allele.codes, allele.anchor)?;
             let target = &mut rebuilt.alleles[id as usize];
             target.regions = allele.regions;
             target.aliases = allele.aliases;
@@ -942,6 +975,9 @@ impl GermlineSet {
                 if let Some(source) = allele.locus_source.key() {
                     write!(out, " locus_source={source}")?;
                 }
+            }
+            if let Some(gene) = &allele.gene_key {
+                write!(out, " gene={gene}")?;
             }
             if let Some(tokens) = extra(id as AlleleId) {
                 write!(out, " {tokens}")?;
@@ -1026,6 +1062,26 @@ impl GermlineSet {
             .0
     }
 
+    /// The same alleles with genes `keys` (`None`: the name's), ids kept.
+    pub fn with_gene_keys(&self, keys: &[Option<String>]) -> Self {
+        let mut set = Self::new(self.kind);
+        for (allele, key) in self.alleles.iter().zip(keys) {
+            let gene = key
+                .as_deref()
+                .unwrap_or_else(|| Self::gene_of_name(&allele.name));
+            let id = set
+                .push_in_gene(&allele.name, gene, allele.codes.clone(), allele.anchor)
+                .expect("a copied allele is valid");
+            let copy = &mut set.alleles[id as usize];
+            *copy = Allele {
+                gene: copy.gene,
+                gene_key: copy.gene_key.take(),
+                ..allele.clone()
+            };
+        }
+        set
+    }
+
     /// Set the loci of allele `id` and where they come from.
     pub fn set_loci(&mut self, id: AlleleId, loci: Loci, source: LocusSource) {
         let allele = &mut self.alleles[id as usize];
@@ -1049,7 +1105,12 @@ impl GermlineSet {
         for &id in ids {
             let allele = &self.alleles[id as usize];
             let new = set
-                .push_codes(&allele.name, allele.codes.clone(), allele.anchor)
+                .push_in_gene(
+                    &allele.name,
+                    allele.gene_label(),
+                    allele.codes.clone(),
+                    allele.anchor,
+                )
                 .expect("a copied allele is valid");
             let gene = set.alleles[new as usize].gene;
             set.alleles[new as usize] = Allele {

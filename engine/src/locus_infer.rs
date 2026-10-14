@@ -166,21 +166,26 @@ impl Pool {
     }
 }
 
-/// The loci of each target from `pool`: those of every relative within
-/// [`MARGIN`] of the best local score, if the best reaches the target's
-/// floor; `None` otherwise. Every alignment of every target runs in one
-/// batch of the SIMD kernel, whose scores equal the scalar kernel's.
-fn decide(targets: &[(&Relative, Score)], pool: &Pool) -> Vec<Option<Loci>> {
+/// The local scores of each target against its [`CANDIDATES`] relatives
+/// of `pool` sharing most 5-mers (`skip(target, relative)` excluded), as
+/// `(relative, score)`. Every alignment runs in one batch of the SIMD
+/// kernel, whose scores equal the scalar kernel's.
+fn score_relatives(
+    targets: &[&Relative],
+    pool: &Pool,
+    skip: impl Fn(usize, usize) -> bool,
+) -> Vec<Vec<(usize, Score)>> {
     let mut votes = Vec::new();
     // (target, relative, band) of each alignment.
     let mut planned: Vec<(usize, usize, Band)> = Vec::new();
     let mut ranked: Vec<(u32, usize)> = Vec::new();
-    for (t, (target, _)) in targets.iter().enumerate() {
+    for (t, target) in targets.iter().enumerate() {
         ranked.clear();
         ranked.extend(
             pool.relatives
                 .iter()
                 .enumerate()
+                .filter(|&(at, _)| !skip(t, at))
                 .map(|(at, r)| (target.shared(r), at))
                 .filter(|&(shared, _)| shared > 0),
         );
@@ -193,7 +198,7 @@ fn decide(targets: &[(&Relative, Score)], pool: &Pool) -> Vec<Option<Loci>> {
     let jobs: Vec<AlignJob<'_>> = planned
         .iter()
         .map(|&(t, at, band)| AlignJob {
-            query: &targets[t].0.codes,
+            query: &targets[t].codes,
             profile: &pool.profiles[at],
             gaps: SCORING.gaps,
             band,
@@ -205,22 +210,32 @@ fn decide(targets: &[(&Relative, Score)], pool: &Pool) -> Vec<Option<Loci>> {
         &mut InterSequenceWorkspace::default(),
         &mut scores,
     );
-    let mut scored: Vec<Vec<(Score, Loci)>> = vec![Vec::new(); targets.len()];
+    let mut scored: Vec<Vec<(usize, Score)>> = vec![Vec::new(); targets.len()];
     for (&(t, at, _), hit) in planned.iter().zip(&scores) {
         if let Some(hit) = hit {
-            scored[t].push((hit.score, pool.relatives[at].loci));
+            scored[t].push((at, hit.score));
         }
     }
     scored
+}
+
+/// The loci of each target from `pool`: those of every relative within
+/// [`MARGIN`] of the best local score, if the best reaches the target's
+/// floor; `None` otherwise.
+fn decide(targets: &[(&Relative, Score)], pool: &Pool) -> Vec<Option<Loci>> {
+    let relatives: Vec<&Relative> = targets.iter().map(|&(t, _)| t).collect();
+    score_relatives(&relatives, pool, |_, _| false)
         .iter()
         .zip(targets)
         .map(|(scored, &(_, floor))| {
-            let top = scored.iter().map(|&(score, _)| score).max()?;
+            let top = scored.iter().map(|&(_, score)| score).max()?;
             (top >= floor).then(|| {
                 scored
                     .iter()
-                    .filter(|&&(score, _)| score + MARGIN >= top)
-                    .fold(Loci::NONE, |loci, &(_, l)| loci.union(l))
+                    .filter(|&&(_, score)| score + MARGIN >= top)
+                    .fold(Loci::NONE, |loci, &(at, _)| {
+                        loci.union(pool.relatives[at].loci)
+                    })
             })
         })
         .collect()
@@ -308,6 +323,101 @@ pub fn infer_loci(set: &mut GermlineSet) -> usize {
         }
     }
     inferred
+}
+
+/// Self-normalised local score ([`normalised`]) at which a V allele named
+/// without `*` joins a gene: about 2 % divergence.
+pub const SAME_GENE: f64 = 0.95;
+
+/// `score` over the smaller of the two sequences' scores against themselves,
+/// so a 5′-partial allele still matches its full-length relative.
+fn normalised(score: Score, a: &Relative, b: &Relative) -> f64 {
+    let own = |r: &Relative| 2 * r.codes.iter().filter(|&&c| c < alphabet::N).count();
+    f64::from(score) / own(a).min(own(b)).max(1) as f64
+}
+
+/// Genes for the V alleles of `set` whose names hold no `*` (REVIEW §0
+/// item 11): such a name is otherwise a gene of its own, and the retrieval
+/// budget, gene frames and the gene counts of the priors key on genes. An
+/// allele joins the gene of its nearest `*`-named relative when their
+/// self-normalised local score reaches [`SAME_GENE`]; the rest are joined
+/// to each other at the same level (single linkage), a group taking the
+/// name of its first allele as its gene. Names with `*`, as in every
+/// shipped reference, keep their genes. `None` when no gene changes.
+pub fn group_genes(set: &GermlineSet) -> Option<GermlineSet> {
+    if set.kind() != SegmentKind::V {
+        return None;
+    }
+    let alleles = set.alleles();
+    let open: Vec<usize> = (0..alleles.len())
+        .filter(|&i| !alleles[i].name.contains('*') && alleles[i].gene_key.is_none())
+        .collect();
+    if open.is_empty() {
+        return None;
+    }
+    let relative = |i: usize| Relative::new(alleles[i].codes.clone(), alleles[i].loci);
+    let named: Vec<usize> = (0..alleles.len())
+        .filter(|&i| alleles[i].name.contains('*'))
+        .collect();
+    let named_pool = Pool::new(named.iter().map(|&i| relative(i)).collect());
+    let targets: Vec<Relative> = open.iter().map(|&i| relative(i)).collect();
+    let target_refs: Vec<&Relative> = targets.iter().collect();
+    let mut keys: Vec<Option<String>> = alleles.iter().map(|a| a.gene_key.clone()).collect();
+    let mut changed = false;
+    let mut left = Vec::new();
+    for (k, scored) in score_relatives(&target_refs, &named_pool, |_, _| false)
+        .into_iter()
+        .enumerate()
+    {
+        let best = scored
+            .iter()
+            .map(|&(at, score)| {
+                (
+                    normalised(score, &targets[k], &named_pool.relatives[at]),
+                    at,
+                )
+            })
+            .filter(|&(level, _)| level >= SAME_GENE)
+            .max_by(|a, b| a.0.total_cmp(&b.0).then(b.1.cmp(&a.1)));
+        match best {
+            Some((_, at)) => {
+                keys[open[k]] = Some(alleles[named[at]].gene_label().to_string());
+                changed = true;
+            }
+            None => left.push(k),
+        }
+    }
+    // Single linkage among the alleles no named gene took.
+    let pool = Pool::new(left.iter().map(|&k| relative(open[k])).collect());
+    let refs: Vec<&Relative> = pool.relatives.iter().collect();
+    let mut parent: Vec<usize> = (0..left.len()).collect();
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    for (a, scored) in score_relatives(&refs, &pool, |t, at| t == at)
+        .into_iter()
+        .enumerate()
+    {
+        for (b, score) in scored {
+            if normalised(score, refs[a], refs[b]) >= SAME_GENE {
+                let (ra, rb) = (root(&mut parent, a), root(&mut parent, b));
+                // The group's root is its first allele.
+                parent[ra.max(rb)] = ra.min(rb);
+            }
+        }
+    }
+    for k in 0..left.len() {
+        let first = root(&mut parent, k);
+        if first != k {
+            keys[open[left[k]]] = Some(alleles[open[left[first]]].name.clone());
+            changed = true;
+        }
+    }
+    changed.then(|| set.with_gene_keys(&keys))
 }
 
 #[cfg(test)]

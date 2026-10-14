@@ -312,6 +312,21 @@ fallback cannot separate loci that share D genes' role: custom TRBD and
 TRDD both become TRB|TRD, and TRDD then competes on TRB reads (−3.6 pp TRB D
 allele on the suite's TCR set); a `locus=` key removes it.
 
+**Gene of a V name without `*`** (`locus_infer::group_genes`). Gene
+identity keys the retrieval budget, gene frames, tie order, family bounds
+and the gene counts of `P*_V`. A name without `*` used to be a gene of its
+own, which cost 8.2 pp of V allele at 30 % SHM on the suite's IGH set with
+every `*` replaced. Such an allele now joins the gene of its nearest
+`*`-named relative (the same 5-mer prefilter and banded local alignment as
+above) when `S / min(S_self(a), S_self(b)) ≥ 0.95`, about 2 % divergence
+under (2, −3) scoring; the rest are grouped among themselves at the same
+level by single linkage, each group named after its first allele.
+`prepare` writes `gene=`. Names with `*`, as in every shipped reference,
+keep their genes, so nothing changes for them. Measured (paired against
+the IMGT-named run): every `*` replaced, V allele +0.10 pp at 30 % SHM
+(was −8.20) and ±0.00 on igh_mid; 20 % of the names hidden, +0.03 (was
+−1.77) and +0.02.
+
 ## 4. Adjudication: exact semi-Markov Viterbi (`adjudicate/dag.rs`)
 
 Placements are nodes, sorted by segment kind (V, D, J), then read start.
@@ -684,7 +699,7 @@ step can lose.
 |---|---|---|---|
 | Strand | `orient.rs` | heuristic + fallback | Count read positions whose 11-mer occurs in the V/J germline, per strand. Trusted when the winner exceeds its Poisson null `λ₀ + 3√λ₀` (`λ₀` = k-mers × germline k-mer density); otherwise compare V seed votes on both strands. |
 | V seeds | `seed.rs` | bounded | Every 9-mer (7-mers as below). `SeedSampling` also offers closed syncmers (a seed is kept when the first smallest `s`-mer of its key, `s = k − w`, in a fixed random order, is first or last; context-free; on a contiguous shape any `w` consecutive k-mers hold one, so every unmutated `k + w − 1` bases yield a shared seed), open syncmers (smallest `s`-mer in the middle, the conservation-optimal offset; context-free, no window guarantee) and minimisers (window guarantee, not context-free). Under the gene margin below, closed syncmers (`w = 4`) are 1.1 points of mean V gene behind every k-mer (4.4 at 30 % SHM) for 0.4 % fewer instructions, so every k-mer is the default. |
-| V retrieval | `retrieve/seed_vote.rs`, `retrieve/budget.rs`, `retrieve/frames.rs` | heuristic | Seed votes per gene frame (4 per 9-mer, 1 per 7-mer), best diagonal cluster per frame. 7-mers vote while the leader holds fewer than 25 nine-mer seeds, where a count's Poisson relative error `1/√n` exceeds 20 %. Keep 3 genes, and up to 16 while votes are within `z·√(2·4·L)` of the leader's `L` (z = 2): two standard deviations of the difference between two seed counts near the leader's, so relative to the leader but proportionally wider for weakly supported (mutated) reads. A fixed margin (8 votes, 5 %) or a proportional one (10–30 % of `L`) loses 4–9 points of V gene at 30 % SHM (same seeds and short-seed rule); accuracy saturates at z ≈ 2 (the 16-gene cap binds). Every allele of a kept gene becomes a candidate. A gene is the allele name's part before `*`; a name without one is a gene of its own, so the cap then binds on alleles (preparation warns when more than 16 V names lack it). |
+| V retrieval | `retrieve/seed_vote.rs`, `retrieve/budget.rs`, `retrieve/frames.rs` | heuristic | Seed votes per gene frame (4 per 9-mer, 1 per 7-mer), best diagonal cluster per frame. 7-mers vote while the leader holds fewer than 25 nine-mer seeds, where a count's Poisson relative error `1/√n` exceeds 20 %. Keep 3 genes, and up to 16 while votes are within `z·√(2·4·L)` of the leader's `L` (z = 2): two standard deviations of the difference between two seed counts near the leader's, so relative to the leader but proportionally wider for weakly supported (mutated) reads. A fixed margin (8 votes, 5 %) or a proportional one (10–30 % of `L`) loses 4–9 points of V gene at 30 % SHM (same seeds and short-seed rule); accuracy saturates at z ≈ 2 (the 16-gene cap binds). Every allele of a kept gene becomes a candidate. A gene is the allele name's part before `*`; a V name without one gets a gene by sequence (§3a), and only one with no close relative is a gene of its own, on which the cap then binds (preparation warns when more than 16 such names remain). |
 | V band | `retrieve/seed_vote.rs` | bounded | Cluster's diagonal range, shifted by the allele's frame offset, ± 8 diagonals: holds unless an indel longer than 8 escapes the seeds. |
 | V scoring | `segment.rs`, `family_bound.rs` | lossless | Score-only DP on one representative `R` per gene frame (most votes, then the frame's medoid, then lowest id). A sibling `A` in `R`'s frame diagonals satisfies `L ≤ S*(A) ≤ S*(R) + Δ(R, A)`: `Δ` sums the best profile gain per frame position both cover plus the best score where only `A` does; `L` is a traced representative path clipped to `A`'s span and rescored with `A`'s profile. The cutoff `c` is the 3rd largest of one lower bound per candidate, so `c ≤` the exact 3rd score. `A` is skipped when `U < c`, known when `U = L`, aligned outright when `L ≥ c` (its traceback reused), scored otherwise. The ranking from the 3rd score up is that of full scoring; ties follow an explicit key (gene leaders first, then retrieval order), never the schedule. Under a length or identity floor only `U <` floor prunes. |
 | J scoring | `segment.rs`, `family_bound.rs` | lossless | The same bounds with each gene one frame, its alleles at offset 0 (sound because J is unbanded); ties in allele order. |

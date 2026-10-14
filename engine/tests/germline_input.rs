@@ -231,3 +231,73 @@ fn a_prepared_database_reloads_with_its_annotation() {
         assert_eq!(allele.regions, before.regions, "{}", allele.name);
     }
 }
+
+/// V names without `*` are genes of their own by name (REVIEW §0 item 11).
+/// One within 2 % of IGHV1-2*02 joins gene IGHV1-2; two close copies of a
+/// relative-less sequence form one gene; an unrelated one stays alone. The
+/// prepared database keeps the grouping (`gene=`).
+#[test]
+fn v_names_without_a_star_join_the_gene_of_a_close_relative() {
+    const IGHV1_2: &str = "CAGGTGCAGCTGGTGCAGTCTGGGGCTGAGGTGAAGAAGCCTGGGGCCTCAGTGAAGGTCTCCTGCAAGGCTTCTGGATACACCTTCACCGGCTACTATATGCACTGGGTGCGACAGGCCCCTGGACAAGGGCTTGAGTGGATGGGATGGATCAACCCTAACAGTGGTGGCACAAACTATGCACAGAAGTTTCAGGGCAGGGTCACCATGACCAGGGACACGTCCATCAGCACAGCCTACATGGAGCTGAGCAGGCTGAGATCTGACGACACGGCCGTGTATTACTGTGCGAGAGA";
+    // `sequence` with every `step`-th base changed.
+    let mutated = |sequence: &str, step: usize, phase: usize| -> String {
+        sequence
+            .bytes()
+            .enumerate()
+            .map(|(i, b)| match (i % step == phase, b) {
+                (true, b'A') => 'C',
+                (true, _) => 'A',
+                (false, b) => b as char,
+            })
+            .collect()
+    };
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut random = |len: usize| -> String {
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ['A', 'C', 'G', 'T'][(state % 4) as usize]
+            })
+            .collect()
+    };
+    let lone = random(290);
+    let other = random(290);
+    let v = [
+        format!(">IGHV1-2*02\n{IGHV1_2}\n"),
+        // 5 of 296 bases changed: 98.3 % identity.
+        format!(">IGHV1-2_novel\n{}\n", mutated(IGHV1_2, 60, 7)),
+        format!(">sample_a\n{lone}\n"),
+        format!(">sample_b\n{}\n", mutated(&lone, 60, 3)),
+        format!(">sample_c\n{other}\n"),
+    ]
+    .concat();
+    let j = ">IGHJ4*02\nACTACTTTGACTACTGGGGCCAGGGAACCCTGGTCACCGTCTCCTCAG\n";
+    let texts = GermlineTexts {
+        v: &v,
+        d: None,
+        j,
+        c: None,
+    };
+    let gene_names = |db: &PreparedDatabase| -> Vec<String> {
+        db.v.alleles()
+            .iter()
+            .map(|a| db.v.gene_name(a.gene).to_string())
+            .collect()
+    };
+    let first = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+    let expected = ["IGHV1-2", "IGHV1-2", "sample_a", "sample_a", "sample_c"];
+    assert_eq!(gene_names(&first), expected);
+    let files: std::collections::HashMap<&str, String> = first.files().into_iter().collect();
+    let texts = GermlineTexts {
+        v: &files["V.fasta"],
+        d: None,
+        j: &files["J.fasta"],
+        c: None,
+    };
+    let again = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+    assert_eq!(gene_names(&again), expected);
+    // Reported names do not change.
+    assert_eq!(again.v.allele(1).name, "IGHV1-2_novel");
+}

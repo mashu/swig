@@ -96,12 +96,11 @@ that review:
     reads cut after V) but also raises chance Ds on D-free ones: 79.8 %
     instead of 68.7 % behind 30 random bases. Needs the N/P length prior of
     item 2.
-11. **Gene identity from allele names.** A gene is the name's part before
-    `*`. A database without `*` names now gets a warning, but it still loses
-    V accuracy at high SHM: 8.2 pp of V allele at 30 % SHM on the suite's IGH
-    set with every `*` replaced. Grouping alleles by sequence would change
-    the gene ids that gene frames, the retrieval budget, tie order and the
-    family bounds key on.
+11. **Gene identity from allele names.** *Resolved:* a V name without `*`
+    joins the gene of a `*`-named relative within about 2 %, or groups with
+    other such names at that level (`gene=`; ALGORITHM §3a). The 8.2 pp V
+    allele loss at 30 % SHM with every `*` replaced is now +0.10 pp (not
+    significant); names with `*` keep their genes.
 12. **Junk V by circular divergence.** With the V presence cost, 7 of 1,200
     V-less test reads still get a V: the read's divergence is estimated
     partly from the junk V's own columns, which raises its per-read value.

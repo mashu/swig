@@ -20,7 +20,7 @@ use crate::germline::{
     Allele, GermlineError, GermlineSet, LocusSource, MergedDuplicate, SegmentKind,
 };
 use crate::locus::Loci;
-use crate::locus_infer::infer_loci;
+use crate::locus_infer::{group_genes, infer_loci};
 use crate::retrieve::{AmbiguityBudget, GeneFrames};
 use crate::seed::SeedShape;
 use crate::translate::open_frames;
@@ -171,11 +171,12 @@ pub enum DatabaseWarning {
     Uncertain(usize),
     /// A convention that keeps C from being called.
     Constant(ConstantWarning),
-    /// More V allele names than retrieval keeps genes per read hold no `*`.
-    /// A gene is the name's part before `*` ([`GermlineSet::gene_of_name`]),
-    /// so each of them is a gene of its own, and the gene budget
-    /// ([`AmbiguityBudget::max`]) caps alleles instead: V calls on mutated
-    /// reads lose accuracy.
+    /// More V allele names than retrieval keeps genes per read hold no `*`
+    /// and have no close relative to share a gene with
+    /// ([`crate::locus_infer::group_genes`]). A gene is otherwise the name's
+    /// part before `*` ([`GermlineSet::gene_of_name`]), so each of them is a
+    /// gene of its own, and the gene budget ([`AmbiguityBudget::max`]) caps
+    /// alleles instead: V calls on mutated reads lose accuracy.
     NoGeneNames(usize),
     /// Alleles of one kind whose name, header and relatives give no locus,
     /// given the loci `loci` the database names for their kind
@@ -225,7 +226,7 @@ impl fmt::Display for DatabaseWarning {
             Self::Constant(warning) => write!(f, "{warning}"),
             Self::NoGeneNames(count) => write!(
                 f,
-                "{count} V allele names hold no '*', so each counts as a gene of its own: retrieval keeps at most {} V genes per read, which then caps alleles, and V calls on mutated reads lose accuracy. Name alleles GENE*ALLELE, as IMGT does",
+                "{count} V allele names hold no '*' and have no close relative, so each counts as a gene of its own: retrieval keeps at most {} V genes per read, which then caps alleles, and V calls on mutated reads lose accuracy. Name alleles GENE*ALLELE, as IMGT does",
                 AmbiguityBudget::default().max
             ),
             Self::LocusFallback {
@@ -306,6 +307,10 @@ pub fn prepare(
         .flatten()
     {
         deduplicate(set, &mut merged)?;
+    }
+    // V names without `*`: genes by sequence (no change for `*` names).
+    if let Some(grouped) = group_genes(&v) {
+        v = grouped;
     }
     // Alleles whose name places no locus: their relatives' loci, else the
     // database's.
@@ -397,8 +402,17 @@ impl PreparedDatabase {
         if self.annotation.uncertain() > 0 {
             warnings.push(DatabaseWarning::Uncertain(self.annotation.uncertain()));
         }
-        let names = self.v.alleles().iter().map(|a| a.name.as_str());
-        let no_gene = names.filter(|name| !name.contains('*')).count();
+        // Names without `*` that no relative grouped into a gene.
+        let mut sizes = vec![0usize; self.v.gene_count()];
+        for allele in self.v.alleles() {
+            sizes[allele.gene as usize] += 1;
+        }
+        let no_gene = self
+            .v
+            .alleles()
+            .iter()
+            .filter(|a| !a.name.contains('*') && sizes[a.gene as usize] == 1)
+            .count();
         if no_gene > AmbiguityBudget::default().max {
             warnings.push(DatabaseWarning::NoGeneNames(no_gene));
         }

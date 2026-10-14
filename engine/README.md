@@ -166,12 +166,17 @@ headers (`accession|allele|species|…`) are read as the allele name, and
 identical sequences are merged and reported under all their names. Anchors
 and V region boundaries come from the headers where present and are
 detected otherwise, on every start (see *Germline annotation and regions*).
-Names must read `GENE*ALLELE`, as IMGT's do: the part before `*` is the
-gene, and a name without `*` is a gene of its own. V retrieval keeps
-candidates by gene (3 genes, up to 16 within the leader's vote noise), so
-without `*` that budget caps alleles: on human IGH at 30 % SHM, renaming
-`*` to `_a` costs 8.2 points of V allele accuracy. `prepare` and
-assignment warn when more than 16 V names hold no `*`.
+Names should read `GENE*ALLELE`, as IMGT's do: the part before `*` is the
+gene. V retrieval keeps candidates by gene (3 genes, up to 16 within the
+leader's vote noise), so a V name without `*` is given a gene by sequence:
+it joins the gene of its closest `*`-named relative when their local score
+is at least 0.95 of the smaller self-score (about 2 % divergence), else the
+names without `*` group among themselves at the same level, a group taking
+its first name as gene (`gene=` in a prepared header). Reported names do
+not change. On human IGH at 30 % SHM, renaming every `*` to `_` cost 8.2
+points of V allele accuracy before this grouping and +0.10 (not
+significant) with it. `prepare` and assignment warn when more than 16 V
+names hold no `*` and have no close relative.
 As with the reads, a leading UTF-8 byte-order mark is skipped and a byte
 that is no UTF-8 (a Latin-1 description) reads as U+FFFD.
 
