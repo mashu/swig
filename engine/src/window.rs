@@ -21,6 +21,14 @@ pub trait DWindowPolicy: Send + Sync {
         j: Option<&Placement>,
         out: &mut Vec<Range<usize>>,
     );
+
+    /// How far a D may lie from the one segment that bounds it on a read
+    /// without the other: its windows end this many bases after the V's
+    /// end (start this many before the J's start). `u32::MAX` (the
+    /// default): the window is open to the read's end (start).
+    fn open_reach(&self) -> u32 {
+        u32::MAX
+    }
 }
 
 /// The V placement that bounds a read's D windows, among its V placements
@@ -140,6 +148,10 @@ impl DWindowPolicy for ExpandedResidual {
             out.push(window);
         }
     }
+
+    fn open_reach(&self) -> u32 {
+        self.reach
+    }
 }
 
 /// Adds the conserved-anchor window `[q(V Cys) + 3, q(J Trp/Phe))` — the
@@ -201,6 +213,11 @@ impl<P: DWindowPolicy> DWindowPolicy for WithAnchorWindow<P> {
         if start < end {
             out.push(start..end);
         }
+    }
+
+    /// The anchor window needs both a V and a J: the inner policy's.
+    fn open_reach(&self) -> u32 {
+        self.inner.open_reach()
     }
 }
 

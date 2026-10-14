@@ -302,26 +302,31 @@ fn the_identity_floor_judges_the_local_alignment() {
 }
 
 /// AIRR names N/P regions by their neighbours: `np1` follows V and `np2`
-/// the D, so a read without V reports its D–J bases as `np2`. Such a call
-/// exists only without the pair guards: under them, as in SwiftIG, a D
-/// needs a V before it, and the read gets its J alone.
+/// the D, so a read without V reports its D–J bases as `np2`. Under the
+/// pair guards such a call needs the open-flank cost, which a D at the
+/// read's start pays nothing for; without the cost (`--d-open-flank off`)
+/// a D needs a V before it, as in SwiftIG, and the read gets its J alone.
 #[test]
 fn np_regions_are_named_by_their_neighbours() {
     let db = Db::new();
-    let mut config = EngineConfig::default();
-    config.options.guards = None;
     let (d_name, d) = &db.d[7];
     let (j_name, j) = &db.j[0];
     let read = format!("{d}GTA{j}");
-    let rec = record(&db.assigner(&config), &read);
-    assert!(rec.v.is_none());
-    assert_eq!(first_label(&rec.d).as_deref(), Some(d_name.as_str()));
-    assert_eq!(first_label(&rec.j).as_deref(), Some(j_name.as_str()));
-    assert_eq!(
-        (rec.np1.as_deref(), rec.np2.as_deref()),
-        (None, Some("GTA"))
-    );
-    let rec = record(&db.assigner(&EngineConfig::default()), &read);
+    let mut unguarded = EngineConfig::default();
+    unguarded.options.guards = None;
+    for config in [unguarded, EngineConfig::default()] {
+        let rec = record(&db.assigner(&config), &read);
+        assert!(rec.v.is_none());
+        assert_eq!(first_label(&rec.d).as_deref(), Some(d_name.as_str()));
+        assert_eq!(first_label(&rec.j).as_deref(), Some(j_name.as_str()));
+        assert_eq!(
+            (rec.np1.as_deref(), rec.np2.as_deref()),
+            (None, Some("GTA"))
+        );
+    }
+    let mut closed = EngineConfig::default();
+    closed.objective.open_flank = None;
+    let rec = record(&db.assigner(&closed), &read);
     assert!(rec.v.is_none() && rec.d.is_none());
     assert_eq!(first_label(&rec.j).as_deref(), Some(j_name.as_str()));
     assert_eq!((rec.np1.as_deref(), rec.np2.as_deref()), (None, None));

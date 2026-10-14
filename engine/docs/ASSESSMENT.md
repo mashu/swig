@@ -532,8 +532,9 @@ restores them as the plausibility guards (ALGORITHM §4c, on by default,
 `--no-pair-guards`): V and J hits of at least 24 and 10 local columns,
 clipped V and J keeping at least 24 and 10 read bases, SwiftIG's
 `supports_rearranged_pair` with its 225-base junction span, a D only
-between a V and a J, and junctions only from aligned anchors at most 231
-bases apart. The 60 % identity floor is Swig Web's and swig-cli's
+between a V and a J (since 0.39.5 also at a read's open end where it pays
+the open-flank cost of ALGORITHM §2.3), and junctions only from aligned
+anchors at most 231 bases apart. The 60 % identity floor is Swig Web's and swig-cli's
 (`--min-identity 0.6`), and under the guards it also judges the part of a
 V or J that a call keeps.
 

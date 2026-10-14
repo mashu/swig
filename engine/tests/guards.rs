@@ -1,7 +1,8 @@
 //! SwiftIG's plausibility guards (Swig ≤ 0.38), which the engine keeps
 //! ([`swig::pipeline::PairGuards`]): implausible and chimeric reads keep
 //! their better segment instead of becoming a rearrangement, a D needs a V
-//! and a J, a junction needs aligned anchors, and C is called as SwiftIG
+//! and a J (or, under the open-flank cost, one of them at the read's open
+//! end: `tests/combine.rs`), a junction needs aligned anchors, and C is called as SwiftIG
 //! anchored it, on 12 columns at 90 % identity.
 
 use swig::prelude::*;
@@ -117,16 +118,21 @@ fn a_j_of_fewer_than_ten_columns_is_not_called() {
     }
 }
 
-/// A D is called only between a V and a J: a read that stops eight bases
-/// after its D (too few for a J) or starts eight bases before it (too few
-/// for a V) gets no D. Without the guards those reads keep the D.
+/// Without the open-flank cost (`--d-open-flank off`), a D is called only
+/// between a V and a J, as in SwiftIG: a read that stops eight bases after
+/// its D (too few for a J) or starts eight bases before it (too few for a
+/// V) gets no D. With the cost (the default) both keep the D, which ends
+/// or starts its path within the N/P allowance and so pays nothing, as
+/// they do without the guards; neither read pairs a V with a J.
 #[test]
-fn a_d_needs_a_v_and_a_j() {
+fn a_d_needs_a_v_and_a_j_without_the_open_flank_cost() {
     let db = database();
     let mut rng = Rng::new(9);
     let v = bases(&db.v.allele(0).codes);
     let j = bases(&db.j.allele(0).codes);
-    let mut unguarded_d = 0;
+    let mut closed = EngineConfig::default();
+    closed.objective.open_flank = None;
+    let (mut unguarded_d, mut open_d) = (0, 0);
     for (k, allele) in db.d.alleles().iter().enumerate().take(8) {
         let d = bases(&allele.codes);
         let v_side = [
@@ -138,13 +144,18 @@ fn a_d_needs_a_v_and_a_j() {
         .concat();
         let j_side = [random(&mut rng, 8), d, random(&mut rng, 6), j.clone()].concat();
         for read in [v_side, j_side] {
-            let r = record(&db, &EngineConfig::default(), &read);
+            let r = record(&db, &closed, &read);
             assert!(r.d.is_none(), "D {k}: {:?}", r.d.map(|d| d.call));
             assert!(!paired(&r), "D {k}");
-            unguarded_d += usize::from(record(&db, &unguarded(), &read).d.is_some());
+            let free = record(&db, &unguarded(), &read).d.is_some();
+            let open = record(&db, &EngineConfig::default(), &read);
+            assert_eq!(open.d.is_some(), free, "D {k}");
+            assert!(!paired(&open), "D {k}");
+            unguarded_d += usize::from(free);
+            open_d += usize::from(open.d.is_some());
         }
     }
-    assert!(unguarded_d > 0, "no read tested the rule");
+    assert!(unguarded_d > 0 && open_d > 0, "no read tested the rule");
 }
 
 /// A V cut six bases before its Cys104 codon pairs with its J, but the

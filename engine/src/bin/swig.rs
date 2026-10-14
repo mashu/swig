@@ -89,8 +89,10 @@ options:
                        when it faces its junction (V within 45 nt of its 3' end, J
                        within 30 of its 5' start, >= 80 columns together), holds a
                        long split (V >= 80, J >= 30) or aligns both anchors in order,
-                       with <= 225 nt between V and J; D only between a V and a J;
-                       a junction only from aligned anchors, Cys-W/F <= 231 nt
+                       with <= 225 nt between V and J; a D only between a V and a
+                       J, or beside one at the read's open end where it pays the
+                       open-flank cost (--d-open-flank); a junction only from
+                       aligned anchors, Cys-W/F <= 231 nt
   --calls MODEL        the model the call maximises: per-read (each read's own, the
                        model its posteriors come from) | fixed (the (2, -3) scores)
   --d-allele RULE      the reported D allele: map (the call's) | max-marginal (largest
@@ -99,19 +101,26 @@ options:
   --d-presence-rate R  D prior from the D search's own chance-hit count (alleles x
                        offsets x positions) at D-presence rate R, 0 < R < 1, instead
                        of genes x positions at even odds (docs/ALGORITHM.md 2.3)
+  --d-open-flank on|off  charge a D that ends (starts) its path for the J (V) the
+                       read would show in the bases after (before) it, and call such
+                       a D under the pair guards (default on; off: a D only between
+                       a V and a J, as in 0.39.4; docs/ALGORITHM.md 2.3)
   --min-d-match N      shortest exact run of an admissible D (default: the profile's)
   --d-mismatch S       D mismatch score, -1000 to -1 (default: the profile's)
   --j-mismatch S       J mismatch score, -1000 to -1 (default: the profile's)
   --min-j-length N     fewest aligned J columns of a J hit (default none)
   --c-evalue E         call C when its anchored E-value, C genes x 15 start
-                       diagonals x e^(-lambda S), is at most E (default 1e-3)
+                       diagonals x e^(-lambda S), is at most E (default 1e-3;
+                       needs --c)
   --c-min-identity F   call C only at identity F or more (default 0.9, SwiftIG's
-                       floor; 0 removes it; the 12-column floor remains)
+                       floor; 0 removes it; the 12-column floor remains;
+                       without --c it is ignored with a warning)
   --c-prefix-identity F  report C only where the germline from its first base
-                       reaches identity F (c_prefix_identity; default 0, off)
+                       reaches identity F (c_prefix_identity; default 0, off;
+                       above 0 needs --c)
   --double-d MODE      off (default) | all | long-span: Swig's double-D screen, a
                        seeded search for two D between every call's V and J,
-                       written to --double-d-out
+                       written to --double-d-out (all and long-span need --d)
   --double-d-out FILE  the screen's sidecar TSV
   --double-d-min-span N, --double-d-seed-length N, --double-d-pseudo-trim N,
   --double-d-pseudo-mismatches N, --double-d-min-gain S
@@ -294,9 +303,11 @@ fn parse_args() -> Result<Command, String> {
 }
 
 impl Args {
-    /// Refuse a command line that lacks an input its mode needs, or gives
-    /// the double-D screen without its sidecar (or the reverse): a usage
-    /// error like any other bad command line.
+    /// Refuse a command line that lacks an input its mode needs, gives the
+    /// double-D screen without its sidecar (or the reverse), or gives an
+    /// option without the database it needs
+    /// ([`RunOptions::check_databases`]): a usage error like any other bad
+    /// command line, before any database is read.
     fn check(&self) -> Result<(), String> {
         let mode = self.mode;
         let germline = matches!(mode, Mode::Assign | Mode::Prepare | Mode::Simulate);
@@ -324,6 +335,10 @@ impl Args {
         let screening = self.run.double_d.mode != DoubleDMode::Off;
         if screening != self.double_d_out.is_some() {
             return Err("--double-d and --double-d-out go together".into());
+        }
+        if mode == Mode::Assign {
+            let (d, c) = (self.files.d.is_some(), self.files.c.is_some());
+            self.run.check_databases(d, c).map_err(|e| e.to_string())?;
         }
         Ok(())
     }
@@ -391,6 +406,9 @@ fn run_assign(args: &Args) -> Result<(), Box<dyn Error>> {
     let screening = args.run.double_d.mode != DoubleDMode::Off;
     let database = load_database(&args.files, &args.run)?;
     let mut run = Run::new(&args.run, database)?;
+    for warning in run.warnings() {
+        eprintln!("swig: warning: {warning}");
+    }
     let mut sidecar = args
         .double_d_out
         .as_deref()

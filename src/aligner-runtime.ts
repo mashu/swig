@@ -37,6 +37,8 @@ export interface RunResult {
   inputRecords: number;
   workers: number;
   fastqFilter: FastqQualityFilterStats;
+  /** The aligner's database and run warnings. */
+  warnings: string[];
 }
 
 let requestId = 0;
@@ -110,6 +112,7 @@ export function runAligner(options: RunOptions): Promise<RunResult> {
         doubleDBody?: ArrayBuffer;
         doubleDCount?: number;
         telemetry?: AssignmentTelemetry;
+        warnings?: string[];
       };
       if (message.id !== id || finished) return;
       if (message.type === "progress") {
@@ -158,6 +161,7 @@ export function runAligner(options: RunOptions): Promise<RunResult> {
           recordsTrimmed: 0,
           basesTrimmed: 0,
         },
+        warnings: message.warnings ?? [],
       });
     };
     worker.onerror = (event) => fail(new Error(event.message || "The aligner worker stopped unexpectedly."));

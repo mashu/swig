@@ -62,7 +62,9 @@ use super::decode::{DAlleleDecoding, Topology, Within, max_marginal_d};
 use super::lattice::{Group, KINDS, Lattice, column_steps};
 use super::model::{Grammar, PathModel, VdjGrammar};
 use super::posterior::{Marginals, PosteriorScratch};
-use super::units::{CallModel, EvidenceModel, PathNats, ReadModel, Units, divergence};
+use super::units::{
+    CallModel, EvidenceModel, Flank, FlankTable, PathNats, ReadContext, ReadModel, Units,
+};
 use super::{Adjudicator, CallPath, CalledSegment, EngineeringObjective, PathScore};
 use crate::germline::SegmentKind;
 use crate::placement::Placement;
@@ -175,6 +177,8 @@ pub struct DagScratch {
     /// Per slot and successor kind: best `X(x) − ι·x` over exits `≤ z`.
     running: Vec<Option<Cell>>,
     tails: Vec<Option<Cell>>,
+    /// The read's open-flank costs.
+    flank: FlankTable,
     posterior: PosteriorScratch,
 }
 
@@ -204,9 +208,11 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         placements: &[Placement],
         keep: impl Fn(usize) -> bool,
         read: &ReadModel,
+        flank: &FlankTable,
         s: &mut DagScratch,
     ) {
         s.lattice.layout(placements, keep);
+        s.lattice.set_closes(flank.closes());
         s.entry.clear();
         s.entry.resize(s.lattice.cells(), None);
         s.exit.clear();
@@ -231,7 +237,8 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
 
     /// Open node `e`'s slots and fill their entry values from path starts
     /// and from every predecessor's running exit maxima.
-    fn gather(&self, read: &ReadModel, s: &mut DagScratch, e: usize) {
+    /// A path that starts here first pays `start_cost`, its open-flank cost.
+    fn gather(&self, read: &ReadModel, start_cost: Units, s: &mut DagScratch, e: usize) {
         let grammar = &self.grammar;
         let node = s.lattice.nodes[e];
         let width = node.width();
@@ -259,7 +266,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
                 prefer(
                     &mut forward[0],
                     Cell {
-                        key: (0, 0),
+                        key: (-start_cost, 0),
                         slot: START,
                         at: 0,
                     },
@@ -457,9 +464,10 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         &self,
         placements: &[Placement],
         read: &ReadModel,
+        flank: &FlankTable,
         s: &mut DagScratch,
     ) -> Option<(PathScore<Units>, Vec<CalledSegment>)> {
-        self.best_path(placements, |_| true, read, s)
+        self.best_path(placements, |_| true, read, flank, s)
     }
 
     /// The best path under `read` with `topology` through the placements
@@ -470,6 +478,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         keep: impl Fn(usize) -> bool,
         topology: Topology,
         read: &ReadModel,
+        flank: &FlankTable,
         s: &mut DagScratch,
     ) -> Option<(PathScore<Units>, Vec<CalledSegment>)> {
         let within = PlacementDag {
@@ -481,7 +490,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
             min_retained: self.min_retained,
             mode: self.mode,
         };
-        within.best_path(placements, keep, read, s)
+        within.best_path(placements, keep, read, flank, s)
     }
 
     fn best_path(
@@ -489,17 +498,22 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         placements: &[Placement],
         keep: impl Fn(usize) -> bool,
         read: &ReadModel,
+        flank: &FlankTable,
         s: &mut DagScratch,
     ) -> Option<(PathScore<Units>, Vec<CalledSegment>)> {
-        self.layout(placements, keep, read, s);
+        self.layout(placements, keep, read, flank, s);
         let mut best: Option<(PathScore<Units>, Cell)> = None;
         for e in 0..s.lattice.nodes.len() {
-            self.gather(read, s, e);
+            // The open-flank costs of a path that starts or ends here, if on a D.
+            let node = s.lattice.nodes[e];
+            let open = |side| flank.units(side, node.kind, node.q_start, node.q_end());
+            self.gather(read, open(Flank::Start), s, e);
             for t in s.lattice.nodes[e].slots() {
-                if let Some((score, cell)) = self.emit(placements, read, s, t)
-                    && best.is_none_or(|(current, _)| score > current)
-                {
-                    best = Some((score, cell));
+                if let Some((mut score, cell)) = self.emit(placements, read, s, t) {
+                    score.score -= open(Flank::End);
+                    if best.is_none_or(|(current, _)| score > current) {
+                        best = Some((score, cell));
+                    }
                 }
             }
         }
@@ -508,10 +522,24 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
     }
 
     /// The fixed-scale objective of a path's `segments` (non-empty, presence
-    /// costs `⌊P*_k⌋`), with its D count and germline support.
-    pub fn path_score(&self, placements: &[Placement], segments: &[CalledSegment]) -> PathScore {
+    /// costs `⌊P*_k⌋`, open-flank costs from `flank`'s fixed scale), with
+    /// its D count and germline support.
+    pub(crate) fn path_score(
+        &self,
+        placements: &[Placement],
+        segments: &[CalledSegment],
+        flank: &FlankTable,
+    ) -> PathScore {
         let kind = |segment: &CalledSegment| placements[segment.placement].kind;
         let (first, last) = (kind(&segments[0]), kind(&segments[segments.len() - 1]));
+        // The open ends: the first segment keeps its placement's start and
+        // the last its end.
+        let open = |side: Flank, segment: &CalledSegment| {
+            let p = &placements[segment.placement];
+            flank.score(side, p.kind, p.q_start(), p.q_end())
+        };
+        let open =
+            open(Flank::Start, &segments[0]) + open(Flank::End, &segments[segments.len() - 1]);
         let (mut score, mut d_count, mut support) = (0, 0u8, 0);
         for (k, segment) in segments.iter().enumerate() {
             let placement = &placements[segment.placement];
@@ -525,7 +553,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
             }
         }
         PathScore {
-            score: score + self.model.end(first, last, d_count),
+            score: score + self.model.end(first, last, d_count) - open,
             d_count,
             support,
         }
@@ -544,8 +572,47 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         SegmentKind::REARRANGED.map(|kind| self.model.presence(kind))
     }
 
+    /// The open-flank costs of a read in `context` with `placements`,
+    /// under `read`, the model the call maximises.
+    pub(crate) fn flank_table(
+        &self,
+        context: &ReadContext,
+        placements: &[Placement],
+        read: &ReadModel,
+        table: &mut FlankTable,
+    ) {
+        table.fill(
+            self.model.open_flank(),
+            self.presence(),
+            read,
+            self.calls(),
+            context,
+            placements,
+        );
+    }
+
+    /// [`Self::flank_table`] for the posterior or the decoder of a call:
+    /// the table its adjudication filled, when `table` still holds it
+    /// ([`FlankTable::refill`]).
+    fn call_flank_table(
+        &self,
+        context: &ReadContext,
+        placements: &[Placement],
+        read: &ReadModel,
+        table: &mut FlankTable,
+    ) {
+        table.refill(
+            self.model.open_flank(),
+            self.presence(),
+            read,
+            self.calls(),
+            context,
+            placements,
+        );
+    }
+
     /// The model a call at divergence `p` maximises.
-    fn read_model(&self, p: f64) -> ReadModel {
+    pub(super) fn read_model(&self, p: f64) -> ReadModel {
         match self.mode {
             Mode::Read {
                 evidence,
@@ -561,7 +628,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
 
     /// The posterior's model at divergence `p`, when the DAG reports
     /// posteriors: the call's own under [`CallModel::PerRead`].
-    fn nats(&self, p: f64) -> Option<PathNats> {
+    pub(super) fn nats(&self, p: f64) -> Option<PathNats> {
         let Mode::Read {
             evidence,
             calls,
@@ -581,23 +648,29 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
     type Scratch = DagScratch;
 
     fn adjudicate(&self, placements: &[Placement], scratch: &mut DagScratch) -> Option<CallPath> {
-        self.adjudicate_at(placements, divergence(placements), scratch)
+        self.adjudicate_at(placements, &ReadContext::of_placements(placements), scratch)
     }
 
     fn adjudicate_at(
         &self,
         placements: &[Placement],
-        divergence: f64,
+        context: &ReadContext,
         scratch: &mut DagScratch,
     ) -> Option<CallPath> {
-        let (value, segments) = self.viterbi(placements, &self.read_model(divergence), scratch)?;
-        Some(CallPath {
-            score: self.path_score(placements, &segments),
-            value,
-            segments,
-            divergence,
-            model: self.calls(),
-        })
+        let mut flank = std::mem::take(&mut scratch.flank);
+        let read = self.read_model(context.divergence);
+        self.flank_table(context, placements, &read, &mut flank);
+        let call = self
+            .viterbi(placements, &read, &flank, scratch)
+            .map(|(value, segments)| CallPath {
+                score: self.path_score(placements, &segments, &flank),
+                value,
+                segments,
+                context: *context,
+                model: self.calls(),
+            });
+        scratch.flank = flank;
+        call
     }
 
     fn marginals(
@@ -606,8 +679,10 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
         path: &CallPath,
         scratch: &mut DagScratch,
     ) -> Option<Marginals> {
-        let nats = self.nats(path.divergence)?;
-        self.posterior(placements, &nats, &mut scratch.posterior)
+        let nats = self.nats(path.context.divergence)?;
+        let read = self.read_model(path.context.divergence);
+        self.call_flank_table(&path.context, placements, &read, &mut scratch.flank);
+        self.posterior(placements, &nats, &scratch.flank, &mut scratch.posterior)
     }
 
     /// A fixed-scale call without posteriors never takes a D scoring at
@@ -624,6 +699,10 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
             } => Score::MIN,
             _ => self.model.d_floor(),
         }
+    }
+
+    fn charges_open_flank(&self) -> bool {
+        self.model.open_flank().is_some()
     }
 
     /// Under [`DAlleleDecoding::MaxMarginal`], a call with one D whose
@@ -658,16 +737,23 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
             let p = &placements[i];
             p.kind != SegmentKind::D || p.alleles.contains(&allele)
         };
-        let read = self.read_model(path.divergence);
-        let (_, mut segments) = self.conditioned(placements, keep, topology, &read, scratch)?;
-        for segment in &mut segments {
-            segment.allele = (kind(segment) == SegmentKind::D).then_some(allele);
-        }
-        Some(CallPath {
-            score: self.path_score(placements, &segments),
-            segments,
-            ..*path
-        })
+        let read = self.read_model(path.context.divergence);
+        let mut flank = std::mem::take(&mut scratch.flank);
+        self.call_flank_table(&path.context, placements, &read, &mut flank);
+        let decoded = self
+            .conditioned(placements, keep, topology, &read, &flank, scratch)
+            .map(|(_, mut segments)| {
+                for segment in &mut segments {
+                    segment.allele = (kind(segment) == SegmentKind::D).then_some(allele);
+                }
+                CallPath {
+                    score: self.path_score(placements, &segments, &flank),
+                    segments,
+                    ..*path
+                }
+            });
+        scratch.flank = flank;
+        decoded
     }
 }
 
@@ -824,7 +910,12 @@ mod tests {
             let model = EngineeringObjective::priced(presence);
             let dag = PlacementDag::new(VdjGrammar::VJ, model, [1, 1, 1], Mode::Fixed);
             let (_, segments) = dag
-                .viterbi(&placements, read, &mut DagScratch::default())
+                .viterbi(
+                    &placements,
+                    read,
+                    &FlankTable::default(),
+                    &mut DagScratch::default(),
+                )
                 .expect("a path");
             segments.len()
         };
@@ -895,14 +986,16 @@ mod tests {
         let call = fixed.adjudicate(&placements, &mut scratch).unwrap();
         assert_eq!((d_of(&call), call.model), (2, CallModel::FixedScale));
         let call = per_read.adjudicate(&placements, &mut scratch).unwrap();
-        assert_eq!(call.divergence, 0.5 / 41.0);
+        assert_eq!(call.context.divergence, 0.5 / 41.0);
         assert_eq!((d_of(&call), call.model), (1, CallModel::PerRead));
         // The reported path score stays the fixed scale's: 40 + 14 − 10 + 40.
         assert_eq!(call.score.score, 84);
         // At δ0 the per-read model is the fixed one.
         let delta0 = evidence().log_odds_divergence(SegmentKind::D);
         let at = ReadModel::at(&evidence(), delta0, model.presence);
-        let (_, segments) = per_read.viterbi(&placements, &at, &mut scratch).unwrap();
+        let (_, segments) = per_read
+            .viterbi(&placements, &at, &FlankTable::default(), &mut scratch)
+            .unwrap();
         assert_eq!(segments[1].placement, 2);
     }
 
@@ -974,7 +1067,10 @@ mod tests {
         let dag = PlacementDag::new(VdjGrammar::VDJ, model, [1, 4, 1], Mode::Fixed);
         let mut scratch = DagScratch::default();
         let d_count = |read: &ReadModel, scratch: &mut DagScratch| {
-            dag.viterbi(&placements, read, scratch).unwrap().0.d_count
+            dag.viterbi(&placements, read, &FlankTable::default(), scratch)
+                .unwrap()
+                .0
+                .d_count
         };
         assert_eq!(
             d_count(&ReadModel::fixed(1.0, model.presence), &mut scratch),

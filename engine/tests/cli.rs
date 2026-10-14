@@ -247,3 +247,172 @@ fn missing_inputs_are_usage_errors() {
     }
     fs::remove_dir_all(dir).unwrap();
 }
+
+/// An option that filters or adds to the output without the database it
+/// needs is a usage error (exit 2 with the usage), refused before any
+/// database is read or the sidecar is created; one that only tunes a stage
+/// the run does not have is run, with a warning, and changes nothing.
+#[test]
+fn options_without_their_database() {
+    let dir = workspace("databases");
+    let simulate = [
+        "--out", "sim", "--reads", "40", "--seed", "3", "--preset", "easy",
+    ];
+    let output = run(&dir, &[&["simulate"], &GERMLINES[..], &simulate].concat());
+    assert!(output.status.success(), "{}", stderr(&output));
+    let vj = ["sim.fasta", "--v", "V.fasta", "--j", "J.fasta"];
+    let vdj = [&vj[..], &["--d", "D.fasta"]].concat();
+    let vjc = [&vj[..], &["--c", "C.fasta"]].concat();
+    for (germlines, options, message) in [
+        (
+            &vdj,
+            &["--c-evalue", "0.01"][..],
+            "--c-evalue needs a C database (--c)",
+        ),
+        (
+            &vdj,
+            &["--c-prefix-identity", "0.97"],
+            "--c-prefix-identity needs a C database (--c)",
+        ),
+        (
+            &vjc,
+            &["--double-d", "all", "--double-d-out", "dd.tsv"],
+            "--double-d needs a D database (--d)",
+        ),
+        (
+            &vjc,
+            &["--double-d", "long-span", "--double-d-out", "dd.tsv"],
+            "--double-d needs a D database (--d)",
+        ),
+    ] {
+        let output = run(&dir, &[&germlines[..], options].concat());
+        let text = stderr(&output);
+        assert_eq!(output.status.code(), Some(2), "{options:?}: {text}");
+        assert!(text.contains(message), "{options:?}: {text}");
+        assert!(text.contains("usage:"), "{options:?}: {text}");
+        assert!(!text.contains("database prepared"), "{options:?}: {text}");
+        assert!(!dir.join("dd.tsv").exists(), "{options:?}");
+    }
+
+    // 0 turns the C-prefix gate off: nothing to refuse or report.
+    let output = run(&dir, &[&vdj[..], &["--c-prefix-identity", "0"]].concat());
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!stderr(&output).contains("c-prefix"), "{}", stderr(&output));
+
+    // D tuning and the screen's rules without a D database or the screen.
+    let plain = run(&dir, &vj);
+    assert!(plain.status.success(), "{}", stderr(&plain));
+    let tuning = [
+        "--min-d-match",
+        "6",
+        "--d-mismatch",
+        "-4",
+        "--no-anchor-window",
+        "--double-d-seed-length",
+        "9",
+    ];
+    let tuned = run(&dir, &[&vj[..], &tuning].concat());
+    let text = stderr(&tuned);
+    assert!(tuned.status.success(), "{text}");
+    assert_eq!(tuned.stdout, plain.stdout);
+    assert!(
+        text.contains(
+            "swig: warning: --min-d-match, --d-mismatch, --no-anchor-window have no \
+             effect without a D database (--d)\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "swig: warning: --double-d-seed-length has no effect without --double-d all \
+             or long-span\n"
+        ),
+        "{text}"
+    );
+    assert!(!stderr(&plain).contains("no effect"), "{}", stderr(&plain));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Fixture (a) of `tests/open_flank.rs` on this database: each full V
+/// allele followed by 100 random bases (a fixed linear congruential stream).
+fn v_then_random() -> String {
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut base = || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        b"ACGT"[(state >> 62) as usize] as char
+    };
+    let v: Vec<&str> = V.lines().filter(|l| !l.starts_with('>')).collect();
+    (0..20)
+        .map(|i| {
+            let tail: String = (0..100).map(|_| base()).collect();
+            format!(">vcut{i}\n{}{tail}\n", v[i % v.len()])
+        })
+        .collect()
+}
+
+/// The `d_call` column of an AIRR TSV.
+fn d_column(tsv: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(tsv);
+    let mut lines = text.lines();
+    let header: Vec<&str> = lines.next().unwrap().split('\t').collect();
+    let d = header.iter().position(|&c| c == "d_call").unwrap();
+    lines
+        .map(|l| l.split('\t').nth(d).unwrap_or("").to_string())
+        .collect()
+}
+
+/// FNV-1a of Swig 0.39.4's AIRR rows on [`v_then_random`].
+const FNV_0394: u64 = 0x1b56_f1c2_c83c_b824;
+/// FNV-1a of Swig 0.39.4's AIRR rows on the 200 reads of `simulate
+/// --reads 200 --seed 5 --preset mid` on this database.
+const FNV_0394_SIMULATED: u64 = 0x78d7_5831_88a5_a108;
+
+/// (e) `--d-open-flank off` turns the open-flank cost off and, with it, the
+/// D at a read's open end: a D is then called only between a V and a J that
+/// pair, and the rows are Swig 0.39.4's, byte for byte, on fixture (a) and
+/// on simulated full-length reads. On fixture (a) Swig 0.39.3 called a
+/// chance D on all 20 reads, 0.39.4 on none, and so does the cost: the one
+/// chance D it left lay more than 60 bases after the V, found only in the
+/// window up to a chance J that the guards drop. The cost still moves the
+/// rows (their D posteriors). The full-length reads show a V and a J, and
+/// the cost changes none of them.
+#[test]
+fn the_open_flank_cost_can_be_turned_off() {
+    let dir = workspace("open-flank");
+    fs::write(dir.join("reads.fa"), v_then_random()).unwrap();
+    let simulate = [
+        "--out", "sim", "--reads", "200", "--seed", "5", "--preset", "mid",
+    ];
+    let output = run(&dir, &[&["simulate"], &GERMLINES[..], &simulate].concat());
+    assert!(output.status.success(), "{}", stderr(&output));
+    let call = |extra: &[&str], reads: &str| {
+        let mut args = GERMLINES.to_vec();
+        args.extend_from_slice(extra);
+        args.push(reads);
+        let output = run(&dir, &args);
+        assert!(output.status.success(), "{}", stderr(&output));
+        output.stdout
+    };
+    let (on, off) = (
+        call(&[], "reads.fa"),
+        call(&["--d-open-flank", "off"], "reads.fa"),
+    );
+    assert_eq!(fnv(&off), FNV_0394);
+    let count = |tsv: &[u8]| d_column(tsv).iter().filter(|d| !d.is_empty()).count();
+    assert_eq!((count(&on), count(&off)), (0, 0));
+    assert_ne!(on, off);
+    assert_eq!(call(&["--d-open-flank", "on"], "reads.fa"), on);
+    let off = call(&["--d-open-flank", "off"], "sim.fasta");
+    assert_eq!(fnv(&off), FNV_0394_SIMULATED);
+    assert_eq!(call(&[], "sim.fasta"), off);
+    let bad = run(&dir, &["--d-open-flank", "maybe", "reads.fa"]);
+    assert_eq!(bad.status.code(), Some(2));
+    assert!(
+        stderr(&bad).contains("--d-open-flank expects on or off"),
+        "{}",
+        stderr(&bad)
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}

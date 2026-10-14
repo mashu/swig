@@ -107,7 +107,8 @@ interface ParsedRecord {
   name: string;
   rawSequence: string;
   sequence: string;
-  locus: GermlineLocus;
+  /** `locus=` written for the engine; empty when the name places the record. */
+  locusKey: string;
   metadata?: CompactMetadata;
 }
 
@@ -226,8 +227,112 @@ function inferLocus(value: string): GermlineLocus | null {
   return LOCI.find((locus) => upper.includes(locus)) ?? null;
 }
 
-function inferSegment(name: string): GermlineSegment | null {
-  const match = /^(?:IGH|IGK|IGL|TRA|TRB|TRD|TRG)([VDJC])/.exec(name.toUpperCase());
+const IGH_ISOTYPE_LETTERS = "AEFGMOTWXYZ";
+
+/**
+ * The loci the Swig engine reads from an allele label (engine/src/locus.rs,
+ * `Loci::named_in`): a locus code at the start of a word followed by a
+ * segment letter or, for IGH, an isotype letter with at most one more letter
+ * after it; a shared TRAV…/DV… gene belongs to TRA and TRD. Empty when the
+ * label names no locus, as a custom name does: the engine then has to infer
+ * it, so the host writes `locus=` for such records.
+ */
+export function namedLoci(label: string): GermlineLocus[] {
+  const upper = label.toUpperCase();
+  for (let at = 0; at < upper.length; at += 1) {
+    if (at > 0 && /[A-Z0-9]/.test(upper[at - 1])) continue;
+    const locus = LOCI.find((code) => upper.startsWith(code, at));
+    if (!locus) continue;
+    const next = upper[at + locus.length];
+    if (next === undefined) continue;
+    let named = "VDJC".includes(next);
+    if (!named && locus === "IGH" && IGH_ISOTYPE_LETTERS.includes(next)) {
+      named = !/^[A-Z]{2}/.test(upper.slice(at + locus.length + 1));
+    }
+    if (!named) continue;
+    return locus === "TRA" && upper.includes("/DV") ? ["TRA", "TRD"] : [locus];
+  }
+  return [];
+}
+
+/** The `locus=` value of a FASTA header, if it has one. */
+function declaredLocus(header: string): string | undefined {
+  return /(?:^|\s)locus=([A-Za-z,]+)(?=\s|$)/.exec(header)?.[1]?.toUpperCase();
+}
+
+/** A prepared header's ` locus=` attribute, carried to the header written from it. */
+function locusAttribute(header: string): string {
+  const declared = declaredLocus(header);
+  return declared ? ` locus=${declared}` : "";
+}
+
+/**
+ * The loci a FASTA header's free text states, word by word: a token that is
+ * a locus code (`IGK`) or names a gene of one (`IGKV1-5`, {@link namedLoci}).
+ * The identifier and `key=value` attributes are skipped, and a code inside a
+ * word (`LIGHT`, `STRAIN`) states none, unlike the substring test that
+ * admits a record ({@link inferLocus}).
+ */
+export function headerLoci(header: string): GermlineLocus[] {
+  const found = new Set<GermlineLocus>();
+  for (const token of header.trim().split(/\s+/).slice(1)) {
+    if (token.includes("=")) continue;
+    for (const word of token.split(/[|,;:()[\]]+/)) {
+      const upper = word.toUpperCase();
+      const loci = (LOCI as string[]).includes(upper) ? [upper as GermlineLocus] : namedLoci(word);
+      for (const locus of loci) found.add(locus);
+    }
+  }
+  return LOCI.filter((locus) => found.has(locus));
+}
+
+/**
+ * The `locus=` value to write for a record the engine cannot place by its
+ * name: the one its header declares; else the loci of the template its
+ * metadata came from (TRA,TRD for a TRAV…/DV… relative), narrowed to those
+ * the header's words state when it states some of them; else the loci the
+ * header's words state. Empty when the name places the record, and when the
+ * template and the header disagree or neither places it: the engine then
+ * infers the locus from the record's relatives.
+ */
+function locusKey(name: string, header: string, template?: string): string {
+  const declared = declaredLocus(header);
+  if (declared) return declared;
+  if (namedLoci(name).length) return "";
+  const stated = headerLoci(header);
+  const relative = template ? namedLoci(template) : [];
+  if (!relative.length) return stated.join(",");
+  if (!stated.length) return relative.join(",");
+  return relative.filter((locus) => stated.includes(locus)).join(",");
+}
+
+/**
+ * The locus that admits a record to the scope `allowed`: of the loci its
+ * name, else its `locus=` key, else its header's words state, the first in
+ * the scope (else the first, which the caller refuses). A record none of
+ * these place takes the one locus of a one-locus scope, as a reference
+ * cell's; else the first locus code anywhere in its name or header
+ * ({@link inferLocus}). Null when nothing names one.
+ */
+function admittedLocus(name: string, header: string, allowed: readonly GermlineLocus[]): GermlineLocus | null {
+  const declared = LOCI.filter((locus) => (declaredLocus(header) ?? "").split(",").includes(locus));
+  for (const stated of [namedLoci(name), declared, headerLoci(header)]) {
+    if (stated.length) return stated.find((locus) => allowed.includes(locus)) ?? stated[0];
+  }
+  if (allowed.length === 1) return allowed[0];
+  return inferLocus(`${name} ${header}`);
+}
+
+/**
+ * The segment an allele name reads as, checked against the database it is in.
+ * IMGT's IgD constant gene (`IGHD*01`) and its J-C cluster orphons
+ * (`IGLJ-C/OR18*01`) are constant-region records whose names read as a D or
+ * a J gene: in a C database they are C.
+ */
+function inferSegment(name: string, database: GermlineSegment): GermlineSegment | null {
+  const upper = name.toUpperCase();
+  if (database === "C" && (/^IGHD(?:\*|$)/.test(upper) || /^(?:IGH|IGK|IGL|TRA|TRB|TRD|TRG)J-C\b/.test(upper))) return "C";
+  const match = /^(?:IGH|IGK|IGL|TRA|TRB|TRD|TRG)([VDJC])/.exec(upper);
   return match ? match[1] as GermlineSegment : null;
 }
 
@@ -696,7 +801,9 @@ function assertChainLocus(
 /**
  * Perform the FASTA preparation done by IgBLAST's `edit_imgt_file.pl` where it
  * is relevant to the aligner: canonicalize the germline identifier and remove IMGT
- * alignment gaps before indexing. Existing SWIGMETA is deliberately removed.
+ * alignment gaps before indexing. Existing SWIGMETA is deliberately removed. A
+ * record whose name places no locus keeps the one its header gives (`locus=`,
+ * else its locus words) as `locus=`, which the engine would otherwise infer.
  */
 export function prepareIgblastStyleGermlineFasta(
   text: string,
@@ -712,12 +819,12 @@ export function prepareIgblastStyleGermlineFasta(
     if (!name) throw new Error(`A ${segment} germline record has an empty identifier.`);
     if (seen.has(name)) throw new Error(`Duplicate ${segment} germline identifier: ${name}.`);
     seen.add(name);
-    const locus = inferLocus(`${name} ${input.header}`);
+    const locus = admittedLocus(name, input.header, allowedLoci);
     if (!locus) throw new Error(`${name} does not identify one of the supported IG/TR loci.`);
     if (!allowedLoci.includes(locus)) {
       throw new Error(`${name} belongs to ${locus}, outside the selected ${allowedLoci.join("/")} search space.`);
     }
-    const detectedSegment = inferSegment(name);
+    const detectedSegment = inferSegment(name, segment);
     if (detectedSegment && detectedSegment !== segment) {
       throw new Error(`${name} looks like a ${detectedSegment} gene, not a ${segment} gene.`);
     }
@@ -727,7 +834,8 @@ export function prepareIgblastStyleGermlineFasta(
     if (!normalized.sequence) throw new Error(`${name} has an empty nucleotide sequence.`);
     ambiguousBases += normalized.ambiguous;
     loci.add(locus);
-    return `>${name}\n${normalized.sequence}\n`;
+    const key = locusKey(name, input.header);
+    return `>${name}${key ? ` locus=${key}` : ""}\n${normalized.sequence}\n`;
   }).join("");
   return { fasta, count: inputRecords.length, ambiguousBases, loci: [...loci].sort() };
 }
@@ -764,16 +872,17 @@ export function applyIgblastInternalData(
   const output = parseFasta(prepared.fasta).map((record) => {
     const name = germlineName(record.header);
     const normalized = normalizeIndexSequence(record.rawSequence);
-    const locus = inferLocus(name)!;
+    const locus = inferLocus(`${name} ${record.header}`)!;
+    const key = locusAttribute(record.header);
     const entry = entries.get(name);
-    if (!entry) { unmatched.push(name); return `>${name}\n${normalized.sequence}\n`; }
+    if (!entry) { unmatched.push(name); return `>${name}${key}\n${normalized.sequence}\n`; }
     assertChainLocus(name, locus, entry.chain, V_CHAIN_LOCI, "IgBLAST internal data");
     const metadata = compactMetadata(entry.frame, -1, entry.bounds, SOURCE_PROVIDED);
     if (!validateMetadata(metadata, normalized.sequence.length, "V")) {
       throw new Error(`IgBLAST internal-data coordinates for ${name} exceed or contradict its ungapped V sequence.`);
     }
     matched += 1;
-    return `>${name}${metadataHeader(metadata)}\n${normalized.sequence}\n`;
+    return `>${name}${metadataHeader(metadata)}${key}\n${normalized.sequence}\n`;
   }).join("");
   return { fasta: output, matched, annotated: matched, total: prepared.count, unmatched };
 }
@@ -816,9 +925,10 @@ export function applyIgblastAuxiliaryData(
   const output = parseFasta(prepared.fasta).map((record) => {
     const name = germlineName(record.header);
     const normalized = normalizeIndexSequence(record.rawSequence);
-    const locus = inferLocus(name)!;
+    const locus = inferLocus(`${name} ${record.header}`)!;
+    const key = locusAttribute(record.header);
     const entry = entries.get(name);
-    if (!entry) { unmatched.push(name); return `>${name}\n${normalized.sequence}\n`; }
+    if (!entry) { unmatched.push(name); return `>${name}${key}\n${normalized.sequence}\n`; }
     assertChainLocus(name, locus, entry.chain, J_CHAIN_LOCI, "IgBLAST auxiliary data");
     const metadata = compactMetadata(entry.frame, entry.cdr3Stop, EMPTY_BOUNDS, SOURCE_PROVIDED);
     if (!validateMetadata(metadata, normalized.sequence.length, "J")) {
@@ -827,7 +937,7 @@ export function applyIgblastAuxiliaryData(
     matched += 1;
     if (entry.cdr3Stop >= 0) annotated += 1;
     if (entry.fwr4EndOffset !== undefined) fwr4EndOffsets[name] = entry.fwr4EndOffset;
-    return `>${name}${metadataHeader(metadata)}\n${normalized.sequence}\n`;
+    return `>${name}${metadataHeader(metadata)}${key}\n${normalized.sequence}\n`;
   }).join("");
   return { fasta: output, matched, annotated, total: prepared.count, unmatched, fwr4EndOffsets };
 }
@@ -855,13 +965,14 @@ export function applyIgblastDFrameData(
   const output = parseFasta(prepared.fasta).map((record) => {
     const name = germlineName(record.header);
     const normalized = normalizeIndexSequence(record.rawSequence);
+    const key = locusAttribute(record.header);
     const frame = entries.get(name);
-    if (frame === undefined) { unmatched.push(name); return `>${name}\n${normalized.sequence}\n`; }
+    if (frame === undefined) { unmatched.push(name); return `>${name}${key}\n${normalized.sequence}\n`; }
     matched += 1;
-    if (frame < 0) return `>${name}\n${normalized.sequence}\n`;
+    if (frame < 0) return `>${name}${key}\n${normalized.sequence}\n`;
     annotated += 1;
     const metadata = compactMetadata(frame, -1, EMPTY_BOUNDS, SOURCE_PROVIDED);
-    return `>${name}${metadataHeader(metadata)}\n${normalized.sequence}\n`;
+    return `>${name}${metadataHeader(metadata)}${key}\n${normalized.sequence}\n`;
   }).join("");
   return { fasta: output, matched, annotated, total: prepared.count, unmatched };
 }
@@ -872,6 +983,41 @@ export function preprocessGermlineFasta(
   templates: MetadataAllele[] = [],
   allowedLoci: readonly GermlineLocus[] = LOCI,
   match: GermlineMatchOptions = {},
+): GermlinePreprocessReport {
+  const origins = new Map<string, RecordOrigin>();
+  const report = preprocessTier(text, segment, templates, allowedLoci, match, origins);
+  refuseUnplaced(origins, allowedLoci);
+  return report;
+}
+
+/**
+ * What a later template tier must know of a record that its input, the
+ * previous tier's output, no longer says: the header it was given, whose
+ * words admit it and state its locus, and the template its metadata came from.
+ */
+interface RecordOrigin {
+  header: string;
+  template?: string;
+  /** Neither its name, its header, its scope nor a template has placed it. */
+  unplaced?: boolean;
+}
+
+function refuseUnplaced(origins: ReadonlyMap<string, RecordOrigin>, allowedLoci: readonly GermlineLocus[]): void {
+  for (const [name, origin] of origins) {
+    if (origin.unplaced) {
+      throw new Error(`${name} names no IG/TR locus and no ${allowedLoci.join("/")} relative places it; name its locus in the header (for example locus=${allowedLoci[0]}).`);
+    }
+  }
+}
+
+/** One template tier; `origins` carries each record's {@link RecordOrigin} between tiers. */
+function preprocessTier(
+  text: string,
+  segment: GermlineSegment,
+  templates: MetadataAllele[],
+  allowedLoci: readonly GermlineLocus[],
+  match: GermlineMatchOptions,
+  origins: Map<string, RecordOrigin>,
 ): GermlinePreprocessReport {
   const matchOptions = resolveGermlineMatchOptions(match);
   const inputRecords = parseFasta(text);
@@ -890,12 +1036,14 @@ export function preprocessGermlineFasta(
     if (!name) throw new Error(`A ${segment} germline record has an empty identifier.`);
     if (seen.has(name)) throw new Error(`Duplicate ${segment} germline identifier: ${name}.`);
     seen.add(name);
-    const locus = inferLocus(`${name} ${input.header}`);
-    if (!locus) throw new Error(`${name} does not identify one of the supported IG/TR loci.`);
-    if (!allowedLoci.includes(locus)) {
+    const origin = origins.get(name);
+    const header = origin?.header ?? input.header;
+    // A record nothing names may still be placed by its template, below.
+    let locus = admittedLocus(name, header, allowedLoci);
+    if (locus && !allowedLoci.includes(locus)) {
       throw new Error(`${name} belongs to ${locus}, outside the selected ${allowedLoci.join("/")} search space.`);
     }
-    const detectedSegment = inferSegment(name);
+    const detectedSegment = inferSegment(name, segment);
     if (detectedSegment && detectedSegment !== segment) {
       throw new Error(`${name} looks like a ${detectedSegment} gene, not a ${segment} gene.`);
     }
@@ -944,13 +1092,26 @@ export function preprocessGermlineFasta(
     if (!annotationPresent(segment, metadata) && warnings.length < 8) {
       warnings.push(`${name}: ${segment === "V" ? "no validated IMGT FWR/CDR delineation" : segment === "J" ? "no unique frame-consistent F/W-G J motif" : "no segment metadata"}.`);
     }
-    loci.add(locus);
-    records.push({ header: input.header, name, rawSequence: input.rawSequence, sequence: normalized.sequence, locus, metadata });
+    const template = transfer?.template ?? origin?.template;
+    locus ??= template ? namedLoci(template).find((candidate) => allowedLoci.includes(candidate)) ?? null : null;
+    if (locus) loci.add(locus);
+    // An unplaced record is refused once no template tier is left to place it.
+    origins.set(name, { header, template, unplaced: !locus });
+    records.push({
+      header: input.header,
+      name,
+      rawSequence: input.rawSequence,
+      sequence: normalized.sequence,
+      // A one-locus scope places what its name and header do not.
+      locusKey: locusKey(name, header, template) || (allowedLoci.length === 1 && !namedLoci(name).length ? allowedLoci[0] : ""),
+      metadata,
+    });
     if (matchOptions.includeDiagnostics) {
       diagnostics.push({
         segment,
         name,
-        locus,
+        // Placeholder for an unplaced record, which a later tier places or which is refused.
+        locus: locus ?? allowedLoci[0],
         status,
         source: metadataSource(metadata),
         template: transfer?.template,
@@ -966,7 +1127,9 @@ export function preprocessGermlineFasta(
   }
 
   const annotated = records.filter((record) => annotationPresent(segment, record.metadata)).length;
-  const fasta = records.map((record) => `>${record.name}${metadataHeader(record.metadata)}\n${record.sequence}\n`).join("");
+  // A record whose name places no locus carries the locus the host checked
+  // (`locus=`), which the engine would otherwise have to infer.
+  const fasta = records.map((record) => `>${record.name}${metadataHeader(record.metadata)}${record.locusKey ? ` locus=${record.locusKey}` : ""}\n${record.sequence}\n`).join("");
   return {
     fasta,
     count: records.length,
@@ -1009,7 +1172,9 @@ function mergeDiagnosticHistory(
 /**
  * Apply the same progressively broadened template search used by the browser
  * worker. Existing valid SWIGMETA is retained, while records still lacking V
- * or J metadata are offered to each successive template tier.
+ * or J metadata are offered to each successive template tier. Each tier reads
+ * a record's original header and earlier template, so a later tier admits and
+ * keys it as the first did.
  */
 export function preprocessGermlineFastaAcrossTiers(
   text: string,
@@ -1020,19 +1185,21 @@ export function preprocessGermlineFastaAcrossTiers(
 ): GermlinePreprocessReport {
   let report: GermlinePreprocessReport | undefined;
   const diagnosticHistory = new Map<string, GermlineRecordDiagnostic>();
+  const origins = new Map<string, RecordOrigin>();
   const tiers = templateTiers.length ? templateTiers : [[]];
   for (let tier = 0; tier < tiers.length; tier += 1) {
-    report = preprocessGermlineFasta(report?.fasta ?? text, segment, [...tiers[tier]], allowedLoci, {
+    report = preprocessTier(report?.fasta ?? text, segment, [...tiers[tier]], allowedLoci, {
       ...match,
       includeDiagnostics: Boolean(match.includeDiagnostics),
       taxonomicTier: tier,
-    });
+    }, origins);
     for (const diagnostic of report.diagnostics ?? []) {
       diagnosticHistory.set(diagnostic.name, mergeDiagnosticHistory(diagnosticHistory.get(diagnostic.name), diagnostic));
     }
     if (segment !== "V" && segment !== "J") break;
     if (report.annotated === report.count) break;
   }
+  refuseUnplaced(origins, allowedLoci);
   if (match.includeDiagnostics) report!.diagnostics = [...diagnosticHistory.values()];
   return report!;
 }

@@ -10,8 +10,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::adjudicate::{
-    Adjudicator, CallModel, DAlleleDecoding, EngineeringObjective, EvidenceModel, Mode,
-    PlacementDag, VdjGrammar,
+    Adjudicator, CallModel, DAlleleDecoding, EngineeringObjective, EvidenceModel, Flank, Mode,
+    PlacementDag, ResolvedOpenFlank, VdjGrammar,
 };
 use crate::admission::{AnyOf, DefaultAdmission, DistributedEvidence, ExactRunFloor};
 use crate::align::{Backend, InterSequenceGotoh};
@@ -235,6 +235,86 @@ impl DPrior {
     }
 }
 
+/// The cost at the open end of a path that ends on a D (no J after it) or
+/// starts on one (no V before it): the log-likelihood ratio that the
+/// missing J (V) stayed undetected in the read bases on that side,
+///
+/// ```text
+/// c(x) = ln(1 + π·(1 − ε_eff(x))/ε_eff(x))
+/// ```
+///
+/// for `x` read bases beyond the D, with `ε` the probability that the
+/// visible part of the missing segment scores below its stage's accept
+/// gate at the read's anchored mismatch rate (beta-binomial), raised to
+/// `miss_floor` ([`crate::adjudicate`]'s `FlankTable`). Chance Ds on reads
+/// without a D lie anywhere in the D window; real ones within the N region
+/// and the D's own unaligned tail of the read end. A far chance D on a read
+/// with a clean V and junk after it therefore pays up to `ln(1 + π/ε_min)`
+/// nats (6.2 at the defaults), and one on a heavily mutated read, whose J
+/// could have been missed, nearly nothing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OpenFlank {
+    /// `N_open`: read bases beyond the D explained without a missing
+    /// segment, N/P bases and the D's unaligned germline (24: the simulated
+    /// distance from a called D to the true J start, or from the V end to
+    /// the D, has p99.9 22–24; real macaque N1 has p99 20).
+    pub n_open: u32,
+    /// `π`, the prior that the bases past an anchor are no junction (½,
+    /// the even odds of [`DPrior::DERIVED`]).
+    pub junk_prior: f64,
+    /// Most visible bases of the missing segment the miss model reads (64).
+    pub max_visible: u32,
+    /// `ε_min`: the miss probability is never taken below it, which bounds
+    /// the cost when the read's V or J is present but missing from the
+    /// database (1e-3, the anchor E-value gate; `None` = no floor).
+    pub miss_floor: Option<f64>,
+}
+
+impl OpenFlank {
+    pub const DEFAULT: Self = Self {
+        n_open: 24,
+        junk_prior: 0.5,
+        max_visible: 64,
+        miss_floor: Some(1e-3),
+    };
+
+    /// The model with the V and J stages' accept gates: the smallest score
+    /// each keeps in a `max_visible`-base window ([`Significance`]), from
+    /// their databases `v` and `j`; a stage without significance turns its
+    /// side off. `d_scoring` gives `λ_D`, the λ of `P*_D`.
+    pub fn resolve(
+        &self,
+        v: &GermlineSet,
+        v_config: &VSegmentConfig,
+        d_scoring: &AffineScoring,
+        j: &GermlineSet,
+        j_config: &JSegmentConfig,
+    ) -> ResolvedOpenFlank {
+        let window = self.max_visible as usize;
+        let accept = |set: &GermlineSet, scoring: &AffineScoring, gates: Option<EvalueGates>| {
+            gates
+                .and_then(|gates| Significance::new(set, scoring, gates))
+                .map(|s| s.min_score(window, s.gates.accept))
+        };
+        let accept = [
+            accept(v, &v_config.scoring, v_config.evalue),
+            accept(j, &j_config.scoring, j_config.evalue),
+        ];
+        ResolvedOpenFlank {
+            n_open: self.n_open,
+            junk_prior: self.junk_prior,
+            max_visible: self.max_visible,
+            miss_floor: self.miss_floor.unwrap_or(0.0),
+            accept,
+            substitution: [
+                (v_config.scoring.matched, v_config.scoring.mismatch),
+                (j_config.scoring.matched, j_config.scoring.mismatch),
+            ],
+            d_lambda: KarlinAltschul::ungapped(d_scoring).map_or(1.0, |ka| ka.lambda),
+        }
+    }
+}
+
 /// Declarative form of [`EngineeringObjective`]; the priors are resolved
 /// against the V, D and J databases when the assigner is built.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -253,6 +333,9 @@ pub struct ObjectiveConfig {
     /// before its J gets one from a few chance bases.
     pub j_prior: DPrior,
     pub insertion_per_base: Score,
+    /// The cost at the open end of a D-first or D-last path ([`OpenFlank`];
+    /// `None` = off).
+    pub open_flank: Option<OpenFlank>,
 }
 
 impl Default for ObjectiveConfig {
@@ -263,23 +346,27 @@ impl Default for ObjectiveConfig {
             d_prior: DPrior::DERIVED,
             j_prior: DPrior::DERIVED,
             insertion_per_base: 0,
+            open_flank: Some(OpenFlank::DEFAULT),
         }
     }
 }
 
 impl ObjectiveConfig {
-    /// The objective for the V database `v` scored with `v_scoring`, the D
-    /// database `d` (none: no D) and the J database `j` scored with
-    /// `j_scoring`.
+    /// The objective for the V database `v` searched by the V stage
+    /// `v_config`, the D database `d` (none: no D) and the J database `j`
+    /// searched by `j_config`. The open-flank cost reads the stages' accept
+    /// gates over `v` and `j` ([`OpenFlank::resolve`]); a locus' objective
+    /// keeps those of the whole databases, which its stages search.
     pub fn resolve(
         &self,
         v: &GermlineSet,
-        v_scoring: &AffineScoring,
+        v_config: &VSegmentConfig,
         d: Option<&GermlineSet>,
         d_config: &DSegmentConfig,
         j: &GermlineSet,
-        j_scoring: &AffineScoring,
+        j_config: &JSegmentConfig,
     ) -> EngineeringObjective {
+        let (v_scoring, j_scoring) = (&v_config.scoring, &j_config.scoring);
         let space = d.map_or(
             DSearchSpace {
                 genes: 1,
@@ -295,6 +382,11 @@ impl ObjectiveConfig {
                 self.j_prior.cost(DSearchSpace::of(j, 1), j_scoring),
             ],
             insertion_per_base: self.insertion_per_base,
+            // Without a D database no path holds a D.
+            open_flank: self
+                .open_flank
+                .filter(|_| d.is_some())
+                .map(|flank| flank.resolve(v, v_config, &d_config.scoring, j, j_config)),
         }
     }
 }
@@ -639,14 +731,10 @@ impl Assigner {
             }
         }
         let strand = StrandIndex::build([&v, &j], StrandIndex::K);
-        let objective = config.objective.resolve(
-            &v,
-            &config.v.scoring,
-            d.as_ref(),
-            &config.d,
-            &j,
-            &config.j.scoring,
-        );
+        let objective =
+            config
+                .objective
+                .resolve(&v, &config.v, d.as_ref(), &config.d, &j, &config.j);
         let mode = if config.calls == CallModel::FixedScale && !config.posterior {
             Mode::Fixed
         } else {
@@ -664,7 +752,9 @@ impl Assigner {
         let dag = |model| PlacementDag::new(grammar, model, min_retained, mode);
         let adjudicator = dag(objective);
         // A V, D or J database of several loci: a read of one locus prices
-        // each segment by that locus' genes.
+        // each segment by that locus' genes, leaving out alleles of
+        // fallback or unknown locus when the locus has definite ones
+        // ([`GermlineSet::counted_part`]).
         let loci: Vec<Locus> = Locus::ALL
             .into_iter()
             .filter(|&l| {
@@ -675,17 +765,38 @@ impl Assigner {
         let locus_adjudicators: Vec<(Locus, PlacementDag)> = if loci.len() > 1 {
             loci.iter()
                 .map(|&locus| {
-                    let part = |set: &GermlineSet| set.subset(|a| a.loci.contains(locus)).0;
+                    let part = |set: &GermlineSet| set.counted_part(locus);
                     let d_part = d.as_ref().map(part).filter(|d| !d.is_empty());
+                    let (v_part, j_part) = (part(&v), part(&j));
                     let model = config.objective.resolve(
-                        &part(&v),
-                        &config.v.scoring,
+                        &v_part,
+                        &config.v,
                         d_part.as_ref(),
                         &config.d,
-                        &part(&j),
-                        &config.j.scoring,
+                        &j_part,
+                        &config.j,
                     );
-                    (locus, dag(model))
+                    // The stages search the whole databases: their gates.
+                    // A locus without V (J) alleles shows none, so its D
+                    // cannot have missed one: that side costs nothing.
+                    let open_flank = objective
+                        .open_flank
+                        .filter(|_| model.open_flank.is_some())
+                        .map(|mut flank| {
+                            for (side, part) in [(Flank::Start, &v_part), (Flank::End, &j_part)] {
+                                if part.is_empty() {
+                                    flank.accept[side as usize] = None;
+                                }
+                            }
+                            flank
+                        });
+                    (
+                        locus,
+                        dag(EngineeringObjective {
+                            open_flank,
+                            ..model
+                        }),
+                    )
                 })
                 .collect()
         } else {
@@ -1017,11 +1128,11 @@ mod tests {
         let lossless = default.d.lossless_min_score();
         let objective = default.objective.resolve(
             &db.v,
-            &default.v.scoring,
+            &default.v,
             Some(&db.d),
             &default.d,
             &db.j,
-            &default.j.scoring,
+            &default.j,
         );
         for (calls, posterior, d_allele) in [
             (CallModel::PerRead, true, DAlleleDecoding::Map),

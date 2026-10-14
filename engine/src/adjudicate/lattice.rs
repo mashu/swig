@@ -98,6 +98,19 @@ pub(super) fn column_steps(
     })
 }
 
+/// Whether a path may step from `b` to `e`: a V that cannot open a D's
+/// flank does not precede a D, and a J that cannot close one does not
+/// follow a D (`closes`, per placement; empty: every one can).
+#[inline]
+pub(super) fn joins(closes: &[bool], b: &Node, e: &Node) -> bool {
+    match (b.kind, e.kind) {
+        _ if closes.is_empty() => true,
+        (SegmentKind::V, SegmentKind::D) => closes[b.placement],
+        (SegmentKind::D, SegmentKind::J) => closes[e.placement],
+        _ => true,
+    }
+}
+
 /// D segments up to and including a node, and the path's first kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Group {
@@ -159,6 +172,11 @@ pub(super) struct Lattice {
     edges: Vec<(u32, u32)>,
     /// `(group, predecessor node, predecessor slot)` while a node opens.
     pending: Vec<(u32, u32, u32)>,
+    /// Per placement: whether a V or J can open or close a D's flank
+    /// ([`super::units::FlankTable::closes`]); empty: every one can.
+    closes: Vec<bool>,
+    /// Whether some placement cannot.
+    blocks: bool,
 }
 
 impl Lattice {
@@ -241,7 +259,10 @@ impl Lattice {
         for (b, before) in self.nodes[..self.predecessors(e)].iter().enumerate() {
             for t in before.slots() {
                 let group = self.slots[t].group;
-                if !(live(t) && grammar.can_follow(before.kind, node.kind, group.d_used)) {
+                if !(live(t)
+                    && grammar.can_follow(before.kind, node.kind, group.d_used)
+                    && (!self.blocks || joins(&self.closes, before, &node)))
+                {
                     continue;
                 }
                 let next = group.then(node.kind);
@@ -297,6 +318,20 @@ impl Lattice {
             .map(move |&o| (o, at + o))
             .take_while(move |&(_, y)| y < end)
             .filter_map(move |(o, y)| y.checked_sub(start).map(|z| (o as usize, z as usize)))
+    }
+
+    /// Which placements can open or close a D's flank (empty: all).
+    pub fn set_closes(&mut self, closes: &[bool]) {
+        self.closes.clear();
+        self.closes.extend_from_slice(closes);
+        self.blocks = closes.contains(&false);
+    }
+
+    /// Whether a D may follow `node` on a path: false only for a V that
+    /// cannot open a D's flank ([`joins`]).
+    #[inline]
+    pub fn opens(&self, node: &Node) -> bool {
+        !self.blocks || node.kind != SegmentKind::V || self.closes[node.placement]
     }
 
     /// The slot of `node` holding `group`, if opened.

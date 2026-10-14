@@ -14,7 +14,7 @@ instead of tuned patches. Every component is a replaceable, statically
 dispatched trait, and every search shortcut is either lossless or measured
 on simulated repertoires.
 
-The crate and binary are `swig` 0.39.4. The workspace member `wasm/` (crate
+The crate and binary are `swig` 0.39.5. The workspace member `wasm/` (crate
 `swig_wasm`) is the WebAssembly module. There are no dependencies; Rust ≥
 1.89, edition 2024. The alignment kernel runs on AVX-512BW, AVX2, NEON,
 WebAssembly SIMD or portable lanes, chosen at run time (on WebAssembly, at
@@ -118,17 +118,18 @@ options (`swig --help` prints them):
 | `--min-identity F` | drop V, D and J hits whose local alignment, before the stitched outer flank, is below identity F (0–1; default none); under the pair guards, also a call that keeps a part of a V or J below F |
 | `--no-anchor-window` | do not add the conserved-anchor D window |
 | `--no-posterior` | skip the V, D, J and D-presence posteriors (~30 % faster) |
-| `--no-pair-guards` | turn off SwiftIG's plausibility guards, on by default (see *Plausibility guards*): hit floors, V–J pairing, the junction span, D only between V and J, junctions only from aligned anchors |
+| `--no-pair-guards` | turn off SwiftIG's plausibility guards, on by default (see *Plausibility guards*): hit floors, V–J pairing, the junction span, a D only beside a V or a J (both, paired, without the open-flank cost), junctions only from aligned anchors |
 | `--calls per-read\|fixed` | the model the call maximises: each read's own (default; the model its posteriors come from) or the fixed `(2, −3)` scores |
 | `--d-allele map\|max-marginal` | report the call's D allele (default) or the one of largest posterior marginal given the call's D presence and topology (needs posteriors) |
 | `--d-presence-rate R` | D prior from the D search's own chance-hit count at D-presence rate R, 0 < R < 1 (see *The model in brief*) |
+| `--d-open-flank on\|off` | charge a D that ends (starts) its path for the J (V) the read would show in the bases after (before) it, and call such a D under the pair guards (default `on`; `off`: a D only between a V and a J that pair, 0.39.4's rule; see *The model in brief* and *Plausibility guards*) |
 | `--min-d-match N` | shortest exact run of an admissible D (default: the profile's) |
 | `--d-mismatch S`, `--j-mismatch S` | D or J mismatch score, negative (default: the profile's) |
 | `--min-j-length N` | fewest aligned J columns of a J hit (default none) |
 | `--c-evalue E` | call C when its anchored E-value is at most E (default 10⁻³; needs `--c`) |
-| `--c-min-identity F` | call C only on at least 12 aligned columns at identity F or more (default 0.9, SwiftIG's floor; 0 removes the identity floor, not the 12 columns) |
-| `--c-prefix-identity F` | report C only where the germline from its first base reaches identity F (default 0, off) |
-| `--double-d off\|all\|long-span` | Swig's double-D screen (default off); needs `--double-d-out FILE` |
+| `--c-min-identity F` | call C only on at least 12 aligned columns at identity F or more (default 0.9, SwiftIG's floor; 0 removes the identity floor, not the 12 columns; without `--c` it is run with a warning) |
+| `--c-prefix-identity F` | report C only where the germline from its first base reaches identity F (default 0, off; above 0 needs `--c`) |
+| `--double-d off\|all\|long-span` | Swig's double-D screen (default off); needs `--double-d-out FILE`, and `all` and `long-span` need `--d` |
 | `--double-d-min-span N`, `--double-d-seed-length N`, `--double-d-pseudo-trim N`, `--double-d-pseudo-mismatches N`, `--double-d-min-gain S` | the screen's evidence rules (defaults 40, 11, 5, 3, 8) |
 | `--simd NAME` | alignment kernel: `avx512`, `avx2`, `neon`, `portable` or `scalar` (default: the fastest this CPU runs, AVX-512 excepted) |
 
@@ -159,21 +160,41 @@ so the cache changes no output.
 
 The command line rejects an option that takes a value given twice (a
 repeated flag changes nothing), a FASTQ file passed as a germline database,
-`--double-d` without `--double-d-out` and the reverse, and `--c-evalue`
-without `--c`. A debug build prints a warning, because it is 10–50× slower.
-The database summary, warnings and throughput go to stderr.
+and `--double-d` without `--double-d-out` and the reverse. An option that
+filters or adds to the output is refused without the database it needs, as
+a usage error before any database is read: `--c-evalue` and
+`--c-prefix-identity` above 0 without `--c`, and `--double-d all` or
+`long-span` without `--d`. An option that only tunes a stage the run does
+not have is run and named in a warning, since it changes nothing: the D
+options (`--min-d-match`, `--d-mismatch`, `--d-presence-rate`, `--d-allele`,
+`--no-anchor-window`, `--d-open-flank off`) without `--d`, `--c-min-identity`
+without `--c`, the screen's rules without `--double-d`, and `--d-allele
+max-marginal` with `--no-posterior`. `--no-pair-guards` acts on V and J,
+which every run has, and needs no database. A profile is a bundle and is
+never reported. With the screen on, D alleles
+shorter than `--double-d-seed-length` are named too, since the screen
+cannot see them. The WebAssembly module refuses the same options (an empty
+D or C text is no database) and adds the warnings to its summary
+(`RunOptions::check_databases`, `Run::warnings`). A debug build prints a
+warning, because it is 10–50× slower. The database summary, warnings and
+throughput go to stderr.
 
 **Germline databases** are FASTA and may hold several loci. IMGT reference
 headers (`accession|allele|species|…`) are read as the allele name, and
 identical sequences are merged and reported under all their names. Anchors
 and V region boundaries come from the headers where present and are
 detected otherwise, on every start (see *Germline annotation and regions*).
-Names must read `GENE*ALLELE`, as IMGT's do: the part before `*` is the
-gene, and a name without `*` is a gene of its own. V retrieval keeps
-candidates by gene (3 genes, up to 16 within the leader's vote noise), so
-without `*` that budget caps alleles: on human IGH at 30 % SHM, renaming
-`*` to `_a` costs 8.2 points of V allele accuracy. `prepare` and
-assignment warn when more than 16 V names hold no `*`.
+Names should read `GENE*ALLELE`, as IMGT's do: the part before `*` is the
+gene. V retrieval keeps candidates by gene (3 genes, up to 16 within the
+leader's vote noise), so a V name without `*` is given a gene by sequence:
+it joins the gene of its closest `*`-named relative when their local score
+is at least 0.95 of the smaller self-score (about 2 % divergence), else the
+names without `*` group among themselves at the same level, a group taking
+its first name as gene (`gene=` in a prepared header). Reported names do
+not change. On human IGH at 30 % SHM, renaming every `*` to `_` cost 8.2
+points of V allele accuracy before this grouping and +0.10 (not
+significant) with it. `prepare` and assignment warn when more than 16 V
+names hold no `*` and have no close relative.
 As with the reads, a leading UTF-8 byte-order mark is skipped and a byte
 that is no UTF-8 (a Latin-1 description) reads as U+FFFD.
 
@@ -305,11 +326,27 @@ Web and swig-cli always run with them.
 - **Clipped segments stay viable.** Where the call clips a V or J, the part
   of its local alignment that the call keeps scores above 0 and meets
   `--min-identity` (0.6 in Swig Web and swig-cli).
-- **A D only between a V and a J.** A call with a D also holds a V and a
-  J, and they pair. SwiftIG paired V and J before it looked for a D; here
-  a path whose D stands beside only a V or only a J breaks the guards, and
-  the read is re-adjudicated as below, so a D on a read without a V or a J
-  is not called.
+- **A D beside a V or a J, charged for the one it lacks.** A call with a D
+  also holds a V or a J; when it holds both, they pair. A path whose D ends
+  it (no J after it) or starts it (no V before it) keeps the guards only
+  under the open-flank cost (`--d-open-flank on`, the default; *The model in
+  brief*), which charges that D for the J or V the read would show in the
+  bases beyond it. Such a D must also lie where a read without the J (V)
+  would have searched it: it ends at most 60 bases (the D window's reach,
+  `ExpandedResidual::reach`) after the end of the V placement, or starts at
+  most 60 bases before the start of the J placement. A J (V) that the guards
+  drop therefore no longer lets the D lie beyond that reach. It still bounds
+  the window the D placements come from, one alignment per D allele: an
+  allele that aligns best across or beyond the 60 bases has no placement
+  within them. The read then keeps no D of that allele there, where the
+  same read without the J would. A chance J between the V and the D can
+  also narrow where the D may lie: the D window ends 12 bases after the
+  first J placement, used or not, so a D at the read's end beyond such a J
+  is not found (on simulated IGH reads cut after their D this costs about
+  5.5 points of right D calls, 92.2 % against 97.8 %). With
+  `--d-open-flank off` a D needs a V and a J that pair, as in SwiftIG,
+  which paired V and J before it looked for a D, and as in 0.39.4. A path
+  of a D alone is never a call.
 
 **When the best path breaks a guard.** The guards are not part of the
 DAG's objective. Each read is adjudicated as before; when its best path
@@ -317,14 +354,25 @@ keeps the guards, checking it is their whole cost. Otherwise
 the read's placements are adjudicated again in subsets: the V placements
 alone, the J placements alone, and, for each J placement, the V placements
 that pair with it and that J, once with every D placement and once
-without. The call is the best of
-the subsets' optima that keep the guards, compared by value at the read's
-divergence (every subset is read at the same `p̂`); an exact tie keeps the
-earlier subset, and a read none of whose subset optima keeps the guards is
-not called. The posteriors are those of the subset that gives the call. As
-in SwiftIG, a chimeric read, a V fragment that stops short of its 3′ end, a
-J aligned only deep inside, or a V and a J hundreds of bases apart then
-keeps its better segment instead of becoming a rearrangement. On 20,000
+without; under the open-flank cost also V placements with the D
+placements within their reach, and D placements with the J placements
+they lie within the reach of (listed last: for each end of a V placement,
+the V placements that end there or later with the Ds that end at most 60
+bases after it, and the same from the J side). The
+call is the best of the subsets' optima that keep the guards, compared by
+value in the read's context (every subset is read at the same divergence
+`p̂`, and its open ends are charged over the whole read's length); an exact
+tie keeps the earlier subset, and a read none of whose subset optima keeps
+the guards is not called. A read whose J does not pair with its V (a
+chance J, or one beyond the junction span) thus can keep its V–D path
+when the D's alignment ends within 60 bases of the V's end and pays for
+the bases after it. A D further on is not called beside the V, as on the
+same read without the J. Nor is the part within the 60 bases of a D whose
+allele aligns best across or beyond them. The posteriors are those of
+the subset that gives the call. As in SwiftIG, a chimeric read, a V
+fragment that stops short of its 3′ end, a J aligned only deep inside, or
+a V and a J hundreds of bases apart then keeps its better segment instead
+of becoming a rearrangement. On 20,000
 simulated human BCR reads per preset the guards changed the V, D or J call
 or its coordinates on 0 mid and 9 hard reads, and CPU time is unchanged
 (within ±2 % on 10,000 simulated reads, one thread).
@@ -353,17 +401,42 @@ against 0.39.3, which had no guards:
 On 1,000 mid IGH reads cut 30 or 100 random bases after their V, 0.39.3
 called a D on 70.0 and 92.5 % of reads, and 0.39.4 on 0.3 and 0.5 % (each
 with a chance J); behind 30 or 100 random bases before their J, a D on 81.0
-and 95.9 % and a V on 7 of 2,000 reads, and now on none. With
-`--no-pair-guards` the calls are those of 0.39.3 except for C and FWR3.
+and 95.9 % and a V on 7 of 2,000 reads, and 0.39.4 on none. 0.39.4 thereby
+also took the D of every read that holds one but stops before its J or
+starts after its V, as SwiftIG did. Since 0.39.5 such a D is called again
+when it pays the open-flank cost, which removes most chance Ds far from
+the read's V or J but not those within about 30 bases of it. With the
+frozen suite's IGH database, D right on reads that hold a D, and D called
+on D-free reads (600 mid reads each):
 
-Two costs remain. The D rule also takes the D of a read that holds one but
-starts after its V, as SwiftIG did: on 952 mid IGH reads with a D, cut
-where their V ends, 0.39.3 called the right D on 878 and 0.39.4 on none;
-keeping the last 30, 40 or 60 V bases, 0.39.4 calls it on 805, 866 and 880
-reads (0.39.3: 881, 881 and 880). And a V of 30–60 bases before a J of
-another locus can still pair with a J of its own locus that aligns to the
-read well enough to be significant on its own: of 168 such constructed
-reads, 10 are called productive (0.39.3: 30; SwiftIG: none).
+| | 0.39.3 | 0.39.4 | 0.39.5 |
+|---|---|---|---|
+| right D, reads cut at their D's end (4,309 mid / 4,251 hard) | 90.2 / 84.2 % | 0.0 / 0.0 % | 92.2 / 86.3 % |
+| right D, reads ending 0–20 nt into their J (1,500 mid / 1,500 hard) | 91.2 / 83.1 % | 49.7 / 41.5 % | 91.7 / 83.8 % |
+| right D, reads starting after their V (1,913 mid) | 93.1 % | 0.0 % | 93.1 % |
+| D called, a V then 100 random bases / 100 random bases then a J | 93.5 / 97.7 % | 0.2 / 0.0 % | 3.2 / 9.5 % |
+| D called, a V then 30 random bases / 30 random bases then a J | 72.0 / 79.8 % | 0.0 / 0.0 % | 72.8 / 79.3 % |
+
+On full-length reads 0.39.5 calls as 0.39.4 does, except where the J (or
+V) of a read is missed or fails the guards: on the frozen suite only 3 IGH
+hard reads (3 right D gained) and 250 IGH reads at 30 % SHM change a D
+call (82 right D gained, none lost; the D-presence Brier score falls from
+0.123 to 0.042). Of the 250, 240 are called with a V and no J and 10 with
+a J and no V. Most of these new D calls are wrong: of the 250, 155 name a
+wrong allele (96 of them away from the true D) and 13 fall on D-free reads,
+because a heavily mutated V aligns short of its end and the D found within
+60 bases of it is often a chance hit. Against 0.39.3, the set's 3,000
+reads lose 28 right D calls and gain 2. On all 28, 0.39.3 called a J that
+0.39.5 does not. 21 are among the 250, and on the other 7 neither 0.39.4
+nor 0.39.5 calls a D. With `--no-pair-guards` the calls are those of
+0.39.3 with the open-flank cost, except for C and FWR3; with
+`--d-open-flank off` they are 0.39.4's, byte for byte on the suite's
+databases.
+
+One cost remains: a V of 30–60 bases before a J of another locus can still
+pair with a J of its own locus that aligns to the read well enough to be
+significant on its own: of 168 such constructed reads, 10 are called
+productive (0.39.3: 30; SwiftIG: none).
 
 ## Double-D screen
 
@@ -383,7 +456,10 @@ evidence rules:
   6–24) of a D allele of the read's locus, or a `max(6, L − 3)` rescue word
   whose ungapped extension reaches `L` aligned bases. Seeds extend without
   gaps (match +2, mismatch −2) to their best-scoring prefix on each side;
-  hits on one allele diagonal count once.
+  hits on one allele diagonal count once. A D allele shorter than the seed
+  length is not indexed, and the run names it in a warning: at the default
+  11 the screen cannot see TRDD1 (8 nt) or TRDD2 (9 nt), so it finds no
+  TRD tandem.
 - **Gain.** Two ordered, non-overlapping hits score at least
   `--double-d-min-gain` (8) above the best single hit.
 - **Pseudo-tandem veto.** The read from D1's start to D2's end, shortened
@@ -521,11 +597,41 @@ the message in the error buffer. Results stay readable until the next call.
 
 One database may hold several loci, as Swig composes them: IGH, IGK and IGL
 for a BCR study, or the TR loci (TRA, TRB, TRD, TRG). Each allele's locus is
-read from its name (`IGHV1-2*02`, `TRBJ2-7*01`: the locus code that occurs
-first, case-insensitively), or from the whole FASTA header when the name
-holds none. Shared TRA/TRD V genes (`TRAV14/DV4`) belong to both loci. An
-allele whose locus cannot be read belongs to every locus, so a database of
-unrecognised names is assigned as a single locus (`locus.rs`).
+found in this order (`locus.rs`, `locus_infer.rs`, `prepare.rs`):
+
+1. a `locus=` header key (`locus=IGK`, `locus=TRA,TRD`), as `swig prepare`
+   writes it;
+2. its name (`IGHV1-2*02`, `TRBJ2-7*01`: the first locus code that starts a
+   word and is followed by a segment letter, case-insensitively; for IGH
+   also an isotype letter, `IGHG1`, `IGHT2D`, `IGHZ`, `IGHO`, `IGHY`), else
+   a gene name in the header's free text. Shared TRA/TRD V genes
+   (`TRAV14/DV4`) belong to both loci;
+3. for a V, J or C allele whose name places it nowhere (`novel_1`,
+   `sample7_J1*01`), the locus of its closest relatives: the database's own
+   named alleles of the kind, else an embedded panel of 269 human and mouse
+   V, J and C family representatives. A relative must align clearly (a local
+   score of at least 30, and 0.3 of the allele's score against itself for
+   the database's alleles; for the panel's 0.1 for V and C, 0.5 for the
+   short J); every locus within 15 of the best counts. As the panel is of
+   another species for most databases, a J or C it places keeps only the
+   loci of the database's V alleles, and a V it places weakly in TRA alone
+   or TRD alone takes both (the two loci share V genes);
+4. otherwise the loci the database names: a D allele (too short to place by
+   sequence) the loci with D genes (IGH in a BCR database, TRB and TRD in a
+   TCR one), a V, J or C allele every locus the database names. In a
+   database of several loci this is warned about once per kind, listing the
+   alleles. Only an allele of a database that names no locus at all keeps
+   every locus, which is warned about too.
+
+`swig prepare` writes the result as `locus=` (with `locus_source=relative`
+or `fallback` for the inferred ones), so a reload does not infer again. Steps
+3 and 4 cost nothing when every name places its locus, as in every shipped
+reference. **Give custom-named alleles a `locus=` key** when the warnings
+appear: the fallback cannot tell a custom TRB D from a TRD D, so TRDD alleles
+then compete on TRB reads. Swig Web and swig-cli write `locus=` for the
+custom records of a reference cell or of `prepare-reference` themselves, and
+`swig-cli --vdj` keeps the locus a header gives (`locus=TRB`, or a locus word
+such as `TRB`).
 
 - **One locus per rearrangement.** J candidates must share a locus with the
   read's anchoring V placements (every locus when no V placement anchors),
@@ -541,17 +647,22 @@ unrecognised names is assigned as a single locus (`locus.rs`).
   pair guards on its own (*Plausibility guards*). The posteriors are
   the mixture over loci weighted by their likelihoods `Z`, so under
   `--calls fixed` the called locus can hold less than half of the posterior.
-  C joins a J of its own locus. `locus` reports the locus the path's
-  alleles share, empty when it is unknown.
+  C joins the locus the path's V, D and J share (an allele of unknown locus
+  constrains nothing), else its J's. `locus` reports the locus the path's
+  alleles share, empty when it is unknown (a fallback to several loci
+  counts as unknown).
 - **Per-locus annotation.** The V and J alleles of each locus are annotated
   on their own: chain type, FR3 length model and Cys23 priors differ between
   heavy and light chains and between TR loci.
 - **Per-locus priors and gates.** A D database of several loci (TRB and TRD)
   prices a D by its own locus' D genes (`P_D`, below), and the C gate's
-  `N_C` counts the C genes of the read's locus only.
+  `N_C` counts the C genes of the read's locus only. Alleles placed by the
+  fallback (step 4) can be called in every locus they pair with but count
+  towards no locus that has alleles of a definite locus.
 
 `tests/loci.rs` assigns IGH and IGK reads against one IGH + IGK database:
-every called allele belongs to the read's locus, and no IGK read gets a D.
+every called allele belongs to the read's locus, and no IGK read gets a D,
+also when the D (or J) alleles have custom names.
 
 ## Germline annotation and regions
 
@@ -861,6 +972,34 @@ The full description, with the guarantee of each search step, is in
   measuring; at the simulator's own rate (0.94) D-free specificity fell
   14–26 pp. The rate has to come from the user, so it is not the default
   (ASSESSMENT §9.9).
+- **A D at a path's open end pays for the J (V) it implies.** A path that
+  ends on a D claims a junction whose J the read does not show in the bases
+  after it (a path that starts on a D, a V missed before it). Past 24 free
+  bases (N/P and the D's unaligned tail), the D pays
+  `ln(1 + ½·(1 − ε)/ε)` nats, where `ε` is the probability that the missing
+  segment's visible bases stay below its stage's accept score at the read's
+  mismatch rate (beta-binomial over the anchored V and J columns). `ε` never
+  drops below the floor `ε_min = 10⁻³`, so the cost is at most 6.2 nats even
+  when the read's J (V) is present but missing from the database; a locus
+  whose database part has no J (V) at all pays nothing on that side, and a
+  V or J too weak to pay for itself cannot open or close a D's flank. With
+  a derived D prior (the default profile `r`, and `sensitive-d`), a chance
+  D far from the anchor of a D-free read goes (a V followed by 100 random
+  bases: 93.5 % → 6.8 % D calls, `sensitive-d` 99.3 % → 9.5 %; 100 random
+  bases then a J: 97.7 % → 10.2 %, `sensitive-d` 99.7 % → 18.2 %, all
+  without the pair guards; with them 3.2 and 9.5 % on the default profile);
+  full-length reads keep their calls. The profiles `truth` and `igblast`
+  charge no D prior (`P*_D = 0`), so a chance D scoring a dozen points
+  outweighs the 6.2-nat ceiling and most stay (`truth`: 93.7 % → 92.8 % and
+  97.8 % → 96.2 %). A chance D within about 30 bases of the anchor sits
+  where a real D sits and stays. Real N/P regions longer than about 24
+  bases at a read that ends in its J lose some D calls (1.1 pp at 26–30
+  bases). The pair guards let such a D be called only because it pays
+  this cost (*Plausibility guards*). `--d-open-flank off` turns the cost
+  off (docs/ALGORITHM.md §2.3) and with it the D at a read's open end; on a
+  database whose allele names all name their locus and gene, as every
+  shipped reference does, that gives 0.39.4's calls (and with
+  `--no-pair-guards` too, 0.39.3's apart from C and FWR3).
 - **Significance.** A V or J hit is kept at E ≤ 1 against its database and
   window. A read is called only when its path contains an *anchor*, a V or J
   hit at E ≤ 10⁻³ whose clip on the path still scores that much, so random
@@ -868,8 +1007,8 @@ The full description, with the guarantee of each search step, is in
 - **Plausibility guards.** SwiftIG's checks on hits and V–J pairs (see
   *Plausibility guards*) are constraints outside the objective: the call is
   the best path that keeps them, found by re-adjudicating subsets of the
-  placements only when the best path breaks one. A D needs a V before it
-  and a J after it.
+  placements only when the best path breaks one. A D needs a V or a J
+  beside it, and a V and a J that pair when the open-flank cost is off.
 - **Constant region.** C is spliced to J at a fixed phase, so C's base 0
   lies next to the J's exit; the engine places it within `s = 7` bases, as
   SwiftIG anchored C (its first aligned base up to 8 bases after the J and
@@ -1332,6 +1471,27 @@ window; searching J over the whole read lets 0.05 % fall outside.
   not the fixed-scale path; at 11.2 % the fixed path exactly), and
   `conditioned_dag_equals_exhaustive_enumeration` checks the masked,
   topology-restricted pass behind max-marginal D decoding.
+  `open_flank_dag_equals_exhaustive_enumeration` repeats it with the
+  open-flank cost on and off, and
+  `guarded_calls_with_open_flanks_equal_the_exhaustive_subset_optima` checks
+  the pipeline's call under the pair guards and the cost together, in both
+  call models with posteriors: on whole reads, reads cut at their D, reads
+  starting after their V, D-free reads with random tails and reads whose J
+  lies beyond the junction span, the call keeps the guards, re-scores on all
+  the read's placements to the oracle's value (and its fixed score to the
+  oracle's fixed value), never beats the unguarded optimum and equals it when
+  that keeps the guards, is otherwise the best guard-keeping subset optimum
+  (each the DAG's and the exhaustive search's alike), and reports the
+  posterior of the subset that gave it. It also states the rule on its own
+  (`CombineRule`: SwiftIG's per-segment floor and pairing from the engine,
+  the 225-base span and the 60-base reach of an open-end D written out),
+  checks that the engine's verdict agrees with it on every call, unguarded
+  optimum and subset optimum, and counts the calls that a path the rule
+  admits beats, over every choice of at most one V, D and J among the
+  read's best placements: none of 435 per-read calls and 1 fixed-scale
+  call (at most 2 allowed). `without_the_cost_or_the_guards`
+  checks that without the cost no D stands without a V and a J, and that
+  without the guards the call is the exhaustive optimum.
 - **Kernel exactness:**
   - The scalar kernel equals a textbook Gotoh across three gap regimes.
   - Every traceback rescores to its reported score.
@@ -1358,7 +1518,11 @@ window; searching J over the whole read lets 0.05 % fall outside.
   reads, with and without `--no-pair-guards`: a V fragment 220 bases short
   of its 3′ end does not pair with a J 20 bases later; V and J more than
   225 bases apart do not pair (200 apart, they do); 8 bases of J after 12
-  random ones are no J call; a D needs a V and a J; a V cut before Cys104
+  random ones are no J call; a D needs a V and a J without the open-flank
+  cost (`tests/combine.rs`: with it, a D at the read's open end is called
+  and charged, a J beyond the junction span gives way to the V and its
+  D, and a D more than 60 bases from the V whose J the guards drop is not
+  called beside it); a V cut before Cys104
   pairs with its J but gets no junction; a short V does not pair with a
   chance J; C is called up to 7 bases off the splice and not below 12
   columns at 90 %.
@@ -1382,10 +1546,14 @@ window; searching J over the whole read lets 0.05 % fall outside.
   read equal to `AirrRecord::from_call`, that repeated sequences within and
   across batches reuse their rows under their own identifiers and
   qualities, that the double-D screen leaves the AIRR rows unchanged and
-  writes well-formed sidecar rows for tandem-D reads, and that `--c-evalue`
-  needs a C database. `wasm/src/lib.rs` checks that the ABI's rows equal
-  `Run::write_airr` for FASTA and AIRR-table input, and that options
-  rebuild the run and bad ones are refused. `metadata.rs` checks that
+  writes well-formed sidecar rows for tandem-D reads, and that options are
+  refused or reported against the databases a run has (a table of every
+  refusal and warning, and the D alleles the screen cannot see).
+  `wasm/src/lib.rs` checks that the ABI's rows equal `Run::write_airr` for
+  FASTA and AIRR-table input, that options rebuild the run and bad ones are
+  refused, and that an option without its database is refused at load or
+  named in the summary's warnings; `tests/cli.rs` that the command line
+  refuses one as a usage error before reading any database. `metadata.rs` checks that
   `SWIGMETA` fields are read and malformed ones rejected.
 - **Platforms:** in the standalone project's CI the suite passed on x86-64
   and AArch64 Linux, with AArch64 output equal to x86-64 output byte for
@@ -1455,7 +1623,8 @@ Each is a named field you can change.
    best anchoring V, and from the read's start when no V anchors; only
    anchors choose the locus of the J and D candidates. Without a J (or V)
    the D window reaches 60 bases past the V (before the J), the D and its N;
-   under the pair guards such a read gets no D, since a D needs a V and a J.
+   under the pair guards such a D is called only when it pays the
+   open-flank cost (with `--d-open-flank off`, never).
    When the anchors share no locus (a read holding two chains, as an scFv
    does), each of their loci with D genes bounds a D window by its own V
    and J.

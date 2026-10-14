@@ -185,7 +185,7 @@ impl ConstantStage {
         let locus_significance = if loci.len() > 1 {
             loci.into_iter()
                 .filter_map(|locus| {
-                    let (part, _) = set.subset(|a| a.loci.contains(locus));
+                    let part = set.counted_part(locus);
                     let gate =
                         AnchoredSignificance::new(&part, &scoring, config.spread, config.evalue)?;
                     Some((locus, gate))

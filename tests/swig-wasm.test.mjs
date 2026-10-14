@@ -3,8 +3,9 @@ import fs from "node:fs";
 import test from "node:test";
 import zlib from "node:zlib";
 
-import { AlignerEngine } from "../src/aligner-engine.ts";
+import { AlignerEngine, alignerOptions } from "../src/aligner-engine.ts";
 import { preprocessGermlineFasta } from "../src/germline-preprocess.ts";
+import { compileReferences } from "../src/reference-pack.ts";
 import { inferLineageGermline, lineageInputFasta } from "../src/lineage-alignment.ts";
 import { streamSequenceBatches } from "../src/sequence-stream.ts";
 import {
@@ -69,6 +70,11 @@ async function makeRuntime() {
 
   function setCallingProfile(profile) {
     return setOption("profile", profile);
+  }
+
+  /** The `{summary, warnings}` that the last `initialize` left in the result buffer. */
+  function summary() {
+    return JSON.parse(read(exports.swig_result_ptr(), exports.swig_result_len()));
   }
 
   function setConstantPrefixIdentity(identity) {
@@ -137,6 +143,7 @@ async function makeRuntime() {
     setCallingProfile,
     setConstantPrefixIdentity,
     setOption,
+    summary,
     error,
   };
 }
@@ -1098,4 +1105,129 @@ test("truncated AIRR coordinates restore non-trimmable lineage guide flanks", as
   assert.equal(input.inferred.restoredVPrefix, prefixLength);
   assert.equal(input.inferred.restoredJSuffix, suffixLength);
   assert.ok(input.fasta.includes(`\n${"-".repeat(prefixLength)}${values.sequence_alignment}${"-".repeat(suffixLength)}\n`));
+});
+
+const webDefaults = {
+  callingProfile: "r_optimized",
+  minimumIdentity: 0.6,
+  minimumConstantPrefixIdentity: null,
+  strand: 0,
+  doubleD: { mode: "off", minimumVjSpan: 40, seedLength: 11, pseudoTrim: 5, maximumPseudoMismatches: 3, minimumScoreGain: 8 },
+};
+
+/** Pack reference sets without C (Mus musculus TRA) and without D (human IGK). */
+function referencesWithout(missing) {
+  const [speciesName, scope] = missing === "C" ? ["Mus musculus", "TRA"] : ["Homo sapiens", "IGK"];
+  const compiled = compileReferences(pack.species.find((entry) => entry.name === speciesName), scope);
+  assert.equal(compiled.counts[missing], 0, `${speciesName} ${scope} has ${missing}`);
+  return compiled;
+}
+
+test("an option without the germlines it needs is refused; one that only tunes a missing stage is named", async () => {
+  const human = pack.species.find((entry) => entry.name === "Homo sapiens");
+  const heavy = referenceFor(human.loci.IGH);
+  assert.ok(heavy.references.D && heavy.references.C);
+  // Blank D or C text is no database, as on the native route.
+  for (const [name, value, references, message] of [
+    ["c-prefix-identity", 0.97, { ...heavy.references, C: " \n" }, /--c-prefix-identity needs a C database \(--c\)/],
+    ["c-evalue", 0.01, { ...heavy.references, C: "" }, /--c-evalue needs a C database \(--c\)/],
+    ["double-d", "all", { ...heavy.references, D: "" }, /--double-d needs a D database \(--d\)/],
+    ["double-d", "long_span", { ...heavy.references, D: "" }, /--double-d needs a D database \(--d\)/],
+  ]) {
+    const runtime = await makeRuntime();
+    assert.equal(runtime.setOption(name, value), 0, runtime.error());
+    assert.throws(() => runtime.initialize(references), message, `${name} ${value}`);
+    // With its database the same option runs.
+    assert.ok(runtime.initialize(heavy.references) > 0, runtime.error());
+  }
+  // The C identity floor (0.39.4) only tunes the C stage: without C it runs and is named
+  // among the warnings; the pair guards act on V and J and need no database.
+  for (const [name, value, warning] of [
+    ["c-min-identity", 0.8, "--c-min-identity has no effect without a C database (--c)"],
+    ["no-pair-guards", "", null],
+  ]) {
+    const tuned = await makeRuntime();
+    assert.equal(tuned.setOption(name, value), 0, tuned.error());
+    assert.ok(tuned.initialize({ ...heavy.references, C: "" }) > 0, tuned.error());
+    const warnings = tuned.summary().warnings.filter((w) => /no effect|needs a/.test(w));
+    assert.deepEqual(warnings, warning ? [warning] : [], name);
+  }
+  // 0 turns the C-prefix gate off: nothing to refuse.
+  const runtime = await makeRuntime();
+  assert.equal(runtime.setConstantPrefixIdentity(0), 0);
+  assert.ok(runtime.initialize({ ...heavy.references, C: "" }) > 0, runtime.error());
+  assert.equal(runtime.annotate(`>q\n${heavy.sequence}\n`, 1).count, 1);
+
+  // Through the wrapper the hosts use: the C gate and the screen are refused on pack
+  // selections without their germlines, and IgBLAST-style D tuning without D runs with a
+  // warning in the summary.
+  const module = await WebAssembly.compile(wasmBytes);
+  await assert.rejects(
+    AlignerEngine.create(module, { ...webDefaults, minimumConstantPrefixIdentity: 0.97 }, referencesWithout("C")),
+    /--c-prefix-identity needs a C database/,
+  );
+  await assert.rejects(
+    AlignerEngine.create(module, { ...webDefaults, doubleD: { ...webDefaults.doubleD, mode: "all" } }, referencesWithout("D")),
+    /--double-d needs a D database/,
+  );
+  const tuned = await AlignerEngine.create(module, { ...webDefaults, tuning: { minimumDMatch: 5, dMismatch: -4 } }, referencesWithout("D"));
+  assert.ok(
+    tuned.engine.summary.warnings.includes("--min-d-match, --d-mismatch have no effect without a D database (--d)"),
+    JSON.stringify(tuned.engine.summary.warnings),
+  );
+});
+
+// Guard (passes on 0.39.3 too): the refusals must not stop a default run.
+test("Swig Web's default settings start on reference sets without D or without C", async () => {
+  assert.deepEqual(alignerOptions(webDefaults).map(([name]) => name), ["profile", "strand", "min-identity"]);
+  const module = await WebAssembly.compile(wasmBytes);
+  for (const missing of ["C", "D"]) {
+    const { engine, records } = await AlignerEngine.create(module, webDefaults, referencesWithout(missing));
+    assert.ok(records > 0);
+    assert.deepEqual(engine.summary.warnings.filter((warning) => /no effect|cannot see/.test(warning)), [], missing);
+  }
+});
+
+test("Swig Web's compute worker reports the aligner's warnings when it loads the germlines", async () => {
+  // Regression: the worker posted only its record count, so no Swig Web run showed the
+  // engine's database and run warnings, such as the D alleles the double-D screen cannot see.
+  const { registerHooks } = await import("node:module");
+  // Vite resolves the worker's extensionless import of the engine wrapper.
+  const hooks = registerHooks({
+    resolve(specifier, context, next) {
+      if (specifier === "./aligner-engine" && context.parentURL?.endsWith("/src/aligner-compute-worker.ts")) {
+        return next(`${specifier}.ts`, context);
+      }
+      return next(specifier, context);
+    },
+  });
+  const listeners = [];
+  const posted = [];
+  const previous = globalThis.self;
+  globalThis.self = {
+    addEventListener: (type, listener) => { if (type === "message") listeners.push(listener); },
+    postMessage: (message) => posted.push(message),
+  };
+  try {
+    await import("../src/aligner-compute-worker.ts");
+    assert.equal(listeners.length, 1);
+    const human = pack.species.find((entry) => entry.name === "Homo sapiens");
+    const settings = {
+      callingProfile: "r_optimized",
+      minimumIdentity: 0.6,
+      minimumConstantPrefixIdentity: null,
+      strand: 0,
+      doubleD: { mode: "all", minimumVjSpan: 40, seedLength: 11, pseudoTrim: 5, maximumPseudoMismatches: 3, minimumScoreGain: 8 },
+    };
+    listeners[0]({ data: { type: "initialize", worker: 0, module: await WebAssembly.compile(wasmBytes), references: compileReferences(human, "TCR"), settings } });
+    for (let wait = 0; !posted.length && wait < 200; wait += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(posted[0]?.type, "ready", JSON.stringify(posted[0]));
+    assert.ok(posted[0].records > 0);
+    assert.ok(Array.isArray(posted[0].warnings));
+    assert.ok(posted[0].warnings.includes("the double-D screen cannot see 2 of 6 D alleles, shorter than --double-d-seed-length 11: TRDD1*01, TRDD2*01"), posted[0].warnings.join("\n"));
+    assert.ok(posted[0].warnings.some((warning) => warning.startsWith("J allele TRAJ35*01 ends 52 bases after its anchor")), posted[0].warnings.join("\n"));
+  } finally {
+    globalThis.self = previous;
+    hooks.deregister();
+  }
 });

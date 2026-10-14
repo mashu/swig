@@ -495,6 +495,77 @@ test("--vdj refuses a D or J penalty outside the aligner's range",async()=>{
   }finally{await rm(temporary,{recursive:true,force:true});}
 });
 
+test("--vdj refuses the C-prefix gate without C germlines on either aligner, and names D tuning without D",async()=>{
+  const root=resolve(import.meta.dirname,"..");
+  const refs=join(root,"public/references/kimdb-1.1/Macaca_mulatta/IGH");
+  const temporary=await mkdtemp(join(root,"tmp-cli-databases-"));
+  try{
+    const env=nativeAlignerEnvironment(root,join(temporary,"cache"))??process.env;
+    const query=join(root,"tests/fixtures/kimdb-perfect-d-regression.fasta");
+    const vj=["--vdj","-query",query,"-germline_db_V",join(refs,"V.fasta"),"-germline_db_J",join(refs,"J.fasta"),"-outfmt","19","--workers","1"];
+    const messages=[];
+    for(const aligner of ["native","wasm"]){
+      const out=join(temporary,`${aligner}.tsv`);
+      const result=runRawCli(root,[...vj,"-germline_db_D",join(refs,"D.fasta"),"--aligner",aligner,"--minimum-c-prefix-identity","0.99","-out",out],env);
+      assert.notEqual(result.status,0,`--aligner ${aligner}: ${result.stderr}`);
+      assert.match(result.stderr,/--minimum-c-prefix-identity needs a constant-region database: add -c_region_db/);
+      assert.doesNotMatch(result.stderr,/did not start/);
+      assert.equal(existsSync(out),false);
+      messages.push(result.stderr.trim().split("\n").at(-1));
+    }
+    assert.equal(messages[0],messages[1]);
+    // 0 turns the gate off.
+    const off=runRawCli(root,[...vj,"-germline_db_D",join(refs,"D.fasta"),"--aligner","wasm","--minimum-c-prefix-identity","0","-out",join(temporary,"off.tsv")],env);
+    assert.equal(off.status,0,off.stderr);
+    // IgBLAST-style scripts pass D tuning for every chain: run, and say it changes nothing.
+    const tuned=runRawCli(root,[...vj,"--aligner","wasm","-min_D_match","5","-out",join(temporary,"tuned.tsv")],env);
+    assert.equal(tuned.status,0,tuned.stderr);
+    assert.match(tuned.stderr,/Warning: -min_D_match has no effect without -germline_db_D\./);
+    const plain=runRawCli(root,[...vj,"--aligner","wasm","-out",join(temporary,"plain.tsv")],env);
+    assert.equal(plain.status,0,plain.stderr);
+    assert.doesNotMatch(plain.stderr,/no effect/);
+    assert.deepEqual(await readFile(join(temporary,"tuned.tsv")),await readFile(join(temporary,"plain.tsv")));
+  }finally{await rm(temporary,{recursive:true,force:true});}
+});
+
+test("a pipeline config is refused when its reference set lacks the germlines an annotation option needs",async()=>{
+  const root=resolve(import.meta.dirname,"..");
+  const temporary=await mkdtemp(join(root,"tmp-cli-config-databases-"));
+  try{
+    let runs=0;
+    const run=async(references,annotation)=>{
+      const name=`run-${runs++}`,configPath=join(temporary,`${name}.json`);
+      await writeFile(configPath,JSON.stringify({inputs:[{path:join(root,"tests/fixtures/cli-smoke.fasta"),sampleId:"a",subjectId:"d"}],references,annotation:{workers:1,...annotation},pipeline:{collapse:{enabled:false},lineage:{enabled:false},shm:{enabled:false}},output:{directory:join(temporary,name),prefix:"run",writeLineageStudy:false}}));
+      return runCli(root,configPath);
+    };
+    // Checked before the aligner is chosen: the same answer on every route.
+    for(const aligner of ["auto","native","wasm"]){
+      const screened=await run({species:"Homo sapiens",scope:"IGK"},{aligner,doubleD:{mode:"all"}});
+      assert.notEqual(screened.status,0,screened.stderr);
+      assert.match(screened.stderr,/annotation\.doubleD needs D germlines, but the Homo sapiens IGK reference set has none; set annotation\.doubleD\.mode to "off"\./);
+      assert.doesNotMatch(screened.stderr,/runs only on WebAssembly/);
+      const gated=await run({species:"Mus musculus",scope:"TRA"},{aligner,minimumConstantPrefixIdentity:0.97});
+      assert.notEqual(gated.status,0,gated.stderr);
+      assert.match(gated.stderr,/annotation\.minimumConstantPrefixIdentity needs constant-region \(C\) germlines, but the Mus musculus TRA reference set has none; set it to null/);
+    }
+    // A blank C text is no C database on either route: the native child is not handed an
+    // empty C file (which it refuses), as WebAssembly is not.
+    const env=nativeAlignerEnvironment(root,join(temporary,"cache"));
+    if(env){
+      const blank={species:"Homo sapiens",scope:"IGH",prepareMetadata:false,inline:{C:" \n"}};
+      const tables=[];
+      for(const aligner of ["native","wasm"]){
+        const name=`blank-${aligner}`,configPath=join(temporary,`${name}.json`);
+        await writeFile(configPath,JSON.stringify({inputs:[{path:join(root,"tests/fixtures/cli-smoke.fasta"),sampleId:"a",subjectId:"d"}],references:blank,annotation:{workers:1,aligner},pipeline:{collapse:{enabled:false},lineage:{enabled:false},shm:{enabled:false}},output:{directory:join(temporary,name),prefix:"run",writeLineageStudy:false}}));
+        const result=runCli(root,configPath,[],env);
+        assert.equal(result.status,0,`${aligner}: ${result.stderr}`);
+        tables.push(await readFile(join(temporary,name,"run.annotated.airr.tsv")));
+      }
+      assert.deepEqual(tables[0],tables[1]);
+    }
+  }finally{await rm(temporary,{recursive:true,force:true});}
+});
+
 test("CLI exposes the embedded IMGT data notice",()=>{
   const root=resolve(import.meta.dirname,"..");
   const result=runRawCli(root,["notices"]);
@@ -737,5 +808,89 @@ test("an unusable native aligner falls back to WebAssembly unless --aligner nati
     await writeFile(configPath,JSON.stringify({inputs:[{path:fasta,sampleId:"a",subjectId:"d"}],annotation:{workers:1,aligner:"gpu"},output:{directory:join(temporary,"gpu")}}));
     const badConfig=runCli(root,configPath,[],env);
     assert.notEqual(badConfig.status,0);assert.match(badConfig.stderr,/annotation\.aligner must be auto, native, wasm/);
+  }finally{await rm(temporary,{recursive:true,force:true});}
+});
+
+test("--vdj keeps the locus a custom D's header gives on the default route",async()=>{
+  // Regression: the assignments-only route wrote the bare name, so a custom TRB D fell back to
+  // TRB and TRD and was called on TRD reads.
+  const root=resolve(import.meta.dirname,"..");
+  const temporary=await mkdtemp(join(root,"tmp-cli-custom-d-"));
+  try{
+    const env=nativeAlignerEnvironment(root,join(temporary,"cache"));
+    const pack=JSON.parse(gunzipSync(await readFile(join(root,"public/references/imgt-202632-7-swig-0.7.json.gz"))).toString("utf8"));
+    const human=pack.species.find((entry)=>entry.name==="Homo sapiens");
+    const delineated=(allele)=>allele[2]?.slice(2,12).every((value)=>value>=0);
+    const trbV=human.loci.TRB.V.filter(delineated).slice(0,6),trdV=human.loci.TRD.V.filter(delineated);
+    const trbJ=human.loci.TRB.J.slice(0,6),trdJ=human.loci.TRD.J;
+    const fasta=(alleles)=>alleles.map(([name,sequence])=>`>${name}\n${sequence}\n`).join("");
+    // Every read holds TRBD2*01 whole: TRD reads may not take it once it is known to be TRB.
+    const trbd2=human.loci.TRB.D[1][1];
+    const reads=Array.from({length:60},(_,index)=>{
+      const trd=index<40,v=(trd?trdV:trbV)[index%(trd?trdV:trbV).length],j=(trd?trdJ:trbJ)[index%(trd?trdJ:trbJ).length];
+      return `>${trd?"trd":"trb"}_${index}\n${v[1]}ACGT${trbd2}TGCA${j[1]}\n`;
+    }).join("");
+    const paths={query:join(temporary,"reads.fasta"),V:join(temporary,"V.fasta"),D:join(temporary,"D.fasta"),J:join(temporary,"J.fasta")};
+    await writeFile(paths.query,reads);await writeFile(paths.V,fasta([...trbV,...trdV]));await writeFile(paths.J,fasta([...trbJ,...trdJ]));
+    await writeFile(paths.D,human.loci.TRB.D.map(([,sequence],index)=>`>myBD${index+1} locus=TRB\n${sequence}\n`).join("")+fasta(human.loci.TRD.D));
+    const tables=[];
+    for(const aligner of env?["native","wasm"]:["wasm"]){
+      const out=join(temporary,`${aligner}.tsv`);
+      const result=runRawCli(root,["--vdj","--aligner",aligner,"--workers","1","-query",paths.query,"-germline_db_V",paths.V,"-germline_db_D",paths.D,"-germline_db_J",paths.J,"-outfmt","19","-out",out],env??process.env);
+      assert.equal(result.status,0,result.stderr);assert.match(result.stderr,/assignments-only/);
+      const [header,...lines]=(await readFile(out,"utf8")).trimEnd().split("\n");
+      const at=Object.fromEntries(header.split("\t").map((name,index)=>[name,index]));
+      const rows=lines.map((line)=>line.split("\t"));
+      const custom=(prefix)=>rows.filter((row)=>row[at.sequence_id].startsWith(prefix)&&row[at.d_call].includes("myBD")).length;
+      assert.equal(custom("trb_"),20,`${aligner}: TRB reads take the custom TRB D`);
+      assert.equal(custom("trd_"),0,`${aligner}: TRD reads never take a TRB D`);
+      tables.push(await readFile(out));
+    }
+    if(tables.length===2)assert.deepEqual(tables[0],tables[1]);
+  }finally{await rm(temporary,{recursive:true,force:true});}
+});
+
+test("both aligner routes print the aligner's database and run warnings once",async()=>{
+  // Regression: neither route showed the engine's warnings (the WebAssembly pool dropped them
+  // with the init reply, and the native child's stderr was read only for exit messages).
+  const root=resolve(import.meta.dirname,"..");
+  const temporary=await mkdtemp(join(root,"tmp-cli-aligner-warnings-"));
+  try{
+    const env=nativeAlignerEnvironment(root,join(temporary,"cache"));
+    const pack=JSON.parse(gunzipSync(await readFile(join(root,"public/references/imgt-202632-7-swig-0.7.json.gz"))).toString("utf8"));
+    const human=pack.species.find((entry)=>entry.name==="Homo sapiens");
+    const paths={query:join(temporary,"reads.fasta")};
+    for(const segment of ["V","J","C"]){
+      paths[segment]=join(temporary,`${segment}.fasta`);
+      await writeFile(paths[segment],human.loci.TRA[segment].map(([name,sequence])=>`>${name}\n${sequence}\n`).join(""));
+    }
+    const v=human.loci.TRA.V[0][1],j=human.loci.TRA.J[0][1];
+    await writeFile(paths.query,Array.from({length:40},(_,index)=>`>read_${index}\n${v}GGCA${j}\n`).join(""));
+    // The TRA J set holds TRAJ35*01, whose bases past the splice donor keep reads from a C call.
+    const warning=/^Aligner warning: J allele TRAJ35\*01 ends 52 bases after its anchor where most end 34 after: .* reads with it get no C call$/m;
+    for(const aligner of env?["native","wasm"]:["wasm"]){
+      const result=runRawCli(root,["--vdj","--aligner",aligner,"--workers","2","--batch-records","10","-query",paths.query,"-germline_db_V",paths.V,"-germline_db_J",paths.J,"-c_region_db",paths.C,"-outfmt","19","-out",join(temporary,`${aligner}.tsv`)],env??process.env);
+      assert.equal(result.status,0,result.stderr);
+      assert.match(result.stderr,warning,aligner);
+      assert.equal(result.stderr.match(new RegExp(warning.source,"gm")).length,1,`${aligner}: once, though two workers load the database`);
+      assert.doesNotMatch(result.stderr,/^swig: /m);
+    }
+    // The pipeline prints them too, once per run though each dataset starts its own aligner, and
+    // keeps them in its summary.
+    const config=(name,aligner,annotation={})=>({inputs:[1,2].map((sample)=>({path:join(root,"tests/fixtures/cli-smoke.fasta"),sampleId:`s${sample}`,subjectId:"d"})),references:{species:"Homo sapiens",scope:"TCR"},annotation:{workers:2,aligner,...annotation},pipeline:{collapse:{enabled:false},lineage:{enabled:false},shm:{enabled:false}},output:{directory:join(temporary,name),prefix:"run",writeLineageStudy:false}});
+    const runs=[["wasm-dd","wasm",{doubleD:{mode:"all"}}]];
+    if(env)runs.push(["native","native",{}]);
+    for(const [name,aligner,annotation] of runs){
+      const configPath=join(temporary,`${name}.json`);
+      await writeFile(configPath,JSON.stringify(config(name,aligner,annotation)));
+      const result=runCli(root,configPath,[],env??process.env);
+      assert.equal(result.status,0,result.stderr);
+      const summary=JSON.parse(await readFile(join(temporary,name,"run.summary.json"),"utf8"));
+      const printed=[...result.stderr.matchAll(/^Aligner warning: (.*)$/gm)].map((match)=>match[1]);
+      assert.deepEqual(summary.references.alignerWarnings,printed,name);
+      assert.ok(printed.some((text)=>/^J allele TRAJ35\*01 ends 52 bases after its anchor/.test(text)),name);
+      assert.equal(new Set(printed).size,printed.length,`${name}: each warning once`);
+      if(annotation.doubleD)assert.ok(printed.some((text)=>/^the double-D screen cannot see 2 of 6 D alleles, shorter than --double-d-seed-length 11: TRDD1\*01, TRDD2\*01$/.test(text)),name);
+    }
   }finally{await rm(temporary,{recursive:true,force:true});}
 });

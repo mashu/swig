@@ -118,6 +118,13 @@ impl Loci {
         self.0 == 0
     }
 
+    /// The loci of the set that have D genes ([`Locus::has_d`]).
+    pub fn with_d(self) -> Self {
+        self.iter()
+            .filter(|l| l.has_d())
+            .fold(Self::NONE, |loci, l| loci.union(Self::of(l)))
+    }
+
     /// Whether an allele of these loci may join one of `other`'s.
     pub const fn pairs_with(self, other: Self) -> bool {
         !self.intersection(other).is_empty()
@@ -157,10 +164,14 @@ impl Loci {
     /// as well for a shared `TRAV…/DV…` gene. A gene name is a locus code
     /// (`IGH`, …, `TRG`, case-insensitively) that starts the text or follows
     /// a character other than a letter or digit, followed by a segment
-    /// letter (`V`, `D`, `J`, `C`) or, for IGH, an isotype letter (`A`,
-    /// `E`, `G`, `M`: `IGHG1`, `IGHEP1`). Empty when no gene name occurs: a
-    /// code inside a word (`LIGHT`, `STRAIN`) or before another letter
-    /// (`TRANSFER`) names none.
+    /// letter (`V`, `D`, `J`, `C`) or, for IGH, an isotype letter: IgA, IgD,
+    /// IgE, IgF, IgG, IgM, IgO, IgT, IgW, IgX, IgY or IgZ (`IGHG1`, `IGHT2`,
+    /// `IGHZ`, `IGHO`). An isotype letter may be followed by at most one
+    /// more letter before a non-letter or the end (`IGHG2A`, `IGHEP1`,
+    /// `IGHMD`, `IGHGP`), so a word such as `IGHTEST1` names none. Empty
+    /// when no gene name occurs: a code inside a word (`LIGHT`, `STRAIN`)
+    /// or before another letter (`TRANSFER`) names none. IgNAR has no IMGT
+    /// `IGH` name and is not read as one.
     pub fn named_in(text: &str) -> Self {
         let upper = text.to_ascii_uppercase();
         let bytes = upper.as_bytes();
@@ -171,9 +182,20 @@ impl Loci {
             let locus = Locus::ALL
                 .into_iter()
                 .find(|locus| bytes[at..].starts_with(locus.name().as_bytes()))?;
-            let next = *bytes.get(at + locus.name().len())?;
-            let isotype = locus == Locus::Igh && matches!(next, b'A' | b'E' | b'G' | b'M');
-            (matches!(next, b'V' | b'D' | b'J' | b'C') || isotype).then_some(locus)
+            let after = at + locus.name().len();
+            let next = *bytes.get(after)?;
+            if matches!(next, b'V' | b'D' | b'J' | b'C') {
+                return Some(locus);
+            }
+            let isotype = locus == Locus::Igh && b"AEFGMOTWXYZ".contains(&next) && {
+                // At most one more letter: `IGHG2A`, `IGHEP1`, not `IGHTEST`.
+                let letters = bytes[after + 1..]
+                    .iter()
+                    .take_while(|b| b.is_ascii_alphabetic())
+                    .count();
+                letters <= 1
+            };
+            isotype.then_some(locus)
         };
         match (0..bytes.len()).find_map(gene_at) {
             None => Self::NONE,
@@ -292,6 +314,39 @@ mod tests {
         assert_eq!(Loci::named_in("LIGHT STRAIN TRANSFER"), Loci::NONE);
     }
 
+    /// Every IGH isotype letter names IGH (IgT and IgZ of fish, IgO of the
+    /// platypus, IgY, IgX, IgF and IgW), with at most one more letter after
+    /// it; delta and the D genes still do, and a word or IgNAR does not.
+    #[test]
+    fn every_igh_isotype_names_igh() {
+        let igh = Loci::of(Locus::Igh);
+        for label in [
+            "IGHT2D*01",
+            "IGHT4*01",
+            "IGHZ*01",
+            "IGHO*01",
+            "IGHY*01",
+            "IGHX*01",
+            "IGHF*01",
+            "IGHW*01",
+            "IGHG2A*01",
+            "IGHMD*01",
+            "IGHDD*01",
+            "IGHGP*01",
+            "IGHEP1*01",
+            // Guards: delta and the D genes, named before.
+            "IGHD*01",
+            "IGHD1-1*01",
+        ] {
+            assert_eq!(Loci::infer(label, ""), igh, "{label}");
+        }
+        for label in ["IGHTEST1", "IgNAR*01", "IGHN*01", "IGHGPX1*01"] {
+            assert_eq!(Loci::infer(label, ""), Loci::ANY, "{label}");
+        }
+        assert_eq!(Loci::infer("T1", "T1 IGHTEST1 sample"), Loci::ANY);
+        assert_eq!(Loci::infer("T1", "T1 Salmo salar IGHT2D*01"), igh);
+    }
+
     #[test]
     fn sets_pair_through_a_shared_locus() {
         let tra_trd = Loci::of(Locus::Tra).union(Loci::of(Locus::Trd));
@@ -303,6 +358,9 @@ mod tests {
         assert_eq!(Loci::of(Locus::Igl).single(), Some(Locus::Igl));
         assert_eq!(Loci::ANY.iter().count(), 7);
         assert!(Locus::Trd.has_d() && !Locus::Igk.has_d());
+        let bcr = Loci::parse_list("IGH,IGK,IGL").unwrap();
+        assert_eq!(bcr.with_d(), Loci::of(Locus::Igh));
+        assert_eq!(Loci::ANY.with_d(), Loci::parse_list("IGH,TRB,TRD").unwrap());
     }
 
     #[test]

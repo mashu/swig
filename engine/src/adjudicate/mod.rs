@@ -34,7 +34,9 @@ pub use model::{EngineeringObjective, Grammar, PathModel, VdjGrammar};
 pub use posterior::{MAX_SPREAD, Marginals, OVERLAP_SPREAD, PosteriorScratch};
 pub(crate) use ties::{CoOptimal, co_optimal};
 pub use units::{
-    CallModel, EvidenceModel, EvidenceScale, PathNats, UNITS_PER_NAT, Units, divergence,
+    CallModel, Columns, DivergenceCounts, EvidenceModel, EvidenceScale, Flank, PathNats,
+    ReadContext, ResolvedOpenFlank, UNITS_PER_NAT, Units, beta_binomial_tail, divergence,
+    divergence_counts,
 };
 
 use std::cmp::Ordering;
@@ -99,14 +101,15 @@ pub struct CallPath {
     pub segments: Vec<CalledSegment>,
     /// The path's fixed-scale objective, whichever model chose it.
     pub score: PathScore,
-    /// The key the call maximised: its value in `model`'s units at
-    /// `divergence` (the fixed scores under [`CallModel::FixedScale`]), then
+    /// The key the call maximised: its value in `model`'s units for
+    /// `context` (the fixed scores under [`CallModel::FixedScale`]), then
     /// fewer D, then support. A path decoded from the posterior keeps its
     /// call's.
     pub value: PathScore<Units>,
-    /// The read's divergence `p̂` ([`divergence`]): the posterior reads
-    /// alignment evidence at it, and so does a [`CallModel::PerRead`] call.
-    pub divergence: f64,
+    /// The read the call was made for: its divergence `p̂` ([`divergence`]),
+    /// at which the posterior reads alignment evidence, and so does a
+    /// [`CallModel::PerRead`] call, and what the open-flank cost reads.
+    pub context: ReadContext,
     /// The model the call maximised.
     pub model: CallModel,
 }
@@ -114,22 +117,27 @@ pub struct CallPath {
 pub trait Adjudicator: Send + Sync {
     type Scratch: Default + Send;
 
+    /// The call of `placements` in the context of their own
+    /// ([`ReadContext::of_placements`]: the read ends where they end). A D
+    /// that ends its path is then charged for the bases after it up to the
+    /// last placement's end only, not to the read's end: a caller that
+    /// knows the read's length passes it with
+    /// [`Adjudicator::adjudicate_at`].
     fn adjudicate(&self, placements: &[Placement], scratch: &mut Self::Scratch)
     -> Option<CallPath>;
 
-    /// [`Adjudicator::adjudicate`] for a read whose divergence `p̂` is
-    /// `divergence` ([`divergence`] of all its placements, of which
-    /// `placements` may be a part): paths of one read's placement subsets
-    /// adjudicated at one divergence are hypotheses of one model, and
-    /// compare by [`CallPath::value`]. Adjudicators without a per-read
-    /// model ignore it.
+    /// [`Adjudicator::adjudicate`] for a read with context `context` (of
+    /// all its placements, of which `placements` may be a part, and its
+    /// length): paths of one read's placement subsets adjudicated in one
+    /// context are hypotheses of one model, and compare by
+    /// [`CallPath::value`]. Adjudicators without a per-read model ignore it.
     fn adjudicate_at(
         &self,
         placements: &[Placement],
-        divergence: f64,
+        context: &ReadContext,
         scratch: &mut Self::Scratch,
     ) -> Option<CallPath> {
-        let _ = divergence;
+        let _ = context;
         self.adjudicate(placements, scratch)
     }
 
@@ -140,9 +148,20 @@ pub trait Adjudicator: Send + Sync {
         Score::MIN
     }
 
+    /// Whether a path that ends on a D (no J after it) or starts on one (no
+    /// V before it) pays the open-flank cost for the J or V it lacks
+    /// ([`ResolvedOpenFlank`]). The pair guards then let such a path be
+    /// called ([`crate::pipeline::PairGuards`]); without the cost a D is
+    /// called only between a V and a J.
+    fn charges_open_flank(&self) -> bool {
+        false
+    }
+
     /// Posterior marginals of `placements` given the adjudicated `path`, for
     /// adjudicators with a probabilistic reading that are configured to
-    /// compute them.
+    /// compute them. With the scratch of the adjudication that returned
+    /// `path` (and of no other read's since), what that adjudication
+    /// computed for the read is reused.
     fn marginals(
         &self,
         _placements: &[Placement],

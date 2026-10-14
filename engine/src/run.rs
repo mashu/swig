@@ -114,6 +114,10 @@ pub struct RunOptions {
     pub d_allele: Option<DAlleleDecoding>,
     /// D prior from the D search at this D-presence rate ([`DPrior::Search`]).
     pub d_presence_rate: Option<f64>,
+    /// Charge a D that ends (starts) its path for the J (V) the read would
+    /// show beyond it ([`crate::config::OpenFlank`]); `false` turns the cost
+    /// off.
+    pub d_open_flank: bool,
     /// Call C at an anchored E-value at most this (needs a C database).
     pub c_evalue: Option<f64>,
     /// Report C only where the germline from its first base reaches this
@@ -150,6 +154,7 @@ impl Default for RunOptions {
             calls: None,
             d_allele: None,
             d_presence_rate: None,
+            d_open_flank: true,
             c_evalue: None,
             c_prefix_identity: None,
             c_min_identity: None,
@@ -201,7 +206,7 @@ fn with_mismatch(scoring: AffineScoring, mismatch: Score) -> AffineScoring {
 
 impl RunOptions {
     /// Every option [`Self::set`] reads, and whether it takes a value.
-    pub const NAMES: [(&'static str, bool); 25] = [
+    pub const NAMES: [(&'static str, bool); 26] = [
         ("profile", true),
         ("chain", true),
         ("strand", true),
@@ -210,6 +215,7 @@ impl RunOptions {
         ("calls", true),
         ("d-allele", true),
         ("d-presence-rate", true),
+        ("d-open-flank", true),
         ("c-evalue", true),
         ("c-prefix-identity", true),
         ("c-min-identity", true),
@@ -298,6 +304,13 @@ impl RunOptions {
                 let rate = |v: &str| v.parse().ok().filter(|r: &f64| *r > 0.0 && *r < 1.0);
                 self.d_presence_rate = Some(parsed(name, value, "a rate in (0, 1)", rate)?);
             }
+            "d-open-flank" => {
+                self.d_open_flank = parsed(name, value, "on or off", |v| match v {
+                    "on" => Some(true),
+                    "off" => Some(false),
+                    _ => None,
+                })?;
+            }
             "c-evalue" => {
                 let evalue = |v: &str| v.parse().ok().filter(|e: &f64| *e > 0.0);
                 self.c_evalue = Some(parsed(name, value, "a positive number", evalue)?);
@@ -352,6 +365,98 @@ impl RunOptions {
         Ok(())
     }
 
+    /// Refuse an option that needs a database the run does not have, and
+    /// list the options that change nothing with the databases it has. `d`
+    /// and `c` say whether the run has a D and a C database.
+    ///
+    /// `--c-evalue`, `--c-prefix-identity` (above 0) and `--double-d`
+    /// (`all`, `long-span`) gate or add to what a run reports: without
+    /// their database they are refused, so a run never looks filtered or
+    /// screened when it was not. The D options, `--c-min-identity` and the
+    /// screen's rules only tune a stage: without it they are reported, not
+    /// refused. `--no-pair-guards` acts on V and J, which every run has. A
+    /// profile is a bundle and is never reported.
+    pub fn check_databases(&self, d: bool, c: bool) -> Result<Vec<String>, OptionError> {
+        let refused = [
+            (
+                self.c_evalue.is_some() && !c,
+                "--c-evalue needs a C database (--c)",
+            ),
+            (
+                self.c_prefix_identity.is_some() && !c,
+                "--c-prefix-identity needs a C database (--c)",
+            ),
+            (
+                self.double_d.mode != DoubleDMode::Off && !d,
+                "--double-d needs a D database (--d)",
+            ),
+        ];
+        if let Some((_, message)) = refused.iter().find(|(refused, _)| *refused) {
+            return Err(OptionError(message.to_string()));
+        }
+        // The options given, as one warning.
+        let unused = |options: &[(bool, &str)], without: &str| {
+            let names: Vec<&str> = options.iter().filter(|o| o.0).map(|o| o.1).collect();
+            let verb = if names.len() == 1 { "has" } else { "have" };
+            (!names.is_empty())
+                .then(|| format!("{} {verb} no effect without {without}", names.join(", ")))
+        };
+        let no_d = !d;
+        let rules = &self.double_d;
+        let default = DoubleDOptions::default();
+        let off = rules.mode == DoubleDMode::Off;
+        let warnings = [
+            unused(
+                &[
+                    (no_d && self.min_d_match.is_some(), "--min-d-match"),
+                    (no_d && self.d_mismatch.is_some(), "--d-mismatch"),
+                    (no_d && self.d_presence_rate.is_some(), "--d-presence-rate"),
+                    (no_d && self.d_allele.is_some(), "--d-allele"),
+                    (no_d && !self.anchor_window, "--no-anchor-window"),
+                    (no_d && !self.d_open_flank, "--d-open-flank off"),
+                ],
+                "a D database (--d)",
+            ),
+            unused(
+                &[(!c && self.c_min_identity.is_some(), "--c-min-identity")],
+                "a C database (--c)",
+            ),
+            unused(
+                &[
+                    (
+                        off && rules.min_vj_span != default.min_vj_span,
+                        "--double-d-min-span",
+                    ),
+                    (
+                        off && rules.seed_length != default.seed_length,
+                        "--double-d-seed-length",
+                    ),
+                    (
+                        off && rules.pseudo_trim != default.pseudo_trim,
+                        "--double-d-pseudo-trim",
+                    ),
+                    (
+                        off && rules.pseudo_mismatches != default.pseudo_mismatches,
+                        "--double-d-pseudo-mismatches",
+                    ),
+                    (
+                        off && rules.min_score_gain != default.min_score_gain,
+                        "--double-d-min-gain",
+                    ),
+                ],
+                "--double-d all or long-span",
+            ),
+            (d && !self.posterior && self.d_allele == Some(DAlleleDecoding::MaxMarginal)).then(
+                || {
+                    "--d-allele max-marginal needs posteriors: with --no-posterior \
+                     the D allele is the call's (map)"
+                        .to_string()
+                },
+            ),
+        ];
+        Ok(warnings.into_iter().flatten().collect())
+    }
+
     /// How germline databases are annotated.
     pub fn annotate(&self) -> AnnotateOptions {
         AnnotateOptions { chain: self.chain }
@@ -376,6 +481,9 @@ impl RunOptions {
         }
         if let Some(presence) = self.d_presence_rate {
             config.objective.d_prior = DPrior::search(presence);
+        }
+        if !self.d_open_flank {
+            config.objective.open_flank = None;
         }
         if let Some(evalue) = self.c_evalue {
             config.c.evalue = evalue;
@@ -559,6 +667,9 @@ pub struct Run {
     c_prefix_identity: Option<f64>,
     /// The double-D screen, when it is on and there is a D database.
     screen: Option<DoubleDScreen>,
+    /// Options that change nothing with this run's databases, and D
+    /// alleles the double-D screen cannot see.
+    warnings: Vec<String>,
     cache: Cache,
     /// Reads seen so far: a read without an identifier is `sequence_N`.
     ordinal: usize,
@@ -567,9 +678,7 @@ pub struct Run {
 impl Run {
     /// Build the assigner `options` describe over `database`.
     pub fn new(options: &RunOptions, database: PreparedDatabase) -> Result<Self, RunError> {
-        if options.c_evalue.is_some() && database.c.is_none() {
-            return Err(OptionError("--c-evalue needs a C database (--c)".into()).into());
-        }
+        let mut warnings = options.check_databases(database.d.is_some(), database.c.is_some())?;
         let config = options.config();
         let support =
             [&config.v.scoring, &config.d.scoring, &config.j.scoring].map(KarlinAltschul::ungapped);
@@ -582,15 +691,44 @@ impl Run {
             .segment(SegmentKind::D)
             .filter(|_| options.double_d.mode != DoubleDMode::Off)
             .map(|d| DoubleDScreen::new(d.set(), options.double_d));
+        // The screen seeds only D alleles at least a seed long (TRDD1 and
+        // TRDD2 are 8 and 9 nt, the default seed 11): say which it misses.
+        if let Some(d) = screen.as_ref().and(assigner.segment(SegmentKind::D)) {
+            let seed = options.double_d.seed_length as usize;
+            let set = d.set();
+            let short: Vec<&str> = set
+                .alleles()
+                .iter()
+                .filter(|a| a.codes.len() < seed)
+                .map(|a| a.name.as_str())
+                .collect();
+            if !short.is_empty() {
+                warnings.push(format!(
+                    "the double-D screen cannot see {} of {} D alleles, shorter than \
+                     --double-d-seed-length {seed}: {}",
+                    short.len(),
+                    set.len(),
+                    short.join(", ")
+                ));
+            }
+        }
         Ok(Self {
             assigner,
             support,
             threads: options.threads,
             c_prefix_identity: options.c_prefix_identity,
             screen,
+            warnings,
             cache: Cache::default(),
             ordinal: 0,
         })
+    }
+
+    /// Options that change nothing with this run's databases
+    /// ([`RunOptions::check_databases`]), and D alleles the double-D screen
+    /// cannot see.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 
     /// The alignment kernel the run uses.
@@ -745,6 +883,7 @@ mod tests {
             ("calls", Some("fixed")),
             ("d-allele", Some("max-marginal")),
             ("d-presence-rate", Some("0.9")),
+            ("d-open-flank", Some("off")),
             ("c-evalue", Some("0.01")),
             ("c-prefix-identity", Some("0.97")),
             ("c-min-identity", Some("0.8")),
@@ -775,6 +914,7 @@ mod tests {
             calls: Some(CallModel::FixedScale),
             d_allele: Some(DAlleleDecoding::MaxMarginal),
             d_presence_rate: Some(0.9),
+            d_open_flank: false,
             c_evalue: Some(0.01),
             c_prefix_identity: Some(0.97),
             c_min_identity: Some(0.8),
@@ -799,6 +939,7 @@ mod tests {
         assert_eq!(config.options.orientation, OrientationPolicy::REVERSE_ONLY);
         assert_eq!(config.options.min_identity, 0.7);
         assert_eq!(config.objective.d_prior, DPrior::search(0.9));
+        assert_eq!(config.objective.open_flank, None);
         assert!(!config.posterior && !config.anchor_window);
         assert_eq!(config.c.evalue, 0.01);
         assert_eq!(config.c.accept.min_identity, 0.8);
@@ -825,6 +966,8 @@ mod tests {
             ("d-mismatch", Some("-1001")),
             ("j-mismatch", Some("-2147483648")),
             ("double-d", Some("some")),
+            ("d-open-flank", Some("yes")),
+            ("d-open-flank", None),
             ("simd", Some("mmx")),
             ("profile", None),
             ("no-posterior", Some("yes")),
@@ -1125,16 +1268,206 @@ mod tests {
         assert!(quoted >= 3, "{quoted} sidecar rows quote the code");
     }
 
+    /// Options that filter or add to the output are refused without their
+    /// database, with the database they run; options that only tune a
+    /// stage the run lacks are reported, each warning naming the options
+    /// given.
     #[test]
-    fn a_c_gate_needs_a_c_database() {
-        let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 5);
-        let database =
-            crate::prepare::prepare(db.v, Some(db.d), db.j, AnnotateOptions::default()).unwrap();
-        let mut options = RunOptions::default();
-        options.set("c-evalue", Some("0.01")).unwrap();
-        assert!(matches!(
-            Run::new(&options, database),
-            Err(RunError::Option(_))
-        ));
+    fn options_are_checked_against_the_databases() {
+        let options = |given: &[(&str, Option<&str>)]| {
+            let mut options = RunOptions::default();
+            for &(name, value) in given {
+                options.set(name, value).unwrap();
+            }
+            options
+        };
+        let c_evalue = "--c-evalue needs a C database (--c)";
+        let c_gate = "--c-prefix-identity needs a C database (--c)";
+        let double_d = "--double-d needs a D database (--d)";
+        let w1 = "--min-d-match, --d-mismatch, --d-presence-rate, --d-allele, \
+                  --no-anchor-window, --d-open-flank off have no effect without a D \
+                  database (--d)";
+        let w2 = "--double-d-min-span, --double-d-seed-length, --double-d-pseudo-trim, \
+                  --double-d-pseudo-mismatches, --double-d-min-gain have no effect without \
+                  --double-d all or long-span";
+        let w3 = "--d-allele max-marginal needs posteriors: with --no-posterior the D \
+                  allele is the call's (map)";
+        // The options given, whether there is a D and a C database, and the
+        // warnings or the refusal.
+        type Case<'a> = (
+            &'a [(&'a str, Option<&'a str>)],
+            bool,
+            bool,
+            Result<&'a [&'a str], &'a str>,
+        );
+        let cases: [Case; 21] = [
+            (&[], false, false, Ok(&[])),
+            // The C identity floor tunes the C stage: reported without it.
+            (
+                &[("c-min-identity", Some("0.8"))],
+                true,
+                false,
+                Ok(&["--c-min-identity has no effect without a C database (--c)"]),
+            ),
+            (&[("c-min-identity", Some("0"))], false, true, Ok(&[])),
+            // The pair guards act on V and J: no database to need.
+            (&[("no-pair-guards", None)], false, false, Ok(&[])),
+            (
+                &[
+                    ("no-pair-guards", None),
+                    ("d-open-flank", Some("off")),
+                    ("c-min-identity", Some("0.5")),
+                ],
+                false,
+                false,
+                Ok(&[
+                    "--d-open-flank off has no effect without a D database (--d)",
+                    "--c-min-identity has no effect without a C database (--c)",
+                ]),
+            ),
+            (&[("c-evalue", Some("0.01"))], true, false, Err(c_evalue)),
+            (&[("c-evalue", Some("0.01"))], true, true, Ok(&[])),
+            (
+                &[("c-prefix-identity", Some("0.97"))],
+                true,
+                false,
+                Err(c_gate),
+            ),
+            (
+                &[("c-prefix-identity", Some("1"))],
+                false,
+                false,
+                Err(c_gate),
+            ),
+            (&[("c-prefix-identity", Some("0.97"))], true, true, Ok(&[])),
+            // 0 turns the gate off.
+            (&[("c-prefix-identity", Some("0"))], false, false, Ok(&[])),
+            (&[("double-d", Some("all"))], false, true, Err(double_d)),
+            (
+                &[("double-d", Some("long-span"))],
+                false,
+                false,
+                Err(double_d),
+            ),
+            (&[("double-d", Some("all"))], true, true, Ok(&[])),
+            (&[("double-d", Some("off"))], false, false, Ok(&[])),
+            (
+                &[
+                    ("min-d-match", Some("6")),
+                    ("d-mismatch", Some("-4")),
+                    ("d-presence-rate", Some("0.9")),
+                    ("d-allele", Some("map")),
+                    ("no-anchor-window", None),
+                    ("d-open-flank", Some("off")),
+                    ("double-d-min-span", Some("30")),
+                    ("double-d-seed-length", Some("9")),
+                    ("double-d-pseudo-trim", Some("4")),
+                    ("double-d-pseudo-mismatches", Some("2")),
+                    ("double-d-min-gain", Some("6")),
+                    // Profiles are bundles: never reported.
+                    ("profile", Some("sensitive-d")),
+                ],
+                false,
+                false,
+                Ok(&[w1, w2]),
+            ),
+            (
+                &[("min-d-match", Some("6"))],
+                false,
+                true,
+                Ok(&["--min-d-match has no effect without a D database (--d)"]),
+            ),
+            (
+                &[
+                    ("min-d-match", Some("6")),
+                    ("double-d-seed-length", Some("9")),
+                ],
+                true,
+                false,
+                Ok(&["--double-d-seed-length has no effect without --double-d all or long-span"]),
+            ),
+            (
+                &[
+                    ("double-d", Some("all")),
+                    ("double-d-seed-length", Some("9")),
+                ],
+                true,
+                false,
+                Ok(&[]),
+            ),
+            (
+                &[("d-allele", Some("max-marginal")), ("no-posterior", None)],
+                true,
+                false,
+                Ok(&[w3]),
+            ),
+            // Without D, max-marginal is a D option without its database.
+            (
+                &[("d-allele", Some("max-marginal")), ("no-posterior", None)],
+                false,
+                false,
+                Ok(&["--d-allele has no effect without a D database (--d)"]),
+            ),
+        ];
+        for (given, d, c, expected) in cases {
+            let checked = options(given).check_databases(d, c);
+            let expected = expected
+                .map(|w| w.iter().map(|w| w.to_string()).collect::<Vec<_>>())
+                .map_err(|e| OptionError(e.to_string()));
+            assert_eq!(checked, expected, "{given:?} D {d} C {c}");
+        }
+
+        // A run refuses the same, and keeps the warnings.
+        let ([v, d, j, _], _) = texts_and_reads(0);
+        let texts = GermlineTexts {
+            v: &v,
+            d: None,
+            j: &j,
+            c: None,
+        };
+        let database = || PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+        let refused = Run::new(&options(&[("c-evalue", Some("0.01"))]), database());
+        assert!(
+            matches!(&refused, Err(RunError::Option(e)) if e.0 == c_evalue),
+            "{:?}",
+            refused.err()
+        );
+        let run = Run::new(&options(&[("min-d-match", Some("6"))]), database()).unwrap();
+        assert_eq!(
+            run.warnings(),
+            ["--min-d-match has no effect without a D database (--d)"]
+        );
+
+        // The screen seeds only D alleles at least a seed long: it names
+        // the ones it cannot see (as TRDD1 and TRDD2 at the default 11).
+        let short = format!("{d}>IGHD9-1*01\nGGTACTAC\n>IGHD9-2*01\nGTTACTACG\n");
+        let alleles = short.matches('>').count();
+        let texts = GermlineTexts {
+            d: Some(&short),
+            ..texts
+        };
+        let database = || PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+        let screened = |seed: &str| {
+            let given = [
+                ("double-d", Some("all")),
+                ("double-d-seed-length", Some(seed)),
+            ];
+            Run::new(&options(&given), database()).unwrap()
+        };
+        assert_eq!(
+            screened("11").warnings(),
+            [format!(
+                "the double-D screen cannot see 2 of {alleles} D alleles, shorter than \
+                 --double-d-seed-length 11: IGHD9-1*01, IGHD9-2*01"
+            )]
+        );
+        assert!(screened("8").warnings().is_empty());
+        // Without the screen there is nothing to report.
+        assert!(
+            Run::new(&RunOptions::default(), database())
+                .unwrap()
+                .warnings()
+                .is_empty()
+        );
     }
 }

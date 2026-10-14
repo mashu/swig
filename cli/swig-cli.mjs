@@ -11702,8 +11702,105 @@ function inferLocus(value) {
 	const upper = value.toUpperCase();
 	return LOCI.find((locus) => upper.includes(locus)) ?? null;
 }
-function inferSegment(name) {
-	const match = /^(?:IGH|IGK|IGL|TRA|TRB|TRD|TRG)([VDJC])/.exec(name.toUpperCase());
+const IGH_ISOTYPE_LETTERS = "AEFGMOTWXYZ";
+/**
+* The loci the Swig engine reads from an allele label (engine/src/locus.rs,
+* `Loci::named_in`): a locus code at the start of a word followed by a
+* segment letter or, for IGH, an isotype letter with at most one more letter
+* after it; a shared TRAV…/DV… gene belongs to TRA and TRD. Empty when the
+* label names no locus, as a custom name does: the engine then has to infer
+* it, so the host writes `locus=` for such records.
+*/
+function namedLoci(label) {
+	const upper = label.toUpperCase();
+	for (let at = 0; at < upper.length; at += 1) {
+		if (at > 0 && /[A-Z0-9]/.test(upper[at - 1])) continue;
+		const locus = LOCI.find((code) => upper.startsWith(code, at));
+		if (!locus) continue;
+		const next = upper[at + locus.length];
+		if (next === void 0) continue;
+		let named = "VDJC".includes(next);
+		if (!named && locus === "IGH" && IGH_ISOTYPE_LETTERS.includes(next)) named = !/^[A-Z]{2}/.test(upper.slice(at + locus.length + 1));
+		if (!named) continue;
+		return locus === "TRA" && upper.includes("/DV") ? ["TRA", "TRD"] : [locus];
+	}
+	return [];
+}
+/** The `locus=` value of a FASTA header, if it has one. */
+function declaredLocus(header) {
+	return /(?:^|\s)locus=([A-Za-z,]+)(?=\s|$)/.exec(header)?.[1]?.toUpperCase();
+}
+/** A prepared header's ` locus=` attribute, carried to the header written from it. */
+function locusAttribute(header) {
+	const declared = declaredLocus(header);
+	return declared ? ` locus=${declared}` : "";
+}
+/**
+* The loci a FASTA header's free text states, word by word: a token that is
+* a locus code (`IGK`) or names a gene of one (`IGKV1-5`, {@link namedLoci}).
+* The identifier and `key=value` attributes are skipped, and a code inside a
+* word (`LIGHT`, `STRAIN`) states none, unlike the substring test that
+* admits a record ({@link inferLocus}).
+*/
+function headerLoci(header) {
+	const found = /* @__PURE__ */ new Set();
+	for (const token of header.trim().split(/\s+/).slice(1)) {
+		if (token.includes("=")) continue;
+		for (const word of token.split(/[|,;:()[\]]+/)) {
+			const upper = word.toUpperCase();
+			const loci = LOCI.includes(upper) ? [upper] : namedLoci(word);
+			for (const locus of loci) found.add(locus);
+		}
+	}
+	return LOCI.filter((locus) => found.has(locus));
+}
+/**
+* The `locus=` value to write for a record the engine cannot place by its
+* name: the one its header declares; else the loci of the template its
+* metadata came from (TRA,TRD for a TRAV…/DV… relative), narrowed to those
+* the header's words state when it states some of them; else the loci the
+* header's words state. Empty when the name places the record, and when the
+* template and the header disagree or neither places it: the engine then
+* infers the locus from the record's relatives.
+*/
+function locusKey(name, header, template) {
+	const declared = declaredLocus(header);
+	if (declared) return declared;
+	if (namedLoci(name).length) return "";
+	const stated = headerLoci(header);
+	const relative = template ? namedLoci(template) : [];
+	if (!relative.length) return stated.join(",");
+	if (!stated.length) return relative.join(",");
+	return relative.filter((locus) => stated.includes(locus)).join(",");
+}
+/**
+* The locus that admits a record to the scope `allowed`: of the loci its
+* name, else its `locus=` key, else its header's words state, the first in
+* the scope (else the first, which the caller refuses). A record none of
+* these place takes the one locus of a one-locus scope, as a reference
+* cell's; else the first locus code anywhere in its name or header
+* ({@link inferLocus}). Null when nothing names one.
+*/
+function admittedLocus(name, header, allowed) {
+	const declared = LOCI.filter((locus) => (declaredLocus(header) ?? "").split(",").includes(locus));
+	for (const stated of [
+		namedLoci(name),
+		declared,
+		headerLoci(header)
+	]) if (stated.length) return stated.find((locus) => allowed.includes(locus)) ?? stated[0];
+	if (allowed.length === 1) return allowed[0];
+	return inferLocus(`${name} ${header}`);
+}
+/**
+* The segment an allele name reads as, checked against the database it is in.
+* IMGT's IgD constant gene (`IGHD*01`) and its J-C cluster orphons
+* (`IGLJ-C/OR18*01`) are constant-region records whose names read as a D or
+* a J gene: in a C database they are C.
+*/
+function inferSegment(name, database) {
+	const upper = name.toUpperCase();
+	if (database === "C" && (/^IGHD(?:\*|$)/.test(upper) || /^(?:IGH|IGK|IGL|TRA|TRB|TRD|TRG)J-C\b/.test(upper))) return "C";
+	const match = /^(?:IGH|IGK|IGL|TRA|TRB|TRD|TRG)([VDJC])/.exec(upper);
 	return match ? match[1] : null;
 }
 function germlineName(header) {
@@ -12128,7 +12225,9 @@ function assertChainLocus(name, locus, chain, chainLoci, source) {
 /**
 * Perform the FASTA preparation done by IgBLAST's `edit_imgt_file.pl` where it
 * is relevant to the aligner: canonicalize the germline identifier and remove IMGT
-* alignment gaps before indexing. Existing SWIGMETA is deliberately removed.
+* alignment gaps before indexing. Existing SWIGMETA is deliberately removed. A
+* record whose name places no locus keeps the one its header gives (`locus=`,
+* else its locus words) as `locus=`, which the engine would otherwise infer.
 */
 function prepareIgblastStyleGermlineFasta(text, segment, allowedLoci = LOCI) {
 	const inputRecords = parseFasta(text);
@@ -12141,10 +12240,10 @@ function prepareIgblastStyleGermlineFasta(text, segment, allowedLoci = LOCI) {
 			if (!name) throw new Error(`A ${segment} germline record has an empty identifier.`);
 			if (seen.has(name)) throw new Error(`Duplicate ${segment} germline identifier: ${name}.`);
 			seen.add(name);
-			const locus = inferLocus(`${name} ${input.header}`);
+			const locus = admittedLocus(name, input.header, allowedLoci);
 			if (!locus) throw new Error(`${name} does not identify one of the supported IG/TR loci.`);
 			if (!allowedLoci.includes(locus)) throw new Error(`${name} belongs to ${locus}, outside the selected ${allowedLoci.join("/")} search space.`);
-			const detectedSegment = inferSegment(name);
+			const detectedSegment = inferSegment(name, segment);
 			if (detectedSegment && detectedSegment !== segment) throw new Error(`${name} looks like a ${detectedSegment} gene, not a ${segment} gene.`);
 			let normalized;
 			try {
@@ -12155,7 +12254,8 @@ function prepareIgblastStyleGermlineFasta(text, segment, allowedLoci = LOCI) {
 			if (!normalized.sequence) throw new Error(`${name} has an empty nucleotide sequence.`);
 			ambiguousBases += normalized.ambiguous;
 			loci.add(locus);
-			return `>${name}\n${normalized.sequence}\n`;
+			const key = locusKey(name, input.header);
+			return `>${name}${key ? ` locus=${key}` : ""}\n${normalized.sequence}\n`;
 		}).join(""),
 		count: inputRecords.length,
 		ambiguousBases,
@@ -12190,17 +12290,18 @@ function applyIgblastInternalData(fasta, data) {
 		fasta: parseFasta(prepared.fasta).map((record) => {
 			const name = germlineName(record.header);
 			const normalized = normalizeIndexSequence(record.rawSequence);
-			const locus = inferLocus(name);
+			const locus = inferLocus(`${name} ${record.header}`);
+			const key = locusAttribute(record.header);
 			const entry = entries.get(name);
 			if (!entry) {
 				unmatched.push(name);
-				return `>${name}\n${normalized.sequence}\n`;
+				return `>${name}${key}\n${normalized.sequence}\n`;
 			}
 			assertChainLocus(name, locus, entry.chain, V_CHAIN_LOCI, "IgBLAST internal data");
 			const metadata = compactMetadata(entry.frame, -1, entry.bounds, SOURCE_PROVIDED);
 			if (!validateMetadata(metadata, normalized.sequence.length, "V")) throw new Error(`IgBLAST internal-data coordinates for ${name} exceed or contradict its ungapped V sequence.`);
 			matched += 1;
-			return `>${name}${metadataHeader(metadata)}\n${normalized.sequence}\n`;
+			return `>${name}${metadataHeader(metadata)}${key}\n${normalized.sequence}\n`;
 		}).join(""),
 		matched,
 		annotated: matched,
@@ -12239,11 +12340,12 @@ function applyIgblastAuxiliaryData(fasta, data) {
 		fasta: parseFasta(prepared.fasta).map((record) => {
 			const name = germlineName(record.header);
 			const normalized = normalizeIndexSequence(record.rawSequence);
-			const locus = inferLocus(name);
+			const locus = inferLocus(`${name} ${record.header}`);
+			const key = locusAttribute(record.header);
 			const entry = entries.get(name);
 			if (!entry) {
 				unmatched.push(name);
-				return `>${name}\n${normalized.sequence}\n`;
+				return `>${name}${key}\n${normalized.sequence}\n`;
 			}
 			assertChainLocus(name, locus, entry.chain, J_CHAIN_LOCI, "IgBLAST auxiliary data");
 			const metadata = compactMetadata(entry.frame, entry.cdr3Stop, EMPTY_BOUNDS, SOURCE_PROVIDED);
@@ -12251,7 +12353,7 @@ function applyIgblastAuxiliaryData(fasta, data) {
 			matched += 1;
 			if (entry.cdr3Stop >= 0) annotated += 1;
 			if (entry.fwr4EndOffset !== void 0) fwr4EndOffsets[name] = entry.fwr4EndOffset;
-			return `>${name}${metadataHeader(metadata)}\n${normalized.sequence}\n`;
+			return `>${name}${metadataHeader(metadata)}${key}\n${normalized.sequence}\n`;
 		}).join(""),
 		matched,
 		annotated,
@@ -12278,15 +12380,16 @@ function applyIgblastDFrameData(fasta, data) {
 		fasta: parseFasta(prepared.fasta).map((record) => {
 			const name = germlineName(record.header);
 			const normalized = normalizeIndexSequence(record.rawSequence);
+			const key = locusAttribute(record.header);
 			const frame = entries.get(name);
 			if (frame === void 0) {
 				unmatched.push(name);
-				return `>${name}\n${normalized.sequence}\n`;
+				return `>${name}${key}\n${normalized.sequence}\n`;
 			}
 			matched += 1;
-			if (frame < 0) return `>${name}\n${normalized.sequence}\n`;
+			if (frame < 0) return `>${name}${key}\n${normalized.sequence}\n`;
 			annotated += 1;
-			return `>${name}${metadataHeader(compactMetadata(frame, -1, EMPTY_BOUNDS, SOURCE_PROVIDED))}\n${normalized.sequence}\n`;
+			return `>${name}${metadataHeader(compactMetadata(frame, -1, EMPTY_BOUNDS, SOURCE_PROVIDED))}${key}\n${normalized.sequence}\n`;
 		}).join(""),
 		matched,
 		annotated,
@@ -12294,7 +12397,11 @@ function applyIgblastDFrameData(fasta, data) {
 		unmatched
 	};
 }
-function preprocessGermlineFasta(text, segment, templates = [], allowedLoci = LOCI, match = {}) {
+function refuseUnplaced(origins, allowedLoci) {
+	for (const [name, origin] of origins) if (origin.unplaced) throw new Error(`${name} names no IG/TR locus and no ${allowedLoci.join("/")} relative places it; name its locus in the header (for example locus=${allowedLoci[0]}).`);
+}
+/** One template tier; `origins` carries each record's {@link RecordOrigin} between tiers. */
+function preprocessTier(text, segment, templates, allowedLoci, match, origins) {
 	const matchOptions = resolveGermlineMatchOptions(match);
 	const inputRecords = parseFasta(text);
 	const records = [];
@@ -12311,10 +12418,11 @@ function preprocessGermlineFasta(text, segment, templates = [], allowedLoci = LO
 		if (!name) throw new Error(`A ${segment} germline record has an empty identifier.`);
 		if (seen.has(name)) throw new Error(`Duplicate ${segment} germline identifier: ${name}.`);
 		seen.add(name);
-		const locus = inferLocus(`${name} ${input.header}`);
-		if (!locus) throw new Error(`${name} does not identify one of the supported IG/TR loci.`);
-		if (!allowedLoci.includes(locus)) throw new Error(`${name} belongs to ${locus}, outside the selected ${allowedLoci.join("/")} search space.`);
-		const detectedSegment = inferSegment(name);
+		const origin = origins.get(name);
+		const header = origin?.header ?? input.header;
+		let locus = admittedLocus(name, header, allowedLoci);
+		if (locus && !allowedLoci.includes(locus)) throw new Error(`${name} belongs to ${locus}, outside the selected ${allowedLoci.join("/")} search space.`);
+		const detectedSegment = inferSegment(name, segment);
 		if (detectedSegment && detectedSegment !== segment) throw new Error(`${name} looks like a ${detectedSegment} gene, not a ${segment} gene.`);
 		let normalized;
 		try {
@@ -12360,19 +12468,26 @@ function preprocessGermlineFasta(text, segment, templates = [], allowedLoci = LO
 		if (metadata?.[12] === SOURCE_TRANSFERRED_IMGT || metadata?.[12] === SOURCE_TRANSFERRED_J) transferred += 1;
 		if (metadata?.[12] === SOURCE_VALIDATED_J_MOTIF) motifValidated += 1;
 		if (!annotationPresent(segment, metadata) && warnings.length < 8) warnings.push(`${name}: ${segment === "V" ? "no validated IMGT FWR/CDR delineation" : segment === "J" ? "no unique frame-consistent F/W-G J motif" : "no segment metadata"}.`);
-		loci.add(locus);
+		const template = transfer?.template ?? origin?.template;
+		locus ??= template ? namedLoci(template).find((candidate) => allowedLoci.includes(candidate)) ?? null : null;
+		if (locus) loci.add(locus);
+		origins.set(name, {
+			header,
+			template,
+			unplaced: !locus
+		});
 		records.push({
 			header: input.header,
 			name,
 			rawSequence: input.rawSequence,
 			sequence: normalized.sequence,
-			locus,
+			locusKey: locusKey(name, header, template) || (allowedLoci.length === 1 && !namedLoci(name).length ? allowedLoci[0] : ""),
 			metadata
 		});
 		if (matchOptions.includeDiagnostics) diagnostics.push({
 			segment,
 			name,
-			locus,
+			locus: locus ?? allowedLoci[0],
 			status,
 			source: metadataSource(metadata),
 			template: transfer?.template,
@@ -12387,7 +12502,7 @@ function preprocessGermlineFasta(text, segment, templates = [], allowedLoci = LO
 	}
 	const annotated = records.filter((record) => annotationPresent(segment, record.metadata)).length;
 	return {
-		fasta: records.map((record) => `>${record.name}${metadataHeader(record.metadata)}\n${record.sequence}\n`).join(""),
+		fasta: records.map((record) => `>${record.name}${metadataHeader(record.metadata)}${record.locusKey ? ` locus=${record.locusKey}` : ""}\n${record.sequence}\n`).join(""),
 		count: records.length,
 		annotated,
 		unannotated: records.length - annotated,
@@ -12418,22 +12533,26 @@ function mergeDiagnosticHistory(previous, current) {
 /**
 * Apply the same progressively broadened template search used by the browser
 * worker. Existing valid SWIGMETA is retained, while records still lacking V
-* or J metadata are offered to each successive template tier.
+* or J metadata are offered to each successive template tier. Each tier reads
+* a record's original header and earlier template, so a later tier admits and
+* keys it as the first did.
 */
 function preprocessGermlineFastaAcrossTiers(text, segment, templateTiers, allowedLoci = LOCI, match = {}) {
 	let report;
 	const diagnosticHistory = /* @__PURE__ */ new Map();
+	const origins = /* @__PURE__ */ new Map();
 	const tiers = templateTiers.length ? templateTiers : [[]];
 	for (let tier = 0; tier < tiers.length; tier += 1) {
-		report = preprocessGermlineFasta(report?.fasta ?? text, segment, [...tiers[tier]], allowedLoci, {
+		report = preprocessTier(report?.fasta ?? text, segment, [...tiers[tier]], allowedLoci, {
 			...match,
 			includeDiagnostics: Boolean(match.includeDiagnostics),
 			taxonomicTier: tier
-		});
+		}, origins);
 		for (const diagnostic of report.diagnostics ?? []) diagnosticHistory.set(diagnostic.name, mergeDiagnosticHistory(diagnosticHistory.get(diagnostic.name), diagnostic));
 		if (segment !== "V" && segment !== "J") break;
 		if (report.annotated === report.count) break;
 	}
+	refuseUnplaced(origins, allowedLoci);
 	if (match.includeDiagnostics) report.diagnostics = [...diagnosticHistory.values()];
 	return report;
 }
@@ -13051,12 +13170,15 @@ var NativePool = class {
 	* @param threads its `--threads`
 	* @param init {references: {V, D, J, C}, settings}, as for the WebAssembly pool
 	* @param batchRecords records per run() call, which sets the in-flight window
+	* @param onWarning called with each database or run warning the child writes
 	*/
-	constructor(binary, threads, init, batchRecords) {
+	constructor(binary, threads, init, batchRecords, onWarning = () => {}) {
 		this.binary = binary;
 		this.threads = threads;
 		this.init = init;
 		this.batchRecords = batchRecords;
+		this.onWarning = onWarning;
+		this.stderrLine = "";
 		this.jobs = [];
 		this.header = null;
 		this.failed = null;
@@ -13087,7 +13209,7 @@ var NativePool = class {
 			"C"
 		]) {
 			const text = this.init.references[segment];
-			if (!text) continue;
+			if (!text?.trim()) continue;
 			const path = join(this.directory, `${segment}.fasta`);
 			writeFileSync(path, text);
 			args.push(`--${segment.toLowerCase()}`, path);
@@ -13124,6 +13246,9 @@ var NativePool = class {
 		});
 		this.child.stderr.on("data", (text) => {
 			this.stderr = (this.stderr + text).slice(-65536);
+			const lines = (this.stderrLine + text).split(/\r?\n/);
+			this.stderrLine = lines.pop().slice(-65536);
+			for (const line of lines) if (line.startsWith("swig: warning: ")) this.onWarning(line.slice(15));
 			if (/database prepared/.test(this.stderr)) readyResolve();
 		});
 		this.exited.then(({ code, signal }) => {
@@ -13284,7 +13409,7 @@ var NativePool = class {
 };
 //#endregion
 //#region cli-src/swig-cli.mjs
-const VERSION = "0.39.4";
+const VERSION = "0.39.5";
 const CLI_STREAM_HIGH_WATER_MARK = 8388608;
 const CLI_GZIP_CHUNK_SIZE = 1048576;
 const CLI_DIRECTORY = dirname(fileURLToPath(import.meta.url));
@@ -13604,10 +13729,29 @@ function bunWorker(name) {
 	const standalone = /\$bunfs|~BUN|%7EBUN/i.test(import.meta.url);
 	return new globalThis.Worker(standalone ? `./${name}.mjs` : new URL(`./${name}.js`, import.meta.url));
 }
+/**
+* The aligner's database and run warnings, written once each as "Aligner warning: …" on either
+* route (a WebAssembly worker returns them when it loads the germlines, the native child writes
+* them as "swig: warning: …"), and kept for the run summary.
+*/
+function alignerWarnings() {
+	const seen = /* @__PURE__ */ new Set();
+	return {
+		report(warning) {
+			if (seen.has(warning)) return;
+			seen.add(warning);
+			process.stderr.write(`Aligner warning: ${warning}\n`);
+		},
+		list() {
+			return [...seen];
+		}
+	};
+}
 var WasmPool = class {
-	constructor(size, init) {
+	constructor(size, init, onWarning = () => {}) {
 		this.size = size;
 		this.init = init;
+		this.onWarning = onWarning;
 		this.workers = [];
 		this.available = [];
 		this.queued = [];
@@ -13647,11 +13791,12 @@ var WasmPool = class {
 			this.workers.push(worker);
 		}
 		const module = await WebAssembly.compile(readFileSync(this.init.wasmPath));
-		await Promise.all(this.workers.map((worker) => this.request(worker, {
+		const replies = await Promise.all(this.workers.map((worker) => this.request(worker, {
 			type: "init",
 			...this.init,
 			module
 		})));
+		for (const warning of replies[0]?.summary?.warnings ?? []) this.onWarning(warning);
 		this.available.push(...this.workers);
 	}
 	request(worker, message, release = false) {
@@ -14755,6 +14900,11 @@ async function runPipeline(config, base, assets) {
 	const references = loadedReferences.references;
 	if (config.annotation.airrMode === "preserve" && config.annotation.doubleD.mode !== "off" && config.inputs.some((input) => detectFormat(input.path, input.format) === "airr")) throw new Error("Double-D screening of AIRR input requires annotation.airrMode = \"reannotate\".");
 	const needsAnnotation = config.inputs.some((input) => detectFormat(input.path, input.format) !== "airr" || config.annotation.airrMode === "reannotate");
+	if (needsAnnotation) {
+		const { species, scope } = config.references;
+		if (config.annotation.minimumConstantPrefixIdentity > 0 && !references.C.trim()) throw new Error(`annotation.minimumConstantPrefixIdentity needs constant-region (C) germlines, but the ${species} ${scope} reference set has none; set it to null to run without the C-prefix gate.`);
+		if (config.annotation.doubleD.mode !== "off" && !references.D.trim()) throw new Error(`annotation.doubleD needs D germlines, but the ${species} ${scope} reference set has none; set annotation.doubleD.mode to "off".`);
+	}
 	const annotationBatchRecords = config.annotation.batchRecords || automaticBatchRecords(config.annotation.workers);
 	const settings = {
 		callingProfile: config.annotation.callingProfile,
@@ -14765,12 +14915,13 @@ async function runPipeline(config, base, assets) {
 	};
 	const init = workerInitialization(assets.wasmPath, references, settings);
 	const mode = config.annotation.aligner;
+	const warnings = alignerWarnings();
 	let nativeBinary = needsAnnotation ? chooseNativeAligner(mode, assets, config.annotation.doubleD.mode !== "off" ? "the double-D screen" : "", config.annotation.alignerLabel) : null;
 	let pool = null;
 	const wasmPool = async () => {
 		if (!pool) {
 			process.stderr.write(`Starting the WebAssembly aligner pool (${config.annotation.workers} worker${config.annotation.workers === 1 ? "" : "s"}; ${annotationBatchRecords.toLocaleString()} records/batch).\n`);
-			pool = new WasmPool(config.annotation.workers, init);
+			pool = new WasmPool(config.annotation.workers, init, warnings.report);
 			try {
 				await pool.start();
 			} catch (error) {
@@ -14810,7 +14961,7 @@ async function runPipeline(config, base, assets) {
 			let datasetPool = null;
 			if (needsAnnotation && !preserveAirr) {
 				if (nativeBinary) {
-					const native = new NativePool(nativeBinary, config.annotation.workers, init, annotationBatchRecords);
+					const native = new NativePool(nativeBinary, config.annotation.workers, init, annotationBatchRecords, warnings.report);
 					try {
 						await native.start();
 						datasetPool = native;
@@ -15039,10 +15190,13 @@ async function runPipeline(config, base, assets) {
 			processed: processedName,
 			airrCompression: config.output.airrCompression
 		},
-		references: { metadataPreparation: {
-			enabled: config.references.prepareMetadata,
-			segments: loadedReferences.preparation
-		} },
+		references: {
+			metadataPreparation: {
+				enabled: config.references.prepareMetadata,
+				segments: loadedReferences.preparation
+			},
+			alignerWarnings: warnings.list()
+		},
 		preprocessing: {
 			subsample: config.preprocessing.subsample,
 			fastqFilter: {
@@ -15166,6 +15320,11 @@ async function runVdj(rawArgs, assets) {
 	const tuning = vdjTuning(options);
 	const minimumConstantPrefixIdentity = options["--minimum-c-prefix-identity"] === void 0 ? null : parseFiniteOption(options["--minimum-c-prefix-identity"], "--minimum-c-prefix-identity");
 	if (minimumConstantPrefixIdentity !== null && (minimumConstantPrefixIdentity < 0 || minimumConstantPrefixIdentity > 1)) throw new Error("--minimum-c-prefix-identity must be between 0 and 1.");
+	if (minimumConstantPrefixIdentity > 0 && !prepared.references.C.trim()) throw new Error("--minimum-c-prefix-identity needs a constant-region database: add -c_region_db (or a prepared reference with C records), or omit the gate.");
+	if (!prepared.references.D.trim()) {
+		const unused = ["-min_D_match", "-D_penalty"].filter((option) => options[option] !== void 0);
+		if (unused.length) process.stderr.write(`Warning: ${unused.join(" and ")} ${unused.length === 1 ? "has" : "have"} no effect without -germline_db_D.\n`);
+	}
 	const init = workerInitialization(assets.wasmPath, prepared.references, {
 		callingProfile,
 		minimumIdentity,
@@ -15174,14 +15333,15 @@ async function runVdj(rawArgs, assets) {
 		tuning
 	});
 	const nativeBinary = chooseNativeAligner(mode, assets, "", alignerLabel);
-	let pool = nativeBinary ? new NativePool(nativeBinary, workers, init, batchRecords) : new WasmPool(workers, init);
+	const warnings = alignerWarnings();
+	let pool = nativeBinary ? new NativePool(nativeBinary, workers, init, batchRecords, warnings.report) : new WasmPool(workers, init, warnings.report);
 	try {
 		await pool.start();
 	} catch (error) {
 		await pool.close().catch(() => {});
 		if (!nativeBinary || mode === "native" || /database/i.test(error.message)) throw error;
 		process.stderr.write(`The native aligner did not start (${error.message}); using WebAssembly.\n`);
-		pool = new WasmPool(workers, init);
+		pool = new WasmPool(workers, init, warnings.report);
 		try {
 			await pool.start();
 		} catch (fallbackError) {
