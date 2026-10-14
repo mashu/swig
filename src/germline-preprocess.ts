@@ -323,8 +323,16 @@ function admittedLocus(name: string, header: string, allowed: readonly GermlineL
   return inferLocus(`${name} ${header}`);
 }
 
-function inferSegment(name: string): GermlineSegment | null {
-  const match = /^(?:IGH|IGK|IGL|TRA|TRB|TRD|TRG)([VDJC])/.exec(name.toUpperCase());
+/**
+ * The segment an allele name reads as, checked against the database it is in.
+ * IMGT's IgD constant gene (`IGHD*01`) and its J-C cluster orphons
+ * (`IGLJ-C/OR18*01`) are constant-region records whose names read as a D or
+ * a J gene: in a C database they are C.
+ */
+function inferSegment(name: string, database: GermlineSegment): GermlineSegment | null {
+  const upper = name.toUpperCase();
+  if (database === "C" && (/^IGHD(?:\*|$)/.test(upper) || /^(?:IGH|IGK|IGL|TRA|TRB|TRD|TRG)J-C\b/.test(upper))) return "C";
+  const match = /^(?:IGH|IGK|IGL|TRA|TRB|TRD|TRG)([VDJC])/.exec(upper);
   return match ? match[1] as GermlineSegment : null;
 }
 
@@ -816,7 +824,7 @@ export function prepareIgblastStyleGermlineFasta(
     if (!allowedLoci.includes(locus)) {
       throw new Error(`${name} belongs to ${locus}, outside the selected ${allowedLoci.join("/")} search space.`);
     }
-    const detectedSegment = inferSegment(name);
+    const detectedSegment = inferSegment(name, segment);
     if (detectedSegment && detectedSegment !== segment) {
       throw new Error(`${name} looks like a ${detectedSegment} gene, not a ${segment} gene.`);
     }
@@ -1035,7 +1043,7 @@ function preprocessTier(
     if (locus && !allowedLoci.includes(locus)) {
       throw new Error(`${name} belongs to ${locus}, outside the selected ${allowedLoci.join("/")} search space.`);
     }
-    const detectedSegment = inferSegment(name);
+    const detectedSegment = inferSegment(name, segment);
     if (detectedSegment && detectedSegment !== segment) {
       throw new Error(`${name} looks like a ${detectedSegment} gene, not a ${segment} gene.`);
     }
