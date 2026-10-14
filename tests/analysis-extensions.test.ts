@@ -32,6 +32,14 @@ test("SHM metrics distinguish synonymous and replacement changes and retain mult
   const accumulator=new ShmAccumulator({metric:"vNtRate",maxSamplesPerLineage:10});accumulator.add(row,0,7);accumulator.add({...row,sequence_id:"r2",sample_id:"day_30",swig_timepoint:"day_30",swig_compartment:"lymph_node",cdr3:"TGTGCCCCC",cdr3_aa:"CAP",duplicate_count:"2",v_sequence_alignment:"GCCGATGTT"},1,7);const dashboard=accumulator.finish();assert.equal(dashboard.analyzedAbundance,5);assert.equal(dashboard.lineages[0].label,"Lineage 7");assert.equal(dashboard.lineageSamples.length,2);assert.deepEqual(dashboard.lineageSamples.map((group)=>group.sampleId).sort(),["day_0","day_30"]);assert.ok(dashboard.lineages[0].maximum>=dashboard.lineages[0].p95);assert.equal(dashboard.lineageSamples.find((group)=>group.sampleId==="day_30")?.compartment,"lymph_node");assert.deepEqual(dashboard.lowestByLineage?.map((value)=>[value.lineageId,value.ordinal,value.cdr3Nt,value.cdr3Aa]),[[7,0,"TGTGCCAAA","CAK"]]);
 });
 
+test("SHM codons follow the read's frame when the V alignment starts inside a codon", () => {
+  // Codons start at read positions 1, 4, 7, 10 (sequence_frame 1); the V
+  // alignment starts at position 2, so its first two bases end the codon at 1.
+  const row={sequence_id:"r1",v_call:"IGHV1-2*01",j_call:"IGHJ4*02",v_sequence_alignment:"AAGCCGATGCT",v_germline_alignment:"AAGCTGCTGCT",v_sequence_start:"2",sequence_frame:"1"};
+  const metric=computeShmMetric(row);
+  assert.ok(metric);assert.equal(metric.vNtMutations,2);assert.equal(metric.comparedCodons,3);assert.equal(metric.synonymous,1);assert.equal(metric.vAaReplacements,1);
+});
+
 type GermlineTestRow={row:Record<string,string>;ordinal:number;lineageId:number};
 function cdr3For(index:number,length=30+index%4){const encoded=index.toString(4).split("").map(value=>"ACGT"[Number(value)]).join("");return `TGT${encoded}${"A".repeat(length-encoded.length-6)}TGG`;}
 function germlineRow(reference:string,index:number,mutations:number[]=[]):Record<string,string>{

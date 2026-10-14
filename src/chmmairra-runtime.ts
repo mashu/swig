@@ -1,4 +1,4 @@
-import type { ChmmOptions } from "./post-analysis-core";
+import { chmmJunctionFlank, type ChmmOptions } from "./post-analysis-core";
 import type { AirrOutputWritable, AirrResultStore } from "./result-store";
 import { tableHeader, tableRow, type TableExportFormat } from "./export-formats";
 
@@ -183,7 +183,7 @@ export async function runChmmairra(
     };
     const prefix = options.segment.toLowerCase();
     await store.scanAirrRows(
-      [`${prefix}_call`, `${prefix}_sequence_alignment`, `${prefix}_germline_alignment`],
+      [`${prefix}_call`, `${prefix}_sequence_alignment`, `${prefix}_germline_alignment`, "sequence", "rev_comp", `${prefix}_sequence_start`, `${prefix}_sequence_end`],
       async (rows) => {
         if (!rows.length) return;
         const current = slot;
@@ -194,6 +194,8 @@ export async function runChmmairra(
           call: row.values[`${prefix}_call`],
           sequenceAlignment: row.values[`${prefix}_sequence_alignment`],
           germlineAlignment: row.values[`${prefix}_germline_alignment`],
+          segment: options.segment,
+          flank: chmmJunctionFlank(options.segment, row.values.sequence, row.values.rev_comp, row.values[`${prefix}_sequence_start`], row.values[`${prefix}_sequence_end`]),
         }));
         slots[current] = clients[current].request<{ results: WorkerResult[] }>({ type: "batch", rows: workerRows }).then(({ results }) => consume(results));
       },
@@ -241,6 +243,8 @@ export async function runChmmairraDetail(
         call,
         sequenceAlignment: detail.values[`${prefix}_sequence_alignment`] ?? "",
         germlineAlignment: detail.values[`${prefix}_germline_alignment`] ?? "",
+        segment: options.segment,
+        flank: chmmJunctionFlank(options.segment, detail.values.sequence, detail.values.rev_comp, detail.values[`${prefix}_sequence_start`], detail.values[`${prefix}_sequence_end`]),
       },
     });
     if (signal?.aborted) throw new DOMException("CHMMAIRRa detail reconstruction was cancelled.", "AbortError");

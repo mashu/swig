@@ -2523,6 +2523,98 @@ function topCallName(value: string): string {
   return value.split(",", 1)[0]?.trim() ?? "";
 }
 
+function chmmReferenceIndex(callName: string, msa: ReferenceMsa): number | undefined {
+  let referenceIndex = msa.lookup.get(callName);
+  if (referenceIndex === undefined) {
+    const gene = callName.replace(/\*.*$/, "");
+    const match = [...msa.lookup.entries()].find(([name]) => name.replace(/\*.*$/, "") === gene);
+    referenceIndex = match?.[1];
+  }
+  return referenceIndex;
+}
+
+const CHMM_COMPLEMENT: Record<string, string> = { A: "T", C: "G", G: "C", T: "A" };
+
+/**
+ * The read bases beside a segment's local alignment on its junction side (after the V
+ * alignment, before the J alignment), in the alignment's orientation. `start`/`end` are the
+ * AIRR 1-based `{v,j}_sequence_start`/`_end`, which refer to the reverse complement of
+ * `sequence` when `rev_comp` is true.
+ */
+export function chmmJunctionFlank(
+  segment: "V" | "J",
+  sequence: string | undefined,
+  revComp: string | undefined,
+  start: string | number | undefined,
+  end: string | number | undefined,
+  limit = 64,
+): string {
+  const raw = (sequence ?? "").toUpperCase();
+  if (!raw) return "";
+  const oriented = /^(T|TRUE)$/i.test(String(revComp ?? "").trim())
+    ? [...raw].reverse().map((base) => CHMM_COMPLEMENT[base] ?? "N").join("")
+    : raw;
+  if (segment === "V") {
+    const last = Number(end);
+    return Number.isInteger(last) && last > 0 ? oriented.slice(last, last + limit) : "";
+  }
+  const first = Number(start);
+  return Number.isInteger(first) && first > 1 ? oriented.slice(Math.max(0, first - 1 - limit), first - 1) : "";
+}
+
+function bestExtension(read: string, germline: string): number {
+  let score = 0;
+  let best = 0;
+  let length = 0;
+  for (let index = 0; index < Math.min(read.length, germline.length); index += 1) {
+    score += read[index] === germline[index] && /[ACGT]/.test(read[index]) ? 1 : -1;
+    if (score > best) {
+      best = score;
+      length = index + 1;
+    }
+  }
+  return length;
+}
+
+/**
+ * Extend a V alignment toward its germline 3' end (a J alignment toward its 5' start) by the
+ * best-scoring gapless prefix of the junction-side read bases, scored +1/-1. The aligner may
+ * stop a V (start a J) before trailing (leading) mismatches it attributes to the junction;
+ * a PCR chimera's last informative columns can lie there. Unchanged when the reference or
+ * the local germline cannot be located (threading then reports why).
+ */
+export function extendChmmAlignment(
+  segment: "V" | "J",
+  sequenceAlignment: string,
+  germlineAlignment: string,
+  call: string,
+  flank: string,
+  msa: ReferenceMsa,
+): { sequenceAlignment: string; germlineAlignment: string } {
+  const unchanged = { sequenceAlignment, germlineAlignment };
+  if (!flank) return unchanged;
+  const referenceIndex = chmmReferenceIndex(topCallName(call), msa);
+  if (referenceIndex === undefined) return unchanged;
+  const reference = msa.sequences[referenceIndex].replaceAll("-", "");
+  const local = germlineAlignment.toUpperCase().replaceAll(".", "-").replaceAll("-", "");
+  const at = reference.indexOf(local);
+  if (at < 0) return unchanged;
+  const read = flank.toUpperCase();
+  if (segment === "V") {
+    const germline = reference.slice(at + local.length);
+    const length = bestExtension(read, germline);
+    return { sequenceAlignment: sequenceAlignment + read.slice(0, length), germlineAlignment: germlineAlignment + germline.slice(0, length) };
+  }
+  const reverse = (value: string) => [...value].reverse().join("");
+  const germline = reverse(reference.slice(0, at));
+  const readReversed = reverse(read);
+  const length = bestExtension(readReversed, germline);
+  return {
+    sequenceAlignment: reverse(readReversed.slice(0, length)) + sequenceAlignment,
+    germlineAlignment: reverse(germline.slice(0, length)) + germlineAlignment,
+  };
+}
+
 export function threadSequenceToMsa(
   sequenceAlignment: string,
   germlineAlignment: string,
@@ -2530,12 +2622,7 @@ export function threadSequenceToMsa(
   msa: ReferenceMsa,
 ): string {
   const callName = topCallName(call);
-  let referenceIndex = msa.lookup.get(callName);
-  if (referenceIndex === undefined) {
-    const gene = callName.replace(/\*.*$/, "");
-    const match = [...msa.lookup.entries()].find(([name]) => name.replace(/\*.*$/, "") === gene);
-    referenceIndex = match?.[1];
-  }
+  const referenceIndex = chmmReferenceIndex(callName, msa);
   if (referenceIndex === undefined) throw new Error(`Reference MSA is missing ${callName || "the assigned allele"}.`);
   const gappedFullReference = msa.sequences[referenceIndex];
   const degappedReference = gappedFullReference.replaceAll("-", "");

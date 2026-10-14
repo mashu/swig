@@ -323,9 +323,12 @@ export function inferIsotype(
   identity: number | null,
   support: number | null = null,
 ): string {
+  // The aligner calls C on at least 12 aligned bases at 90 % identity with an
+  // anchored E-value of at most 1e-3 (SwiftIG's floors and its anchor); a
+  // stretch of 30 bases or more stands on its identity alone.
   const alignedBases = alignedSequence.replace(/[-.\s]/g, "").length;
   const longLocalEvidence = alignedBases >= 30;
-  const shortAnchoredEvidence = alignedBases >= 12 && support !== null && support <= 1e-4;
+  const shortAnchoredEvidence = alignedBases >= 12 && support !== null && support <= 1e-3;
   if (!call || (identity ?? 0) < 0.90 || (!longLocalEvidence && !shortAnchoredEvidence)) return "";
   const labels = [...new Set(calls(call).map(isotypeLabel).filter(Boolean))];
   if (labels.length <= 1) return labels[0] ?? "";

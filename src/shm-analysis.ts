@@ -113,7 +113,9 @@ export function computeShmMetric(row: Record<string,string>, ordinal = 0, lineag
     }
   };
 
-  let codingBases = (frame - 1) % 3;
+  // Bases of the current codon before the V alignment's first base: codons
+  // start at read positions ≡ sequence_frame (mod 3), one-based.
+  let codingBases = (((queryStart - frame) % 3) + 3) % 3;
   for (let column = 0; column < length; column += 1) {
     const q = query[column], g = germline[column];
     if (q !== "-") queryPosition += 1;

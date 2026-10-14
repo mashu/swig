@@ -5,6 +5,8 @@ import {
   assignLineages,
   boundedEditProfile,
   chmmairraDistanceFromReference,
+  chmmJunctionFlank,
+  extendChmmAlignment,
   createExactDedupPlan,
   DenoiseAccumulator,
   deduplicate,
@@ -22,6 +24,7 @@ import {
   threadSequenceToMsa,
   type PostAnalysisRecord,
 } from "../src/post-analysis-core.ts";
+import { denoiseVdjSequence } from "../src/post-analysis-record.ts";
 
 function record(
   ordinal: number,
@@ -597,4 +600,26 @@ test("50k post-analysis records retain bounded compact state and avoid all-pairs
   assert.equal(lineages.truncatedCandidates, 0);
   assert.ok(lineages.candidateComparisons < 50_000 * 100, `${lineages.candidateComparisons}`);
   assert.ok(lineages.lineageCount <= collapsed.uniqueRecords);
+});
+
+test("the denoising V-to-J slice reads AIRR coordinates on the aligned strand", () => {
+  // The aligned read is TTACGTACGTCC; V starts at 3 and J ends at 10.
+  const forward = { ordinal: 0, values: { sequence: "TTACGTACGTCC", rev_comp: "F", v_sequence_start: "3", j_sequence_end: "10" } };
+  const reverse = { ordinal: 1, values: { sequence: "GGACGTACGTAA", rev_comp: "T", v_sequence_start: "3", j_sequence_end: "10" } };
+  assert.equal(denoiseVdjSequence(forward), "ACGTACGT");
+  assert.equal(denoiseVdjSequence(reverse), "ACGTACGT");
+});
+
+test("CHMMAIRRa extends a local alignment toward the junction by its best-scoring flank", () => {
+  const msa = prepareReferenceMsa(">IGHV1*01\nAA--CCGGTACA\n>IGHV2*01\nAATTCCGGTTCA\n>IGHJ1*01\nAA--CCGGTACA\n");
+  // V: the aligner stopped before a trailing mismatch the next bases outweigh (X then ==).
+  assert.deepEqual(extendChmmAlignment("V", "AACCGG", "AACCGG", "IGHV1*01", "AACAGGG", msa), { sequenceAlignment: "AACCGGAACA", germlineAlignment: "AACCGGTACA" });
+  // A flank that never scores positive (junction bases) is not taken.
+  assert.deepEqual(extendChmmAlignment("V", "AACCGG", "AACCGG", "IGHV1*01", "CGTGCC", msa), { sequenceAlignment: "AACCGG", germlineAlignment: "AACCGG" });
+  // J: extended 5'-ward with the read bases before the alignment.
+  assert.deepEqual(extendChmmAlignment("J", "GGTACA", "GGTACA", "IGHJ1*01", "TACC", msa), { sequenceAlignment: "ACCGGTACA", germlineAlignment: "ACCGGTACA" });
+  assert.equal(chmmJunctionFlank("V", "TTACGTAA", "F", 1, 4), "GTAA");
+  assert.equal(chmmJunctionFlank("J", "TTACGTAA", "F", 5, 8), "TTAC");
+  assert.equal(chmmJunctionFlank("V", "AAACCCGG", "T", 1, 4), "GTTT", "rev_comp rows use the reverse complement of sequence");
+  assert.equal(threadSequenceToMsa("AACCGGAACA", "AACCGGTACA", "IGHV1*01", msa), "AA--CCGGAACA");
 });

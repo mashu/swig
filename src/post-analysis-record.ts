@@ -33,9 +33,16 @@ export function airrRowToPostAnalysisRecord(row: OrdinalAirrRow, intern: (value:
   };
 }
 
-/** Exact V-to-J slice used by every denoising front end. AIRR coordinates are one-based. */
+const COMPLEMENT: Record<string, string> = { A: "T", C: "G", G: "C", T: "A" };
+
+/**
+ * Exact V-to-J slice used by every denoising front end. AIRR coordinates are
+ * one-based and refer to the read as aligned: its reverse complement when
+ * `rev_comp` is true.
+ */
 export function denoiseVdjSequence(row: OrdinalAirrRow): string {
-  const raw=row.values.sequence??"";
+  const given=row.values.sequence??"";
+  const raw=/^(?:T|TRUE|1)$/i.test(row.values.rev_comp??"")?[...given.toUpperCase()].reverse().map((base)=>COMPLEMENT[base]??"N").join(""):given;
   const start=Math.floor(Number(row.values.v_sequence_start));
   const end=Math.floor(Number(row.values.j_sequence_end));
   if(raw&&Number.isFinite(start)&&Number.isFinite(end)&&start>=1&&end>=start&&end<=raw.length)return raw.slice(start-1,end);

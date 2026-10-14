@@ -2,6 +2,7 @@
 
 import {
   chmmairraDistanceFromReference,
+  extendChmmAlignment,
   prepareReferenceMsa,
   runChmm,
   threadSequenceToMsa,
@@ -14,6 +15,14 @@ interface ChmmRow {
   call: string;
   sequenceAlignment: string;
   germlineAlignment: string;
+  /** "V" or "J", with `flank` the read bases on the junction side of the local alignment. */
+  segment?: "V" | "J";
+  flank?: string;
+}
+
+function extended(row: ChmmRow): ChmmRow {
+  if (!row.segment || !row.flank || !msa) return row;
+  return { ...row, ...extendChmmAlignment(row.segment, row.sequenceAlignment, row.germlineAlignment, row.call, row.flank, msa) };
 }
 
 interface ChmmWorkerResult {
@@ -50,7 +59,7 @@ worker.onmessage = (event: MessageEvent<Request>) => {
     }
     if (!msa || !options) throw new Error("CHMMAIRRa worker is not initialized.");
     if (request.type === "detail") {
-      const row = request.row;
+      const row = extended(request.row);
       if (!row.call || !row.sequenceAlignment || !row.germlineAlignment) {
         throw new Error("This record does not contain the selected segment alignment.");
       }
@@ -78,11 +87,12 @@ worker.onmessage = (event: MessageEvent<Request>) => {
       return;
     }
     const results: ChmmWorkerResult[] = [];
-    for (const row of request.rows) {
-      if (!row.call || !row.sequenceAlignment || !row.germlineAlignment) {
-        results.push({ ordinal: row.ordinal, probability: Number.NaN, dfr: 0, startingReference: "", recombinations: [], status: "missing_alignment" });
+    for (const input of request.rows) {
+      if (!input.call || !input.sequenceAlignment || !input.germlineAlignment) {
+        results.push({ ordinal: input.ordinal, probability: Number.NaN, dfr: 0, startingReference: "", recombinations: [], status: "missing_alignment" });
         continue;
       }
+      const row = extended(input);
       const dfr = chmmairraDistanceFromReference(row.sequenceAlignment, row.germlineAlignment);
       if (dfr < minDfr) {
         results.push({ ordinal: row.ordinal, probability: Number.NaN, dfr, startingReference: "", recombinations: [], status: "low_dfr" });
