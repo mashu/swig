@@ -134,8 +134,9 @@ fn heavy_texts(db: &SyntheticDatabase) -> (String, String, String) {
 
 /// (a) A full V followed by 100 random bases: a chance D in the random
 /// bases would assert a junction whose J the read does not show. Swig
-/// 0.39.3 calls a D on about half of these reads (this database has 35 D
-/// alleles; 93 % on human IGH), the cost on under a tenth.
+/// 0.39.3 calls a D on 56 of these 100 reads at mean presence 0.60 (this
+/// database has 35 D alleles; 93 % on human IGH); the cost on 5, at 0.14.
+/// The bound is the acceptance gate's 10 %.
 #[test]
 fn a_full_v_followed_by_random_bases_gets_no_d() {
     let db = heavy();
@@ -143,40 +144,65 @@ fn a_full_v_followed_by_random_bases_gets_no_d() {
     let reads = v_then_random(&simulated(&db, SimParams::mid(), 100, 11), 101);
     let (called, presence) = summary(&d_calls(&v, &d, &j, &RunOptions::default(), &reads));
     assert!(
-        called <= 15 && presence < 0.3,
+        called <= 10 && presence < 0.2,
         "{called} D calls, mean presence {presence:.3}"
     );
 }
 
 /// (b) 100 random bases followed by a J (and its C): a chance D first on
-/// its path would assert a junction whose V the read does not show.
+/// its path would assert a junction whose V the read does not show. Swig
+/// 0.39.3 calls a D on all 100 reads at mean presence 0.99; the cost on 14,
+/// at 0.41. The V side prices less than the J side: the read's only anchor
+/// is its J, whose few columns leave the V's divergence uncertain, and a V
+/// stays hidden in more bases than a J (on human IGH 12 against 8: accept
+/// scores 24 and 16, as measured on reads cut inside them). This bound is
+/// what the cost reaches, so that it catches any weakening of the V side;
+/// the acceptance gate's 10 % is the ignored test below.
 #[test]
+fn random_bases_followed_by_a_j_get_few_ds() {
+    let db = heavy();
+    let (v, d, j) = heavy_texts(&db);
+    let reads = random_then_j(&simulated(&db, SimParams::mid(), 100, 12), 102);
+    let (called, presence) = summary(&d_calls(&v, &d, &j, &RunOptions::default(), &reads));
+    assert!(
+        called <= 15 && presence < 0.45,
+        "{called} D calls, mean presence {presence:.3}"
+    );
+}
+
+/// (b) at the acceptance gate's 10 % D calls and mean presence 0.2. It
+/// fails (14 calls, 0.41), as human IGH jcut100 does (10.2 %): open until
+/// the gate or the V side's parameters are decided (REVIEW §0 item 10).
+#[test]
+#[ignore = "open: the jcut100 gate (10.2 % against 10 %) awaits a decision"]
 fn random_bases_followed_by_a_j_get_no_d() {
     let db = heavy();
     let (v, d, j) = heavy_texts(&db);
     let reads = random_then_j(&simulated(&db, SimParams::mid(), 100, 12), 102);
     let (called, presence) = summary(&d_calls(&v, &d, &j, &RunOptions::default(), &reads));
     assert!(
-        called <= 20 && presence < 0.5,
+        called <= 10 && presence < 0.2,
         "{called} D calls, mean presence {presence:.3}"
     );
 }
 
 /// (c) Fixture (a) against a BCR database of two loci: the heavy locus is
-/// adjudicated alone and pays the same cost.
+/// adjudicated alone and pays the same cost. Swig 0.39.3: 86 D calls at
+/// mean presence 0.86; the cost: 4, at 0.18.
 #[test]
 fn a_full_v_followed_by_random_bases_gets_no_d_in_a_bcr_database() {
     let (db, v, d, j) = bcr();
     let reads = v_then_random(&simulated(&db, SimParams::mid(), 100, 11), 101);
     let (called, presence) = summary(&d_calls(&v, &d, &j, &RunOptions::default(), &reads));
     assert!(
-        called <= 15 && presence < 0.3,
+        called <= 10 && presence < 0.2,
         "{called} D calls, mean presence {presence:.3}"
     );
 }
 
 /// (d) Fixture (a) under `--calls fixed`: the fixed scale charges the cost
-/// as `⌊P*_D + c/λ_D⌋ − ⌊P*_D⌋` score units, its posterior `c` nats.
+/// as `⌊P*_D + c/λ_D⌋ − ⌊P*_D⌋` score units, its posterior `c` nats. Swig
+/// 0.39.3: 55 D calls at mean presence 0.62; the cost: 8, at 0.17.
 #[test]
 fn a_full_v_followed_by_random_bases_gets_no_d_on_the_fixed_scale() {
     let db = heavy();
@@ -186,7 +212,7 @@ fn a_full_v_followed_by_random_bases_gets_no_d_on_the_fixed_scale() {
     options.set("calls", Some("fixed")).unwrap();
     let (called, presence) = summary(&d_calls(&v, &d, &j, &options, &reads));
     assert!(
-        called <= 15 && presence < 0.3,
+        called <= 10 && presence < 0.2,
         "{called} D calls, mean presence {presence:.3}"
     );
 }
@@ -233,4 +259,52 @@ fn guard_a_read_starting_just_before_its_d_keeps_it() {
     assert!(reads.len() >= 40, "{}", reads.len());
     let (called, _) = summary(&d_calls(&v, &d, &j, &RunOptions::default(), &reads));
     assert_eq!(called, reads.len());
+}
+
+/// Guard: at 30 % SHM, a read that ends 20–40 bases into its J keeps its
+/// D. The J stage misses such a short, mutated J on about a fifth of these
+/// reads, whose D then ends its path some 20–60 bases before the read's
+/// end and pays for the J it implies there. The miss model reads the
+/// divergence of the read's V, at which those bases could well hide a J,
+/// so the D pays little. A model that took the read for unmutated drops 5
+/// of these D calls. The reference is the same run with
+/// `--d-open-flank off`, which reproduces Swig 0.39.3.
+#[test]
+fn guard_a_mutated_read_ending_in_a_short_j_keeps_its_d() {
+    let db = heavy();
+    let (v, d, j) = heavy_texts(&db);
+    let simulated = simulated(&db, SimParams::mid().with_shm(0.3), 120, 15);
+    let reads: Vec<ReadRecord> = simulated
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let end = r.span(Region::J).unwrap().start + 20 + i % 21;
+            record(
+                format!("shortj{i}"),
+                r.forward[..end.min(r.forward.len())].to_vec(),
+            )
+        })
+        .collect();
+    let truth: Vec<&str> = simulated
+        .iter()
+        .map(|r| db.d.alleles()[r.d.unwrap()].name.as_str())
+        .collect();
+    let calls = |options: &RunOptions| {
+        let rows = d_calls(&v, &d, &j, options, &reads);
+        let correct = rows
+            .iter()
+            .zip(&truth)
+            .filter(|((call, _), name)| call.split(',').any(|c| c == **name))
+            .count();
+        (summary(&rows).0, correct)
+    };
+    let mut off = RunOptions::default();
+    off.set("d-open-flank", Some("off")).unwrap();
+    // 114 D calls, 51 of them right, as with the cost (52).
+    let (called_off, correct_off) = calls(&off);
+    let (called, correct) = calls(&RunOptions::default());
+    assert!(
+        called + 1 >= called_off && correct + 1 >= correct_off,
+        "{called} D calls ({correct} right), off: {called_off} ({correct_off})"
+    );
 }
