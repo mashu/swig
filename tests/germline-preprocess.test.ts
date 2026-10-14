@@ -394,3 +394,45 @@ test("later template tiers read a record's original header", () => {
   }
 });
 
+test("a custom name with no locus code is placed by its scope or its template", () => {
+  const igkv15 = (human.loci.IGK.V as MetadataAllele[]).find((allele) => allele[0] === "IGKV1-5*01");
+  assert.ok(igkv15);
+  const changed = `${igkv15[1].slice(0, 145)}${igkv15[1][145] === "A" ? "C" : "A"}${igkv15[1].slice(146)}`;
+  // The record's key, "" for none; undefined when the record is missing.
+  const keyOf = (fasta: string, name: string) => {
+    const found = new RegExp(`^>${name}\\b.*?(?: locus=([A-Z,]+))?$`, "m").exec(fasta);
+    return found ? found[1] ?? "" : undefined;
+  };
+  const igkTiers = germlineTemplateTiers(pack, human, "IGK", "V");
+  // A reference cell's scope is its one locus: a bare name, or words holding
+  // a code inside them ('light' holds IGH), take that locus.
+  for (const header of ["novel_1", "novel_1 kappa light chain"]) {
+    const cell = preprocessGermlineFastaAcrossTiers(`>${header}\n${changed}\n`, "V", igkTiers, ["IGK"]);
+    assert.equal(cell.annotated, 1, header);
+    assert.equal(keyOf(cell.fasta, "novel_1"), "IGK", header);
+    assert.deepEqual(cell.loci, ["IGK"], header);
+  }
+  const bareJ = preprocessGermlineFasta(">novel_j\nGTGGACGTTCGGCCAAGGGACCAAGGTGGAAATCAAAC\n", "J", [], ["IGK"]);
+  assert.equal(keyOf(bareJ.fasta, "novel_j"), "IGK");
+  // A gene word of another locus is still refused.
+  assert.throws(
+    () => preprocessGermlineFasta(`>novel_1 IGHV-like\n${changed}\n`, "V", igkTiers[0], ["IGK"]),
+    /novel_1 belongs to IGH, outside the selected IGK search space/,
+  );
+  // In a multi-locus scope the template places it.
+  const bcrTiers = germlineTemplateTiers(pack, human, "BCR", "V");
+  const bcr = preprocessGermlineFastaAcrossTiers(`>novel_1\n${changed}\n`, "V", bcrTiers, ["IGH", "IGK", "IGL"], { includeDiagnostics: true });
+  assert.equal(keyOf(bcr.fasta, "novel_1"), "IGK");
+  assert.deepEqual(bcr.loci, ["IGK"]);
+  assert.equal(bcr.diagnostics?.[0].locus, "IGK");
+  // Nothing places it: refused, saying how to place it.
+  assert.throws(
+    () => preprocessGermlineFastaAcrossTiers(">novel_d\nGGTATAACTGGAACGAC\n", "D", [], ["IGH", "IGK", "IGL"]),
+    /novel_d names no IG\/TR locus and no IGH\/IGK\/IGL relative places it; name its locus in the header \(for example locus=IGH\)\./,
+  );
+  assert.throws(
+    () => preprocessGermlineFasta(`>novel_v\n${"ACGT".repeat(75)}\n`, "V", bcrTiers[0], ["IGH", "IGK", "IGL"]),
+    /novel_v names no IG\/TR locus/,
+  );
+});
+

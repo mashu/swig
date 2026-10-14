@@ -107,7 +107,6 @@ interface ParsedRecord {
   name: string;
   rawSequence: string;
   sequence: string;
-  locus: GermlineLocus;
   /** `locus=` written for the engine; empty when the name places the record. */
   locusKey: string;
   metadata?: CompactMetadata;
@@ -305,6 +304,23 @@ function locusKey(name: string, header: string, template?: string): string {
   if (!relative.length) return stated.join(",");
   if (!stated.length) return relative.join(",");
   return relative.filter((locus) => stated.includes(locus)).join(",");
+}
+
+/**
+ * The locus that admits a record to the scope `allowed`: of the loci its
+ * name, else its `locus=` key, else its header's words state, the first in
+ * the scope (else the first, which the caller refuses). A record none of
+ * these place takes the one locus of a one-locus scope, as a reference
+ * cell's; else the first locus code anywhere in its name or header
+ * ({@link inferLocus}). Null when nothing names one.
+ */
+function admittedLocus(name: string, header: string, allowed: readonly GermlineLocus[]): GermlineLocus | null {
+  const declared = LOCI.filter((locus) => (declaredLocus(header) ?? "").split(",").includes(locus));
+  for (const stated of [namedLoci(name), declared, headerLoci(header)]) {
+    if (stated.length) return stated.find((locus) => allowed.includes(locus)) ?? stated[0];
+  }
+  if (allowed.length === 1) return allowed[0];
+  return inferLocus(`${name} ${header}`);
 }
 
 function inferSegment(name: string): GermlineSegment | null {
@@ -795,7 +811,7 @@ export function prepareIgblastStyleGermlineFasta(
     if (!name) throw new Error(`A ${segment} germline record has an empty identifier.`);
     if (seen.has(name)) throw new Error(`Duplicate ${segment} germline identifier: ${name}.`);
     seen.add(name);
-    const locus = inferLocus(`${name} ${input.header}`);
+    const locus = admittedLocus(name, input.header, allowedLoci);
     if (!locus) throw new Error(`${name} does not identify one of the supported IG/TR loci.`);
     if (!allowedLoci.includes(locus)) {
       throw new Error(`${name} belongs to ${locus}, outside the selected ${allowedLoci.join("/")} search space.`);
@@ -960,7 +976,10 @@ export function preprocessGermlineFasta(
   allowedLoci: readonly GermlineLocus[] = LOCI,
   match: GermlineMatchOptions = {},
 ): GermlinePreprocessReport {
-  return preprocessTier(text, segment, templates, allowedLoci, match, new Map());
+  const origins = new Map<string, RecordOrigin>();
+  const report = preprocessTier(text, segment, templates, allowedLoci, match, origins);
+  refuseUnplaced(origins, allowedLoci);
+  return report;
 }
 
 /**
@@ -971,6 +990,16 @@ export function preprocessGermlineFasta(
 interface RecordOrigin {
   header: string;
   template?: string;
+  /** Neither its name, its header, its scope nor a template has placed it. */
+  unplaced?: boolean;
+}
+
+function refuseUnplaced(origins: ReadonlyMap<string, RecordOrigin>, allowedLoci: readonly GermlineLocus[]): void {
+  for (const [name, origin] of origins) {
+    if (origin.unplaced) {
+      throw new Error(`${name} names no IG/TR locus and no ${allowedLoci.join("/")} relative places it; name its locus in the header (for example locus=${allowedLoci[0]}).`);
+    }
+  }
 }
 
 /** One template tier; `origins` carries each record's {@link RecordOrigin} between tiers. */
@@ -1001,9 +1030,9 @@ function preprocessTier(
     seen.add(name);
     const origin = origins.get(name);
     const header = origin?.header ?? input.header;
-    const locus = inferLocus(`${name} ${header}`);
-    if (!locus) throw new Error(`${name} does not identify one of the supported IG/TR loci.`);
-    if (!allowedLoci.includes(locus)) {
+    // A record nothing names may still be placed by its template, below.
+    let locus = admittedLocus(name, header, allowedLoci);
+    if (locus && !allowedLoci.includes(locus)) {
       throw new Error(`${name} belongs to ${locus}, outside the selected ${allowedLoci.join("/")} search space.`);
     }
     const detectedSegment = inferSegment(name);
@@ -1055,23 +1084,26 @@ function preprocessTier(
     if (!annotationPresent(segment, metadata) && warnings.length < 8) {
       warnings.push(`${name}: ${segment === "V" ? "no validated IMGT FWR/CDR delineation" : segment === "J" ? "no unique frame-consistent F/W-G J motif" : "no segment metadata"}.`);
     }
-    loci.add(locus);
     const template = transfer?.template ?? origin?.template;
-    origins.set(name, { header, template });
+    locus ??= template ? namedLoci(template).find((candidate) => allowedLoci.includes(candidate)) ?? null : null;
+    if (locus) loci.add(locus);
+    // An unplaced record is refused once no template tier is left to place it.
+    origins.set(name, { header, template, unplaced: !locus });
     records.push({
       header: input.header,
       name,
       rawSequence: input.rawSequence,
       sequence: normalized.sequence,
-      locus,
-      locusKey: locusKey(name, header, template),
+      // A one-locus scope places what its name and header do not.
+      locusKey: locusKey(name, header, template) || (allowedLoci.length === 1 && !namedLoci(name).length ? allowedLoci[0] : ""),
       metadata,
     });
     if (matchOptions.includeDiagnostics) {
       diagnostics.push({
         segment,
         name,
-        locus,
+        // Placeholder for an unplaced record, which a later tier places or which is refused.
+        locus: locus ?? allowedLoci[0],
         status,
         source: metadataSource(metadata),
         template: transfer?.template,
@@ -1159,6 +1191,7 @@ export function preprocessGermlineFastaAcrossTiers(
     if (segment !== "V" && segment !== "J") break;
     if (report.annotated === report.count) break;
   }
+  refuseUnplaced(origins, allowedLoci);
   if (match.includeDiagnostics) report!.diagnostics = [...diagnosticHistory.values()];
   return report!;
 }
