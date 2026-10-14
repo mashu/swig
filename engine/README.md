@@ -465,7 +465,9 @@ or `fallback` for the inferred ones), so a reload does not infer again. Steps
 reference. **Give custom-named alleles a `locus=` key** when the warnings
 appear: the fallback cannot tell a custom TRB D from a TRD D, so TRDD alleles
 then compete on TRB reads. Swig Web and swig-cli write `locus=` for the
-custom records of a reference cell or of `prepare-reference` themselves.
+custom records of a reference cell or of `prepare-reference` themselves, and
+`swig-cli --vdj` keeps the locus a header gives (`locus=TRB`, or a locus word
+such as `TRB`).
 
 - **One locus per rearrangement.** J candidates must share a locus with the
   read's anchoring V placements (every locus when no V placement anchors),

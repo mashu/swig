@@ -338,3 +338,30 @@ test("a custom FASTA in a reference cell is given the cell's locus", () => {
   // Pack records are untouched.
   assert.doesNotMatch(composed.V ?? "", /^>IGHV.* locus=/m);
 });
+
+test("the IgBLAST-style preparation keeps the locus a custom record's header gives", () => {
+  // Regression: the default swig-cli --vdj route wrote the bare name, so a
+  // custom TRB D fell back to TRB,TRD and TRD reads were given it.
+  const prepared = prepareIgblastStyleGermlineFasta(
+    ">myBD1 locus=TRB\nGGGACAGGGGGC\n>myBD2 TRB D gene\nGGGACTAGCGGGGGGG\n>TRBD1*01 locus=TRB\nGGGACAGGGGGC\n>myDD1 TRD\nGAAATAGT\n",
+    "D",
+  );
+  assert.equal(
+    prepared.fasta,
+    ">myBD1 locus=TRB\nGGGACAGGGGGC\n>myBD2 locus=TRB\nGGGACTAGCGGGGGGG\n>TRBD1*01 locus=TRB\nGGGACAGGGGGC\n>myDD1 locus=TRD\nGAAATAGT\n",
+  );
+  // The IgBLAST annotation files rewrite the headers and keep the key.
+  const framed = applyIgblastDFrameData(prepared.fasta, "myBD1 0\nmyBD2 -1\n");
+  assert.match(framed.fasta, /^>myBD1 SWIGMETA=0,-1,[-\d,]+ locus=TRB$/m);
+  assert.match(framed.fasta, /^>myBD2 locus=TRB$/m);
+  assert.match(framed.fasta, /^>myDD1 locus=TRD$/m);
+  const j = firstAnnotated(humanIghJ, "J");
+  const jApplied = applyIgblastAuxiliaryData(`>myJ1 IGH\n${j[1]}\n>other_j IGH\n${j[1]}\n`, `myJ1 ${j[2]![0]} JH ${j[2]![1]}\n`);
+  assert.match(jApplied.fasta, /^>myJ1 SWIGMETA=[-\d,]+ locus=IGH$/m);
+  assert.match(jApplied.fasta, /^>other_j locus=IGH$/m);
+  const v = firstAnnotated(humanIghV, "V");
+  const bounds = v[2]!.slice(2, 12);
+  const vApplied = applyIgblastInternalData(`>myV1 IGH\n${v[1]}\n`, `myV1 ${bounds.map((value, index) => index % 2 === 0 ? value + 1 : value).join(" ")} VH ${v[2]![0]}\n`);
+  assert.match(vApplied.fasta, /^>myV1 SWIGMETA=[-\d,]+ locus=IGH$/m);
+});
+

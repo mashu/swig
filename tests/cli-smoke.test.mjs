@@ -810,3 +810,42 @@ test("an unusable native aligner falls back to WebAssembly unless --aligner nati
     assert.notEqual(badConfig.status,0);assert.match(badConfig.stderr,/annotation\.aligner must be auto, native, wasm/);
   }finally{await rm(temporary,{recursive:true,force:true});}
 });
+
+test("--vdj keeps the locus a custom D's header gives on the default route",async()=>{
+  // Regression: the assignments-only route wrote the bare name, so a custom TRB D fell back to
+  // TRB and TRD and was called on TRD reads.
+  const root=resolve(import.meta.dirname,"..");
+  const temporary=await mkdtemp(join(root,"tmp-cli-custom-d-"));
+  try{
+    const env=nativeAlignerEnvironment(root,join(temporary,"cache"));
+    const pack=JSON.parse(gunzipSync(await readFile(join(root,"public/references/imgt-202632-7-swig-0.7.json.gz"))).toString("utf8"));
+    const human=pack.species.find((entry)=>entry.name==="Homo sapiens");
+    const delineated=(allele)=>allele[2]?.slice(2,12).every((value)=>value>=0);
+    const trbV=human.loci.TRB.V.filter(delineated).slice(0,6),trdV=human.loci.TRD.V.filter(delineated);
+    const trbJ=human.loci.TRB.J.slice(0,6),trdJ=human.loci.TRD.J;
+    const fasta=(alleles)=>alleles.map(([name,sequence])=>`>${name}\n${sequence}\n`).join("");
+    // Every read holds TRBD2*01 whole: TRD reads may not take it once it is known to be TRB.
+    const trbd2=human.loci.TRB.D[1][1];
+    const reads=Array.from({length:60},(_,index)=>{
+      const trd=index<40,v=(trd?trdV:trbV)[index%(trd?trdV:trbV).length],j=(trd?trdJ:trbJ)[index%(trd?trdJ:trbJ).length];
+      return `>${trd?"trd":"trb"}_${index}\n${v[1]}ACGT${trbd2}TGCA${j[1]}\n`;
+    }).join("");
+    const paths={query:join(temporary,"reads.fasta"),V:join(temporary,"V.fasta"),D:join(temporary,"D.fasta"),J:join(temporary,"J.fasta")};
+    await writeFile(paths.query,reads);await writeFile(paths.V,fasta([...trbV,...trdV]));await writeFile(paths.J,fasta([...trbJ,...trdJ]));
+    await writeFile(paths.D,human.loci.TRB.D.map(([,sequence],index)=>`>myBD${index+1} locus=TRB\n${sequence}\n`).join("")+fasta(human.loci.TRD.D));
+    const tables=[];
+    for(const aligner of env?["native","wasm"]:["wasm"]){
+      const out=join(temporary,`${aligner}.tsv`);
+      const result=runRawCli(root,["--vdj","--aligner",aligner,"--workers","1","-query",paths.query,"-germline_db_V",paths.V,"-germline_db_D",paths.D,"-germline_db_J",paths.J,"-outfmt","19","-out",out],env??process.env);
+      assert.equal(result.status,0,result.stderr);assert.match(result.stderr,/assignments-only/);
+      const [header,...lines]=(await readFile(out,"utf8")).trimEnd().split("\n");
+      const at=Object.fromEntries(header.split("\t").map((name,index)=>[name,index]));
+      const rows=lines.map((line)=>line.split("\t"));
+      const custom=(prefix)=>rows.filter((row)=>row[at.sequence_id].startsWith(prefix)&&row[at.d_call].includes("myBD")).length;
+      assert.equal(custom("trb_"),20,`${aligner}: TRB reads take the custom TRB D`);
+      assert.equal(custom("trd_"),0,`${aligner}: TRD reads never take a TRB D`);
+      tables.push(await readFile(out));
+    }
+    if(tables.length===2)assert.deepEqual(tables[0],tables[1]);
+  }finally{await rm(temporary,{recursive:true,force:true});}
+});

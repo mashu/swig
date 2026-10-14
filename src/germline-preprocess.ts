@@ -261,6 +261,12 @@ function declaredLocus(header: string): string | undefined {
   return /(?:^|\s)locus=([A-Za-z,]+)(?=\s|$)/.exec(header)?.[1]?.toUpperCase();
 }
 
+/** A prepared header's ` locus=` attribute, carried to the header written from it. */
+function locusAttribute(header: string): string {
+  const declared = declaredLocus(header);
+  return declared ? ` locus=${declared}` : "";
+}
+
 /**
  * The loci a FASTA header's free text states, word by word: a token that is
  * a locus code (`IGK`) or names a gene of one (`IGKV1-5`, {@link namedLoci}).
@@ -771,7 +777,9 @@ function assertChainLocus(
 /**
  * Perform the FASTA preparation done by IgBLAST's `edit_imgt_file.pl` where it
  * is relevant to the aligner: canonicalize the germline identifier and remove IMGT
- * alignment gaps before indexing. Existing SWIGMETA is deliberately removed.
+ * alignment gaps before indexing. Existing SWIGMETA is deliberately removed. A
+ * record whose name places no locus keeps the one its header gives (`locus=`,
+ * else its locus words) as `locus=`, which the engine would otherwise infer.
  */
 export function prepareIgblastStyleGermlineFasta(
   text: string,
@@ -802,7 +810,8 @@ export function prepareIgblastStyleGermlineFasta(
     if (!normalized.sequence) throw new Error(`${name} has an empty nucleotide sequence.`);
     ambiguousBases += normalized.ambiguous;
     loci.add(locus);
-    return `>${name}\n${normalized.sequence}\n`;
+    const key = locusKey(name, input.header);
+    return `>${name}${key ? ` locus=${key}` : ""}\n${normalized.sequence}\n`;
   }).join("");
   return { fasta, count: inputRecords.length, ambiguousBases, loci: [...loci].sort() };
 }
@@ -839,16 +848,17 @@ export function applyIgblastInternalData(
   const output = parseFasta(prepared.fasta).map((record) => {
     const name = germlineName(record.header);
     const normalized = normalizeIndexSequence(record.rawSequence);
-    const locus = inferLocus(name)!;
+    const locus = inferLocus(`${name} ${record.header}`)!;
+    const key = locusAttribute(record.header);
     const entry = entries.get(name);
-    if (!entry) { unmatched.push(name); return `>${name}\n${normalized.sequence}\n`; }
+    if (!entry) { unmatched.push(name); return `>${name}${key}\n${normalized.sequence}\n`; }
     assertChainLocus(name, locus, entry.chain, V_CHAIN_LOCI, "IgBLAST internal data");
     const metadata = compactMetadata(entry.frame, -1, entry.bounds, SOURCE_PROVIDED);
     if (!validateMetadata(metadata, normalized.sequence.length, "V")) {
       throw new Error(`IgBLAST internal-data coordinates for ${name} exceed or contradict its ungapped V sequence.`);
     }
     matched += 1;
-    return `>${name}${metadataHeader(metadata)}\n${normalized.sequence}\n`;
+    return `>${name}${metadataHeader(metadata)}${key}\n${normalized.sequence}\n`;
   }).join("");
   return { fasta: output, matched, annotated: matched, total: prepared.count, unmatched };
 }
@@ -891,9 +901,10 @@ export function applyIgblastAuxiliaryData(
   const output = parseFasta(prepared.fasta).map((record) => {
     const name = germlineName(record.header);
     const normalized = normalizeIndexSequence(record.rawSequence);
-    const locus = inferLocus(name)!;
+    const locus = inferLocus(`${name} ${record.header}`)!;
+    const key = locusAttribute(record.header);
     const entry = entries.get(name);
-    if (!entry) { unmatched.push(name); return `>${name}\n${normalized.sequence}\n`; }
+    if (!entry) { unmatched.push(name); return `>${name}${key}\n${normalized.sequence}\n`; }
     assertChainLocus(name, locus, entry.chain, J_CHAIN_LOCI, "IgBLAST auxiliary data");
     const metadata = compactMetadata(entry.frame, entry.cdr3Stop, EMPTY_BOUNDS, SOURCE_PROVIDED);
     if (!validateMetadata(metadata, normalized.sequence.length, "J")) {
@@ -902,7 +913,7 @@ export function applyIgblastAuxiliaryData(
     matched += 1;
     if (entry.cdr3Stop >= 0) annotated += 1;
     if (entry.fwr4EndOffset !== undefined) fwr4EndOffsets[name] = entry.fwr4EndOffset;
-    return `>${name}${metadataHeader(metadata)}\n${normalized.sequence}\n`;
+    return `>${name}${metadataHeader(metadata)}${key}\n${normalized.sequence}\n`;
   }).join("");
   return { fasta: output, matched, annotated, total: prepared.count, unmatched, fwr4EndOffsets };
 }
@@ -930,13 +941,14 @@ export function applyIgblastDFrameData(
   const output = parseFasta(prepared.fasta).map((record) => {
     const name = germlineName(record.header);
     const normalized = normalizeIndexSequence(record.rawSequence);
+    const key = locusAttribute(record.header);
     const frame = entries.get(name);
-    if (frame === undefined) { unmatched.push(name); return `>${name}\n${normalized.sequence}\n`; }
+    if (frame === undefined) { unmatched.push(name); return `>${name}${key}\n${normalized.sequence}\n`; }
     matched += 1;
-    if (frame < 0) return `>${name}\n${normalized.sequence}\n`;
+    if (frame < 0) return `>${name}${key}\n${normalized.sequence}\n`;
     annotated += 1;
     const metadata = compactMetadata(frame, -1, EMPTY_BOUNDS, SOURCE_PROVIDED);
-    return `>${name}${metadataHeader(metadata)}\n${normalized.sequence}\n`;
+    return `>${name}${metadataHeader(metadata)}${key}\n${normalized.sequence}\n`;
   }).join("");
   return { fasta: output, matched, annotated, total: prepared.count, unmatched };
 }
