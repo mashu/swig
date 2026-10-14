@@ -825,8 +825,9 @@ The full description, with the guarantee of each search step, is in
   97.8 % → 96.2 %). A chance D within about 30 bases of the anchor sits
   where a real D sits and stays. Real N/P regions longer than about 24
   bases at a read that ends in its J lose some D calls (1.1 pp at 26–30
-  bases). `--d-open-flank off` restores 0.39.3's calls (docs/ALGORITHM.md
-  §2.3).
+  bases). `--d-open-flank off` turns the cost off (docs/ALGORITHM.md §2.3);
+  on a database whose allele names all name their locus and gene, as every
+  shipped reference does, that gives 0.39.3's calls.
 - **Significance.** A V or J hit is kept at E ≤ 1 against its database and
   window. A read is called only when its path contains an *anchor*, a V or J
   hit at E ≤ 10⁻³ whose clip on the path still scores that much, so random
