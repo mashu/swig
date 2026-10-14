@@ -270,6 +270,48 @@ silent error. The bit is set for:
 - the bounds of a CDR of unusual length;
 - a start transferred from a flagged one.
 
+**Locus of each allele** (`locus.rs`, `locus_infer.rs`, `prepare.rs`). The
+locus decides which alleles may form one rearrangement, which locus' gene
+counts price a segment (`P*_V`, `P*_D`, `P*_J`, `N_C`), which annotation
+context (chain type, FR3 model) a V or J gets, and the AIRR `locus`. It is
+settled once per database, in this order:
+
+1. a `locus=` header key;
+2. the label: a locus code starting a word, followed by a segment letter
+   or, for IGH, an isotype letter `A D E F G M O T W X Y Z` with at most one
+   more letter after it (`IGHG2A`, `IGHT2D`, not `IGHTEST1`); else a gene
+   name in the header's free text. On the IMGT pack (5,472 labels) and
+   kimdb every label gives exactly its pack locus;
+3. relatives, for a V, J or C allele steps 1–2 leave open. Candidates are
+   the database's alleles of the kind placed by steps 1–2, the 8 sharing
+   most distinct 5-mers. Each is aligned locally (`AffineScoring(2, −3,
+   −5, −1)`) in a band of ±16 diagonals around the diagonal most shared
+   5-mers lie on; the allele takes the loci of every candidate within 15 of
+   the best score `S`, when `S ≥ max(30, 0.3·S_self)` (`S_self = 2·length`).
+   Undecided alleles are compared the same way with an embedded panel of
+   human and mouse family representatives (122 V, 118 J, 29 C from the IMGT
+   pack) at `S ≥ max(30, 0.1·S_self)`. In the design's leave-one-allele-out
+   test over the pack (unbanded scores), the database rule placed 6,670 of
+   8,027 BCR/TCR V, J and C alleles in their locus or a superset of it,
+   wrongly only 12 of 1,277 TCR J. The panel, on 1,500 V alleles of species
+   outside it, placed 1,385 at the 0.1 floor with none wrong (without the
+   floor all 1,500, one wrong and 142 supersets). The 0.1 floor sits
+   above the 30–40 that unrelated V sequences reach by chance;
+4. otherwise the loci the database names (steps 1–3, any kind): a D, too
+   short for step 3, takes those with D genes. Such an allele stays callable
+   in each of its loci but counts in no locus' gene numbers when the locus
+   has alleles of steps 1–3, so it cannot inflate a prior or a C gate. Only
+   when nothing names a locus does an allele keep every locus.
+
+A merged identical copy keeps the known locus of its partner (a custom
+name for a named sequence once made it of every locus). C takes the loci
+the path's V, D and J share, else its J's. Steps 3 and 4 run only for
+alleles steps 1–2 leave open, so a database of IMGT names pays nothing;
+`swig prepare` writes their result (`locus=`, `locus_source=`). The
+fallback cannot separate loci that share D genes' role: custom TRBD and
+TRDD both become TRB|TRD, and TRDD then competes on TRB reads (−3.6 pp TRB D
+allele on the suite's TCR set); a `locus=` key removes it.
+
 ## 4. Adjudication: exact semi-Markov Viterbi (`adjudicate/dag.rs`)
 
 Placements are nodes, sorted by segment kind (V, D, J), then read start.

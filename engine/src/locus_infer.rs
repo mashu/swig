@@ -18,14 +18,15 @@
 //! the best scores at least [`MIN_SCORE`] and at least a fraction of the
 //! allele's score against itself: [`MIN_SELF_FRACTION`] for the database's
 //! own alleles, [`MIN_PANEL_FRACTION`] for the panel's. Several loci may
-//! result: a relative of the shared TRA/TRD V genes gives both. In
-//! leave-one-out tests over the IMGT pack this rule assigned no wrong locus
-//! among database relatives, and none to the V alleles of the 1,500 sampled
-//! from species outside the panel (ALGORITHM §3a).
+//! result: a relative of the shared TRA/TRD V genes gives both. In the
+//! design's leave-one-allele-out tests over the IMGT pack, database
+//! relatives placed an allele in a wrong locus only for 12 of 1,277 TCR J,
+//! and the panel placed none of 1,500 V alleles of other species wrongly
+//! (ALGORITHM §3a).
 //!
 //! D alleles are too short to place by sequence: they, and every allele
-//! this step leaves undecided, take the loci the database names for their
-//! kind ([`crate::prepare`]). Nothing runs when every allele names its
+//! this step leaves undecided, take the loci the database names (a D those
+//! with D genes, [`crate::prepare`]). Nothing runs when every allele names its
 //! locus, as in every shipped reference.
 
 use std::sync::OnceLock;

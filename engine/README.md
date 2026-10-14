@@ -411,11 +411,36 @@ the message in the error buffer. Results stay readable until the next call.
 
 One database may hold several loci, as Swig composes them: IGH, IGK and IGL
 for a BCR study, or the TR loci (TRA, TRB, TRD, TRG). Each allele's locus is
-read from its name (`IGHV1-2*02`, `TRBJ2-7*01`: the locus code that occurs
-first, case-insensitively), or from the whole FASTA header when the name
-holds none. Shared TRA/TRD V genes (`TRAV14/DV4`) belong to both loci. An
-allele whose locus cannot be read belongs to every locus, so a database of
-unrecognised names is assigned as a single locus (`locus.rs`).
+found in this order (`locus.rs`, `locus_infer.rs`, `prepare.rs`):
+
+1. a `locus=` header key (`locus=IGK`, `locus=TRA,TRD`), as `swig prepare`
+   writes it;
+2. its name (`IGHV1-2*02`, `TRBJ2-7*01`: the first locus code that starts a
+   word and is followed by a segment letter, case-insensitively; for IGH
+   also an isotype letter, `IGHG1`, `IGHT2D`, `IGHZ`, `IGHO`, `IGHY`), else
+   a gene name in the header's free text. Shared TRA/TRD V genes
+   (`TRAV14/DV4`) belong to both loci;
+3. for a V, J or C allele whose name places it nowhere (`novel_1`,
+   `sample7_J1*01`), the locus of its closest relatives: the database's own
+   named alleles of the kind, else an embedded panel of 269 human and mouse
+   V, J and C family representatives. A relative must align clearly (a local
+   score of at least 30, and 0.3 of the allele's score against itself for
+   the database's alleles, 0.1 for the panel's); every locus within 15 of
+   the best counts;
+4. otherwise the loci the database names: a D allele (too short to place by
+   sequence) the loci with D genes (IGH in a BCR database, TRB and TRD in a
+   TCR one), a V, J or C allele every locus the database names. In a
+   database of several loci this is warned about once per kind, listing the
+   alleles. Only an allele of a database that names no locus at all keeps
+   every locus, which is warned about too.
+
+`swig prepare` writes the result as `locus=` (with `locus_source=relative`
+or `fallback` for the inferred ones), so a reload does not infer again. Steps
+3 and 4 cost nothing when every name places its locus, as in every shipped
+reference. **Give custom-named alleles a `locus=` key** when the warnings
+appear: the fallback cannot tell a custom TRB D from a TRD D, so TRDD alleles
+then compete on TRB reads. Swig Web and swig-cli write `locus=` for the
+custom records of a reference cell or of `prepare-reference` themselves.
 
 - **One locus per rearrangement.** J candidates must share a locus with the
   read's anchoring V placements (every locus when no V placement anchors),
@@ -430,17 +455,22 @@ unrecognised names is assigned as a single locus (`locus.rs`).
   kind, then position), as within one locus. The posteriors are
   the mixture over loci weighted by their likelihoods `Z`, so under
   `--calls fixed` the called locus can hold less than half of the posterior.
-  C joins a J of its own locus. `locus` reports the locus the path's
-  alleles share, empty when it is unknown.
+  C joins the locus the path's V, D and J share (an allele of unknown locus
+  constrains nothing), else its J's. `locus` reports the locus the path's
+  alleles share, empty when it is unknown (a fallback to several loci
+  counts as unknown).
 - **Per-locus annotation.** The V and J alleles of each locus are annotated
   on their own: chain type, FR3 length model and Cys23 priors differ between
   heavy and light chains and between TR loci.
 - **Per-locus priors and gates.** A D database of several loci (TRB and TRD)
   prices a D by its own locus' D genes (`P_D`, below), and the C gate's
-  `N_C` counts the C genes of the read's locus only.
+  `N_C` counts the C genes of the read's locus only. Alleles placed by the
+  fallback (step 4) can be called in every locus they pair with but count
+  towards no locus that has alleles of a definite locus.
 
 `tests/loci.rs` assigns IGH and IGK reads against one IGH + IGK database:
-every called allele belongs to the read's locus, and no IGK read gets a D.
+every called allele belongs to the read's locus, and no IGK read gets a D,
+also when the D (or J) alleles have custom names.
 
 ## Germline annotation and regions
 
