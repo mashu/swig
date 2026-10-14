@@ -13409,7 +13409,7 @@ var NativePool = class {
 };
 //#endregion
 //#region cli-src/swig-cli.mjs
-const VERSION = "0.39.4";
+const VERSION = "0.39.5";
 const CLI_STREAM_HIGH_WATER_MARK = 8388608;
 const CLI_GZIP_CHUNK_SIZE = 1048576;
 const CLI_DIRECTORY = dirname(fileURLToPath(import.meta.url));

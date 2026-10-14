@@ -1144,7 +1144,7 @@ test("an option without the germlines it needs is refused; one that only tunes a
   // among the warnings; the pair guards act on V and J and need no database.
   for (const [name, value, warning] of [
     ["c-min-identity", 0.8, "--c-min-identity has no effect without a C database (--c)"],
-    ["no-pair-guards", null, null],
+    ["no-pair-guards", "", null],
   ]) {
     const tuned = await makeRuntime();
     assert.equal(tuned.setOption(name, value), 0, tuned.error());
