@@ -619,6 +619,19 @@ impl GermlineSet {
         name.split('*').next().unwrap_or(name)
     }
 
+    /// The loci of an allele labelled `label` in a record with header
+    /// `header` ([`Loci::infer`]) and where they come from.
+    fn loci_of(label: &str, header: &str) -> (Loci, LocusSource) {
+        let named = Loci::named_in(label);
+        if !named.is_empty() {
+            return (named, LocusSource::Named);
+        }
+        match Loci::infer(label, header) {
+            Loci::ANY => (Loci::ANY, LocusSource::Any),
+            loci => (loci, LocusSource::Header),
+        }
+    }
+
     /// Add an allele from ASCII sequence.
     pub fn push(
         &mut self,
@@ -659,6 +672,7 @@ impl GermlineSet {
             });
         let id = AlleleId::try_from(self.alleles.len()).expect("allele count fits u32");
         self.total_len += codes.len();
+        let (loci, locus_source) = Self::loci_of(name, name);
         self.alleles.push(Allele {
             name: name.to_string(),
             gene,
@@ -667,12 +681,8 @@ impl GermlineSet {
             regions: RegionStarts::default(),
             aliases: Vec::new(),
             imgt: None,
-            loci: Loci::infer(name, name),
-            locus_source: if Loci::named_in(name).is_empty() {
-                LocusSource::Any
-            } else {
-                LocusSource::Named
-            },
+            loci,
+            locus_source,
             frame: None,
             source: None,
             uncertain: [false; 5],
@@ -800,13 +810,7 @@ impl GermlineSet {
                         .and_then(LocusSource::parse);
                     (loci, source.unwrap_or(LocusSource::Named))
                 }
-                None if !Loci::named_in(name).is_empty() => {
-                    (Loci::named_in(name), LocusSource::Named)
-                }
-                None => match Loci::infer(name, &record.header) {
-                    Loci::ANY => (Loci::ANY, LocusSource::Any),
-                    loci => (loci, LocusSource::Header),
-                },
+                None => Self::loci_of(name, &record.header),
             };
             if kind == SegmentKind::V {
                 allele.imgt = ImgtNumbering::read(&record.gaps, &allele.codes).map(Box::new);

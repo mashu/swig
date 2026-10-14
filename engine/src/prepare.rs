@@ -20,6 +20,7 @@ use crate::germline::{
     Allele, GermlineError, GermlineSet, LocusSource, MergedDuplicate, SegmentKind,
 };
 use crate::locus::Loci;
+use crate::locus_infer::infer_loci;
 use crate::retrieve::{AmbiguityBudget, GeneFrames};
 use crate::seed::SeedShape;
 use crate::translate::open_frames;
@@ -306,6 +307,11 @@ pub fn prepare(
     {
         deduplicate(set, &mut merged)?;
     }
+    // Alleles whose name places no locus: their relatives' loci, else the
+    // database's.
+    for set in [&mut v, &mut j] {
+        infer_loci(set);
+    }
     let database = [Some(&v), d.as_ref(), Some(&j)]
         .into_iter()
         .flatten()
@@ -367,10 +373,11 @@ impl PreparedDatabase {
     }
 
     /// Add a constant-region database, identical sequences merged as for V,
-    /// D and J, and C alleles of unknown locus given the loci the database
-    /// names ([`prepare`]).
+    /// D and J, and C alleles of unknown locus given the loci of their
+    /// relatives, else those the database names ([`prepare`]).
     pub fn with_constant(mut self, mut c: GermlineSet) -> Result<Self, DatabaseError> {
         deduplicate(&mut c, &mut self.merged)?;
+        infer_loci(&mut c);
         let database = [Some(&self.v), self.d.as_ref(), Some(&self.j)]
             .into_iter()
             .flatten()
@@ -405,18 +412,21 @@ impl PreparedDatabase {
     }
 
     /// One warning per kind for the alleles that fell back to the loci of
-    /// the database, and one for those of unknown locus.
+    /// a database of several loci (in a database of one, the fallback is
+    /// that locus), and one for those of unknown locus.
     pub fn locus_warnings(&self) -> Vec<DatabaseWarning> {
         let mut warnings = Vec::new();
-        for set in [
+        let sets = [
             Some(&self.v),
             self.d.as_ref(),
             Some(&self.j),
             self.c.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
+        ];
+        let database = sets
+            .into_iter()
+            .flatten()
+            .fold(Loci::NONE, |loci, set| loci.union(definite_loci(set)));
+        for set in sets.into_iter().flatten() {
             let of = |source| -> Vec<&Allele> {
                 set.alleles()
                     .iter()
@@ -426,7 +436,7 @@ impl PreparedDatabase {
             let names =
                 |alleles: &[&Allele]| alleles.iter().map(|a| a.name.clone()).collect::<Vec<_>>();
             let fallback = of(LocusSource::Fallback);
-            if !fallback.is_empty() {
+            if !fallback.is_empty() && database.single().is_none() {
                 warnings.push(DatabaseWarning::LocusFallback {
                     kind: set.kind(),
                     loci: fallback.iter().fold(Loci::NONE, |l, a| l.union(a.loci)),
@@ -510,6 +520,23 @@ impl PreparedDatabase {
         if merged > 0 {
             let noun = if merged == 1 { "sequence" } else { "sequences" };
             text += &format!(" ({merged} identical {noun} merged as aliases)");
+        }
+        // Loci inferred from relatives ([`crate::locus_infer`]): none in a
+        // database whose names give every locus.
+        let inferred: Vec<String> = [Some(&self.v), Some(&self.j), self.c.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|set| {
+                let n = set
+                    .alleles()
+                    .iter()
+                    .filter(|a| a.locus_source == LocusSource::Relative)
+                    .count();
+                (n > 0).then(|| format!("{} {n}", set.kind().label()))
+            })
+            .collect();
+        if !inferred.is_empty() {
+            text += &format!(" (loci from relatives: {})", inferred.join(", "));
         }
         format!("{text}; {}", self.annotation.summary())
     }

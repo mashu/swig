@@ -551,9 +551,9 @@ fn custom_named_j_alleles_keep_c_in_the_read_locus() {
     assert!(heavy_c * 10 >= reaching * 9, "{heavy_c} of {reaching}");
 }
 
-/// A C allele of unknown locus in a database of heavy and light C does not
-/// join the light locus' gate: `N_C` of the kappa gate counts its own C
-/// genes only, as without the allele.
+/// C alleles of no named locus and no relative in a database of heavy and
+/// light C do not join the light locus' gate: `N_C` of the kappa gate
+/// counts its own C genes only, as without them.
 #[test]
 fn a_c_allele_of_no_named_locus_leaves_other_gates_alone() {
     let (heavy, _, light_v, light_j) = databases();
@@ -599,6 +599,59 @@ fn a_c_allele_of_no_named_locus_leaves_other_gates_alone() {
             .unwrap()
     };
     let named = fasta(&heavy.c) + &kappa;
-    let custom = named.clone() + &mutated(rename(&fasta(&heavy.c), "IGHC", "Cx"), 20);
+    // Custom-named C alleles related to no C (random sequences): their
+    // locus falls back to the database's, IGH and IGK.
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut base = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        ['A', 'C', 'G', 'T'][(state % 4) as usize]
+    };
+    let custom = (1..=3).fold(named.clone(), |text, k| {
+        let sequence: String = (0..330).map(|_| base()).collect();
+        text + &format!(">Cx{k}\n{sequence}\n")
+    });
     assert_eq!(gate(&custom), gate(&named));
+}
+
+/// A database of one locus whose alleles all have custom names: the
+/// embedded panel places its V and J in IGH (its D follows them), so the
+/// AIRR `locus` column is filled.
+#[test]
+fn a_one_locus_database_of_custom_names_reports_its_locus() {
+    const IGHV3_23: &str = "GAGGTGCAGCTGTTGGAGTCTGGGGGAGGCTTGGTACAGCCTGGGGGGTCCCTGAGACTCTCCTGTGCAGCCTCTGGATTCACCTTTAGCAGCTATGCCATGAGCTGGGTCCGCCAGGCTCCAGGGAAGGGGCTGGAGTGGGTCTCAGCTATTAGTGGTAGTGGTGGTAGCACATACTACGCAGACTCCGTGAAGGGCCGGTTCACCATCTCCAGAGACAATTCCAAGAACACGCTGTATCTGCAAATGAACAGCCTGAGAGCCGAGGACACGGCCGTATATTACTGTGCGAAAGA";
+    const IGHD3_10: &str = "GTATTACTATGGTTCGGGGAGTTATTATAAC";
+    const IGHJ4: &str = "ACTACTTTGACTACTGGGGCCAGGGAACCCTGGTCACCGTCTCCTCAG";
+    let v = format!(">sample_v1\n{IGHV3_23}\n");
+    let d = format!(">sample_d1\n{IGHD3_10}\n");
+    let j = format!(">sample_j1\n{IGHJ4}\n");
+    let texts = GermlineTexts {
+        v: &v,
+        d: Some(&d),
+        j: &j,
+        c: None,
+    };
+    let options = RunOptions::default();
+    let database = PreparedDatabase::from_fasta(texts, options.annotate()).unwrap();
+    assert!(
+        database.locus_warnings().is_empty(),
+        "{:?}",
+        database.locus_warnings()
+    );
+    let mut run = Run::new(&options, database).unwrap();
+    let reads: String = (0..5)
+        .map(|k| {
+            let n1 = &"GGGACTCC"[..2 + k];
+            format!(">r{k}\n{IGHV3_23}{n1}{}TC{IGHJ4}\n", &IGHD3_10[2..])
+        })
+        .collect();
+    let mut out = Vec::new();
+    run.write_airr(reads.as_bytes(), &mut out, None).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    let mut lines = text.lines();
+    let header: Vec<&str> = lines.next().unwrap().split('\t').collect();
+    let locus = header.iter().position(|&c| c == "locus").unwrap();
+    let rows: Vec<&str> = lines.map(|l| l.split('\t').nth(locus).unwrap()).collect();
+    assert_eq!(rows, ["IGH"; 5]);
 }

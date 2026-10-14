@@ -64,6 +64,7 @@ pub mod flank;
 pub mod germline;
 pub mod index;
 pub mod locus;
+pub mod locus_infer;
 pub mod metadata;
 pub mod orient;
 pub mod pipeline;

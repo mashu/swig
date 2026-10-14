@@ -1602,9 +1602,11 @@ mod tests {
     }
 
     /// Alleles whose names give no locus (`novel_*`) in a heavy + kappa +
-    /// lambda database join the locus of their nearest named relative:
-    /// novel_h1 takes IGHV3-23*01's FR3 start (174, CDR2 8 codons), where a
-    /// group of its own, voted light, gave it the light FR3 length (180).
+    /// lambda database take the locus of their nearest named relative
+    /// ([`crate::locus_infer`]) and are annotated in it: novel_h1 takes
+    /// IGHV3-23*01's FR3 start (174, CDR2 8 codons), where a group of its
+    /// own, voted light, gave it the light FR3 length (180). A prepared
+    /// database writes the inferred loci.
     #[test]
     fn alleles_of_unknown_locus_are_annotated_with_their_relatives_locus() {
         let keys = |cdr1: u32, fr2: u32, cdr2: u32, fr3: u32, anchor: u32| {
@@ -1632,15 +1634,16 @@ mod tests {
         ]
         .map(|(name, header, sequence)| format!("{name} {header}\n{sequence}\n"))
         .concat();
-        let mut v = GermlineSet::from_fasta(SegmentKind::V, &text).unwrap();
-        let mut j = GermlineSet::from_fasta(
+        let v = GermlineSet::from_fasta(SegmentKind::V, &text).unwrap();
+        let j = GermlineSet::from_fasta(
             SegmentKind::J,
             ">IGHJ4*02\nACTACTTTGACTACTGGGGCCAGGGAACCCTGGTCACCGTCTCCTCAG\n\
              >IGKJ1*01\nGTGGACGTTCGGCCAAGGGACCAAGGTGGAAATCAAAC\n\
              >IGLJ2*01\nTGTGGTATTCGGCGGAGGGACCAAGCTGACCGTCCTAG\n",
         )
         .unwrap();
-        let report = annotate_by_locus(&mut v, Some(&mut j), AnnotateOptions::default());
+        let db = crate::prepare::prepare(v, None, j, AnnotateOptions::default()).unwrap();
+        let (v, report) = (&db.v, &db.annotation);
         let parts: Vec<Option<Locus>> = report.parts.iter().map(|(l, _)| *l).collect();
         assert_eq!(
             parts,
@@ -1653,8 +1656,45 @@ mod tests {
             relative: "IGHV3-23*01".into(),
         };
         assert!(report.v[3].notes.contains(&relative), "{:?}", report.v[3]);
-        // Each keeps the unknown locus it pairs with.
-        assert_eq!(novel.loci, Loci::ANY);
+        // Each takes its relative's locus, which the prepared V.fasta keeps.
+        let loci: Vec<Loci> = (3..6).map(|id| v.allele(id).loci).collect();
+        assert_eq!(loci, [Locus::Igh, Locus::Igk, Locus::Igl].map(Loci::of));
+        let files: HashMap<&str, String> = db.files().into_iter().collect();
+        let header = files["V.fasta"]
+            .lines()
+            .find(|l| l.starts_with(">novel_k1 "));
+        assert!(
+            header.is_some_and(|h| h.contains(" locus=IGK locus_source=relative ")),
+            "{header:?}"
+        );
+    }
+
+    /// A kappa V with a custom name in a database without kappa V names
+    /// (a heavy V set and kappa J): no allele of the database is its
+    /// relative, but the embedded panel places it in IGK, so it is
+    /// annotated with the kappa J and chain, not as heavy.
+    #[test]
+    fn a_light_v_without_named_relatives_is_placed_by_the_panel() {
+        let text = format!(
+            ">IGHV3-23*01\n{IGHV3_23}\n>sample_k\n{}\n",
+            variant(IGKV1_5, 30)
+        );
+        let v = GermlineSet::from_fasta(SegmentKind::V, &text).unwrap();
+        let j = GermlineSet::from_fasta(
+            SegmentKind::J,
+            ">IGHJ4*02\nACTACTTTGACTACTGGGGCCAGGGAACCCTGGTCACCGTCTCCTCAG\n\
+             >IGKJ1*01\nGTGGACGTTCGGCCAAGGGACCAAGGTGGAAATCAAAC\n",
+        )
+        .unwrap();
+        let db = crate::prepare::prepare(v, None, j, AnnotateOptions::default()).unwrap();
+        let sample = db.v.allele(1);
+        assert_eq!(sample.loci, Loci::of(Locus::Igk));
+        assert_eq!(sample.locus_source, crate::germline::LocusSource::Relative);
+        let parts: Vec<Option<Locus>> = db.annotation.parts.iter().map(|(l, _)| *l).collect();
+        assert_eq!(parts, [Some(Locus::Igh), Some(Locus::Igk)]);
+        // IGKV1-5's FR3 starts at 156 and its Cys104 at 261 (IMGT).
+        assert_eq!(sample.anchor, Some(261), "{:?}", db.annotation.v[1]);
+        assert_eq!(sample.regions.fr3, Some(156), "{:?}", db.annotation.v[1]);
     }
 
     fn annotate_j(text: &str) -> (GermlineSet, DatabaseAnnotation) {

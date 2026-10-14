@@ -97,15 +97,18 @@ fn junctions_end_at_the_j_motif_a_swigmeta_anchor_misplaces() {
 
 /// Kappa V alleles labelled without their locus code (`KV…`) in a heavy +
 /// kappa database, whose headers read "human kappa light chain": `LIGHT`
-/// holds `IGH` but names no locus. They are not placed in IGH: lacking a
-/// clear relative, they take every locus the database names, IGH and IGK
-/// (a fallback, no definite locus). The kappa reads keep kappa J calls and
-/// get no D, as with the IMGT names.
+/// holds `IGH` but names no locus, so their loci come from their sequences
+/// ([`swig::locus_infer`]), never from the header word. These synthetic
+/// kappa V are built like the heavy ones, so their relatives place many in
+/// IGH; the rest take every locus the database names, IGH and IGK (a
+/// fallback, no definite locus). (Reads of these kappa V are heavy-like
+/// too, so their calls are not checked here; `tests/loci.rs` covers the
+/// calls of custom names.)
 #[test]
 fn header_words_name_no_locus() {
-    use swig::germline::GermlineSet;
+    use swig::germline::{GermlineSet, LocusSource};
     use swig::locus::{Loci, Locus};
-    use swig::sim::{SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
+    use swig::sim::{SyntheticDatabase, SyntheticSpec};
     let heavy = SyntheticDatabase::generate(&SyntheticSpec::default(), 1);
     let light = SyntheticDatabase::generate(&SyntheticSpec::default(), 2);
     let fasta = |set: &GermlineSet, rename: &dyn Fn(&str) -> String| {
@@ -136,36 +139,21 @@ fn header_words_name_no_locus() {
         .filter(|a| a.name.starts_with("KV"));
     assert!(kappa_v.clone().count() > 0);
     let heavy_kappa = Loci::of(Locus::Igh).union(Loci::of(Locus::Igk));
-    assert!(
-        kappa_v
-            .into_iter()
-            .all(|a| a.loci == heavy_kappa && a.definite_loci() == Loci::ANY)
-    );
-    let reads_v = GermlineSet::from_fasta(SegmentKind::V, &light_v).unwrap();
-    let reads_j = GermlineSet::from_fasta(SegmentKind::J, &light_j).unwrap();
-    let reads = Simulator::new(&reads_v, None, &reads_j, SimParams::mid())
-        .unwrap()
-        .reads(150, 12)
-        .unwrap();
-    let config = CallingProfile::ROptimized.config();
-    let assigner =
-        DefaultAssigner::from_config(&config, database.v, database.d, database.j).unwrap();
-    let mut ws = assigner.workspace();
-    let (mut kappa_j, mut d_calls) = (0, 0);
-    for read in &reads {
-        let call = assigner.assign(&encode(&read.sequence), &mut ws);
-        let Some(path) = &call.path else { continue };
-        for segment in &path.segments {
-            let placement = &call.placements[segment.placement];
-            let set = assigner.segment(placement.kind).unwrap().set();
-            let loci = set.allele(placement.alleles[0]).loci;
-            kappa_j +=
-                usize::from(placement.kind == SegmentKind::J && loci == Loci::of(Locus::Igk));
-            d_calls += usize::from(placement.kind == SegmentKind::D);
+    for a in kappa_v {
+        match a.locus_source {
+            LocusSource::Relative => assert_eq!(a.loci, Loci::of(Locus::Igh), "{}", a.name),
+            LocusSource::Fallback => assert_eq!(a.loci, heavy_kappa, "{}", a.name),
+            source => panic!("{} has loci from {source:?}", a.name),
         }
     }
-    assert_eq!(d_calls, 0);
-    assert!(kappa_j >= 145, "{kappa_j} of 150 reads called a kappa J");
+    // The kappa J alleles keep the locus their names give.
+    let kappa_j = database
+        .j
+        .alleles()
+        .iter()
+        .filter(|a| a.name.starts_with("IGKJ"));
+    assert!(kappa_j.clone().count() > 0);
+    assert!(kappa_j.into_iter().all(|a| a.loci == Loci::of(Locus::Igk)));
 }
 
 /// A prepared database read back keeps what its annotation knew: values
