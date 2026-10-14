@@ -160,18 +160,20 @@ impl State {
             };
             let database = PreparedDatabase::from_fasta(texts, self.options.annotate())
                 .map_err(|e| format!("{} database: {e}", e.kind().label()))?;
-            let summary = format!(
-                "{{\"summary\":{},\"warnings\":[{}]}}",
-                json_string(&database.summary()),
-                database
-                    .warnings(CSegmentConfig::default().spread)
-                    .iter()
-                    .map(|w| json_string(&w.to_string()))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
-            self.run = Some(Run::new(&self.options, database).map_err(|e| e.to_string())?);
-            self.result = summary.into_bytes();
+            let summary = json_string(&database.summary());
+            let mut warnings: Vec<String> = database
+                .warnings(CSegmentConfig::default().spread)
+                .iter()
+                .map(|w| json_string(&w.to_string()))
+                .collect();
+            let run = Run::new(&self.options, database).map_err(|e| e.to_string())?;
+            warnings.extend(run.warnings().iter().map(|w| json_string(w)));
+            self.run = Some(run);
+            self.result = format!(
+                "{{\"summary\":{summary},\"warnings\":[{}]}}",
+                warnings.join(",")
+            )
+            .into_bytes();
         }
         Ok(self.run.as_mut().expect("just built"))
     }
@@ -511,6 +513,64 @@ mod tests {
         assert_eq!(backend, Some(Backend::Scalar));
         swig_version();
         assert!(result().contains("\"backend\":\"scalar\""), "{}", result());
+    }
+
+    /// An option without the database it needs is refused as the binary
+    /// refuses it (empty D or C text is no database); one that only tunes
+    /// a stage the run lacks is run and named in the summary's warnings.
+    #[test]
+    fn options_without_their_database() {
+        let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 5);
+        let fasta = |set: &swig::germline::GermlineSet| {
+            let mut text = Vec::new();
+            set.write_fasta(&mut text, |_| None).unwrap();
+            String::from_utf8(text).unwrap()
+        };
+        let (v, d, j, c) = (fasta(&db.v), fasta(&db.d), fasta(&db.j), fasta(&db.c));
+        let reads = Simulator::new(&db.v, Some(&db.d), &db.j, SimParams::mid())
+            .unwrap()
+            .reads(5, 7)
+            .unwrap();
+        let text: String = reads
+            .iter()
+            .enumerate()
+            .map(|(i, r)| format!(">r{i}\n{}\n", String::from_utf8_lossy(&r.sequence)))
+            .collect();
+
+        assert_eq!(set("c-prefix-identity", "0.97"), 0);
+        assert_eq!(init([&v, &d, &j, " \n"]), -1);
+        assert!(
+            error().contains("--c-prefix-identity needs a C database (--c)"),
+            "{}",
+            error()
+        );
+        assert_eq!(
+            init([&v, &d, &j, &c]),
+            (db.v.len() + db.d.len() + db.j.len() + db.c.len()) as i32
+        );
+        assert_eq!(annotate(&text), 5);
+        // 0 turns the gate off.
+        assert_eq!(set("c-prefix-identity", "0"), 0);
+        assert!(init([&v, &d, &j, ""]) > 0, "{}", error());
+        assert_eq!(annotate(&text), 5);
+
+        assert_eq!(set("double-d", "all"), 0);
+        assert_eq!(init([&v, "", &j, &c]), -1);
+        assert!(
+            error().contains("--double-d needs a D database (--d)"),
+            "{}",
+            error()
+        );
+        assert_eq!(set("double-d", "off"), 0);
+
+        assert_eq!(set("min-d-match", "6"), 0);
+        assert!(init([&v, "", &j, ""]) > 0, "{}", error());
+        assert!(
+            result().contains("\"--min-d-match has no effect without a D database (--d)\"]"),
+            "{}",
+            result()
+        );
+        assert_eq!(annotate(&text), 5);
     }
 
     /// A panic inside a call keeps its message and stops the instance: the

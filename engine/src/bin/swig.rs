@@ -95,12 +95,14 @@ options:
   --j-mismatch S       J mismatch score, -1000 to -1 (default: the profile's)
   --min-j-length N     fewest aligned J columns of a J hit (default none)
   --c-evalue E         call C when its anchored E-value, C genes x 7 start
-                       diagonals x e^(-lambda S), is at most E (default 1e-3)
+                       diagonals x e^(-lambda S), is at most E (default 1e-3;
+                       needs --c)
   --c-prefix-identity F  report C only where the germline from its first base
-                       reaches identity F (c_prefix_identity; default 0, off)
+                       reaches identity F (c_prefix_identity; default 0, off;
+                       above 0 needs --c)
   --double-d MODE      off (default) | all | long-span: Swig's double-D screen, a
                        seeded search for two D between every call's V and J,
-                       written to --double-d-out
+                       written to --double-d-out (all and long-span need --d)
   --double-d-out FILE  the screen's sidecar TSV
   --double-d-min-span N, --double-d-seed-length N, --double-d-pseudo-trim N,
   --double-d-pseudo-mismatches N, --double-d-min-gain S
@@ -283,9 +285,11 @@ fn parse_args() -> Result<Command, String> {
 }
 
 impl Args {
-    /// Refuse a command line that lacks an input its mode needs, or gives
-    /// the double-D screen without its sidecar (or the reverse): a usage
-    /// error like any other bad command line.
+    /// Refuse a command line that lacks an input its mode needs, gives the
+    /// double-D screen without its sidecar (or the reverse), or gives an
+    /// option without the database it needs
+    /// ([`RunOptions::check_databases`]): a usage error like any other bad
+    /// command line, before any database is read.
     fn check(&self) -> Result<(), String> {
         let mode = self.mode;
         let germline = matches!(mode, Mode::Assign | Mode::Prepare | Mode::Simulate);
@@ -313,6 +317,10 @@ impl Args {
         let screening = self.run.double_d.mode != DoubleDMode::Off;
         if screening != self.double_d_out.is_some() {
             return Err("--double-d and --double-d-out go together".into());
+        }
+        if mode == Mode::Assign {
+            let (d, c) = (self.files.d.is_some(), self.files.c.is_some());
+            self.run.check_databases(d, c).map_err(|e| e.to_string())?;
         }
         Ok(())
     }
@@ -380,6 +388,9 @@ fn run_assign(args: &Args) -> Result<(), Box<dyn Error>> {
     let screening = args.run.double_d.mode != DoubleDMode::Off;
     let database = load_database(&args.files, &args.run)?;
     let mut run = Run::new(&args.run, database)?;
+    for warning in run.warnings() {
+        eprintln!("swig: warning: {warning}");
+    }
     let mut sidecar = args
         .double_d_out
         .as_deref()

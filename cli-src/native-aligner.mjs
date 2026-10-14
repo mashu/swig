@@ -195,7 +195,8 @@ export class NativePool {
     const args = [];
     for (const segment of ["V", "D", "J", "C"]) {
       const text = this.init.references[segment];
-      if (!text) continue;
+      // Blank text is no database, as on WebAssembly.
+      if (!text?.trim()) continue;
       const path = join(this.directory, `${segment}.fasta`);
       writeFileSync(path, text);
       args.push(`--${segment.toLowerCase()}`, path);

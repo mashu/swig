@@ -125,8 +125,8 @@ options (`swig --help` prints them):
 | `--d-mismatch S`, `--j-mismatch S` | D or J mismatch score, negative (default: the profile's) |
 | `--min-j-length N` | fewest aligned J columns of a J hit (default none) |
 | `--c-evalue E` | call C when its anchored E-value is at most E (default 10⁻³; needs `--c`) |
-| `--c-prefix-identity F` | report C only where the germline from its first base reaches identity F (default 0, off) |
-| `--double-d off\|all\|long-span` | Swig's double-D screen (default off); needs `--double-d-out FILE` |
+| `--c-prefix-identity F` | report C only where the germline from its first base reaches identity F (default 0, off; above 0 needs `--c`) |
+| `--double-d off\|all\|long-span` | Swig's double-D screen (default off); needs `--double-d-out FILE`, and `all` and `long-span` need `--d` |
 | `--double-d-min-span N`, `--double-d-seed-length N`, `--double-d-pseudo-trim N`, `--double-d-pseudo-mismatches N`, `--double-d-min-gain S` | the screen's evidence rules (defaults 40, 11, 5, 3, 8) |
 | `--simd NAME` | alignment kernel: `avx512`, `avx2`, `neon`, `portable` or `scalar` (default: the fastest this CPU runs, AVX-512 excepted) |
 
@@ -157,9 +157,22 @@ so the cache changes no output.
 
 The command line rejects an option that takes a value given twice (a
 repeated flag changes nothing), a FASTQ file passed as a germline database,
-`--double-d` without `--double-d-out` and the reverse, and `--c-evalue`
-without `--c`. A debug build prints a warning, because it is 10–50× slower.
-The database summary, warnings and throughput go to stderr.
+and `--double-d` without `--double-d-out` and the reverse. An option that
+filters or adds to the output is refused without the database it needs, as
+a usage error before any database is read: `--c-evalue` and
+`--c-prefix-identity` above 0 without `--c`, and `--double-d all` or
+`long-span` without `--d`. An option that only tunes a stage the run does
+not have is run and named in a warning, since it changes nothing: the D
+options (`--min-d-match`, `--d-mismatch`, `--d-presence-rate`, `--d-allele`,
+`--no-anchor-window`) without `--d`, the screen's rules without
+`--double-d`, and `--d-allele max-marginal` with `--no-posterior`. A
+profile is a bundle and is never reported. With the screen on, D alleles
+shorter than `--double-d-seed-length` are named too, since the screen
+cannot see them. The WebAssembly module refuses the same options (an empty
+D or C text is no database) and adds the warnings to its summary
+(`RunOptions::check_databases`, `Run::warnings`). A debug build prints a
+warning, because it is 10–50× slower. The database summary, warnings and
+throughput go to stderr.
 
 **Germline databases** are FASTA and may hold several loci. IMGT reference
 headers (`accession|allele|species|…`) are read as the allele name, and
@@ -275,7 +288,10 @@ evidence rules:
   6–24) of a D allele of the read's locus, or a `max(6, L − 3)` rescue word
   whose ungapped extension reaches `L` aligned bases. Seeds extend without
   gaps (match +2, mismatch −2) to their best-scoring prefix on each side;
-  hits on one allele diagonal count once.
+  hits on one allele diagonal count once. A D allele shorter than the seed
+  length is not indexed, and the run names it in a warning: at the default
+  11 the screen cannot see TRDD1 (8 nt) or TRDD2 (9 nt), so it finds no
+  TRD tandem.
 - **Gain.** Two ordered, non-overlapping hits score at least
   `--double-d-min-gain` (8) above the best single hit.
 - **Pseudo-tandem veto.** The read from D1's start to D2's end, shortened
@@ -1235,10 +1251,14 @@ window; searching J over the whole read lets 0.05 % fall outside.
   read equal to `AirrRecord::from_call`, that repeated sequences within and
   across batches reuse their rows under their own identifiers and
   qualities, that the double-D screen leaves the AIRR rows unchanged and
-  writes well-formed sidecar rows for tandem-D reads, and that `--c-evalue`
-  needs a C database. `wasm/src/lib.rs` checks that the ABI's rows equal
-  `Run::write_airr` for FASTA and AIRR-table input, and that options
-  rebuild the run and bad ones are refused. `metadata.rs` checks that
+  writes well-formed sidecar rows for tandem-D reads, and that options are
+  refused or reported against the databases a run has (a table of every
+  refusal and warning, and the D alleles the screen cannot see).
+  `wasm/src/lib.rs` checks that the ABI's rows equal `Run::write_airr` for
+  FASTA and AIRR-table input, that options rebuild the run and bad ones are
+  refused, and that an option without its database is refused at load or
+  named in the summary's warnings; `tests/cli.rs` that the command line
+  refuses one as a usage error before reading any database. `metadata.rs` checks that
   `SWIGMETA` fields are read and malformed ones rejected.
 - **Platforms:** in the standalone project's CI the suite passed on x86-64
   and AArch64 Linux, with AArch64 output equal to x86-64 output byte for

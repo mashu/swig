@@ -965,6 +965,13 @@ async function runPipeline(config,base,assets){
   const references=loadedReferences.references;
   if(config.annotation.airrMode==="preserve"&&config.annotation.doubleD.mode!=="off"&&config.inputs.some((input)=>detectFormat(input.path,input.format)==="airr"))throw new Error("Double-D screening of AIRR input requires annotation.airrMode = \"reannotate\".");
   const needsAnnotation=config.inputs.some((input)=>detectFormat(input.path,input.format)!=="airr"||config.annotation.airrMode==="reannotate");
+  if(needsAnnotation){
+    // The aligner refuses these without their germlines on either route; say so in the
+    // config's own terms first.
+    const {species,scope}=config.references;
+    if(config.annotation.minimumConstantPrefixIdentity>0&&!references.C.trim())throw new Error(`annotation.minimumConstantPrefixIdentity needs constant-region (C) germlines, but the ${species} ${scope} reference set has none; set it to null to run without the C-prefix gate.`);
+    if(config.annotation.doubleD.mode!=="off"&&!references.D.trim())throw new Error(`annotation.doubleD needs D germlines, but the ${species} ${scope} reference set has none; set annotation.doubleD.mode to "off".`);
+  }
   const annotationBatchRecords=config.annotation.batchRecords||automaticBatchRecords(config.annotation.workers);
   const settings={callingProfile:config.annotation.callingProfile,minimumIdentity:config.annotation.minimumIdentity,minimumConstantPrefixIdentity:config.annotation.minimumConstantPrefixIdentity,strand:config.annotation.strand,doubleD:config.annotation.doubleD};
   const init=workerInitialization(assets.wasmPath,references,settings);
@@ -1232,6 +1239,12 @@ async function runVdj(rawArgs,assets){
   const tuning=vdjTuning(options);
   const minimumConstantPrefixIdentity=options["--minimum-c-prefix-identity"]===undefined?null:parseFiniteOption(options["--minimum-c-prefix-identity"],"--minimum-c-prefix-identity");
   if(minimumConstantPrefixIdentity!==null&&(minimumConstantPrefixIdentity<0||minimumConstantPrefixIdentity>1))throw new Error("--minimum-c-prefix-identity must be between 0 and 1.");
+  // 0 turns the gate off; above it the aligner refuses a run without C germlines.
+  if(minimumConstantPrefixIdentity>0&&!prepared.references.C.trim())throw new Error("--minimum-c-prefix-identity needs a constant-region database: add -c_region_db (or a prepared reference with C records), or omit the gate.");
+  if(!prepared.references.D.trim()){
+    const unused=["-min_D_match","-D_penalty"].filter((option)=>options[option]!==undefined);
+    if(unused.length)process.stderr.write(`Warning: ${unused.join(" and ")} ${unused.length===1?"has":"have"} no effect without -germline_db_D.\n`);
+  }
   const init=workerInitialization(assets.wasmPath,prepared.references,{callingProfile,minimumIdentity,minimumConstantPrefixIdentity,strand,tuning});
   const nativeBinary=chooseNativeAligner(mode,assets,"",alignerLabel);
   let pool=nativeBinary?new NativePool(nativeBinary,workers,init,batchRecords):new WasmPool(workers,init);

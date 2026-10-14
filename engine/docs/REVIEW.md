@@ -108,10 +108,8 @@ that review:
     malformed record in the same batch; locus inference misses the IGHT,
     IGHZ and IGHO isotypes, so those constant alleles are `Loci::ANY`;
     `join_indel` compares weighted votes after the 7-mer fallback, not the
-    primary seed counts its guard describes; `--c-prefix-identity` and
-    `--double-d` are ignored without the database they need, while
-    `--c-evalue` is refused; `swig_version` and `AlignerEngine.version()`
-    have no caller.
+    primary seed counts its guard describes; `swig_version` and
+    `AlignerEngine.version()` have no caller.
 14. **V keep on reads holding two chains.** The V stage keeps the top 3
     alignments over the whole read, so a lightly mutated light V can crowd
     every heavy V out (seen on synthetic scFv reads with a mutated heavy
@@ -120,6 +118,15 @@ that review:
 15. **swig-cli and prepared databases** (outside the aligner). With
     `prepareMetadata` on, swig-cli rejects a V database written by
     `swig prepare` ("contains invalid SWIGMETA coordinates").
+16. **The double-D screen cannot see TRDD1 or TRDD2.** It indexes only D
+    alleles at least `--double-d-seed-length` long (11 by default), and its
+    rescue words come from those alleles too, so the 8- and 9-nt TRDD1 and
+    TRDD2 are never seeded; every human TRD tandem holds one of them. On
+    4,000 simulated TCR reads it found 0 of 199 TRD tandem-D reads at seed
+    11 and 38 (19 %) at seed 8 (TRB: 52 % and 83 %). A run now names the
+    alleles the screen cannot see. A per-locus default seed length (or
+    indexing short alleles at their own length) needs a false-positive
+    measurement on single-D TRD reads first.
 
 ## 1. Verdict
 

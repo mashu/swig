@@ -3,8 +3,9 @@ import fs from "node:fs";
 import test from "node:test";
 import zlib from "node:zlib";
 
-import { AlignerEngine } from "../src/aligner-engine.ts";
+import { AlignerEngine, alignerOptions } from "../src/aligner-engine.ts";
 import { preprocessGermlineFasta } from "../src/germline-preprocess.ts";
+import { compileReferences } from "../src/reference-pack.ts";
 import { inferLineageGermline, lineageInputFasta } from "../src/lineage-alignment.ts";
 import { streamSequenceBatches } from "../src/sequence-stream.ts";
 import {
@@ -1094,4 +1095,73 @@ test("truncated AIRR coordinates restore non-trimmable lineage guide flanks", as
   assert.equal(input.inferred.restoredVPrefix, prefixLength);
   assert.equal(input.inferred.restoredJSuffix, suffixLength);
   assert.ok(input.fasta.includes(`\n${"-".repeat(prefixLength)}${values.sequence_alignment}${"-".repeat(suffixLength)}\n`));
+});
+
+const webDefaults = {
+  callingProfile: "r_optimized",
+  minimumIdentity: 0.6,
+  minimumConstantPrefixIdentity: null,
+  strand: 0,
+  doubleD: { mode: "off", minimumVjSpan: 40, seedLength: 11, pseudoTrim: 5, maximumPseudoMismatches: 3, minimumScoreGain: 8 },
+};
+
+/** Pack reference sets without C (Mus musculus TRA) and without D (human IGK). */
+function referencesWithout(missing) {
+  const [speciesName, scope] = missing === "C" ? ["Mus musculus", "TRA"] : ["Homo sapiens", "IGK"];
+  const compiled = compileReferences(pack.species.find((entry) => entry.name === speciesName), scope);
+  assert.equal(compiled.counts[missing], 0, `${speciesName} ${scope} has ${missing}`);
+  return compiled;
+}
+
+test("an option without the germlines it needs is refused; one that only tunes a missing stage is named", async () => {
+  const human = pack.species.find((entry) => entry.name === "Homo sapiens");
+  const heavy = referenceFor(human.loci.IGH);
+  assert.ok(heavy.references.D && heavy.references.C);
+  // Blank D or C text is no database, as on the native route.
+  for (const [name, value, references, message] of [
+    ["c-prefix-identity", 0.97, { ...heavy.references, C: " \n" }, /--c-prefix-identity needs a C database \(--c\)/],
+    ["c-evalue", 0.01, { ...heavy.references, C: "" }, /--c-evalue needs a C database \(--c\)/],
+    ["double-d", "all", { ...heavy.references, D: "" }, /--double-d needs a D database \(--d\)/],
+    ["double-d", "long_span", { ...heavy.references, D: "" }, /--double-d needs a D database \(--d\)/],
+  ]) {
+    const runtime = await makeRuntime();
+    assert.equal(runtime.setOption(name, value), 0, runtime.error());
+    assert.throws(() => runtime.initialize(references), message, `${name} ${value}`);
+    // With its database the same option runs.
+    assert.ok(runtime.initialize(heavy.references) > 0, runtime.error());
+  }
+  // 0 turns the C-prefix gate off: nothing to refuse.
+  const runtime = await makeRuntime();
+  assert.equal(runtime.setConstantPrefixIdentity(0), 0);
+  assert.ok(runtime.initialize({ ...heavy.references, C: "" }) > 0, runtime.error());
+  assert.equal(runtime.annotate(`>q\n${heavy.sequence}\n`, 1).count, 1);
+
+  // Through the wrapper the hosts use: the C gate and the screen are refused on pack
+  // selections without their germlines, and IgBLAST-style D tuning without D runs with a
+  // warning in the summary.
+  const module = await WebAssembly.compile(wasmBytes);
+  await assert.rejects(
+    AlignerEngine.create(module, { ...webDefaults, minimumConstantPrefixIdentity: 0.97 }, referencesWithout("C")),
+    /--c-prefix-identity needs a C database/,
+  );
+  await assert.rejects(
+    AlignerEngine.create(module, { ...webDefaults, doubleD: { ...webDefaults.doubleD, mode: "all" } }, referencesWithout("D")),
+    /--double-d needs a D database/,
+  );
+  const tuned = await AlignerEngine.create(module, { ...webDefaults, tuning: { minimumDMatch: 5, dMismatch: -4 } }, referencesWithout("D"));
+  assert.ok(
+    tuned.engine.summary.warnings.includes("--min-d-match, --d-mismatch have no effect without a D database (--d)"),
+    JSON.stringify(tuned.engine.summary.warnings),
+  );
+});
+
+// Guard (passes on 0.39.3 too): the refusals must not stop a default run.
+test("Swig Web's default settings start on reference sets without D or without C", async () => {
+  assert.deepEqual(alignerOptions(webDefaults).map(([name]) => name), ["profile", "strand", "min-identity"]);
+  const module = await WebAssembly.compile(wasmBytes);
+  for (const missing of ["C", "D"]) {
+    const { engine, records } = await AlignerEngine.create(module, webDefaults, referencesWithout(missing));
+    assert.ok(records > 0);
+    assert.deepEqual(engine.summary.warnings.filter((warning) => /no effect|cannot see/.test(warning)), [], missing);
+  }
 });

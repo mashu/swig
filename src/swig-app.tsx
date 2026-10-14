@@ -2391,6 +2391,10 @@ export default function SwigApp() {
         return;
       }
     }
+    if (constantPrefixIdentityEnabled && !compiled.counts.C) {
+      setRunError("The covered C-prefix identity gate requires at least one C germline in the composed reference set.");
+      return;
+    }
     if (doubleDMode !== "off") {
       if (!compiled.counts.D) {
         setRunError("Double-D screening requires at least one D germline in the composed reference set.");
