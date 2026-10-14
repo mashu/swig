@@ -643,7 +643,9 @@ impl Assigner {
         let dag = |model| PlacementDag::new(grammar, model, config.min_retained, mode);
         let adjudicator = dag(objective);
         // A V, D or J database of several loci: a read of one locus prices
-        // each segment by that locus' genes.
+        // each segment by that locus' genes, leaving out alleles of
+        // fallback or unknown locus when the locus has definite ones
+        // ([`GermlineSet::counted_part`]).
         let loci: Vec<Locus> = Locus::ALL
             .into_iter()
             .filter(|&l| {
@@ -654,7 +656,7 @@ impl Assigner {
         let locus_adjudicators: Vec<(Locus, PlacementDag)> = if loci.len() > 1 {
             loci.iter()
                 .map(|&locus| {
-                    let part = |set: &GermlineSet| set.subset(|a| a.loci.contains(locus)).0;
+                    let part = |set: &GermlineSet| set.counted_part(locus);
                     let d_part = d.as_ref().map(part).filter(|d| !d.is_empty());
                     let model = config.objective.resolve(
                         &part(&v),

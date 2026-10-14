@@ -16,7 +16,10 @@ use std::path::Path;
 use crate::annotate::{
     AlleleAnnotation, AnnotateOptions, DatabaseAnnotation, Note, annotate_by_locus,
 };
-use crate::germline::{GermlineError, GermlineSet, MergedDuplicate, SegmentKind};
+use crate::germline::{
+    Allele, GermlineError, GermlineSet, LocusSource, MergedDuplicate, SegmentKind,
+};
+use crate::locus::Loci;
 use crate::retrieve::{AmbiguityBudget, GeneFrames};
 use crate::seed::SeedShape;
 use crate::translate::open_frames;
@@ -173,6 +176,38 @@ pub enum DatabaseWarning {
     /// ([`AmbiguityBudget::max`]) caps alleles instead: V calls on mutated
     /// reads lose accuracy.
     NoGeneNames(usize),
+    /// Alleles of one kind whose name, header and relatives give no locus,
+    /// given the loci `loci` the database names for their kind
+    /// ([`LocusSource::Fallback`]).
+    LocusFallback {
+        kind: SegmentKind,
+        loci: Loci,
+        alleles: Vec<String>,
+    },
+    /// Alleles of one kind whose locus stays unknown, as nothing in the
+    /// database names a locus: they pair with every locus
+    /// ([`LocusSource::Any`]).
+    LocusUnknown {
+        kind: SegmentKind,
+        alleles: Vec<String>,
+    },
+}
+
+/// At most this many allele names are listed in a locus warning.
+const LISTED_NAMES: usize = 8;
+
+/// `names`, `, `-separated, the first [`LISTED_NAMES`] of them.
+fn listed(names: &[String]) -> String {
+    let mut text = names
+        .iter()
+        .take(LISTED_NAMES)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if names.len() > LISTED_NAMES {
+        text += &format!(" and {} more", names.len() - LISTED_NAMES);
+    }
+    text
 }
 
 impl fmt::Display for DatabaseWarning {
@@ -192,6 +227,25 @@ impl fmt::Display for DatabaseWarning {
                 "{count} V allele names hold no '*', so each counts as a gene of its own: retrieval keeps at most {} V genes per read, which then caps alleles, and V calls on mutated reads lose accuracy. Name alleles GENE*ALLELE, as IMGT does",
                 AmbiguityBudget::default().max
             ),
+            Self::LocusFallback {
+                kind,
+                loci,
+                alleles,
+            } => write!(
+                f,
+                "{} {} alleles name no locus and have no clear relative; treated as {}: {} (add locus= to their headers)",
+                alleles.len(),
+                kind.label(),
+                loci.list(),
+                listed(alleles)
+            ),
+            Self::LocusUnknown { kind, alleles } => write!(
+                f,
+                "{} {} alleles name no locus, and nothing in the database names one: they pair with every locus, the AIRR locus column stays empty, and in a database of several loci a light-chain or TRA/TRG read can get a D or another locus' C: {} (add locus= to their headers)",
+                alleles.len(),
+                kind.label(),
+                listed(alleles)
+            ),
         }
     }
 }
@@ -209,6 +263,36 @@ fn deduplicate(
     Ok(())
 }
 
+/// The loci of the alleles of `set` whose locus is definite
+/// ([`LocusSource::is_definite`]).
+fn definite_loci(set: &GermlineSet) -> Loci {
+    set.alleles()
+        .iter()
+        .filter(|a| a.locus_source.is_definite())
+        .fold(Loci::NONE, |loci, a| loci.union(a.loci))
+}
+
+/// Give the alleles of `set` of unknown locus ([`LocusSource::Any`]) the
+/// loci the database names, `database` (those of its definite alleles of
+/// every kind): a D allele those of them with D genes, if any. The loci a
+/// kind's own named alleles give would be too narrow: kappa V alleles with
+/// custom names beside named heavy V must still pair with kappa J. Nothing
+/// changes when nothing names a locus.
+fn fall_back(set: &mut GermlineSet, database: Loci) {
+    let loci = match set.kind() {
+        SegmentKind::D if !database.with_d().is_empty() => database.with_d(),
+        _ => database,
+    };
+    if loci.is_empty() {
+        return;
+    }
+    for id in 0..set.len() as u32 {
+        if set.allele(id).locus_source == LocusSource::Any {
+            set.set_loci(id, loci, LocusSource::Fallback);
+        }
+    }
+}
+
 pub fn prepare(
     mut v: GermlineSet,
     mut d: Option<GermlineSet>,
@@ -221,6 +305,16 @@ pub fn prepare(
         .flatten()
     {
         deduplicate(set, &mut merged)?;
+    }
+    let database = [Some(&v), d.as_ref(), Some(&j)]
+        .into_iter()
+        .flatten()
+        .fold(Loci::NONE, |loci, set| loci.union(definite_loci(set)));
+    for set in [Some(&mut v), d.as_mut(), Some(&mut j)]
+        .into_iter()
+        .flatten()
+    {
+        fall_back(set, database);
     }
     let annotation = annotate_by_locus(&mut v, Some(&mut j), options);
     // An allele reports the provenance of its given coordinates
@@ -273,9 +367,15 @@ impl PreparedDatabase {
     }
 
     /// Add a constant-region database, identical sequences merged as for V,
-    /// D and J.
+    /// D and J, and C alleles of unknown locus given the loci the database
+    /// names ([`prepare`]).
     pub fn with_constant(mut self, mut c: GermlineSet) -> Result<Self, DatabaseError> {
         deduplicate(&mut c, &mut self.merged)?;
+        let database = [Some(&self.v), self.d.as_ref(), Some(&self.j)]
+            .into_iter()
+            .flatten()
+            .fold(Loci::NONE, |loci, set| loci.union(definite_loci(set)));
+        fall_back(&mut c, database);
         self.c = Some(c);
         Ok(self)
     }
@@ -295,11 +395,52 @@ impl PreparedDatabase {
         if no_gene > AmbiguityBudget::default().max {
             warnings.push(DatabaseWarning::NoGeneNames(no_gene));
         }
+        warnings.extend(self.locus_warnings());
         warnings.extend(
             self.constant_warnings(spread)
                 .into_iter()
                 .map(DatabaseWarning::Constant),
         );
+        warnings
+    }
+
+    /// One warning per kind for the alleles that fell back to the loci of
+    /// the database, and one for those of unknown locus.
+    pub fn locus_warnings(&self) -> Vec<DatabaseWarning> {
+        let mut warnings = Vec::new();
+        for set in [
+            Some(&self.v),
+            self.d.as_ref(),
+            Some(&self.j),
+            self.c.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let of = |source| -> Vec<&Allele> {
+                set.alleles()
+                    .iter()
+                    .filter(|a| a.locus_source == source)
+                    .collect()
+            };
+            let names =
+                |alleles: &[&Allele]| alleles.iter().map(|a| a.name.clone()).collect::<Vec<_>>();
+            let fallback = of(LocusSource::Fallback);
+            if !fallback.is_empty() {
+                warnings.push(DatabaseWarning::LocusFallback {
+                    kind: set.kind(),
+                    loci: fallback.iter().fold(Loci::NONE, |l, a| l.union(a.loci)),
+                    alleles: names(&fallback),
+                });
+            }
+            let unknown = of(LocusSource::Any);
+            if !unknown.is_empty() {
+                warnings.push(DatabaseWarning::LocusUnknown {
+                    kind: set.kind(),
+                    alleles: names(&unknown),
+                });
+            }
+        }
         warnings
     }
 
@@ -481,6 +622,104 @@ mod tests {
                 .collect()
         };
         assert_eq!(parts(&again), [Some(Locus::Igh), Some(Locus::Igk)]);
+    }
+
+    /// Alleles whose name, header and relatives give no locus take the loci
+    /// the database names for their kind: a custom D those with D genes, a
+    /// custom J (or C) those of the named J (or C), and they are warned about
+    /// once per kind. A prepared database keeps them, their source and the
+    /// warning. Only a database that names no locus at all keeps them
+    /// unknown, which is warned about too.
+    #[test]
+    fn alleles_of_no_named_locus_take_the_loci_of_the_database() {
+        let mut next = rng(15);
+        let mut record = |label: &str, len: usize| {
+            format!(">{label}\n{}\n", decode(&random_codes(&mut next, len)))
+        };
+        let v = record("IGHV1-2*01", 290) + &record("IGKV1-5*01", 280);
+        let d = record("Dx1*01", 20) + &record("Dx2*01", 17);
+        let j = record("IGHJ4*02", 48) + &record("IGKJ1*01", 38) + &record("kj9", 38);
+        let c = record("IGHG1*01", 330) + &record("Cx1", 330);
+        // Custom-named alleles of every kind: D falls back to the loci with
+        // D genes, V, J and C to every locus the database names.
+        let texts = GermlineTexts {
+            v: &v,
+            d: Some(&d),
+            j: &j,
+            c: Some(&c),
+        };
+        let first = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+        let igh = Loci::of(Locus::Igh);
+        let bcr = igh.union(Loci::of(Locus::Igk));
+        let d_set = first.d.as_ref().unwrap();
+        for allele in d_set.alleles() {
+            assert_eq!(allele.loci, igh, "{}", allele.name);
+            assert_eq!(allele.locus_source, LocusSource::Fallback);
+        }
+        assert_eq!(first.j.allele(2).loci, bcr);
+        assert_eq!(first.j.allele(0).locus_source, LocusSource::Named);
+        assert_eq!(first.c.as_ref().unwrap().allele(1).loci, bcr);
+        let locus_warnings = first.locus_warnings();
+        assert_eq!(
+            locus_warnings,
+            [
+                DatabaseWarning::LocusFallback {
+                    kind: SegmentKind::D,
+                    loci: igh,
+                    alleles: vec!["Dx1*01".into(), "Dx2*01".into()],
+                },
+                DatabaseWarning::LocusFallback {
+                    kind: SegmentKind::J,
+                    loci: bcr,
+                    alleles: vec!["kj9".into()],
+                },
+                DatabaseWarning::LocusFallback {
+                    kind: SegmentKind::C,
+                    loci: bcr,
+                    alleles: vec!["Cx1".into()],
+                },
+            ]
+        );
+        assert_eq!(
+            locus_warnings[0].to_string(),
+            "2 D alleles name no locus and have no clear relative; treated as IGH: \
+             Dx1*01, Dx2*01 (add locus= to their headers)"
+        );
+        let files: HashMap<&str, String> = first.files().into_iter().collect();
+        assert!(files["D.fasta"].contains(">Dx1*01 locus=IGH locus_source=fallback\n"));
+        let texts = GermlineTexts {
+            v: &files["V.fasta"],
+            d: Some(&files["D.fasta"]),
+            j: &files["J.fasta"],
+            c: Some(&files["C.fasta"]),
+        };
+        let again = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+        assert_eq!(again.locus_warnings(), locus_warnings);
+
+        // Nothing names a locus: the alleles stay unknown and are warned about.
+        let v = record("v1", 290);
+        let j = record("j1", 48);
+        let texts = GermlineTexts {
+            v: &v,
+            d: None,
+            j: &j,
+            c: None,
+        };
+        let unnamed = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+        assert_eq!(unnamed.v.allele(0).loci, Loci::ANY);
+        assert_eq!(
+            unnamed.locus_warnings(),
+            [
+                DatabaseWarning::LocusUnknown {
+                    kind: SegmentKind::V,
+                    alleles: vec!["v1".into()],
+                },
+                DatabaseWarning::LocusUnknown {
+                    kind: SegmentKind::J,
+                    alleles: vec!["j1".into()],
+                },
+            ]
+        );
     }
 
     /// An allele reports a `SWIGMETA` provenance only for coordinates the

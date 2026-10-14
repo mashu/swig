@@ -836,11 +836,11 @@ fn check_given_v_anchor(
     }
 }
 
-/// The locus an allele's name gives: its first, `None` if unknown.
+/// The locus an allele's name, header or relative gives: its first, `None`
+/// if unknown or a fallback of several loci ([`Allele::definite_loci`]).
 fn annotation_locus(allele: &Allele) -> Option<Locus> {
-    (allele.loci != Loci::ANY)
-        .then(|| allele.loci.first())
-        .flatten()
+    let loci = allele.definite_loci();
+    (loci != Loci::ANY).then(|| loci.first()).flatten()
 }
 
 /// The locus each allele of `set` is annotated with: the one its name gives

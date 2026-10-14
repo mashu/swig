@@ -378,3 +378,227 @@ fn each_chain_bounds_its_own_d_window() {
         "heavy D outside every window: {lost:?} ({light_first} light-first)"
     );
 }
+
+/// Every allele label of the shipped references names exactly its locus:
+/// the IMGT pack (its labels listed in `tests/data/imgt-labels.tsv` by
+/// `scripts/build-locus-data.mjs`), the IgT, IgZ and IgO constant regions of
+/// fish and the platypus included, and the kimdb macaque sets.
+#[test]
+fn every_shipped_label_names_its_locus() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let listed = std::fs::read_to_string(root.join("tests/data/imgt-labels.tsv")).unwrap();
+    let mut checked = 0;
+    let mut wrong = Vec::new();
+    for line in listed.lines() {
+        let mut fields = line.split('\t');
+        let (locus, _kind, labels) = (
+            fields.next().unwrap(),
+            fields.next().unwrap(),
+            fields.next().unwrap(),
+        );
+        let locus = Loci::parse_list(locus).unwrap();
+        for label in labels.split(' ') {
+            let expected = if label.starts_with("TRAV") && label.contains("/DV") {
+                Loci::parse_list("TRA,TRD").unwrap()
+            } else {
+                locus
+            };
+            if Loci::infer(label, label) != expected {
+                wrong.push(label.to_string());
+            }
+            checked += 1;
+        }
+    }
+    let kimdb = root.join("../public/references/kimdb-1.1");
+    for species in ["Macaca_mulatta", "Macaca_fascicularis"] {
+        for (kind, file) in [
+            (SegmentKind::V, "V.fasta"),
+            (SegmentKind::D, "D.fasta"),
+            (SegmentKind::J, "J.fasta"),
+        ] {
+            let text = std::fs::read_to_string(kimdb.join(species).join("IGH").join(file)).unwrap();
+            let set = GermlineSet::from_fasta(kind, &text).unwrap();
+            for allele in set.alleles() {
+                if allele.loci != Loci::of(Locus::Igh) {
+                    wrong.push(allele.name.clone());
+                }
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 5000, "{checked} labels");
+    assert!(wrong.is_empty(), "{} of {checked}: {wrong:?}", wrong.len());
+}
+
+/// `text` with every label starting `from` renamed to start `to` and the
+/// written loci dropped: alleles whose names give no locus.
+fn rename(text: &str, from: &str, to: &str) -> String {
+    text.replace(&format!(">{from}"), &format!(">{to}"))
+        .lines()
+        .map(|line| match line.split_once(" locus=") {
+            Some((head, _)) if line.starts_with('>') => head.to_string(),
+            _ => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
+}
+
+/// The D calls on `reads` assigned against `database`.
+fn d_calls(database: PreparedDatabase, reads: &[swig::sim::SimulatedRead]) -> usize {
+    let config = CallingProfile::ROptimized.config();
+    let assigner =
+        DefaultAssigner::from_config(&config, database.v, database.d, database.j).unwrap();
+    let mut ws = assigner.workspace();
+    reads
+        .iter()
+        .filter(|read| {
+            let call = assigner.assign(&encode(&read.sequence), &mut ws);
+            call.path.is_some_and(|path| {
+                path.segments
+                    .iter()
+                    .any(|s| call.placements[s.placement].kind == SegmentKind::D)
+            })
+        })
+        .count()
+}
+
+/// D alleles with custom names in a database of a heavy and a light locus
+/// (BCR) or of TRB and TRA (TCR) belong to the locus with D genes, not to
+/// every locus: light-chain and TRA reads get no D, heavy and TRB reads
+/// keep theirs.
+#[test]
+fn custom_named_d_alleles_stay_out_of_light_and_tra_reads() {
+    let (heavy, _, light_v, light_j) = databases();
+    for (with_d, without_d) in [("IGH", "IGK"), ("TRB", "TRA")] {
+        let v =
+            rename(&fasta(&heavy.v), "IGH", with_d) + &rename(&fasta(&light_v), "IGK", without_d);
+        let j =
+            rename(&fasta(&heavy.j), "IGH", with_d) + &rename(&fasta(&light_j), "IGK", without_d);
+        let d = rename(&fasta(&heavy.d), "IGHD", "Dx");
+        let texts = GermlineTexts {
+            v: &v,
+            d: Some(&d),
+            j: &j,
+            c: None,
+        };
+        let database = || PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+        let light_reads = Simulator::new(&light_v, None, &light_j, SimParams::mid())
+            .unwrap()
+            .reads(200, 41)
+            .unwrap();
+        let heavy_reads = Simulator::new(&heavy.v, Some(&heavy.d), &heavy.j, SimParams::mid())
+            .unwrap()
+            .reads(100, 42)
+            .unwrap();
+        assert_eq!(d_calls(database(), &light_reads), 0, "{without_d} reads");
+        let heavy_d = d_calls(database(), &heavy_reads);
+        assert!(heavy_d > 60, "{heavy_d} of 100 {with_d} reads with a D");
+    }
+}
+
+/// J alleles with custom names in a heavy + light database: C follows the
+/// locus the read's path shares, so a light read with a heavy constant
+/// region behind its J gets no heavy C; heavy reads keep their C calls.
+#[test]
+fn custom_named_j_alleles_keep_c_in_the_read_locus() {
+    let (heavy, light, light_v, light_j) = databases();
+    let v = fasta(&heavy.v) + &fasta(&light_v);
+    let j = rename(&fasta(&heavy.j), "IGHJ", "hj") + &rename(&fasta(&light_j), "IGKJ", "kj");
+    let d = fasta(&heavy.d);
+    let c = fasta(&heavy.c);
+    let texts = GermlineTexts {
+        v: &v,
+        d: Some(&d),
+        j: &j,
+        c: Some(&c),
+    };
+    let database = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+    let config = CallingProfile::ROptimized.config();
+    let assigner = DefaultAssigner::from_config(&config, database.v, database.d, database.j)
+        .unwrap()
+        .with_constant(database.c.unwrap(), &config.c)
+        .unwrap();
+    let mut ws = assigner.workspace();
+    // Light V–J rearrangements ending at their J's 3′ end, then 150 nt of
+    // a heavy C.
+    let constant = &heavy.c.alleles()[0].codes[..150];
+    let mut light_c = 0;
+    for (k, lv) in light.v.alleles().iter().take(30).enumerate() {
+        let lj = &light_j.alleles()[k % light_j.len()];
+        let read = [&lv.codes[..], &encode(b"GGTC"), &lj.codes, constant].concat();
+        let call = assigner.assign(&read, &mut ws);
+        assert!(call.path.is_some(), "light read {k}");
+        light_c += usize::from(call.c.is_some());
+    }
+    assert_eq!(light_c, 0, "light reads with a heavy C");
+    let sim = Simulator::new(&heavy.v, Some(&heavy.d), &heavy.j, SimParams::mid())
+        .unwrap()
+        .with_constant(&heavy.c)
+        .unwrap();
+    let reads = sim.reads(100, 43).unwrap();
+    let heavy_c = reads
+        .iter()
+        .filter(|read| read.c.is_some())
+        .filter(|read| {
+            assigner
+                .assign(&encode(&read.sequence), &mut ws)
+                .c
+                .is_some()
+        })
+        .count();
+    let reaching = reads.iter().filter(|read| read.c.is_some()).count();
+    assert!(heavy_c * 10 >= reaching * 9, "{heavy_c} of {reaching}");
+}
+
+/// A C allele of unknown locus in a database of heavy and light C does not
+/// join the light locus' gate: `N_C` of the kappa gate counts its own C
+/// genes only, as without the allele.
+#[test]
+fn a_c_allele_of_no_named_locus_leaves_other_gates_alone() {
+    let (heavy, _, light_v, light_j) = databases();
+    let v = fasta(&heavy.v) + &fasta(&light_v);
+    let j = fasta(&heavy.j) + &fasta(&light_j);
+    // Sequences of their own (not merged into the heavy ones as aliases).
+    let mutated = |text: String, at: usize| {
+        text.lines()
+            .map(|line| {
+                let mut line = line.to_string();
+                if !line.starts_with('>') {
+                    let base = if &line[at..=at] == "A" { "C" } else { "A" };
+                    line.replace_range(at..=at, base);
+                }
+                line + "\n"
+            })
+            .collect::<String>()
+    };
+    // One kappa C gene: a heavy C renamed.
+    let kappa = mutated(rename(&fasta(&heavy.c), "IGHC1-1", "IGKC1-1"), 10)
+        .split('>')
+        .filter(|r| r.starts_with("IGKC"))
+        .map(|r| format!(">{r}"))
+        .collect::<String>();
+    let gate = |c: &str| {
+        let texts = GermlineTexts {
+            v: &v,
+            d: None,
+            j: &j,
+            c: Some(c),
+        };
+        let database = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+        let stage = swig::constant::ConstantStage::new(
+            database.c.unwrap(),
+            &CallingProfile::ROptimized.config().c,
+        )
+        .unwrap();
+        stage
+            .locus_significance
+            .iter()
+            .find(|(locus, _)| *locus == Locus::Igk)
+            .map(|(_, gate)| gate.ln_hypotheses)
+            .unwrap()
+    };
+    let named = fasta(&heavy.c) + &kappa;
+    let custom = named.clone() + &mutated(rename(&fasta(&heavy.c), "IGHC", "Cx"), 20);
+    assert_eq!(gate(&custom), gate(&named));
+}

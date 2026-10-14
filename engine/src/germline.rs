@@ -6,7 +6,7 @@ use std::io::{self, Write};
 
 use crate::alphabet;
 use crate::fasta::{FastaError, parse_fasta};
-use crate::locus::Loci;
+use crate::locus::{Loci, Locus};
 use crate::metadata::SwigMeta;
 use crate::translate::codon;
 
@@ -227,6 +227,52 @@ impl ImgtNumbering {
     }
 }
 
+/// Where an allele's loci ([`Allele::loci`]) come from, most certain
+/// first. Prepared databases record the inferred ones (`locus_source=`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum LocusSource {
+    /// A `locus=` header key or the gene name in the allele's label.
+    Named,
+    /// A gene name in the FASTA header's free text ([`Loci::infer`]).
+    Header,
+    /// The nearest relative whose locus is named, in the database or the
+    /// embedded panel ([`crate::locus_infer`]).
+    Relative,
+    /// No name and no clear relative: the loci the database names for the
+    /// allele's kind ([`crate::prepare`]).
+    Fallback,
+    /// Unknown: nothing in the database names a locus. The allele pairs
+    /// with every locus ([`Loci::ANY`]).
+    #[default]
+    Any,
+}
+
+impl LocusSource {
+    /// Whether the loci come from the allele's name, header or a clear
+    /// relative, rather than standing in for an unknown locus.
+    pub const fn is_definite(self) -> bool {
+        matches!(self, Self::Named | Self::Header | Self::Relative)
+    }
+
+    /// The `locus_source=` value of an inferred source; `None` for a source
+    /// that a reload reads from the name or `locus=` again.
+    pub const fn key(self) -> Option<&'static str> {
+        match self {
+            Self::Relative => Some("relative"),
+            Self::Fallback => Some("fallback"),
+            Self::Named | Self::Header | Self::Any => None,
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "relative" => Some(Self::Relative),
+            "fallback" => Some(Self::Fallback),
+            _ => None,
+        }
+    }
+}
+
 /// Dense allele id within one [`GermlineSet`].
 pub type AlleleId = u32;
 /// Dense gene id within one [`GermlineSet`].
@@ -310,6 +356,8 @@ pub struct Allele {
     pub imgt: Option<Box<ImgtNumbering>>,
     /// The loci the allele belongs to ([`crate::locus`]).
     pub loci: Loci,
+    /// Where [`Self::loci`] comes from.
+    pub locus_source: LocusSource,
     /// Offset (0–2) of the first complete codon, when given (`frame=` or
     /// `SWIGMETA=`); a V or J anchor fixes the frame too.
     pub frame: Option<u8>,
@@ -339,6 +387,16 @@ pub struct Allele {
 }
 
 impl Allele {
+    /// The loci the allele is known to belong to: [`Self::loci`], or
+    /// [`Loci::ANY`] for a fallback of several loci, which stands in for
+    /// an unknown locus ([`LocusSource::Fallback`]).
+    pub fn definite_loci(&self) -> Loci {
+        match self.locus_source {
+            LocusSource::Fallback if self.loci.single().is_none() => Loci::ANY,
+            _ => self.loci,
+        }
+    }
+
     /// The name followed by its aliases.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         std::iter::once(self.name.as_str()).chain(self.aliases.iter().map(String::as_str))
@@ -349,7 +407,9 @@ impl Allele {
     /// it, its region starts (only as a whole, and only when they fit this
     /// allele's anchor) and its IMGT numbering; its provenance only with
     /// coordinates taken. Values this allele has are kept, so the allele
-    /// stays consistent ([`RegionStarts::check`]).
+    /// stays consistent ([`RegionStarts::check`]). Loci join when both are
+    /// known; an unknown locus ([`Loci::ANY`]) takes the copy's, so a
+    /// custom name for a named sequence does not unname it.
     fn absorb(&mut self, copy: Allele) {
         let len = self.codes.len();
         let mut taken = false;
@@ -373,7 +433,11 @@ impl Allele {
         }
         self.ends_before_cys104 |= copy.ends_before_cys104;
         self.imgt = self.imgt.take().or(copy.imgt);
-        self.loci = self.loci.union(copy.loci);
+        if self.loci == Loci::ANY {
+            (self.loci, self.locus_source) = (copy.loci, copy.locus_source);
+        } else if copy.loci != Loci::ANY {
+            self.loci = self.loci.union(copy.loci);
+        }
         self.frame = self.frame.or(copy.frame);
         if taken {
             self.source = self.source.take().or(copy.source);
@@ -604,6 +668,11 @@ impl GermlineSet {
             aliases: Vec::new(),
             imgt: None,
             loci: Loci::infer(name, name),
+            locus_source: if Loci::named_in(name).is_empty() {
+                LocusSource::Any
+            } else {
+                LocusSource::Named
+            },
             frame: None,
             source: None,
             uncertain: [false; 5],
@@ -625,8 +694,9 @@ impl GermlineSet {
     /// and what the IMGT numbering of a partial V record showed
     /// ([`Allele::before_start`], [`Allele::ends_before_cys104`]).
     /// A gapped V record keeps its IMGT numbering in [`Allele::imgt`]; the
-    /// loci come from `locus=` (as [`Self::write_fasta`] writes them), else
-    /// the label, else the header ([`Loci::infer`]).
+    /// loci come from `locus=` (as [`Self::write_fasta`] writes them, with
+    /// `locus_source=` for inferred ones), else the label, else the header
+    /// ([`Loci::infer`]).
     pub fn from_fasta(kind: SegmentKind, text: &str) -> Result<Self, GermlineError> {
         let mut set = Self::new(kind);
         for record in parse_fasta(text)? {
@@ -717,15 +787,26 @@ impl GermlineSet {
             allele.before_start = before_start;
             allele.ends_before_cys104 = ends_before_cys104;
             allele.anchor_from_meta = anchor_from_meta;
-            allele.loci = match record.attribute("locus") {
+            (allele.loci, allele.locus_source) = match record.attribute("locus") {
                 Some(list) => {
-                    Loci::parse_list(list).ok_or_else(|| GermlineError::BadAttribute {
-                        name: name.to_string(),
-                        key: "locus".to_string(),
-                        value: list.to_string(),
-                    })?
+                    let loci =
+                        Loci::parse_list(list).ok_or_else(|| GermlineError::BadAttribute {
+                            name: name.to_string(),
+                            key: "locus".to_string(),
+                            value: list.to_string(),
+                        })?;
+                    let source = record
+                        .attribute("locus_source")
+                        .and_then(LocusSource::parse);
+                    (loci, source.unwrap_or(LocusSource::Named))
                 }
-                None => Loci::infer(name, &record.header),
+                None if !Loci::named_in(name).is_empty() => {
+                    (Loci::named_in(name), LocusSource::Named)
+                }
+                None => match Loci::infer(name, &record.header) {
+                    Loci::ANY => (Loci::ANY, LocusSource::Any),
+                    loci => (loci, LocusSource::Header),
+                },
             };
             if kind == SegmentKind::V {
                 allele.imgt = ImgtNumbering::read(&record.gaps, &allele.codes).map(Box::new);
@@ -761,6 +842,7 @@ impl GermlineSet {
             let copy = set.alleles.last_mut().expect("just pushed");
             copy.aliases = allele.aliases.clone();
             copy.loci = allele.loci;
+            copy.locus_source = allele.locus_source;
         }
         set
     }
@@ -815,6 +897,7 @@ impl GermlineSet {
             target.aliases = allele.aliases;
             target.imgt = allele.imgt;
             target.loci = allele.loci;
+            target.locus_source = allele.locus_source;
             target.frame = allele.frame;
             target.source = allele.source;
             target.uncertain = allele.uncertain;
@@ -827,8 +910,8 @@ impl GermlineSet {
     }
 
     /// Write as FASTA with every known annotation in the header, the loci of
-    /// an allele of known locus included (`locus=`); `extra` appends further
-    /// `key=value` tokens per allele.
+    /// an allele of known locus included (`locus=`, with `locus_source=` when
+    /// inferred); `extra` appends further `key=value` tokens per allele.
     pub fn write_fasta<W: Write>(
         &self,
         out: &mut W,
@@ -852,6 +935,9 @@ impl GermlineSet {
             }
             if allele.loci != Loci::ANY {
                 write!(out, " locus={}", allele.loci.list())?;
+                if let Some(source) = allele.locus_source.key() {
+                    write!(out, " locus_source={source}")?;
+                }
             }
             if let Some(tokens) = extra(id as AlleleId) {
                 write!(out, " {tokens}")?;
@@ -919,6 +1005,27 @@ impl GermlineSet {
         self.alleles
             .iter()
             .fold(Loci::NONE, |loci, a| loci.union(a.loci))
+    }
+
+    /// The alleles of `locus` whose genes count towards its priors and gates
+    /// ([`crate::config`], [`crate::constant`]): those whose loci hold it,
+    /// leaving out the fallback and unknown ones ([`LocusSource::is_definite`])
+    /// when some allele of the locus is definite. They are still called in
+    /// every locus they pair with; they only do not inflate its gene count.
+    pub fn counted_part(&self, locus: Locus) -> Self {
+        let of = |a: &Allele| a.loci.contains(locus);
+        let definite = self
+            .alleles
+            .iter()
+            .any(|a| of(a) && a.locus_source.is_definite());
+        self.subset(|a| of(a) && (!definite || a.locus_source.is_definite()))
+            .0
+    }
+
+    /// Set the loci of allele `id` and where they come from.
+    pub fn set_loci(&mut self, id: AlleleId, loci: Loci, source: LocusSource) {
+        let allele = &mut self.alleles[id as usize];
+        (allele.loci, allele.locus_source) = (loci, source);
     }
 
     /// The alleles for which `keep` holds, in order, as a set of their own,
@@ -1122,6 +1229,48 @@ mod tests {
             GermlineSet::from_fasta(SegmentKind::V, ">V1*01 locus=XYZ\nACGT\n"),
             Err(GermlineError::BadAttribute { key, .. }) if key == "locus"
         ));
+    }
+
+    /// A custom name for the sequence of a named allele is merged into it
+    /// without unnaming it, in either order: the known locus is kept, and
+    /// two known loci join. The source of inferred loci survives a reload.
+    #[test]
+    fn a_custom_copy_of_a_named_allele_keeps_its_locus() {
+        use crate::locus::Locus;
+        let igh = Loci::of(Locus::Igh);
+        for text in [
+            ">IGHV1-69*10\nACGTACGTAA\n>novel_1\nACGTACGTAA\n",
+            ">novel_1\nACGTACGTAA\n>IGHV1-69*10\nACGTACGTAA\n",
+        ] {
+            let mut set = GermlineSet::from_fasta(SegmentKind::V, text).unwrap();
+            set.deduplicate().unwrap();
+            assert_eq!(set.len(), 1);
+            let allele = set.allele(0);
+            assert_eq!(allele.loci, igh, "{text}");
+            assert_eq!(allele.locus_source, LocusSource::Named, "{text}");
+            let mut written = Vec::new();
+            set.write_fasta(&mut written, |_| None).unwrap();
+            assert!(String::from_utf8(written).unwrap().contains("locus=IGH"));
+        }
+        let text = ">TRAV1*01\nACGTACGTAA\n>TRDV1*01\nACGTACGTAA\n";
+        let mut set = GermlineSet::from_fasta(SegmentKind::V, text).unwrap();
+        set.deduplicate().unwrap();
+        assert_eq!(set.allele(0).loci, Loci::parse_list("TRA,TRD").unwrap());
+        // Inferred loci are written with their source and read back.
+        let mut set = GermlineSet::from_fasta(SegmentKind::V, ">x1\nACGT\n>x2\nACGG\n").unwrap();
+        set.set_loci(0, igh, LocusSource::Fallback);
+        set.set_loci(1, igh, LocusSource::Relative);
+        let mut written = Vec::new();
+        set.write_fasta(&mut written, |_| None).unwrap();
+        let written = String::from_utf8(written).unwrap();
+        assert!(
+            written.contains(">x1 locus=IGH locus_source=fallback\n"),
+            "{written}"
+        );
+        let again = GermlineSet::from_fasta(SegmentKind::V, &written).unwrap();
+        let sources: Vec<_> = again.alleles().iter().map(|a| a.locus_source).collect();
+        assert_eq!(sources, [LocusSource::Fallback, LocusSource::Relative]);
+        assert_eq!(again.allele(0).loci, igh);
     }
 
     #[test]

@@ -97,7 +97,9 @@ fn junctions_end_at_the_j_motif_a_swigmeta_anchor_misplaces() {
 
 /// Kappa V alleles labelled without their locus code (`KV…`) in a heavy +
 /// kappa database, whose headers read "human kappa light chain": `LIGHT`
-/// holds `IGH` but names no locus. The kappa reads keep kappa J calls and
+/// holds `IGH` but names no locus. They are not placed in IGH: lacking a
+/// clear relative, they take every locus the database names, IGH and IGK
+/// (a fallback, no definite locus). The kappa reads keep kappa J calls and
 /// get no D, as with the IMGT names.
 #[test]
 fn header_words_name_no_locus() {
@@ -133,7 +135,12 @@ fn header_words_name_no_locus() {
         .iter()
         .filter(|a| a.name.starts_with("KV"));
     assert!(kappa_v.clone().count() > 0);
-    assert!(kappa_v.into_iter().all(|a| a.loci == Loci::ANY));
+    let heavy_kappa = Loci::of(Locus::Igh).union(Loci::of(Locus::Igk));
+    assert!(
+        kappa_v
+            .into_iter()
+            .all(|a| a.loci == heavy_kappa && a.definite_loci() == Loci::ANY)
+    );
     let reads_v = GermlineSet::from_fasta(SegmentKind::V, &light_v).unwrap();
     let reads_j = GermlineSet::from_fasta(SegmentKind::J, &light_j).unwrap();
     let reads = Simulator::new(&reads_v, None, &reads_j, SimParams::mid())
