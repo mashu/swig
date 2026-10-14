@@ -365,3 +365,32 @@ test("the IgBLAST-style preparation keeps the locus a custom record's header giv
   assert.match(vApplied.fasta, /^>myV1 SWIGMETA=[-\d,]+ locus=IGH$/m);
 });
 
+test("later template tiers read a record's original header", () => {
+  // Regression: tier 1 re-read tier 0's output, whose header had lost the
+  // words that admitted the record, and refused it.
+  const bcr = (segment: "V") => germlineTemplateTiers(pack, human, "BCR", segment);
+  const igkv18 = (human.loci.IGK.V as MetadataAllele[]).find((allele) => allele[0] === "IGKV1-8*03");
+  assert.ok(igkv18);
+  const unannotated = `>IGKV99-1*01\n${"ACGT".repeat(75)}\n`;
+  // The record's key, "" for none; undefined when the record is missing.
+  const keyOf = (fasta: string, name: string) => {
+    const found = new RegExp(`^>${name}\\b.*?(?: locus=([A-Z,]+))?$`, "m").exec(fasta);
+    return found ? found[1] ?? "" : undefined;
+  };
+  for (const [header, key] of [
+    // The header and the template disagree: no key, the engine decides.
+    ["sample_k1 IGL", ""],
+    ["sample_k1 IGK", "IGK"],
+    ["sample_k1 light chain", "IGK"],
+  ] as const) {
+    const alone = preprocessGermlineFastaAcrossTiers(`>${header}\n${igkv18[1]}\n`, "V", bcr("V"), ["IGH", "IGK", "IGL"]);
+    const report = preprocessGermlineFastaAcrossTiers(`>${header}\n${igkv18[1]}\n${unannotated}`, "V", bcr("V"), ["IGH", "IGK", "IGL"], { includeDiagnostics: true });
+    assert.equal(report.count, 2, header);
+    assert.equal(report.annotated, 1, header);
+    assert.equal(keyOf(report.fasta, "sample_k1"), key, header);
+    assert.equal(keyOf(alone.fasta, "sample_k1"), key, header);
+    // The first tier's template stays the record's.
+    assert.equal(report.diagnostics?.find((entry) => entry.name === "sample_k1")?.template, "IGKV1-8*03", header);
+  }
+});
+

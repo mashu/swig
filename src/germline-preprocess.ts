@@ -960,6 +960,28 @@ export function preprocessGermlineFasta(
   allowedLoci: readonly GermlineLocus[] = LOCI,
   match: GermlineMatchOptions = {},
 ): GermlinePreprocessReport {
+  return preprocessTier(text, segment, templates, allowedLoci, match, new Map());
+}
+
+/**
+ * What a later template tier must know of a record that its input, the
+ * previous tier's output, no longer says: the header it was given, whose
+ * words admit it and state its locus, and the template its metadata came from.
+ */
+interface RecordOrigin {
+  header: string;
+  template?: string;
+}
+
+/** One template tier; `origins` carries each record's {@link RecordOrigin} between tiers. */
+function preprocessTier(
+  text: string,
+  segment: GermlineSegment,
+  templates: MetadataAllele[],
+  allowedLoci: readonly GermlineLocus[],
+  match: GermlineMatchOptions,
+  origins: Map<string, RecordOrigin>,
+): GermlinePreprocessReport {
   const matchOptions = resolveGermlineMatchOptions(match);
   const inputRecords = parseFasta(text);
   const records: ParsedRecord[] = [];
@@ -977,7 +999,9 @@ export function preprocessGermlineFasta(
     if (!name) throw new Error(`A ${segment} germline record has an empty identifier.`);
     if (seen.has(name)) throw new Error(`Duplicate ${segment} germline identifier: ${name}.`);
     seen.add(name);
-    const locus = inferLocus(`${name} ${input.header}`);
+    const origin = origins.get(name);
+    const header = origin?.header ?? input.header;
+    const locus = inferLocus(`${name} ${header}`);
     if (!locus) throw new Error(`${name} does not identify one of the supported IG/TR loci.`);
     if (!allowedLoci.includes(locus)) {
       throw new Error(`${name} belongs to ${locus}, outside the selected ${allowedLoci.join("/")} search space.`);
@@ -1032,13 +1056,15 @@ export function preprocessGermlineFasta(
       warnings.push(`${name}: ${segment === "V" ? "no validated IMGT FWR/CDR delineation" : segment === "J" ? "no unique frame-consistent F/W-G J motif" : "no segment metadata"}.`);
     }
     loci.add(locus);
+    const template = transfer?.template ?? origin?.template;
+    origins.set(name, { header, template });
     records.push({
       header: input.header,
       name,
       rawSequence: input.rawSequence,
       sequence: normalized.sequence,
       locus,
-      locusKey: locusKey(name, input.header, transfer?.template),
+      locusKey: locusKey(name, header, template),
       metadata,
     });
     if (matchOptions.includeDiagnostics) {
@@ -1106,7 +1132,9 @@ function mergeDiagnosticHistory(
 /**
  * Apply the same progressively broadened template search used by the browser
  * worker. Existing valid SWIGMETA is retained, while records still lacking V
- * or J metadata are offered to each successive template tier.
+ * or J metadata are offered to each successive template tier. Each tier reads
+ * a record's original header and earlier template, so a later tier admits and
+ * keys it as the first did.
  */
 export function preprocessGermlineFastaAcrossTiers(
   text: string,
@@ -1117,13 +1145,14 @@ export function preprocessGermlineFastaAcrossTiers(
 ): GermlinePreprocessReport {
   let report: GermlinePreprocessReport | undefined;
   const diagnosticHistory = new Map<string, GermlineRecordDiagnostic>();
+  const origins = new Map<string, RecordOrigin>();
   const tiers = templateTiers.length ? templateTiers : [[]];
   for (let tier = 0; tier < tiers.length; tier += 1) {
-    report = preprocessGermlineFasta(report?.fasta ?? text, segment, [...tiers[tier]], allowedLoci, {
+    report = preprocessTier(report?.fasta ?? text, segment, [...tiers[tier]], allowedLoci, {
       ...match,
       includeDiagnostics: Boolean(match.includeDiagnostics),
       taxonomicTier: tier,
-    });
+    }, origins);
     for (const diagnostic of report.diagnostics ?? []) {
       diagnosticHistory.set(diagnostic.name, mergeDiagnosticHistory(diagnosticHistory.get(diagnostic.name), diagnostic));
     }
