@@ -87,14 +87,29 @@ A third review, after Swig 0.39.2, found 2 major and 13 minor defects. Swig
 that fails on 0.39.2; `RELEASE_NOTES_0.39.3.md` lists them. Still open from
 that review:
 
-10. **Chance D on reads without a J or a V.** The D window of such a read now
-    ends 60 bases after the V (or starts 60 bases before the J), but `P*_D`
-    is priced for 25 junction positions, so 30 random bases after the V still
-    give a D in 72 % of D-free reads. Reads that start in CDR3 now search
-    for a D from their start, which recovers real Ds (+11 pp of D allele on
-    reads cut after V) but also raises chance Ds on D-free ones: 79.8 %
-    instead of 68.7 % behind 30 random bases. Needs the N/P length prior of
-    item 2.
+10. **Chance D on reads without a J or a V.** Resolved for chance Ds more
+    than about 30 bases from the anchor: a D that ends its path (no J after
+    it) or starts it (no V before it) now pays for the J (V) its read would
+    show in the bases beyond it (ALGORITHM §2.3, `--d-open-flank`). A V
+    followed by 100 random bases gets a D in 6.8 % of D-free reads instead
+    of 93.5 %, 100 random bases followed by a J in 10.2 % instead of
+    97.7 % (`--calls fixed`: 6.5 % and 10.8 % instead of 98.0 % and
+    99.5 %), 60 random bases after the V in 73.5 % instead of 89.5 %. The
+    full-length suite sets keep every call; igh_hard, igh_shm30 and the
+    cut reads lose no D allele, and the macaque lineage reads change no D
+    call. Open by design for the near ones: 10, 25 and 30 random bases
+    after the V still give a D in 27.2, 63.7 and 72.0 % of reads, and 30
+    before the J in 79.8 %. Such a chance D sits where the real D of a
+    truncated read sits, so no length or window term separates them; only
+    `P*_D` itself moves them, along the curve of D accuracy against D-free
+    specificity (ASSESSMENT §9.9). The cost assumes N/P regions of at most
+    about 24 bases: real D calls behind a 26–30-base N2 at a read that
+    ends in its J drop by 1.1 pp, behind 31–40 bases by 3.8 pp (N1 of
+    31–40 bases at a read that starts there: 1.1 pp); reads that end
+    inside their J keep their D calls, at a D-presence Brier 0.0045 (mid)
+    and 0.0015 (hard) higher. The N1/N2 gap hinge first proposed here was
+    measured and rejected (−8 to −12 pp D allele at 30 % SHM); a geometric
+    N-length allowance traced the same trade-off as the fixed one.
 11. **Gene identity from allele names.** A gene is the name's part before
     `*`. A database without `*` names now gets a warning, but it still loses
     V accuracy at high SHM: 8.2 pp of V allele at 30 % SHM on the suite's IGH

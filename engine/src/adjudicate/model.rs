@@ -223,7 +223,9 @@ impl PathModel for EngineeringObjective {
     /// valid (the exit before it is ≤ the entry after it), so the no-D path
     /// scores at least as much and "with-D must strictly beat no-D" rejects
     /// it. With a negative per-base junction score a D could pay for itself
-    /// by replacing N bases, so no floor is derived then.
+    /// by replacing N bases, so no floor is derived then. The open-flank
+    /// cost is non-negative and charges only a D, so it only lowers a path
+    /// that keeps such a D: the floor holds with it.
     fn d_floor(&self) -> Score {
         if self.insertion_per_base < 0 {
             Score::MIN
