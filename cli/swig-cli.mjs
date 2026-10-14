@@ -11708,6 +11708,72 @@ function inferLocus(value) {
 	const upper = value.toUpperCase();
 	return LOCI.find((locus) => upper.includes(locus)) ?? null;
 }
+const IGH_ISOTYPE_LETTERS = "AEFGMOTWXYZ";
+/**
+* The loci the Swig engine reads from an allele label (engine/src/locus.rs,
+* `Loci::named_in`): a locus code at the start of a word followed by a
+* segment letter or, for IGH, an isotype letter with at most one more letter
+* after it; a shared TRAV…/DV… gene belongs to TRA and TRD. Empty when the
+* label names no locus, as a custom name does: the engine then has to infer
+* it, so the host writes `locus=` for such records.
+*/
+function namedLoci(label) {
+	const upper = label.toUpperCase();
+	for (let at = 0; at < upper.length; at += 1) {
+		if (at > 0 && /[A-Z0-9]/.test(upper[at - 1])) continue;
+		const locus = LOCI.find((code) => upper.startsWith(code, at));
+		if (!locus) continue;
+		const next = upper[at + locus.length];
+		if (next === void 0) continue;
+		let named = "VDJC".includes(next);
+		if (!named && locus === "IGH" && IGH_ISOTYPE_LETTERS.includes(next)) named = !/^[A-Z]{2}/.test(upper.slice(at + locus.length + 1));
+		if (!named) continue;
+		return locus === "TRA" && upper.includes("/DV") ? ["TRA", "TRD"] : [locus];
+	}
+	return [];
+}
+/** The `locus=` value of a FASTA header, if it has one. */
+function declaredLocus(header) {
+	return /(?:^|\s)locus=([A-Za-z,]+)(?=\s|$)/.exec(header)?.[1]?.toUpperCase();
+}
+/**
+* The loci a FASTA header's free text states, word by word: a token that is
+* a locus code (`IGK`) or names a gene of one (`IGKV1-5`, {@link namedLoci}).
+* The identifier and `key=value` attributes are skipped, and a code inside a
+* word (`LIGHT`, `STRAIN`) states none, unlike the substring test that
+* admits a record ({@link inferLocus}).
+*/
+function headerLoci(header) {
+	const found = /* @__PURE__ */ new Set();
+	for (const token of header.trim().split(/\s+/).slice(1)) {
+		if (token.includes("=")) continue;
+		for (const word of token.split(/[|,;:()[\]]+/)) {
+			const upper = word.toUpperCase();
+			const loci = LOCI.includes(upper) ? [upper] : namedLoci(word);
+			for (const locus of loci) found.add(locus);
+		}
+	}
+	return LOCI.filter((locus) => found.has(locus));
+}
+/**
+* The `locus=` value to write for a record the engine cannot place by its
+* name: the one its header declares; else the loci of the template its
+* metadata came from (TRA,TRD for a TRAV…/DV… relative), narrowed to those
+* the header's words state when it states some of them; else the loci the
+* header's words state. Empty when the name places the record, and when the
+* template and the header disagree or neither places it: the engine then
+* infers the locus from the record's relatives.
+*/
+function locusKey(name, header, template) {
+	const declared = declaredLocus(header);
+	if (declared) return declared;
+	if (namedLoci(name).length) return "";
+	const stated = headerLoci(header);
+	const relative = template ? namedLoci(template) : [];
+	if (!relative.length) return stated.join(",");
+	if (!stated.length) return relative.join(",");
+	return relative.filter((locus) => stated.includes(locus)).join(",");
+}
 function inferSegment(name) {
 	const match = /^(?:IGH|IGK|IGL|TRA|TRB|TRD|TRG)([VDJC])/.exec(name.toUpperCase());
 	return match ? match[1] : null;
@@ -12373,6 +12439,7 @@ function preprocessGermlineFasta(text, segment, templates = [], allowedLoci = LO
 			rawSequence: input.rawSequence,
 			sequence: normalized.sequence,
 			locus,
+			locusKey: locusKey(name, input.header, transfer?.template),
 			metadata
 		});
 		if (matchOptions.includeDiagnostics) diagnostics.push({
@@ -12393,7 +12460,7 @@ function preprocessGermlineFasta(text, segment, templates = [], allowedLoci = LO
 	}
 	const annotated = records.filter((record) => annotationPresent(segment, record.metadata)).length;
 	return {
-		fasta: records.map((record) => `>${record.name}${metadataHeader(record.metadata)}\n${record.sequence}\n`).join(""),
+		fasta: records.map((record) => `>${record.name}${metadataHeader(record.metadata)}${record.locusKey ? ` locus=${record.locusKey}` : ""}\n${record.sequence}\n`).join(""),
 		count: records.length,
 		annotated,
 		unannotated: records.length - annotated,
@@ -13088,7 +13155,7 @@ var NativePool = class {
 			"C"
 		]) {
 			const text = this.init.references[segment];
-			if (!text) continue;
+			if (!text?.trim()) continue;
 			const path = join(this.directory, `${segment}.fasta`);
 			writeFileSync(path, text);
 			args.push(`--${segment.toLowerCase()}`, path);
@@ -14753,6 +14820,11 @@ async function runPipeline(config, base, assets) {
 	const references = loadedReferences.references;
 	if (config.annotation.airrMode === "preserve" && config.annotation.doubleD.mode !== "off" && config.inputs.some((input) => detectFormat(input.path, input.format) === "airr")) throw new Error("Double-D screening of AIRR input requires annotation.airrMode = \"reannotate\".");
 	const needsAnnotation = config.inputs.some((input) => detectFormat(input.path, input.format) !== "airr" || config.annotation.airrMode === "reannotate");
+	if (needsAnnotation) {
+		const { species, scope } = config.references;
+		if (config.annotation.minimumConstantPrefixIdentity > 0 && !references.C.trim()) throw new Error(`annotation.minimumConstantPrefixIdentity needs constant-region (C) germlines, but the ${species} ${scope} reference set has none; set it to null to run without the C-prefix gate.`);
+		if (config.annotation.doubleD.mode !== "off" && !references.D.trim()) throw new Error(`annotation.doubleD needs D germlines, but the ${species} ${scope} reference set has none; set annotation.doubleD.mode to "off".`);
+	}
 	const annotationBatchRecords = config.annotation.batchRecords || automaticBatchRecords(config.annotation.workers);
 	const settings = {
 		callingProfile: config.annotation.callingProfile,
@@ -15164,6 +15236,11 @@ async function runVdj(rawArgs, assets) {
 	const tuning = vdjTuning(options);
 	const minimumConstantPrefixIdentity = options["--minimum-c-prefix-identity"] === void 0 ? null : parseFiniteOption(options["--minimum-c-prefix-identity"], "--minimum-c-prefix-identity");
 	if (minimumConstantPrefixIdentity !== null && (minimumConstantPrefixIdentity < 0 || minimumConstantPrefixIdentity > 1)) throw new Error("--minimum-c-prefix-identity must be between 0 and 1.");
+	if (minimumConstantPrefixIdentity > 0 && !prepared.references.C.trim()) throw new Error("--minimum-c-prefix-identity needs a constant-region database: add -c_region_db (or a prepared reference with C records), or omit the gate.");
+	if (!prepared.references.D.trim()) {
+		const unused = ["-min_D_match", "-D_penalty"].filter((option) => options[option] !== void 0);
+		if (unused.length) process.stderr.write(`Warning: ${unused.join(" and ")} ${unused.length === 1 ? "has" : "have"} no effect without -germline_db_D.\n`);
+	}
 	const init = workerInitialization(assets.wasmPath, prepared.references, {
 		callingProfile,
 		minimumIdentity,
