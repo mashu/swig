@@ -175,7 +175,7 @@ The non-alignment terms are log prior odds in score units:
   | `π` | ½ | even odds, as `DPrior::DERIVED` |
   | visible cap | 64 | `ε` is below 10⁻¹⁰ by 40 bases at `p ≤ 0.2`; bounds the table |
   | `ε_min` | 10⁻³ | the anchor E-value gate; bounds the cost at `ln(1 + π/ε_min)` = 6.2 nats when the J or V is present but missing from the database |
-  | `S_acc`, `(m, μ)` | per stage | the V and J stages' accept gates and scorings |
+  | `S_acc`, `(m, μ)` | per stage | the V and J stages' accept gates and scorings; measured on 300 igh_mid reads cut inside their V (J), Swig 0.39.3 calls the V in 2 % of reads with 9 visible bases, 44 % with 12 and 87 % with 13, the J in 34 % with 7 and 87 % with 8: the stages hide 12 V and 8 J bases, as `S_acc` = 24 and 16 say |
 
   A locus whose database part has no J (V) cannot show one, so in a
   multi-locus database its end (start) side costs nothing. A V or J none
@@ -198,7 +198,9 @@ The non-alignment terms are log prior odds in score units:
   window: on 600 D-free reads of a V followed by 100 random bases (vcut100)
   the D-call rate falls from 93.5 % to 6.8 %, on 100 random bases followed
   by a J (jcut100) from 97.7 % to 10.2 %, and every full-length suite set
-  keeps its calls (§8, item 2). A geometric N/P length (`ε_eff(x) = Σ_n
+  keeps its calls (§8, item 2). That needs a derived `P*_D`: the profiles
+  `truth` and `igblast` fix it at 0, a chance D of a dozen points then
+  outweighs the 6.2-nat ceiling, and most stay (vcut100 92.8 %). A geometric N/P length (`ε_eff(x) = Σ_n
   P(n)·ε(x − 9 − n) + P(N > x − 9)`, mean 6) was measured as the
   alternative allowance: it traced the same trade-off between far chance
   Ds and real Ds behind long N regions, and the step won at the stated
@@ -474,10 +476,11 @@ paths, placements and pairs of canonical cuts. Checks:
 - the open-flank cost (`open_flank_dag_equals_exhaustive_enumeration`): mid
   and hard IgSim reads cut 0–80 bases before and after a D, with all their
   placements and without the V or the J (so that optima start or end on a
-  D), at random anchored columns, under both allowances, the per-read and
-  the fixed model, and the cost on and off: the key equals the oracle's,
-  the traced path re-scores to it, and `path_score` equals the oracle's
-  fixed value of that path. `d_floor_bounds_pruning_with_the_open_flank_cost`
+  D), at random anchored columns, at the step allowances `N_open` = 24 and
+  12, in the per-read and the fixed model, and with the cost on and off:
+  the key equals the oracle's, the traced path re-scores to it, and
+  `path_score` equals the oracle's fixed value of that path.
+  `d_floor_bounds_pruning_with_the_open_flank_cost`
   checks that pruning every D below `P_D + 1` leaves the fixed-scale call
   unchanged with the cost on (it is non-negative and D-only).
 
@@ -630,9 +633,10 @@ N/P cost, at `p̂` = 0.5 %, `δ` and 30 %: the call is a mode of the reported
 posterior. With the open-flank cost on
 (`marginals_equal_exhaustive_summation_with_open_flanks`,
 `call_is_a_posterior_mode_with_open_flank`) the same holds on the fixtures
-with and without their V or J and with up to 60 read bases past them, under
-both allowances, with and without the floor, at clean and mutated anchors,
-in the fixed-scale and the per-read pair; the cost changes some optima, so
+with and without their V or J and with up to 60 read bases past them, at
+the step allowances `N_open` = 0 and 2, with and without the floor, at
+clean and mutated anchors, in the fixed-scale and the per-read pair; the
+cost changes some optima, so
 the tests discriminate.
 
 ## 4b. Constant region (`constant.rs`)

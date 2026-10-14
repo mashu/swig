@@ -758,14 +758,19 @@ The full description, with the guarantee of each search step, is in
   drops below the floor `ε_min = 10⁻³`, so the cost is at most 6.2 nats even
   when the read's J (V) is present but missing from the database; a locus
   whose database part has no J (V) at all pays nothing on that side, and a
-  V or J too weak to pay for itself cannot open or close a D's flank. A
-  chance D far from the anchor of a D-free read goes (a V followed by 100
-  random bases: 93.5 % → 6.8 % D calls; 100 random bases then a J: 97.7 % →
-  10.2 %); full-length reads keep their calls. A chance D within about 30
-  bases of the anchor sits where a real D sits and stays. Real N/P regions
-  longer than about 24 bases at a read that ends in its J lose some D calls
-  (1.1 pp at 26–30 bases). `--d-open-flank off` restores 0.39.3's calls
-  (docs/ALGORITHM.md §2.3).
+  V or J too weak to pay for itself cannot open or close a D's flank. With
+  a derived D prior (the default profile `r`, and `sensitive-d`), a chance
+  D far from the anchor of a D-free read goes (a V followed by 100 random
+  bases: 93.5 % → 6.8 % D calls, `sensitive-d` 99.3 % → 9.5 %; 100 random
+  bases then a J: 97.7 % → 10.2 %, `sensitive-d` 99.7 % → 18.2 %);
+  full-length reads keep their calls. The profiles `truth` and `igblast`
+  charge no D prior (`P*_D = 0`), so a chance D scoring a dozen points
+  outweighs the 6.2-nat ceiling and most stay (`truth`: 93.7 % → 92.8 % and
+  97.8 % → 96.2 %). A chance D within about 30 bases of the anchor sits
+  where a real D sits and stays. Real N/P regions longer than about 24
+  bases at a read that ends in its J lose some D calls (1.1 pp at 26–30
+  bases). `--d-open-flank off` restores 0.39.3's calls (docs/ALGORITHM.md
+  §2.3).
 - **Significance.** A V or J hit is kept at E ≤ 1 against its database and
   window. A read is called only when its path contains an *anchor*, a V or J
   hit at E ≤ 10⁻³ whose clip on the path still scores that much, so random
