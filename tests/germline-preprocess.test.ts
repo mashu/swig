@@ -338,3 +338,111 @@ test("a custom FASTA in a reference cell is given the cell's locus", () => {
   // Pack records are untouched.
   assert.doesNotMatch(composed.V ?? "", /^>IGHV.* locus=/m);
 });
+
+test("the IgBLAST-style preparation keeps the locus a custom record's header gives", () => {
+  // Regression: the default swig-cli --vdj route wrote the bare name, so a
+  // custom TRB D fell back to TRB,TRD and TRD reads were given it.
+  const prepared = prepareIgblastStyleGermlineFasta(
+    ">myBD1 locus=TRB\nGGGACAGGGGGC\n>myBD2 TRB D gene\nGGGACTAGCGGGGGGG\n>TRBD1*01 locus=TRB\nGGGACAGGGGGC\n>myDD1 TRD\nGAAATAGT\n",
+    "D",
+  );
+  assert.equal(
+    prepared.fasta,
+    ">myBD1 locus=TRB\nGGGACAGGGGGC\n>myBD2 locus=TRB\nGGGACTAGCGGGGGGG\n>TRBD1*01 locus=TRB\nGGGACAGGGGGC\n>myDD1 locus=TRD\nGAAATAGT\n",
+  );
+  // The IgBLAST annotation files rewrite the headers and keep the key.
+  const framed = applyIgblastDFrameData(prepared.fasta, "myBD1 0\nmyBD2 -1\n");
+  assert.match(framed.fasta, /^>myBD1 SWIGMETA=0,-1,[-\d,]+ locus=TRB$/m);
+  assert.match(framed.fasta, /^>myBD2 locus=TRB$/m);
+  assert.match(framed.fasta, /^>myDD1 locus=TRD$/m);
+  const j = firstAnnotated(humanIghJ, "J");
+  const jApplied = applyIgblastAuxiliaryData(`>myJ1 IGH\n${j[1]}\n>other_j IGH\n${j[1]}\n`, `myJ1 ${j[2]![0]} JH ${j[2]![1]}\n`);
+  assert.match(jApplied.fasta, /^>myJ1 SWIGMETA=[-\d,]+ locus=IGH$/m);
+  assert.match(jApplied.fasta, /^>other_j locus=IGH$/m);
+  const v = firstAnnotated(humanIghV, "V");
+  const bounds = v[2]!.slice(2, 12);
+  const vApplied = applyIgblastInternalData(`>myV1 IGH\n${v[1]}\n`, `myV1 ${bounds.map((value, index) => index % 2 === 0 ? value + 1 : value).join(" ")} VH ${v[2]![0]}\n`);
+  assert.match(vApplied.fasta, /^>myV1 SWIGMETA=[-\d,]+ locus=IGH$/m);
+});
+
+test("later template tiers read a record's original header", () => {
+  // Regression: tier 1 re-read tier 0's output, whose header had lost the
+  // words that admitted the record, and refused it.
+  const bcr = (segment: "V") => germlineTemplateTiers(pack, human, "BCR", segment);
+  const igkv18 = (human.loci.IGK.V as MetadataAllele[]).find((allele) => allele[0] === "IGKV1-8*03");
+  assert.ok(igkv18);
+  const unannotated = `>IGKV99-1*01\n${"ACGT".repeat(75)}\n`;
+  // The record's key, "" for none; undefined when the record is missing.
+  const keyOf = (fasta: string, name: string) => {
+    const found = new RegExp(`^>${name}\\b.*?(?: locus=([A-Z,]+))?$`, "m").exec(fasta);
+    return found ? found[1] ?? "" : undefined;
+  };
+  for (const [header, key] of [
+    // The header and the template disagree: no key, the engine decides.
+    ["sample_k1 IGL", ""],
+    ["sample_k1 IGK", "IGK"],
+    ["sample_k1 light chain", "IGK"],
+  ] as const) {
+    const alone = preprocessGermlineFastaAcrossTiers(`>${header}\n${igkv18[1]}\n`, "V", bcr("V"), ["IGH", "IGK", "IGL"]);
+    const report = preprocessGermlineFastaAcrossTiers(`>${header}\n${igkv18[1]}\n${unannotated}`, "V", bcr("V"), ["IGH", "IGK", "IGL"], { includeDiagnostics: true });
+    assert.equal(report.count, 2, header);
+    assert.equal(report.annotated, 1, header);
+    assert.equal(keyOf(report.fasta, "sample_k1"), key, header);
+    assert.equal(keyOf(alone.fasta, "sample_k1"), key, header);
+    // The first tier's template stays the record's.
+    assert.equal(report.diagnostics?.find((entry) => entry.name === "sample_k1")?.template, "IGKV1-8*03", header);
+  }
+});
+
+test("a custom name with no locus code is placed by its scope or its template", () => {
+  const igkv15 = (human.loci.IGK.V as MetadataAllele[]).find((allele) => allele[0] === "IGKV1-5*01");
+  assert.ok(igkv15);
+  const changed = `${igkv15[1].slice(0, 145)}${igkv15[1][145] === "A" ? "C" : "A"}${igkv15[1].slice(146)}`;
+  // The record's key, "" for none; undefined when the record is missing.
+  const keyOf = (fasta: string, name: string) => {
+    const found = new RegExp(`^>${name}\\b.*?(?: locus=([A-Z,]+))?$`, "m").exec(fasta);
+    return found ? found[1] ?? "" : undefined;
+  };
+  const igkTiers = germlineTemplateTiers(pack, human, "IGK", "V");
+  // A reference cell's scope is its one locus: a bare name, or words holding
+  // a code inside them ('light' holds IGH), take that locus.
+  for (const header of ["novel_1", "novel_1 kappa light chain"]) {
+    const cell = preprocessGermlineFastaAcrossTiers(`>${header}\n${changed}\n`, "V", igkTiers, ["IGK"]);
+    assert.equal(cell.annotated, 1, header);
+    assert.equal(keyOf(cell.fasta, "novel_1"), "IGK", header);
+    assert.deepEqual(cell.loci, ["IGK"], header);
+  }
+  const bareJ = preprocessGermlineFasta(">novel_j\nGTGGACGTTCGGCCAAGGGACCAAGGTGGAAATCAAAC\n", "J", [], ["IGK"]);
+  assert.equal(keyOf(bareJ.fasta, "novel_j"), "IGK");
+  // A gene word of another locus is still refused.
+  assert.throws(
+    () => preprocessGermlineFasta(`>novel_1 IGHV-like\n${changed}\n`, "V", igkTiers[0], ["IGK"]),
+    /novel_1 belongs to IGH, outside the selected IGK search space/,
+  );
+  // In a multi-locus scope the template places it.
+  const bcrTiers = germlineTemplateTiers(pack, human, "BCR", "V");
+  const bcr = preprocessGermlineFastaAcrossTiers(`>novel_1\n${changed}\n`, "V", bcrTiers, ["IGH", "IGK", "IGL"], { includeDiagnostics: true });
+  assert.equal(keyOf(bcr.fasta, "novel_1"), "IGK");
+  assert.deepEqual(bcr.loci, ["IGK"]);
+  assert.equal(bcr.diagnostics?.[0].locus, "IGK");
+  // Nothing places it: refused, saying how to place it.
+  assert.throws(
+    () => preprocessGermlineFastaAcrossTiers(">novel_d\nGGTATAACTGGAACGAC\n", "D", [], ["IGH", "IGK", "IGL"]),
+    /novel_d names no IG\/TR locus and no IGH\/IGK\/IGL relative places it; name its locus in the header \(for example locus=IGH\)\./,
+  );
+  assert.throws(
+    () => preprocessGermlineFasta(`>novel_v\n${"ACGT".repeat(75)}\n`, "V", bcrTiers[0], ["IGH", "IGK", "IGL"]),
+    /novel_v names no IG\/TR locus/,
+  );
+});
+
+test("constant-region FASTA may hold IMGT's IgD constant gene and J-C orphons", () => {
+  // Regression: IGHD*01 read as a D gene and IGLJ-C/OR18*01 as a J gene.
+  const c = ">IGHD*01\nGCACCCACCAAGGCTCCGGATGTGTTCCCCATCATATCAGGGTGCAGACACCCAAAGGATAACAGCCCTGTGGTCCTGGCATGCTTGATAACTGGGTACCACCCAACGTCCGTGACTGTCACCTGGTACATGGGGACACAGAGCCAGCCCCAGAGAACCTTCCCTGAGATACAAAGACGGGACAGCTACTACATGACAAGCAGCCAGCTCTCCACCCCCCTCCAGCAGTGGCGCCAAGGCGAGTACAAATGCGTGGTCCAGCACACCGCCAGCAAGAGTAAGAAGGAGATCTTCCGCTGGCCAG\n>IGLJ-C/OR18*01\nGGTGTTCGGCGGAGGGACCAAGCTGACCGTCCTAGGTCAGCCCAAGGCTGCCCCCTCGGTCACTCTGTTCCCGCCCTCCTCTGAGGAGCTTCAAGCCAACAAGGCCACACTGGTGTGTCTCATAAGTGACTTCTACCCGGGAGCCGTGACAGTGGCCTGGAAGGCAGATAGCAGCCCCGTCAAGGCGGGAGTGGAGACCACCACACCCTCCAAACAAAGCAACAACAAGTACGCGGCCAGCAGCTACCTGAGCCTGACGCCTGAGCAGTGGAAGTCCCACAGAAGCTACAGCTGCCAGGTCACGCATGAAGGGAGCACCGTGGAGAAGACAGTGGCCCCTACAGAATGTTCA\n";
+  assert.equal(preprocessGermlineFasta(c, "C", [], ["IGH", "IGK", "IGL"]).count, 2);
+  assert.equal(prepareIgblastStyleGermlineFasta(c, "C").count, 2);
+  for (const [header, segment] of [["IGHD1-1*01", "D"], ["IGHJ4*02", "J"], ["IGLJ1*01", "J"]] as const) {
+    assert.throws(() => preprocessGermlineFasta(`>${header}\nACGTACGTACGT\n`, "C", [], ["IGH", "IGL"]), new RegExp(`looks like a ${segment} gene, not a C gene`), header);
+    assert.throws(() => prepareIgblastStyleGermlineFasta(`>${header}\nACGTACGTACGT\n`, "C"), new RegExp(`looks like a ${segment} gene, not a C gene`), header);
+  }
+});

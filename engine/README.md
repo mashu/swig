@@ -165,7 +165,7 @@ a usage error before any database is read: `--c-evalue` and
 `long-span` without `--d`. An option that only tunes a stage the run does
 not have is run and named in a warning, since it changes nothing: the D
 options (`--min-d-match`, `--d-mismatch`, `--d-presence-rate`, `--d-allele`,
-`--no-anchor-window`) without `--d`, the screen's rules without
+`--no-anchor-window`, `--d-open-flank off`) without `--d`, the screen's rules without
 `--double-d`, and `--d-allele max-marginal` with `--no-posterior`. A
 profile is a bundle and is never reported. With the screen on, D alleles
 shorter than `--double-d-seed-length` are named too, since the screen
@@ -465,7 +465,9 @@ or `fallback` for the inferred ones), so a reload does not infer again. Steps
 reference. **Give custom-named alleles a `locus=` key** when the warnings
 appear: the fallback cannot tell a custom TRB D from a TRD D, so TRDD alleles
 then compete on TRB reads. Swig Web and swig-cli write `locus=` for the
-custom records of a reference cell or of `prepare-reference` themselves.
+custom records of a reference cell or of `prepare-reference` themselves, and
+`swig-cli --vdj` keeps the locus a header gives (`locus=TRB`, or a locus word
+such as `TRB`).
 
 - **One locus per rearrangement.** J candidates must share a locus with the
   read's anchoring V placements (every locus when no V placement anchors),

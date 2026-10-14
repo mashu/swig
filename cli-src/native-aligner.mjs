@@ -162,12 +162,15 @@ export class NativePool {
    * @param threads its `--threads`
    * @param init {references: {V, D, J, C}, settings}, as for the WebAssembly pool
    * @param batchRecords records per run() call, which sets the in-flight window
+   * @param onWarning called with each database or run warning the child writes
    */
-  constructor(binary, threads, init, batchRecords) {
+  constructor(binary, threads, init, batchRecords, onWarning = () => {}) {
     this.binary = binary;
     this.threads = threads;
     this.init = init;
     this.batchRecords = batchRecords;
+    this.onWarning = onWarning;
+    this.stderrLine = "";
     this.jobs = [];
     this.header = null;
     this.failed = null;
@@ -223,6 +226,10 @@ export class NativePool {
     });
     this.child.stderr.on("data", (text) => {
       this.stderr = (this.stderr + text).slice(-65_536);
+      // The database and run warnings, which WebAssembly returns with its summary.
+      const lines = (this.stderrLine + text).split(/\r?\n/);
+      this.stderrLine = lines.pop().slice(-65_536);
+      for (const line of lines) if (line.startsWith("swig: warning: ")) this.onWarning(line.slice("swig: warning: ".length));
       if (/database prepared/.test(this.stderr)) readyResolve();
     });
     this.exited.then(({ code, signal }) => {

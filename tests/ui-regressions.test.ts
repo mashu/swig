@@ -457,3 +457,18 @@ test("a run is refused before it starts when an option lacks the germlines it ne
   assert.match(requestRun, /if \(constantPrefixIdentityEnabled && !compiled\.counts\.C\) \{\s*setRunError\("The covered C-prefix identity gate requires at least one C germline in the composed reference set\."\);\s*return;/);
   assert.match(requestRun, /if \(!compiled\.counts\.D\) \{\s*setRunError\("Double-D screening requires at least one D germline in the composed reference set\."\);\s*return;/);
 });
+
+test("Swig Web shows the aligner's warnings in the run summary", () => {
+  // Regression: the scheduler dropped the warnings the compute workers' engines return.
+  const app = fs.readFileSync(new URL("../src/swig-app.tsx", import.meta.url), "utf8");
+  const scheduler = fs.readFileSync(new URL("../src/aligner-worker.ts", import.meta.url), "utf8");
+  const runtime = fs.readFileSync(new URL("../src/aligner-runtime.ts", import.meta.url), "utf8");
+  assert.match(scheduler, /slot\.warnings = message\.warnings \?\? \[\]/);
+  assert.match(scheduler, /warnings: slots\[0\]\?\.warnings \?\? \[\]/);
+  assert.match(runtime, /warnings: message\.warnings \?\? \[\]/);
+  assert.match(app, /for \(const warning of completed\.warnings\) alignerWarnings\.add\(warning\)/);
+  assert.match(app, /alignerWarnings: result\.alignerWarnings/);
+  // Both result layouts list them.
+  assert.equal(app.match(/\{alignerNotes\}/g)?.length, 2);
+  assert.match(app, /className="aligner-warnings" role="status"/);
+});
