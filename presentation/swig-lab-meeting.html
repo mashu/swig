@@ -1,0 +1,2036 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>How Swig Reads V(D)J</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap" media="print" onload="this.media='all'">
+<style>
+/* Layout: a fixed 1280x720 "lab bench" stage scaled to the window; each slide is a sheet
+   with a section rail on the left. Sequences are always monospace; segment identity
+   (V, D, J, N/P) is carried by fixed hues used everywhere in the deck. */
+:root{
+  --bg:#eef1ee;          /* room around the stage */
+  --paper:#fbfcfa;       /* slide sheet */
+  --ink:#15202a;
+  --ink-2:#44535f;
+  --muted:#76848e;
+  --rule:#d7ddda;
+  --soft:#eef2ef;
+  --accent:#0d6b73;      /* deep teal: interaction, emphasis */
+  --accent-soft:#d6ecec;
+  --seg-v:#2f63c9; --seg-v-soft:#dbe5f8;
+  --seg-d:#c27500; --seg-d-soft:#f8e8cc;
+  --seg-j:#25864a; --seg-j-soft:#d6eedd;
+  --seg-n:#8b969d; --seg-n-soft:#e7eaec;
+  --bad:#c0303a; --bad-soft:#f7d9dc;
+  --good:#1f7a43;
+  --series-a:#008c99;    /* swig */
+  --series-b:#b5602a;    /* IgBLAST / comparator */
+  --heat-0:#f3f6f5; --heat-1:#0d6b73;
+  --f-display:"Bricolage Grotesque","Avenir Next","Segoe UI",system-ui,sans-serif;
+  --f-body:"IBM Plex Sans","Segoe UI",system-ui,-apple-system,sans-serif;
+  --f-mono:"IBM Plex Mono",ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#0b1014; --paper:#121a20; --ink:#e4eaed; --ink-2:#b4c0c7; --muted:#83929b; --rule:#2a363e; --soft:#18232a;
+  --accent:#4fc0c4; --accent-soft:#183a3d;
+  --seg-v:#7ea4ff; --seg-v-soft:#1d2c4d; --seg-d:#f0a83a; --seg-d-soft:#3f2e12; --seg-j:#5fcf88; --seg-j-soft:#173826;
+  --seg-n:#8b979e; --seg-n-soft:#232d33; --bad:#ff6b74; --bad-soft:#4a1c21; --good:#5fcf88;
+  --series-a:#1e9aa3; --series-b:#c97a3e; --heat-0:#18232a; --heat-1:#4fc0c4; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#0b1014; --paper:#121a20; --ink:#e4eaed; --ink-2:#b4c0c7; --muted:#83929b; --rule:#2a363e; --soft:#18232a;
+  --accent:#4fc0c4; --accent-soft:#183a3d;
+  --seg-v:#7ea4ff; --seg-v-soft:#1d2c4d; --seg-d:#f0a83a; --seg-d-soft:#3f2e12; --seg-j:#5fcf88; --seg-j-soft:#173826;
+  --seg-n:#8b979e; --seg-n-soft:#232d33; --bad:#ff6b74; --bad-soft:#4a1c21; --good:#5fcf88;
+  --series-a:#1e9aa3; --series-b:#c97a3e; --heat-0:#18232a; --heat-1:#4fc0c4; color-scheme:dark}
+
+[hidden]{display:none!important}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--f-body);overflow:hidden;
+  padding-left:max(0px, env(safe-area-inset-left,0px));padding-right:max(0px, env(safe-area-inset-right,0px))}
+#viewport{position:fixed;inset:0;display:grid;place-items:center}
+#stage{width:1280px;height:720px;position:relative;transform-origin:center center;flex:none}
+.slide{position:absolute;inset:0;background:var(--paper);border-radius:6px;box-shadow:0 1px 2px rgba(0,0,0,.06),0 12px 40px rgba(20,40,40,.10);
+  display:none;grid-template-columns:44px 1fr;overflow:hidden}
+.slide.active{display:grid}
+.rail{border-right:1px solid var(--rule);display:flex;align-items:flex-end;justify-content:center;padding-bottom:22px}
+.rail span{writing-mode:vertical-rl;transform:rotate(180deg);font:600 11px/1 var(--f-body);letter-spacing:.18em;text-transform:uppercase;color:var(--muted)}
+.body{padding:40px 56px 44px 48px;display:flex;flex-direction:column;gap:18px;min-width:0;position:relative}
+.eyebrow{font:600 12px/1 var(--f-body);letter-spacing:.16em;text-transform:uppercase;color:var(--accent)}
+h1,h2,h3{font-family:var(--f-display);margin:0;text-wrap:balance;letter-spacing:-.01em}
+h1{font-size:64px;line-height:1.02;font-weight:800}
+h2{font-size:38px;line-height:1.1;font-weight:700}
+h3{font-size:20px;line-height:1.25;font-weight:700}
+p,li{font-size:19px;line-height:1.5;margin:0;color:var(--ink-2)}
+p strong,li strong{color:var(--ink);font-weight:600}
+ul{margin:0;padding-left:1.1em;display:flex;flex-direction:column;gap:8px}
+.lede{font-size:22px;line-height:1.45;color:var(--ink-2);max-width:60ch}
+.small{font-size:15px;line-height:1.45;color:var(--muted)}
+.mono,code{font-family:var(--f-mono)}
+code{font-size:.92em;background:var(--soft);padding:1px 5px;border-radius:3px;color:var(--ink)}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:36px;min-height:0;flex:1}
+.cols.w60{grid-template-columns:1.5fr 1fr}
+.cols.w40{grid-template-columns:1fr 1.5fr}
+.cols > *{min-width:0}
+.cols > table{align-self:start}
+.seq.wrap{flex-wrap:wrap;row-gap:3px}
+.seq.two b{height:auto;flex-direction:column;display:inline-flex;align-items:center;padding:3px 0 2px;gap:2px}
+.seq.two b i{font-style:normal;font-size:9px;color:var(--muted);line-height:1}
+.stack{display:flex;flex-direction:column;gap:14px;min-width:0}
+.row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.panel{border:1px solid var(--rule);border-radius:8px;padding:16px 18px;background:var(--paper)}
+.panel.fill{background:var(--soft);border-color:transparent}
+.key{display:inline-flex;align-items:center;gap:6px;font-size:14px;color:var(--ink-2)}
+.sw{width:12px;height:12px;border-radius:2px;display:inline-block}
+.tag{display:inline-block;font:600 12px/1 var(--f-body);letter-spacing:.06em;text-transform:uppercase;padding:5px 8px;border-radius:4px;background:var(--accent-soft);color:var(--accent)}
+.note{border-left:3px solid var(--accent);padding:6px 0 6px 14px;font-size:17px;color:var(--ink-2)}
+.pill{display:inline-block;padding:3px 9px;border-radius:999px;font-size:13px;font-weight:600}
+.pill.good{background:var(--seg-j-soft);color:var(--good)}
+.pill.bad{background:var(--bad-soft);color:var(--bad)}
+.big-num{font:800 56px/1 var(--f-display);color:var(--accent);letter-spacing:-.02em}
+.big-cap{font-size:15px;color:var(--muted);margin-top:4px}
+
+/* segment colours */
+.v{color:var(--seg-v)} .d{color:var(--seg-d)} .j{color:var(--seg-j)} .n{color:var(--seg-n)}
+.bg-v{background:var(--seg-v-soft)} .bg-d{background:var(--seg-d-soft)} .bg-j{background:var(--seg-j-soft)} .bg-n{background:var(--seg-n-soft)}
+
+/* sequence strips */
+.seq{font-family:var(--f-mono);font-size:16px;letter-spacing:0;display:flex;flex-wrap:nowrap;line-height:1}
+.seq b{font-weight:500;width:13px;height:24px;display:inline-grid;place-items:center;border-radius:2px}
+.seq b.mm{background:var(--bad-soft)!important;color:var(--bad);font-weight:700}
+.seq b.gap{color:var(--muted)}
+.seqrow{display:grid;grid-template-columns:96px auto;align-items:center;gap:8px;font-size:13px;color:var(--muted)}
+.scroll-x{overflow-x:auto;max-width:100%}
+
+/* controls */
+button,.btn{font:600 14px/1 var(--f-body);color:var(--ink);background:var(--paper);border:1px solid var(--rule);border-radius:6px;padding:9px 13px;cursor:pointer}
+button:hover{border-color:var(--accent);color:var(--accent)}
+button.primary{background:var(--accent);border-color:var(--accent);color:var(--paper)}
+button.primary:hover{filter:brightness(1.08);color:var(--paper)}
+button[aria-pressed="true"]{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.seg{display:inline-flex;border:1px solid var(--rule);border-radius:7px;overflow:hidden}
+.seg button{border:0;border-radius:0;border-right:1px solid var(--rule)}
+.seg button:last-child{border-right:0}
+label.ctl{display:flex;flex-direction:column;gap:4px;font-size:13px;color:var(--muted);font-weight:500}
+label.ctl output{font-family:var(--f-mono);color:var(--ink);font-size:14px}
+input[type=range]{accent-color:var(--accent);width:150px}
+input[type=text]{font:500 15px/1 var(--f-mono);padding:7px 9px;border:1px solid var(--rule);border-radius:6px;background:var(--paper);color:var(--ink);width:128px;text-transform:uppercase}
+select{font:500 14px var(--f-body);padding:7px;border:1px solid var(--rule);border-radius:6px;background:var(--paper);color:var(--ink)}
+
+/* tables */
+table{border-collapse:collapse;font-size:15px;font-variant-numeric:tabular-nums;width:100%}
+th{font:600 12px/1.2 var(--f-body);letter-spacing:.06em;text-transform:uppercase;color:var(--muted);text-align:left;padding:7px 10px;border-bottom:1px solid var(--rule)}
+td{padding:7px 10px;border-bottom:1px solid var(--rule);color:var(--ink-2)}
+td.num,th.num{text-align:right}
+td.win{color:var(--ink);font-weight:700}
+tr.hl td{background:var(--accent-soft)}
+
+/* DP matrix */
+.dp{border-collapse:separate;border-spacing:2px;font-family:var(--f-mono);width:auto}
+.dp td,.dp th{width:34px;height:30px;padding:0;text-align:center;border:0;font-size:13px;border-radius:3px}
+.dp th{font:600 15px var(--f-mono);color:var(--ink);text-transform:none;letter-spacing:0}
+.dp th.rowh{color:var(--seg-n)}
+.dp td{background:var(--soft);color:var(--ink-2);cursor:pointer;position:relative}
+.dp td.done{color:var(--ink)}
+.dp td.cur{outline:2px solid var(--accent);outline-offset:-1px;background:var(--accent-soft)}
+.dp td.src{outline:2px dashed var(--accent);outline-offset:-2px}
+.dp td.path{background:var(--accent)!important;color:var(--paper)!important;font-weight:700}
+#dpGrid .dp td,#dpGrid .dp th{height:27px}
+.dp td.out{background:transparent;color:transparent;cursor:default}
+.dp td.best{box-shadow:inset 0 0 0 2px var(--seg-d)}
+
+/* figures */
+svg text{font-family:var(--f-body)}
+.fig{width:100%;height:auto;display:block}
+.fig-caption{font-size:13px;color:var(--muted)}
+
+/* chrome */
+#chrome{position:fixed;left:0;right:0;bottom:0;display:flex;align-items:center;gap:12px;
+  padding:8px max(14px, env(safe-area-inset-right,0px)) calc(8px + env(safe-area-inset-bottom,0px)) max(14px, env(safe-area-inset-left,0px));
+  font:500 13px var(--f-body);color:var(--muted);pointer-events:none}
+#chrome > *{pointer-events:auto}
+#chrome button{padding:6px 10px;font-size:13px;background:var(--paper)}
+#progress{position:fixed;left:0;top:0;height:3px;background:var(--accent);transition:width .25s;top:env(safe-area-inset-top,0px)}
+#count{font-variant-numeric:tabular-nums;margin-left:auto}
+#notes{position:fixed;left:50%;transform:translateX(-50%);bottom:52px;width:min(900px,calc(100vw - 32px));max-height:32vh;overflow:auto;
+  background:var(--paper);border:1px solid var(--rule);border-radius:8px;padding:14px 18px;font-size:15px;line-height:1.5;color:var(--ink-2);box-shadow:0 10px 30px rgba(0,0,0,.18)}
+#overview{position:fixed;inset:0;background:var(--bg);overflow:auto;padding:24px max(16px, env(safe-area-inset-left,0px));display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px;align-content:start;z-index:5}
+#overview button{text-align:left;padding:12px;line-height:1.35;font-weight:500}
+#overview button small{display:block;color:var(--muted);font-size:11px;letter-spacing:.1em;text-transform:uppercase;margin-bottom:4px}
+.step{transition:opacity .3s}
+.step:not(.shown){opacity:0;pointer-events:none}
+aside.notes{display:none}
+@media (prefers-reduced-motion: reduce){*{transition:none!important;animation:none!important}}
+</style>
+</head>
+<body>
+<div id="progress"></div>
+<div id="viewport"><div id="stage">
+
+<!-- ============================ TITLE ============================ -->
+<section class="slide" data-section="Swig" data-title="Title">
+  <div class="body" style="justify-content:center;gap:26px">
+    <div class="eyebrow">Lab meeting · a short course on the aligner</div>
+    <h1>How Swig reads a<br>V(D)J rearrangement</h1>
+    <p class="lede">Alignments, scores, dynamic programming, k-mers and one exact graph that places V, D and J together. We build each idea from scratch, then check the result against simulated reads whose answer we know.</p>
+    <div id="titleRead" class="seq scroll-x" aria-label="A simulated heavy-chain read coloured by germline origin"></div>
+    <div class="row">
+      <span class="key"><i class="sw" style="background:var(--seg-v)"></i>V gene</span>
+      <span class="key"><i class="sw" style="background:var(--seg-n)"></i>N/P additions</span>
+      <span class="key"><i class="sw" style="background:var(--seg-d)"></i>D gene</span>
+      <span class="key"><i class="sw" style="background:var(--seg-j)"></i>J gene</span>
+      <span class="small" style="margin-left:auto">← → or space to move · N notes · O overview · F fullscreen</span>
+    </div>
+  </div>
+  <aside class="notes">Goal of the session: by the end, everyone should be able to explain what an alignment score means, why the matrix is filled the way it is, what makes Swig fast, and why placing V, D and J jointly matters. The read in the title is a real slice of the example we use later.</aside>
+</section>
+
+<!-- ============================ PART A ============================ -->
+<section class="slide" data-section="The question" data-title="One receptor, many origins">
+  <div class="body">
+    <div class="eyebrow">The question</div>
+    <h2>Every receptor read is a mosaic</h2>
+    <div class="cols" style="flex:none;gap:40px">
+      <p>A developing B cell cuts and joins one <strong class="v">V</strong>, one <strong class="d">D</strong> and one <strong class="j">J</strong> gene. The joints are trimmed by exonucleases and filled with random <strong class="n">N</strong> nucleotides. Later, somatic hypermutation sprinkles point mutations on top.</p>
+      <div class="stack" style="gap:6px">
+        <h3>An annotator must answer</h3>
+        <ul>
+          <li>Which <strong>V, D and J alleles</strong> made this read?</li>
+          <li>Where does each segment <strong>start and stop</strong>, which bases are N/P, and what is the <strong>junction</strong> (CDR3)?</li>
+        </ul>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="row" style="justify-content:space-between">
+        <h3>Recombine a receptor</h3>
+        <span class="small">Faded letters were trimmed away. Red read bases are mutations.</span>
+        <button class="primary" id="recBtn">Recombine</button>
+      </div>
+      <div id="recGerm" style="margin-top:12px;display:flex;flex-direction:column;gap:6px"></div>
+      <div class="small" style="margin:10px 0 6px">The read the sequencer sees:</div>
+      <div id="recRead" class="seq wrap"></div>
+      <div id="recInfo" class="small" style="margin-top:8px"></div>
+    </div>
+  </div>
+  <aside class="notes">The germline rows show the full genes; faded letters were trimmed away. Mutated read bases are red. This is the same generative story the simulator uses at the end, so keep it in mind.</aside>
+</section>
+
+<section class="slide" data-section="The question" data-title="Why it is hard">
+  <div class="body">
+    <div class="eyebrow">The question</div>
+    <h2>Three things make the answer uncertain</h2>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:22px;margin-top:6px">
+      <div class="panel stack"><span class="tag">Short D</span><h3>The D is tiny</h3><p>Human IGHD genes are 11–37 nt. After trimming, a remnant of 4–8 nt is common. Random sequence matches 5 nt of <em>some</em> D by chance all the time.</p></div>
+      <div class="panel stack"><span class="tag">Mutation</span><h3>Mutations look like alleles</h3><p>Under hypermutation (IgG reads carry about 7 % mutated bases) a mismatch may be a mutation, a sequencing error, or the base that separates two alleles.</p></div>
+      <div class="panel stack"><span class="tag">Boundaries</span><h3>Junctions are ambiguous</h3><p>An N base that happens to match the V can be explained by either. Where V stops, where D starts and where J starts must be decided together.</p></div>
+    </div>
+    <p class="lede" style="margin-top:auto">So the job is not "find a match". It is <strong>choosing the most probable explanation</strong> among many partial ones. Everything in this course is a tool for that choice.</p>
+  </div>
+  <aside class="notes">D lengths: human IGHD genes range roughly from 11 nt (IGHD7-27) to 37 nt (IGHD3-16). In the simulator's mid preset the D is trimmed by geometric amounts on both ends.</aside>
+</section>
+
+<!-- ============================ PART B ============================ -->
+<section class="slide" data-section="Alignment" data-title="What an alignment is">
+  <div class="body">
+    <div class="eyebrow">Alignment from first principles</div>
+    <h2>An alignment is a hypothesis about history</h2>
+    <p class="lede">Write two sequences one above the other. Each <strong>column</strong> claims something happened: the base was copied (match), changed (mismatch), or one side gained or lost bases (gap).</p>
+    <div class="panel" style="display:flex;flex-direction:column;gap:6px">
+      <div class="seqrow"><span>germline V</span><div id="alnTop" class="seq"></div></div>
+      <div class="seqrow"><span></span><div id="alnMid" class="seq"></div></div>
+      <div class="seqrow"><span>read</span><div id="alnBot" class="seq"></div></div>
+    </div>
+    <div class="cols" style="grid-template-columns:repeat(3,1fr);gap:22px;flex:none">
+      <div><h3>Match <span class="mono">|</span></h3><p>Same base. Evidence the read was copied from this gene.</p></div>
+      <div><h3>Mismatch <span class="mono" style="color:var(--bad)">×</span></h3><p>A mutation, a sequencing error, or the wrong allele.</p></div>
+      <div><h3>Gap <span class="mono">–</span></h3><p>An insertion or deletion (indel). Rare in receptors, so it should cost more than a mismatch.</p></div>
+    </div>
+    <p>The <strong>score</strong> of an alignment adds up one number per column. The best alignment is the one with the highest score. Two questions follow: <em>which numbers</em>, and <em>how to find the best one</em> without trying every alignment.</p>
+  </div>
+  <aside class="notes">There are astronomically many ways to place gaps. For two 300-nt sequences the number of alignments exceeds 10^170. We need dynamic programming.</aside>
+</section>
+
+<section class="slide" data-section="Alignment" data-title="The matrix">
+  <div class="body">
+    <div class="eyebrow">Alignment from first principles</div>
+    <h2>Rows are one sequence, columns the other</h2>
+    <div class="cols w40">
+      <div class="stack">
+        <p>Put the <strong>read</strong> down the rows and the <strong>germline</strong> across the columns. A cell <span class="mono">(i, j)</span> asks: "what is the best alignment that ends with read base <span class="mono">i</span> and germline base <span class="mono">j</span>?"</p>
+        <p>An alignment is a <strong>path</strong> through this grid:</p>
+        <ul>
+          <li><strong>↘ diagonal</strong>: both advance, a match or mismatch column.</li>
+          <li><strong>→ right</strong>: germline advances alone, a deletion in the read.</li>
+          <li><strong>↓ down</strong>: read advances alone, an insertion in the read.</li>
+        </ul>
+        <p class="small">Swig's own code uses exactly this layout: rows are query positions, columns reference positions, and a diagonal is <span class="mono">d = i − j</span>.</p>
+      </div>
+      <div class="stack" style="align-items:flex-start">
+        <div class="row"><button id="mxPath1" aria-pressed="true">No gaps</button><button id="mxPath2">With a deletion</button><span id="mxInfo" class="small"></span></div>
+        <div id="mxGrid" class="scroll-x"></div>
+        <div class="seq" id="mxAln" style="flex-direction:column;gap:4px"></div>
+      </div>
+    </div>
+  </div>
+  <aside class="notes">Hover any cell: it highlights which read base is compared with which germline base. The two buttons show two different paths, which are two different alignments of the same pair.</aside>
+</section>
+
+<section class="slide" data-section="Alignment" data-title="Log-odds and BLOSUM">
+  <div class="body">
+    <div class="eyebrow">Which numbers? Log-odds</div>
+    <h2>A score is a log-odds ratio</h2>
+    <div class="cols w40">
+      <div class="stack">
+        <p>For each pair of letters <span class="mono">a, b</span> compare two stories:</p>
+        <div class="panel fill mono" style="font-size:17px;line-height:1.7">
+          s(a,b) = log [ q<sub>ab</sub> / (p<sub>a</sub> · p<sub>b</sub>) ]
+        </div>
+        <ul>
+          <li><span class="mono">q<sub>ab</sub></span>: how often <span class="mono">a</span> and <span class="mono">b</span> are aligned in truly related sequences.</li>
+          <li><span class="mono">p<sub>a</sub>p<sub>b</sub></span>: how often they would meet by chance.</li>
+        </ul>
+        <p>Positive means "more often than chance". Because logs add, the sum over columns is the log-likelihood ratio of the whole alignment: <strong>related</strong> versus <strong>random</strong>.</p>
+        <p class="small">BLOSUM62 (Henikoff &amp; Henikoff 1992) counts substitutions in conserved protein blocks, clustered at 62 % identity, and stores the log-odds in half-bits: <span class="mono">s = 2·log₂(ratio)</span>.</p>
+      </div>
+      <div class="stack">
+        <div class="row" style="justify-content:space-between"><h3>BLOSUM62, a slice</h3><span class="small">hover a cell</span></div>
+        <div id="blosum" class="scroll-x"></div>
+        <div id="blosumInfo" class="panel fill" style="min-height:78px;font-size:16px;color:var(--ink-2)">W–W scores <strong>11</strong>: tryptophan is aligned with itself 2<sup>5.5</sup> ≈ 45 times more often than chance predicts. Rare and important residues are rarely replaced.</div>
+      </div>
+    </div>
+  </div>
+  <aside class="notes">BLOSUM is the classic teaching example of log-odds. I versus L is +2 (both hydrophobic), D versus E is +2 (both acidic), W versus G is negative. Swig aligns nucleotides, so it uses the DNA version of the same idea, next slide.</aside>
+</section>
+
+<section class="slide" data-section="Alignment" data-title="Swig's nucleotide log-odds">
+  <div class="body">
+    <div class="eyebrow">Which numbers? The DNA version in Swig</div>
+    <h2>+2 / −3 is a log-odds matrix for DNA</h2>
+    <div class="cols">
+      <div class="stack">
+        <p>Swig aligns nucleotides, so its "BLOSUM" is a 4×4 matrix: <strong>match +2</strong>, <strong>mismatch −3</strong>, an <span class="mono">N</span> scores 0. These are not arbitrary. With the Karlin–Altschul constant <span class="mono">λ = 0.634</span>, they are exactly the log-odds of "copied from this gene at 11.2 % divergence" against "random sequence".</p>
+        <div class="panel fill mono" style="font-size:16px;line-height:1.8">
+          match&nbsp;&nbsp;&nbsp;: ln 4(1−p)<br>
+          mismatch: ln (4p/3)
+        </div>
+        <p><strong>Novelty: each read gets its own <span class="mono">p</span>.</strong> Swig estimates the read's divergence <span class="mono">p̂</span> from V and J columns that no boundary decision touches, then scores the call at that divergence. An unmutated read makes a single mismatch strong evidence; a heavily mutated read makes it cheap.</p>
+      </div>
+      <div class="stack">
+        <label class="ctl">Read divergence p̂ <output id="divOut">11.2 %</output><input type="range" id="divSlider" min="1" max="400" value="112" style="width:100%"></label>
+        <svg id="divFig" class="fig" viewBox="0 0 520 300" role="img" aria-label="Log-odds of match and mismatch against divergence"></svg>
+        <div id="divInfo" class="panel" style="font-size:16px"></div>
+      </div>
+    </div>
+  </div>
+  <aside class="notes">Example from the docs: a single nucleotide difference between two alleles is worth ln(3(1−p)/p) = 8.0 nats on an unmutated read at p = 0.1 %, not the 3.2 nats a fixed +2/−3 scale gives. That is why allele calls on clean reads become far more confident.</aside>
+</section>
+
+<section class="slide" data-section="Alignment" data-title="Affine gaps">
+  <div class="body">
+    <div class="eyebrow">Which numbers? Gaps</div>
+    <h2>Affine gaps: opening costs more than extending</h2>
+    <div class="cols w40">
+      <div class="stack">
+        <p>An indel is one rare event, whether it removes 1 base or 3. A <strong>linear</strong> penalty charges every gap base the same, so one 3-base deletion would look like three independent events.</p>
+        <div class="panel fill mono" style="font-size:17px;line-height:1.7">gap(L) = open + (L − 1) · extend</div>
+        <p>Swig's V scoring is <span class="mono">open = −9, extend = −1</span>: a 3-nt deletion costs −11, barely more than a 1-nt one (−9). In hypermutated antibodies indels are rare and often a whole codon, so this is the right shape.</p>
+        <p class="small">Defaults: V (2, −3, −9, −1); D (2, −3, −13, −1); J (2, −3, −17, −2).</p>
+      </div>
+      <div class="stack">
+        <div class="row">
+          <label class="ctl">open <output id="goOut">−9</output><input type="range" id="goSlider" min="1" max="20" value="9"></label>
+          <label class="ctl">extend <output id="geOut">−1</output><input type="range" id="geSlider" min="0" max="6" value="1"></label>
+          <label class="ctl">linear (per base) <output id="glOut">−4</output><input type="range" id="glSlider" min="1" max="10" value="4"></label>
+        </div>
+        <svg id="gapFig" class="fig" viewBox="0 0 560 320" role="img" aria-label="Gap cost by length, linear versus affine"></svg>
+        <div class="row"><span class="key"><i class="sw" style="background:var(--series-a)"></i>affine</span><span class="key"><i class="sw" style="background:var(--series-b)"></i>linear</span></div>
+      </div>
+    </div>
+  </div>
+  <aside class="notes">Note the constructor in scoring.rs refuses open cheaper than extend: otherwise the optimum would price a long gap as repeated openings.</aside>
+</section>
+
+<!-- ============================ PART C ============================ -->
+<section class="slide" data-section="Dynamic programming" data-title="Filling the matrix">
+  <div class="body" style="gap:12px">
+    <div class="eyebrow">How to find the best path</div>
+    <h2>Dynamic programming: each cell from three neighbours</h2>
+    <div class="cols w60" style="gap:28px">
+      <div class="stack" style="gap:10px">
+        <div class="row">
+          <div class="seg" role="group" aria-label="Algorithm">
+            <button data-mode="nw" aria-pressed="true">Global (NW)</button>
+            <button data-mode="sw">Local (SW)</button>
+            <button data-mode="gotoh">Local + affine (Gotoh)</button>
+          </div>
+        </div>
+        <div class="row">
+          <label class="ctl">read (rows)<input type="text" id="dpA" value="GCATGCTAGCA" maxlength="11" spellcheck="false"></label>
+          <label class="ctl">germline (columns)<input type="text" id="dpB" value="TGCATCGCTAGC" maxlength="12" spellcheck="false"></label>
+          <button id="dpStep">Step</button><button id="dpPlay">Play</button><button id="dpAll" class="primary">Fill all</button><button id="dpReset">Reset</button>
+        </div>
+        <div id="dpGrid" class="scroll-x"></div>
+      </div>
+      <div class="stack" style="gap:10px">
+        <div id="dpRule" class="panel fill mono" style="font-size:14px;line-height:1.6"></div>
+        <div id="dpExplain" class="panel" style="font-size:15px;line-height:1.5;min-height:130px"></div>
+        <div class="row">
+          <label class="ctl">match <output id="smOut">+2</output><input type="range" id="smS" min="1" max="5" value="2" style="width:90px"></label>
+          <label class="ctl">mismatch <output id="sxOut">−3</output><input type="range" id="sxS" min="1" max="6" value="3" style="width:90px"></label>
+          <label class="ctl">gap / open <output id="soOut">−4</output><input type="range" id="soS" min="1" max="12" value="4" style="width:90px"></label>
+          <label class="ctl">extend <output id="seOut">−1</output><input type="range" id="seS" min="0" max="4" value="1" style="width:90px"></label>
+        </div>
+        <div id="dpAln" class="seq" style="flex-direction:column;gap:4px"></div>
+      </div>
+    </div>
+  </div>
+  <aside class="notes">Start in Global mode, press Step a few times, then click any filled cell to see which neighbour it came from. Then switch to Local: negative cells are floored at 0, and the best cell (orange ring) can be anywhere. Gotoh adds the gap-state bookkeeping for affine gaps; click a cell to see its three values.</aside>
+</section>
+
+<section class="slide" data-section="Dynamic programming" data-title="NW, SW, Gotoh">
+  <div class="body">
+    <div class="eyebrow">How to find the best path</div>
+    <h2>Three ideas, often confused</h2>
+    <table style="font-size:17px">
+      <thead><tr><th>Algorithm</th><th>What it adds</th><th>Recurrence change</th><th>Answers</th></tr></thead>
+      <tbody>
+        <tr><td class="win">Needleman–Wunsch (1970)</td><td>The DP grid itself</td><td class="mono">H = max(diag + s, up + g, left + g)</td><td>Best <strong>global</strong> alignment, end to end</td></tr>
+        <tr><td class="win">Smith–Waterman (1981)</td><td>A floor at zero</td><td class="mono">H = max(<strong>0</strong>, diag + s, up + g, left + g)</td><td>Best <strong>local</strong> alignment: the best-matching piece of each</td></tr>
+        <tr><td class="win">Gotoh (1982)</td><td>Affine gaps at the same cost</td><td class="mono">E, F track "already in a gap"; extend is cheap</td><td>Same answers, with <strong>open + extend</strong> gaps, still O(n·m)</td></tr>
+      </tbody>
+    </table>
+    <div class="cols" style="flex:none;margin-top:10px">
+      <div class="note"><strong>Why local?</strong> A read holds V, then junction, then J, plus primers and adapters. A germline V only explains part of the read, and the read only covers part of a J. Local alignment lets each gene explain only the piece it fits.</div>
+      <div class="note"><strong>Why Gotoh?</strong> Done naively, affine gaps make every cell look back over all gap lengths: O(n·m·(n+m)). Gotoh's two extra matrices remember whether we are already inside a gap, which brings it back to O(n·m). Swig runs "Smith–Waterman with Gotoh gaps".</div>
+    </div>
+  </div>
+  <aside class="notes">Smith–Waterman and Gotoh answer different questions: SW is about local versus global, Gotoh is about how gaps are charged. They combine. The scalar kernel in Swig is tested to equal a textbook Gotoh exactly.</aside>
+</section>
+
+<section class="slide" data-section="Dynamic programming" data-title="Banded alignment">
+  <div class="body">
+    <div class="eyebrow">How to find the best path, faster</div>
+    <h2>Banded alignment: compute only near the diagonal</h2>
+    <div class="cols w40">
+      <div class="stack">
+        <p>If we already know roughly where the read sits on the gene (from seeds, next section), the optimal path stays close to one diagonal <span class="mono">d = i − j</span>. We only fill cells with <span class="mono">d</span> in <span class="mono">[lo, hi]</span>.</p>
+        <p>Work drops from <span class="mono">n·m</span> to about <span class="mono">n·(band width)</span>. Memory too: one rolling row plus traceback for band cells only.</p>
+        <p><strong>The risk:</strong> an indel shifts the path to another diagonal. An indel bigger than the band escapes it.</p>
+        <p>Swig's V band is the diagonal range of the seed cluster <strong>± 8</strong>. When seeds on both sides of a long indel form two clusters, the band spans both. J alleles are short and aligned without a band; D windows are small.</p>
+      </div>
+      <div class="stack">
+        <div class="row">
+          <label class="ctl">band half-width <output id="bwOut">8</output><input type="range" id="bwS" min="1" max="30" value="8"></label>
+          <label class="ctl">indel length <output id="biOut">3</output><input type="range" id="biS" min="0" max="20" value="3"></label>
+        </div>
+        <canvas id="bandCv" width="560" height="380" style="width:100%;max-width:560px;height:auto;border-radius:6px" aria-label="Band of computed cells around the alignment path"></canvas>
+        <div id="bandInfo" class="small"></div>
+      </div>
+    </div>
+  </div>
+  <aside class="notes">A 300-nt V against a 400-nt read: full matrix 120,000 cells, a band of 17 diagonals about 5,000. The canvas is a 120 by 80 cartoon of that.</aside>
+</section>
+
+<!-- ============================ PART D ============================ -->
+<section class="slide" data-section="Speed: k-mers" data-title="k-mers as integers">
+  <div class="body">
+    <div class="eyebrow">Speed tricks · k-mers</div>
+    <h2>A k-mer is a word of k letters, stored as a number</h2>
+    <div class="cols">
+      <div class="stack">
+        <p>Slide a window of <span class="mono">k</span> bases along a sequence: every position gives one <strong>k-mer</strong>. Two related sequences share many identical k-mers; unrelated ones share few.</p>
+        <p><strong>Trick 1, 2 bits per base.</strong> A=00, C=01, G=10, T=11. A 9-mer is an 18-bit integer, so it can be used directly as an array index: no hashing, no string comparison.</p>
+        <p><strong>Trick 2, rolling update.</strong> Moving the window by one base costs one shift, one OR and one AND:</p>
+        <div class="panel fill mono" style="font-size:15px">key = ((key &lt;&lt; 2) | code(base)) &amp; (4<sup>k</sup> − 1)</div>
+        <p class="small">Swig uses 9-mers for V seeds (7-mers as a fallback for heavily mutated reads), 11-mers to decide the read's strand, and 4-mers to prefilter D alleles.</p>
+      </div>
+      <div class="stack">
+        <div class="row">
+          <label class="ctl">k <output id="kOut">5</output><input type="range" id="kS" min="3" max="11" value="5"></label>
+          <button id="kPrev">◀</button><button id="kNext" class="primary">Slide ▶</button>
+        </div>
+        <div id="kSeq" class="seq scroll-x"></div>
+        <div id="kBits" class="panel mono" style="font-size:14px;line-height:1.7"></div>
+        <div id="kInfo" class="small"></div>
+      </div>
+    </div>
+  </div>
+  <aside class="notes">4^9 = 262,144 possible 9-mers, so a direct-address table of offsets fits easily in memory.</aside>
+</section>
+
+<section class="slide" data-section="Speed: k-mers" data-title="The index">
+  <div class="body">
+    <div class="eyebrow">Speed tricks · counting k-mers</div>
+    <h2>The germline index: one array lookup per k-mer</h2>
+    <div class="cols w60">
+      <svg id="idxFig" class="fig" viewBox="0 0 700 380" role="img" aria-label="Offsets array pointing into a flat postings array"></svg>
+      <div class="stack">
+        <p><strong>Built once</strong> per germline set, before any read. For every k-mer key, the <em>offsets</em> array says where its occurrences start in one flat <em>postings</em> array (compressed sparse rows).</p>
+        <p><strong>Lookup = two loads.</strong> <span class="mono">postings[offsets[key] .. offsets[key+1]]</span> is every place the k-mer occurs.</p>
+        <p><strong>Packed postings.</strong> One 32-bit word holds both the gene frame (20 bits) and the position (12 bits): germline genes are under 4,096 nt.</p>
+        <p><strong>No hash map for votes either.</strong> Each vote is packed into one 64-bit number and the votes are radix-sorted in linear time, then one scan groups them by gene and diagonal.</p>
+        <p class="small">Seeds that occur too often (low-complexity) are skipped, and a seed occurring twice in one gene does not vote, so a repeat like <span class="mono">AGTAGTAGT</span> cannot collect quadratic votes.</p>
+      </div>
+    </div>
+  </div>
+  <aside class="notes">Why not an FM-index? Germline databases are a few hundred kilobases and seeds have fixed length, so a flat k-mer array is smaller in constants and faster than backward search.</aside>
+</section>
+
+<section class="slide" data-section="Speed: k-mers" data-title="Seeding by diagonal votes">
+  <div class="body" style="gap:12px">
+    <div class="eyebrow">Speed tricks · seeding</div>
+    <h2>Shared k-mers vote for a diagonal</h2>
+    <div class="cols w60" style="gap:28px">
+      <div class="stack" style="gap:8px">
+        <div class="row">
+          <label class="ctl">k <output id="dkOut">9</output><input type="range" id="dkS" min="5" max="13" value="9"></label>
+          <label class="ctl">mutation rate <output id="dmOut">5 %</output><input type="range" id="dmS" min="0" max="30" value="5"></label>
+          <label class="ctl">deletion <output id="ddOut">4 nt</output><input type="range" id="ddS" min="0" max="12" value="4"></label>
+          <button id="dNew">New read</button>
+        </div>
+        <canvas id="dotCv" width="640" height="400" style="width:100%;height:auto;border-radius:6px" aria-label="Dot plot of shared k-mers and diagonal vote histogram"></canvas>
+      </div>
+      <div class="stack">
+        <p>Each k-mer shared by the read (rows) and a germline (columns) is a dot. If the read came from this gene, the dots line up on <strong>one diagonal</strong> <span class="mono">d = i − p</span>. The histogram on the right counts votes per diagonal.</p>
+        <ul>
+          <li>A <strong>mutation</strong> destroys the k overlapping k-mers. Longer k is more specific but more fragile.</li>
+          <li>A <strong>deletion</strong> shifts later seeds to another diagonal: two clusters, which Swig joins when they are close.</li>
+          <li>9-mers vote with weight 4; while the leader has fewer than 25 nine-mer seeds, 7-mers join with weight 1.</li>
+        </ul>
+        <div id="dotInfo" class="panel fill" style="font-size:15px"></div>
+      </div>
+    </div>
+  </div>
+  <aside class="notes">Push the mutation rate to 20-30 % with k = 11: the diagonal fades. Drop k to 7 and it returns, with more random dots. This is why Swig keeps 9-mers as primary seeds and adds 7-mers only for weakly supported reads.</aside>
+</section>
+
+<section class="slide" data-section="Speed: k-mers" data-title="From votes to candidates">
+  <div class="body">
+    <div class="eyebrow">Speed tricks · fewer, smarter alignments</div>
+    <h2>Rank genes, then align as few alleles as possible</h2>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:22px">
+      <div class="panel stack"><span class="tag">Gene frames</span><h3>Alleles share coordinates</h3><p>Alleles of one gene that differ by SNPs or truncation are placed in one coordinate frame. A seed shared by all alleles is one posting and one vote. Retrieval work scales with <strong>genes</strong>, not alleles.</p></div>
+      <div class="panel stack"><span class="tag">Noise-aware budget</span><h3>How many genes to keep</h3><p>Keep 3 genes, and up to 16 while their votes are within two standard deviations of the leader's: <span class="mono">z·√(2·4·L)</span>. Mutated reads with few votes get a wider net automatically.</p></div>
+      <div class="panel stack"><span class="tag">Lossless bounds</span><h3>Skip what cannot win</h3><p>Align one representative per frame. For each sibling allele compute an upper bound from the positions where it differs. If the bound is below the current 3rd-best score, the allele is skipped. The ranking is provably the same as aligning everything.</p></div>
+    </div>
+    <div class="cols" style="flex:none">
+      <div class="note"><strong>D:</strong> every allele sharing a 4-mer with the junction window is aligned, unbanded. <strong>J:</strong> every allele, unbanded, downstream of the V.</div>
+      <div class="note"><strong>Strand:</strong> decided once, by counting read positions whose 11-mer occurs in the germline on each strand against a Poisson null.</div>
+    </div>
+  </div>
+  <aside class="notes">ALGORITHM.md labels every step: exact, lossless, bounded or heuristic. The sibling bounds are lossless; gene retrieval is the heuristic step, and its z = 2 margin was measured.</aside>
+</section>
+
+<section class="slide" data-section="Speed: k-mers" data-title="SIMD lanes">
+  <div class="body">
+    <div class="eyebrow">Speed tricks · hardware</div>
+    <h2>Sixteen to thirty-two alignments at once</h2>
+    <div class="cols w60">
+      <div class="stack">
+        <svg id="simdFig" class="fig" viewBox="0 0 660 300" role="img" aria-label="SIMD lanes each running a different alignment"></svg>
+        <p class="small">Each lane runs the same Gotoh recurrence on a different read–allele job. The kernel is written once and compiled for AVX-512 (32 lanes), AVX2, ARM NEON and WebAssembly SIMD (16 lanes).</p>
+      </div>
+      <div class="stack">
+        <p><strong>Inter-sequence SIMD</strong>: one CPU instruction updates the same cell of 16 or 32 different matrices, in 16-bit integers.</p>
+        <p><strong>Reference profiles</strong>: each allele gets a precomputed table <span class="mono">score[base][position]</span>, so the inner loop has no branches.</p>
+        <p><strong>Batching</strong>: each stage runs over 64 reads at a time, yet every decision is per read. A read's result does not depend on its batch (tested).</p>
+        <p><strong>Exactness</strong>: SIMD output is bit-identical to the scalar kernel, and the scalar kernel equals a textbook Gotoh. Output is byte-identical on x86-64 and ARM.</p>
+        <div class="row" style="gap:28px;margin-top:6px">
+          <div><div class="big-num">5,200</div><div class="big-cap">reads/s, 4 threads (native)</div></div>
+          <div><div class="big-num">~1,000</div><div class="big-cap">reads/s, one browser worker</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <aside class="notes">The browser version is the same Rust code compiled to WebAssembly with simd128, which is why Swig Web can run on a laptop without a server.</aside>
+</section>
+
+<!-- ============================ PART E ============================ -->
+<section class="slide" data-section="V, D and J together" data-title="Chance D matches">
+  <div class="body" style="gap:12px">
+    <div class="eyebrow">Putting V, D and J together</div>
+    <h2>A short D must pay for every place it could have been</h2>
+    <div class="cols w40">
+      <div class="stack">
+        <p>Search 32 D genes at 25 junction positions and a 5-base exact match turns up in random sequence all the time. So a D is only added if its score beats a <strong>prior cost</strong> for the look-elsewhere effect:</p>
+        <div class="panel fill mono" style="font-size:17px;line-height:1.7">P*<sub>D</sub> = ln(N · L) / λ</div>
+        <p>For human IGH, <span class="mono">N = 32</span> genes, <span class="mono">L = 25</span> positions: <strong>P*<sub>D</sub> = 10.55</strong>. An exact 5-mer (score 10) loses; an exact 6-mer (12) wins. V and J pay the same kind of presence cost.</p>
+        <p class="small">TRB has only 2 D genes, so P*<sub>D</sub> ≈ 6.2. The cost is derived from the number of hypotheses, not tuned.</p>
+      </div>
+      <div class="stack">
+        <div class="row">
+          <label class="ctl">D genes N <output id="pdN">32</output><input type="range" id="pdNS" min="1" max="60" value="32"></label>
+          <label class="ctl">positions L <output id="pdL">25</output><input type="range" id="pdLS" min="5" max="60" value="25"></label>
+          <div><div class="big-num" id="pdVal" style="font-size:44px">10.55</div><div class="big-cap">P*<sub>D</sub>, score units</div></div>
+        </div>
+        <div class="panel">
+          <div class="row" style="justify-content:space-between"><h3>Random junctions vs 6 real D genes</h3><button id="pdRun" class="primary">Draw 2,000</button></div>
+          <svg id="pdFig" class="fig" viewBox="0 0 560 220" role="img" aria-label="Histogram of best chance D scores"></svg>
+          <div id="pdInfo" class="small"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <aside class="notes">The demo uses only six IGHD genes, so chance hits are rarer than with all 32. The point is the shape: chance scores pile up at 6-10, which is why the threshold sits just above 10.</aside>
+</section>
+
+<section class="slide" data-section="V, D and J together" data-title="V or J eats D">
+  <div class="body" style="gap:12px">
+    <div class="eyebrow">Putting V, D and J together</div>
+    <h2>Deciding one segment at a time lets V and J eat the D</h2>
+    <p>A simulated read whose truth we know. A <strong>sequential</strong> annotator aligns V, keeps its whole local alignment, aligns J, keeps its whole alignment, then looks for a D in whatever is left.</p>
+    <div class="panel" style="display:flex;flex-direction:column;gap:6px">
+      <div class="seqrow"><span>truth</span><div class="seq" id="eatTruth"></div></div>
+      <div class="seqrow"><span>read</span><div class="seq" id="eatRead"></div></div>
+      <div class="seqrow"><span>V alignment</span><div class="seq" id="eatV"></div></div>
+      <div class="seqrow"><span>J alignment</span><div class="seq" id="eatJ"></div></div>
+      <div class="seqrow"><span>sequential</span><div class="seq" id="eatSeq"></div></div>
+    </div>
+    <div class="cols" style="flex:none">
+      <div class="note">V's last germline base happens to be <span class="mono">G</span>, the first base of the D: V's local alignment extends by one. J's germline 5′ end <span class="mono">ACTA</span> matches the D's <span class="mono">ACT</span> plus an N base: three matches and a mismatch still score +3 for J, so J reaches back over the D.</div>
+      <div class="note" id="eatVerdict"></div>
+    </div>
+  </div>
+  <aside class="notes">This read comes straight from the generative model: V trimmed by 2, D IGHD3-22 trimmed to GTTATTACT, one N base, J trimmed by 4. Both neighbours steal from the D with chance matches.</aside>
+</section>
+
+<section class="slide" data-section="V, D and J together" data-title="Placement DAG">
+  <div class="body" style="gap:10px">
+    <div class="eyebrow">Putting V, D and J together · the novelty</div>
+    <h2>One graph decides alleles and boundaries together</h2>
+    <div class="cols w60" style="gap:26px">
+      <div class="stack" style="gap:8px">
+        <svg id="dagFig" class="fig" viewBox="0 0 700 330" role="img" aria-label="Placement graph from start through V, D and J placements to end"></svg>
+        <div class="row">
+          <div class="seg" role="group" aria-label="Decision"><button id="dagSeq">Sequential</button><button id="dagJoint" aria-pressed="true">Joint (DAG optimum)</button><button id="dagMine">My cuts</button></div>
+        </div>
+        <div id="dagCuts" class="row" hidden>
+          <label class="ctl">V exit <output id="cx1o"></output><input type="range" id="cx1"></label>
+          <label class="ctl">D entry <output id="cy1o"></output><input type="range" id="cy1"></label>
+          <label class="ctl">D exit <output id="cx2o"></output><input type="range" id="cx2"></label>
+          <label class="ctl">J entry <output id="cy2o"></output><input type="range" id="cy2"></label>
+        </div>
+      </div>
+      <div class="stack" style="gap:10px">
+        <p><strong>Nodes</strong> are <em>placements</em>: candidate alignments of an allele to a read interval (top 3 V, up to 32 D, top 3 J). <strong>Paths</strong> follow the grammar V → D(0 or 1) → J.</p>
+        <p>Between neighbours there are two <strong>cuts</strong>: V keeps bases before its exit, D keeps bases from its entry. Bases between the cuts are N/P. Overlaps can be split anywhere.</p>
+        <table id="dagScore" style="font-size:14px"></table>
+      </div>
+    </div>
+    <div class="seq" id="dagRead"></div>
+  </div>
+  <aside class="notes">Try "My cuts" and move the sliders: every combination is a different hypothesis with its own score. The DAG finds the maximum over all of them, all alleles and all paths, exactly. Here it recovers the simulated truth base for base.</aside>
+</section>
+
+<section class="slide" data-section="V, D and J together" data-title="Solving the DAG exactly">
+  <div class="body">
+    <div class="eyebrow">Putting V, D and J together</div>
+    <h2>Exact, and linear in the overlaps</h2>
+    <div class="cols">
+      <div class="stack">
+        <h3>1 · Any clip in O(1)</h3>
+        <p>Store prefix sums of each alignment's column scores. Keeping only bases <span class="mono">[entry, exit)</span> scores <span class="mono">P[exit] − P[entry]</span>: two lookups, one subtraction.</p>
+        <h3>2 · Separable cuts</h3>
+        <p>That score has one term per cut. So the best entry for each exit is a <strong>running maximum</strong> along the placement, and each edge costs O(overlap + 1) instead of trying all cut pairs.</p>
+        <h3>3 · Order by kind</h3>
+        <p>Nodes are sorted V, then D, then J, not by read start. A D may precede a J whose alignment reaches back over it, which is precisely the "J eats D" configuration.</p>
+      </div>
+      <div class="stack">
+        <div class="panel fill mono" style="font-size:14px;line-height:1.75">
+score(path) = Σ clipped segment scores<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;− P<sub>V</sub>·#V − P<sub>D</sub>·#D − P<sub>J</sub>·#J<br><br>
+ties: fewer D first, then germline support
+        </div>
+        <p><strong>Lemma.</strong> Clipping an optimal local alignment never raises its score: every prefix and suffix scores ≥ 0, or the alignment would not have been optimal.</p>
+        <p><strong>Theorem (checked by brute force).</strong> The DAG returns the optimum over all grammatical paths, placements and cut pairs. Tests compare it with exhaustive enumeration on simulated and hypermutated reads, including VDDJ grammars.</p>
+        <div class="note">Earlier versions searched only inside overlaps and sorted by read start. Adversarial review and hypermutated test reads found both gaps; the exhaustive oracle now guards them.</div>
+      </div>
+    </div>
+  </div>
+  <aside class="notes">This is a semi-Markov Viterbi: segments of variable length, scored as wholes, with the cut positions as the hidden states.</aside>
+</section>
+
+<section class="slide" data-section="V, D and J together" data-title="Posteriors and E-values">
+  <div class="body">
+    <div class="eyebrow">Putting V, D and J together</div>
+    <h2>From the best answer to how sure we are</h2>
+    <div class="cols">
+      <div class="stack">
+        <h3>Posterior probabilities</h3>
+        <p>The path score is a log-likelihood ratio, so it defines a distribution over every path and every cut pair:</p>
+        <div class="panel fill mono" style="font-size:16px">P(path | read) = e<sup>score</sup> / Σ e<sup>score</sup></div>
+        <p>Forward–backward over the same DAG (sum instead of max) gives the probability of each V, D, J and C allele and of "this read has a D". The best path is a mode of this distribution. Calibration is checked on simulated reads (ECE, Brier score).</p>
+      </div>
+      <div class="stack">
+        <h3>Significance gates</h3>
+        <p>Each V and J hit gets a Karlin–Altschul E-value, the number of chance hits this good:</p>
+        <div class="panel fill mono" style="font-size:16px">E = K · m · n · e<sup>−λS</sup></div>
+        <ul>
+          <li>A hit is kept only if <strong>E ≤ 1</strong>.</li>
+          <li>A read is called only if its path holds an <strong>anchor</strong>: a V or J with <strong>E ≤ 10⁻³</strong>.</li>
+        </ul>
+        <div class="row" style="gap:28px">
+          <div><div class="big-num">0.04 %</div><div class="big-cap">random reads called</div></div>
+          <div><div class="big-num">0 / 1,000</div><div class="big-cap">IGK reads called against an IGH database</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <aside class="notes">Before the redesign about 30 % of random reads got a call on human IGH; with the anchor gate it is 0.04 %. The previous Swig core (SwiftIG) called an IGH J on 919 of 1,000 kappa reads.</aside>
+</section>
+
+<!-- ============================ PART F ============================ -->
+<section class="slide" data-section="Ground truth" data-title="The simulator">
+  <div class="body" style="gap:12px">
+    <div class="eyebrow">Ground truth</div>
+    <h2>Simulated reads: every base knows where it came from</h2>
+    <div class="cols w60" style="gap:28px">
+      <div class="stack" style="gap:10px">
+        <p>Real data has no answer key. Swig ships a Rust port of <strong>IgSim.jl</strong>: the same generative model as the recombination demo, with every base labelled by its germline origin.</p>
+        <div class="row">
+          <div class="seg" role="group" aria-label="Preset"><button data-preset="easy">easy</button><button data-preset="mid" aria-pressed="true">mid (IgM-like)</button><button data-preset="hard">hard (IgG-like)</button></div>
+          <button id="simBtn" class="primary">Simulate a read</button>
+        </div>
+        <div class="panel"><div class="seq wrap two" id="simRead"></div><div class="small" style="margin-top:6px">Small letters under each base: its true origin (V, D, J, N, or · for flank).</div></div>
+        <div id="simInfo" class="small"></div>
+      </div>
+      <div class="stack">
+        <table style="font-size:14px">
+          <thead><tr><th>Step</th><th>easy</th><th>mid</th><th>hard</th></tr></thead>
+          <tbody>
+            <tr><td>Alleles</td><td colspan="3">uniform choice of V, D (99 %), J</td></tr>
+            <tr><td>V 3′ trim</td><td>0–4</td><td>0–10</td><td>0–18</td></tr>
+            <tr><td>D trims</td><td>0–2</td><td>geometric</td><td>geometric</td></tr>
+            <tr><td>J 5′ trim</td><td>0–3</td><td>0–14</td><td>0–14</td></tr>
+            <tr><td>N1, N2</td><td>0–4</td><td>0–18</td><td>neg. binomial</td></tr>
+            <tr><td>SHM</td><td>none</td><td>40 % of reads, 0.5–7 %</td><td>97 %, median ≈ 7 %</td></tr>
+            <tr><td>1-nt indels</td><td>none</td><td>8 % of reads</td><td>15 % of reads</td></tr>
+            <tr><td colspan="4" class="small">All: random 5′/3′ flanks, MiSeq-like errors (0.1 %), half the reads reverse-complemented, 80 % run into the constant region.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <aside class="notes">The presets reproduce IgSim.jl's easy, mid and hard parameters exactly. The demo here uses a handful of germline fragments; real benchmarks use the full IMGT human sets.</aside>
+</section>
+
+<section class="slide" data-section="Ground truth" data-title="How we score">
+  <div class="body">
+    <div class="eyebrow">Ground truth</div>
+    <h2>Scoring fairly against the truth</h2>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:22px">
+      <div class="panel stack"><span class="tag">Equivalence</span><h3>Germline-equivalent alleles</h3><p>If two alleles differ only in bases that were trimmed away, no method could tell them apart. A call is correct when it contains the trimmed, pre-mutation germline that was simulated.</p></div>
+      <div class="panel stack"><span class="tag">Pairing</span><h3>Same reads, paired tests</h3><p>Two tools run on identical reads. For each metric: the difference with a 95 % interval and an exact McNemar test on the reads only one tool gets right.</p></div>
+      <div class="panel stack"><span class="tag">D honesty</span><h3>D is reported two ways</h3><p>Calling a D everywhere raises D accuracy. So D accuracy always appears next to the share of <strong>D-free reads left without a D</strong>, and split by remnant length (1–3, 4–7, 8+ nt).</p></div>
+    </div>
+    <div class="note" style="margin-top:auto">The junction truth comes from the germline annotation. A wrong anchor relabels the truth instead of showing up as an error, so claims always compare two callers on one truth.</div>
+  </div>
+  <aside class="notes">A remnant of 1-3 nt cannot be found by any method (below the 4-nt admission run), so accuracy there partly rests on luck.</aside>
+</section>
+
+<!-- ============================ PART G ============================ -->
+<section class="slide" data-section="Results" data-title="Swig vs IgBLAST: accuracy">
+  <div class="body" style="gap:12px">
+    <div class="eyebrow">Results · same reads, same germline, same evaluator</div>
+    <h2>Swig against IgBLAST 1.22</h2>
+    <div class="cols w60" style="gap:28px">
+      <div class="stack" style="gap:8px">
+        <div class="row">
+          <div class="seg" role="group" aria-label="Preset" id="resPreset"><button data-p="easy">easy</button><button data-p="mid">mid</button><button data-p="hard" aria-pressed="true">hard</button></div>
+          <span class="key"><i class="sw" style="background:var(--series-a);border-radius:50%"></i>Swig</span>
+          <span class="key"><i class="sw" style="border:3px solid var(--series-b);box-sizing:border-box;border-radius:50%"></i>IgBLAST</span>
+        </div>
+        <svg id="resFig" class="fig" viewBox="0 0 700 360" role="img" aria-label="Accuracy by metric for Swig and IgBLAST"></svg>
+        <div id="resTip" class="small" style="min-height:20px"></div>
+      </div>
+      <div class="stack">
+        <table id="resTable" style="font-size:15px"></table>
+        <p class="small">5,000 simulated human IGH reads per preset, forward strand. Accuracy = germline-equivalent allele; junction = exact CDR3 nucleotides. IgBLAST's auxiliary file lacked three J alleles; they were added so it could report junctions fairly.</p>
+      </div>
+    </div>
+  </div>
+  <aside class="notes">Honest reading: on easy and mid reads both tools are close to the ceiling. The gaps open on hard reads: V +0.3, D +1.25, J +1.0, junction +1.6 points. IgBLAST's mid D accuracy is 0.4 points higher, but it gives a D to 43 % of D-free reads against Swig's 23 %, and its V gene is 0.06 points better on hard reads.</aside>
+</section>
+
+<section class="slide" data-section="Results" data-title="Speed and false D">
+  <div class="body">
+    <div class="eyebrow">Results</div>
+    <h2>About 75× faster, with half the spurious D calls</h2>
+    <div class="cols">
+      <div class="stack">
+        <h3>Throughput, 4 threads</h3>
+        <svg id="spdFig" class="fig" viewBox="0 0 560 230" role="img" aria-label="Reads per second, Swig versus IgBLAST"></svg>
+        <p class="small">Wall clock for the whole command, posteriors on. Swig ≈ 5,100–5,200 reads/s; IgBLAST 66–71 reads/s.</p>
+      </div>
+      <div class="stack">
+        <h3>D called on reads that have no D</h3>
+        <svg id="dfFig" class="fig" viewBox="0 0 560 230" role="img" aria-label="Share of D-free reads given a D"></svg>
+        <p class="small">Lower is better. A tool can buy D accuracy by calling D everywhere; Swig's derived D cost keeps this down while matching or beating D accuracy.</p>
+      </div>
+    </div>
+  </div>
+  <aside class="notes">The speed comes from seeding and banding, lossless pruning, SIMD lanes and batching; the specificity comes from the derived D prior and the E-value gates.</aside>
+</section>
+
+<section class="slide" data-section="Results" data-title="Hard conditions">
+  <div class="body">
+    <div class="eyebrow">Results · versus the previous Swig core (SwiftIG)</div>
+    <h2>Where it matters most: heavily mutated reads</h2>
+    <div class="cols w60">
+      <table style="font-size:16px">
+        <thead><tr><th>IGH, 30 % SHM (3,000 reads)</th><th class="num">SwiftIG</th><th class="num">Swig</th><th class="num">Δ (pp)</th></tr></thead>
+        <tbody>
+          <tr><td>V allele</td><td class="num">58.1</td><td class="num win">63.9</td><td class="num">+5.8</td></tr>
+          <tr><td>D allele</td><td class="num">33.0</td><td class="num win">41.6</td><td class="num">+8.5</td></tr>
+          <tr><td>J allele</td><td class="num">55.8</td><td class="num win">59.2</td><td class="num">+3.4</td></tr>
+          <tr class="hl"><td>Junction reported correctly</td><td class="num">41.4</td><td class="num win">85.1</td><td class="num">+43.6</td></tr>
+          <tr><td>C allele</td><td class="num">77.4</td><td class="num win">83.4</td><td class="num">+6.1</td></tr>
+          <tr><td>Reads per second (1 browser worker)</td><td class="num">47</td><td class="num win">737</td><td class="num">15.7×</td></tr>
+        </tbody>
+      </table>
+      <div class="stack">
+        <p>The old core gave up on hard reads: it reported no junction when a conserved anchor fell outside its alignments, and slowed to 47 reads/s on fallbacks.</p>
+        <p>Swig projects the conserved Cys104 and Trp/Phe118 anchors along the alignments, so it reports a junction on almost every read that has one.</p>
+        <p class="small">TCR D allele: +15.9 pp (77.1 → 93.0 %). Same reads, same references, same settings; exact McNemar p &lt; 10⁻⁶ for every accuracy row.</p>
+      </div>
+    </div>
+  </div>
+  <aside class="notes">Caveat from the report: the junction gain is coverage, not precision. When SwiftIG reports a junction it is as exact, even slightly more exact at 30 % SHM (99.2 vs 95.7 %).</aside>
+</section>
+
+<section class="slide" data-section="Results" data-title="Does J still eat D?">
+  <div class="body">
+    <div class="eyebrow">Results · checking the mechanism</div>
+    <h2>Where do the remaining D errors come from?</h2>
+    <div class="cols w60">
+      <table style="font-size:16px">
+        <thead><tr><th>Human IGH, D remnant ≥ 8 nt, 5,000 reads</th><th class="num">mid</th><th class="num">hard</th></tr></thead>
+        <tbody>
+          <tr><td>D correct</td><td class="num win">97.08 %</td><td class="num win">87.52 %</td></tr>
+          <tr><td>Wrong D, though a correct placement existed</td><td class="num">2.66 %</td><td class="num">10.22 %</td></tr>
+          <tr><td>Wrong D, correct allele never aligned</td><td class="num">0.23 %</td><td class="num">1.77 %</td></tr>
+          <tr><td>True D outside the search windows</td><td class="num">0.00 %</td><td class="num">0.00 %</td></tr>
+          <tr class="hl"><td>Missing D, the called J covers its bases</td><td class="num">0.00 %</td><td class="num">0.00 %</td></tr>
+          <tr class="hl"><td>Missing D, the called V covers its bases</td><td class="num">0.00 %</td><td class="num">0.02 %</td></tr>
+        </tbody>
+      </table>
+      <div class="stack">
+        <p>Every wrong or missing D call is traced to where it arose. The failure mode we designed against, a neighbour swallowing the D, is <strong>essentially gone</strong>.</p>
+        <p>What remains is choosing between similar D alleles on mutated reads: the evidence is there but weak. That is a modelling question, not a search failure.</p>
+        <p class="small">A separate diagnostic aligns each read to every allele, unbanded, under the same objective. If that exhaustive optimum is also wrong, no caller using this objective could do better.</p>
+      </div>
+    </div>
+  </div>
+  <aside class="notes">From engine/docs/ASSESSMENT.md section 8, produced by examples/d_errors.rs.</aside>
+</section>
+
+<section class="slide" data-section="Results" data-title="Limits">
+  <div class="body">
+    <div class="eyebrow">What we do not claim</div>
+    <h2>Limits and open questions</h2>
+    <div class="cols">
+      <ul>
+        <li><strong>All benchmarks are simulated.</strong> The priors were measured on the same simulator. A real-data comparison (and partis) is still to do.</li>
+        <li><strong>D on D-free reads:</strong> 16–24 % of reads whose D was fully deleted still get one (IgBLAST 30–43 %). On TRB the D cost is about 6, so one exact 4-mer clears it.</li>
+        <li><strong>Junction gains versus the old core are coverage</strong>, not more precise boundaries.</li>
+      </ul>
+      <ul>
+        <li><strong>Open:</strong> a prior on N/P length. The posterior's remaining miscalibration tracks junction length.</li>
+        <li><strong>Open:</strong> one divergence per read assumes uniform mutation across V, D and J.</li>
+        <li><strong>Not simulated:</strong> chimeras, long adapters, unseeded indels longer than 8 nt. Some old safeguards against them were removed.</li>
+      </ul>
+    </div>
+  </div>
+  <aside class="notes">These are taken from the benchmark limitations and ALGORITHM.md section 8 (open problems).</aside>
+</section>
+
+<section class="slide" data-section="Summary" data-title="Take-home">
+  <div class="body" style="justify-content:center;gap:22px">
+    <div class="eyebrow">Take-home</div>
+    <h2 style="font-size:46px">Five ideas to remember</h2>
+    <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:16px">
+      <div class="panel stack"><h3>Scores are log-odds</h3><p class="small">+2/−3 is DNA's BLOSUM, re-read at each read's own divergence.</p></div>
+      <div class="panel stack"><h3>Local + affine</h3><p class="small">Smith–Waterman picks the piece; Gotoh prices indels as single events.</p></div>
+      <div class="panel stack"><h3>Seeds, then bands</h3><p class="small">2-bit k-mers vote on diagonals; DP runs only near them.</p></div>
+      <div class="panel stack"><h3>One exact DAG</h3><p class="small">Alleles and boundaries are chosen together, so neither V nor J eats the D.</p></div>
+      <div class="panel stack"><h3>Known truth</h3><p class="small">Simulated reads with per-base origin make every claim testable.</p></div>
+    </div>
+    <p class="lede">Questions? The methods, proofs and every number in this talk are in <code>engine/docs/ALGORITHM.md</code>, <code>engine/docs/ASSESSMENT.md</code> and the benchmark reports in the repository.</p>
+  </div>
+</section>
+
+</div></div>
+
+<div id="chrome">
+  <button id="prevBtn" aria-label="Previous slide">◀</button>
+  <button id="nextBtn" aria-label="Next slide">▶</button>
+  <button id="notesBtn" aria-pressed="false">Notes</button>
+  <button id="ovBtn">Overview</button>
+  <button id="themeBtn" aria-label="Toggle theme">Theme</button>
+  <span id="count"></span>
+</div>
+<div id="notes" hidden></div>
+<div id="overview" hidden></div>
+<script>
+/* ==================== Algorithms (pure; tested in Node) ==================== */
+const Algo = (() => {
+  // Karlin–Altschul lambda for uniform bases: 1/4 e^{λm} + 3/4 e^{λμ} = 1
+  function lambda(m = 2, mu = -3) {
+    let lo = 1e-6, hi = 5;
+    for (let it = 0; it < 200; it++) {
+      const mid = (lo + hi) / 2;
+      const f = 0.25 * Math.exp(mid * m) + 0.75 * Math.exp(mid * mu) - 1;
+      if (f > 0) hi = mid; else lo = mid;
+    }
+    return (lo + hi) / 2;
+  }
+
+  // Seeded RNG (mulberry32)
+  function rng(seed) {
+    let a = seed >>> 0;
+    return () => {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  /* Dynamic programming over read A (rows) and germline B (columns).
+     mode: 'nw' global linear, 'sw' local linear, 'gotoh' local affine.
+     Gap convention (as in swig): a run of L gap columns costs open + (L-1)*extend. */
+  function dp(A, B, mode, sc) {
+    const n = A.length, m = B.length, NEG = -1e9;
+    const H = [], E = [], F = [];
+    const linear = mode !== 'gotoh';
+    const open = linear ? sc.gap : sc.open, ext = linear ? sc.gap : sc.extend;
+    for (let i = 0; i <= n; i++) { H.push(new Array(m + 1).fill(0)); E.push(new Array(m + 1).fill(NEG)); F.push(new Array(m + 1).fill(NEG)); }
+    if (mode === 'nw') { for (let i = 1; i <= n; i++) H[i][0] = i * sc.gap; for (let j = 1; j <= m; j++) H[0][j] = j * sc.gap; }
+    const s = (i, j) => (A[i - 1] === B[j - 1] ? sc.match : sc.mismatch);
+    let best = { v: mode === 'nw' ? null : 0, i: 0, j: 0 };
+    for (let i = 1; i <= n; i++) for (let j = 1; j <= m; j++) {
+      const diag = H[i - 1][j - 1] + s(i, j);
+      if (linear) {
+        const up = H[i - 1][j] + sc.gap, left = H[i][j - 1] + sc.gap;
+        let v = Math.max(diag, up, left);
+        if (mode === 'sw') v = Math.max(0, v);
+        H[i][j] = v;
+      } else {
+        E[i][j] = Math.max(H[i][j - 1] + open, E[i][j - 1] + ext);
+        F[i][j] = Math.max(H[i - 1][j] + open, F[i - 1][j] + ext);
+        H[i][j] = Math.max(0, diag, E[i][j], F[i][j]);
+      }
+      if (mode !== 'nw' && H[i][j] > best.v) best = { v: H[i][j], i, j };
+    }
+    if (mode === 'nw') best = { v: H[n][m], i: n, j: m };
+    // traceback: list of cells [i,j] from end to start, and aligned strings
+    const path = [[best.i, best.j]];
+    let i = best.i, j = best.j, state = 'H', top = '', bot = '';
+    while (i > 0 || j > 0) {
+      if (mode !== 'nw' && state === 'H' && H[i][j] === 0) break;
+      if (mode === 'nw' && (i === 0 || j === 0)) {
+        if (i === 0) { top = B[j - 1] + top; bot = '-' + bot; j--; } else { top = '-' + top; bot = A[i - 1] + bot; i--; }
+        path.push([i, j]); continue;
+      }
+      if (state === 'H') {
+        if (i > 0 && j > 0 && H[i][j] === H[i - 1][j - 1] + s(i, j)) { top = B[j - 1] + top; bot = A[i - 1] + bot; i--; j--; }
+        else if (linear) {
+          if (i > 0 && H[i][j] === H[i - 1][j] + sc.gap) { top = '-' + top; bot = A[i - 1] + bot; i--; }
+          else { top = B[j - 1] + top; bot = '-' + bot; j--; }
+        } else if (H[i][j] === E[i][j]) { state = 'E'; continue; }
+        else { state = 'F'; continue; }
+      } else if (state === 'E') { // horizontal: germline advances, gap in read
+        const fromH = E[i][j] === H[i][j - 1] + open;
+        top = B[j - 1] + top; bot = '-' + bot; j--;
+        state = fromH ? 'H' : 'E';
+      } else { // F, vertical: read advances, gap in germline
+        const fromH = F[i][j] === H[i - 1][j] + open;
+        top = '-' + top; bot = A[i - 1] + bot; i--;
+        state = fromH ? 'H' : 'F';
+      }
+      path.push([i, j]);
+    }
+    return { H, E, F, best, path, top, bot, s, open, ext };
+  }
+
+  // Best ungapped local alignment of germline g on read r (one diagonal segment).
+  function ungapped(r, g, M = 2, X = -3) {
+    let best = { score: 0 };
+    for (let d = -(g.length - 1); d < r.length; d++) {
+      let run = 0, start = 0;
+      for (let j = Math.max(0, -d); j < g.length && j + d < r.length; j++) {
+        const i = j + d;
+        if (run <= 0) { run = 0; start = j; }
+        run += r[i] === g[j] ? M : X;
+        if (run > best.score) best = { score: run, d, rs: start + d, re: i + 1, gs: start, ge: j + 1 };
+      }
+    }
+    return best;
+  }
+  // Placement with prefix sums over read positions: clip [a,b) scores P[b]-P[a].
+  function placement(r, g, name, kind) {
+    const b = ungapped(r, g);
+    const P = new Array(r.length + 1).fill(0);
+    for (let i = 0; i < r.length; i++) {
+      const inside = b.score > 0 && i >= b.rs && i < b.re;
+      P[i + 1] = P[i] + (inside ? (r[i] === g[i - b.d] ? 2 : -3) : 0);
+    }
+    return { ...b, P, name, kind, g };
+  }
+  // Exact best V-(D)-J segmentation by running maxima (separable cuts).
+  // V keeps its start, J keeps its end; between neighbours exit x <= entry y, gap = N/P.
+  function joint(n, V, Ds, J, PD) {
+    let best = { score: -1e9 };
+    const bestV = new Array(n + 1).fill(-1e9), argV = new Array(n + 1).fill(-1);
+    let run = -1e9, arg = -1;
+    for (let t = 0; t <= n; t++) {
+      if (t >= V.rs && t <= V.re) { const s = V.P[t] - V.P[V.rs]; if (s > run) { run = s; arg = t; } }
+      bestV[t] = run; argV[t] = arg;
+    }
+    for (let y = J.rs; y <= J.re; y++) {
+      const s = bestV[y] + J.P[J.re] - J.P[y];
+      if (s > best.score) best = { score: s, D: null, x1: argV[y], y2: y };
+    }
+    for (const D of Ds) {
+      let r = -1e9, ay = -1; const into = new Array(n + 1).fill(-1e9), ay1 = new Array(n + 1).fill(-1);
+      for (let t = D.rs + 1; t <= D.re; t++) {
+        const y1 = t - 1, s = bestV[y1] - D.P[y1];
+        if (s > r) { r = s; ay = y1; }
+        into[t] = r + D.P[t] - PD; ay1[t] = ay;
+      }
+      let r2 = -1e9, ax = -1;
+      for (let t = 0; t <= n; t++) {
+        if (t > D.rs && t <= D.re && into[t] > r2) { r2 = into[t]; ax = t; }
+        if (ax >= 0 && t >= J.rs && t <= J.re) {
+          const s = r2 + J.P[J.re] - J.P[t];
+          if (s > best.score + 1e-9) best = { score: s, D, x1: argV[ay1[ax]], y1: ay1[ax], x2: ax, y2: t };
+        }
+      }
+    }
+    return best;
+  }
+  // Brute force over every cut combination (for testing joint()).
+  function brute(n, V, Ds, J, PD) {
+    let best = -1e9;
+    for (let x1 = V.rs; x1 <= V.re; x1++) for (let y2 = Math.max(x1, J.rs); y2 <= J.re; y2++)
+      best = Math.max(best, V.P[x1] - V.P[V.rs] + J.P[J.re] - J.P[y2]);
+    for (const D of Ds) for (let x1 = V.rs; x1 <= V.re; x1++) for (let y1 = Math.max(x1, D.rs); y1 < D.re; y1++)
+      for (let x2 = y1 + 1; x2 <= D.re; x2++) for (let y2 = Math.max(x2, J.rs); y2 <= J.re; y2++)
+        best = Math.max(best, V.P[x1] - V.P[V.rs] + D.P[x2] - D.P[y1] - PD + J.P[J.re] - J.P[y2]);
+    return best;
+  }
+  const CODE = { A: 0, C: 1, G: 2, T: 3 };
+  function kmers(s, k) { // rolling 2-bit keys
+    const out = []; const mask = (1 << (2 * k)) - 1; let key = 0, valid = 0;
+    for (let i = 0; i < s.length; i++) {
+      const c = CODE[s[i]];
+      if (c === undefined) { valid = 0; key = 0; continue; }
+      key = ((key << 2) | c) & mask; valid++;
+      if (valid >= k) out.push({ pos: i - k + 1, key });
+    }
+    return out;
+  }
+  return { lambda, rng, dp, ungapped, placement, joint, brute, kmers, CODE };
+})();
+if (typeof module !== 'undefined') module.exports = Algo;
+
+/* ==================== Shared helpers ==================== */
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
+const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const LAMBDA = Algo.lambda(2, -3);
+const fmtMinus = (x) => (x < 0 ? '−' + Math.abs(x) : (x > 0 ? '+' + x : '0'));
+const SVGNS = 'http://www.w3.org/2000/svg';
+function svgEl(tag, attrs = {}, text) {
+  const e = document.createElementNS(SVGNS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+const SEGCLASS = { V: 'bg-v', D: 'bg-d', J: 'bg-j', N: 'bg-n', F: '' };
+// Render letters with per-base classes. cells: [{c, cls, title}]
+function seqHTML(cells) {
+  return cells.map(x => `<b class="${x.cls || ''}"${x.title ? ` title="${x.title}"` : ''}>${x.c}</b>`).join('');
+}
+function rcomp(s) { return s.split('').reverse().map(c => ({ A: 'T', C: 'G', G: 'C', T: 'A' }[c] || 'N')).join(''); }
+
+/* Germline fragments (illustrative; modelled on human IGH genes, V shown as its 3′ end) */
+const GERM = {
+  V: {
+    'IGHV3-23': 'GCCGAGGACACGGCCGTATATTACTGTGCGAAAGA',
+    'IGHV1-69': 'TCTGAGGACACGGCCGTGTATTACTGTGCGAGAGA',
+    'IGHV4-34': 'CTGACCGCCGCGGACACGGCTGTGTATTACTGTGCGAGAGG',
+  },
+  D: {
+    'IGHD3-22': 'GTATTACTATGATAGTAGTGGTTATTACTAC',
+    'IGHD3-10': 'GTATTACTATGGTTCGGGGAGTTATTATAAC',
+    'IGHD2-2': 'AGGATATTGTAGTAGTACCAGCTGCTATGCC',
+    'IGHD6-19': 'GGGTATAGCAGTGGCTGGTAC',
+    'IGHD1-26': 'GGTATAGTGGGAGCTACTAC',
+    'IGHD4-17': 'TGACTACGGTGACTAC',
+  },
+  J: {
+    'IGHJ4': 'ACTACTTTGACTACTGGGGCCAGGGAACCCTGG',
+    'IGHJ6': 'ATTACTACTACTACTACGGTATGGACGTCTGGGGGCAAGGG',
+    'IGHJ3': 'TGATGCTTTTGATATCTGGGGCCAAGGGACAATGG',
+  },
+};
+const IGHV323_FULL = 'GAGGTGCAGCTGTTGGAGTCTGGGGGAGGCTTGGTACAGCCTGGGGGGTCCCTGAGACTCTCCTGTGCAGCCTCTGGATTCACCTTTAGCAGCTATGCCATGAGCTGGGTCCGCCAGGCTCCAGGGAAGGGGCTGGAGTGGGTCTCAGCTATTAGTGGTAGTGGTGGTAGCACATACTACGCAGACTCCGTGAAGGGCCGGTTCACCATCTCCAGAGACAATTCCAAGAACACGCTGTATCTGCAAATGAACAGCCTGAGAGCCGAGGACACGGCCGTATATTACTGTGCGAAAGA';
+
+/* The worked example (simulated: V trimmed 2, D IGHD3-22 trimmed to GTTATTACT, N2 = C, J trimmed 4) */
+const EX = {
+  read: 'GAGGACACGGCCGTATATTACTGTGCGAAAGTTATTACTCCTTTGACTACTGGGGCCAGGGAACCCTGGTCACC',
+  V: 'GAGGACACGGCCGTATATTACTGTGCGAAAGA',
+  J: 'ACTACTTTGACTACTGGGGCCAGGGAACCCTGGTCACC',
+  truth: { V: [0, 30], D: [30, 39], J: [40, 74] },
+};
+EX.Ds = Object.fromEntries(Object.entries(GERM.D).filter(([k]) => k !== 'IGHD4-17'));
+function truthLabel(i) {
+  const t = EX.truth;
+  if (i >= t.V[0] && i < t.V[1]) return 'V';
+  if (i >= t.D[0] && i < t.D[1]) return 'D';
+  if (i >= t.J[0] && i < t.J[1]) return 'J';
+  return 'N';
+}
+
+/* ==================== Simulator (simplified IgSim presets) ==================== */
+const PRESETS = {
+  easy: { v3: [0, 4], d5: () => 'u2', j5: [0, 3], n: [0, 4], shm: { p: 0, lo: 0, hi: 0 } },
+  mid: { v3: [0, 10], d5: () => 'g', j5: [0, 14], n: [0, 18], shm: { p: 0.40, lo: 0.005, hi: 0.07 } },
+  hard: { v3: [0, 18], d5: () => 'g', j5: [0, 14], n: 'nb', shm: { p: 0.97, logn: true } },
+};
+function simulate(preset, rnd) {
+  const P = PRESETS[preset];
+  const ui = (a, b) => a + Math.floor(rnd() * (b - a + 1));
+  const geo = (p) => { let k = 0; while (rnd() > p && k < 40) k++; return k; };
+  const nb = () => { let k = 0, succ = 0; while (succ < 3 && k < 60) { if (rnd() < 0.35) succ++; else k++; } return k; };
+  const pick = (o) => { const ks = Object.keys(o); const k = ks[Math.floor(rnd() * ks.length)]; return [k, o[k]]; };
+  const base = () => 'ACGT'[Math.floor(rnd() * 4)];
+  const [vn, vg] = pick(GERM.V), [dn, dg] = pick(GERM.D), [jn, jg] = pick(GERM.J);
+  const v3 = ui(...P.v3);
+  let d5, d3;
+  if (preset === 'easy') { d5 = ui(0, 2); d3 = ui(0, 2); } else { d5 = geo(0.20); d3 = geo(0.21); }
+  if (d5 + d3 > dg.length - 1) { d3 = Math.max(0, dg.length - 1 - d5); if (d5 > dg.length - 1) { d5 = dg.length - 1; d3 = 0; } }
+  const hasD = rnd() < 0.99;
+  const j5 = ui(...P.j5);
+  const nlen = () => (P.n === 'nb' ? nb() : ui(...P.n));
+  const n1 = Array.from({ length: nlen() }, base).join(''), n2 = hasD ? Array.from({ length: nlen() }, base).join('') : '';
+  const flank = Array.from({ length: ui(2, 6) }, base).join('');
+  const parts = [
+    { seg: 'F', s: flank, g: null },
+    { seg: 'V', s: vg.slice(0, vg.length - v3), g: vg, off: 0 },
+    { seg: 'N', s: n1, g: null },
+  ];
+  if (hasD) { parts.push({ seg: 'D', s: dg.slice(d5, dg.length - d3), g: dg, off: d5 }); parts.push({ seg: 'N', s: n2, g: null }); }
+  parts.push({ seg: 'J', s: jg.slice(j5), g: jg, off: j5 });
+  // SHM: gated per-read rate
+  let rate = 0;
+  if (rnd() < P.shm.p) rate = P.shm.logn ? Math.min(0.35, Math.exp(-2.65 + 0.5 * gauss(rnd))) : P.shm.lo + rnd() * (P.shm.hi - P.shm.lo);
+  const cells = [];
+  let nmut = 0;
+  for (const part of parts) for (let k = 0; k < part.s.length; k++) {
+    let c = part.s[k], mut = false;
+    if (part.seg !== 'F' && rate > 0 && rnd() < rate) { let nc; do { nc = base(); } while (nc === c); c = nc; mut = true; nmut++; }
+    cells.push({ c, seg: part.seg, mut });
+  }
+  return { cells, vn, dn: hasD ? dn : null, jn, v3, d5, d3, j5, n1, n2, rate, nmut, vg, dg, jg, hasD };
+}
+function gauss(rnd) { let u = 0, v = 0; while (u === 0) u = rnd(); v = rnd(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+function simReadHTML(sim) {
+  return seqHTML(sim.cells.map(x => ({ c: x.c, cls: (x.mut ? 'mm ' : '') + (SEGCLASS[x.seg] || ''), title: x.seg === 'F' ? 'flank' : x.seg })));
+}
+
+/* ==================== Deck engine ==================== */
+const Deck = (() => {
+  const slides = $$('.slide');
+  let cur = 0;
+  slides.forEach((s, i) => {
+    const rail = document.createElement('div');
+    rail.className = 'rail';
+    rail.innerHTML = `<span>${s.dataset.section}</span>`;
+    s.prepend(rail);
+    s.setAttribute('aria-label', `Slide ${i + 1}: ${s.dataset.title}`);
+  });
+  function fit() {
+    const st = $('#stage');
+    const w = window.innerWidth, h = window.innerHeight - 44;
+    const k = Math.min(w / 1280, h / 720) * 0.98;
+    st.style.transform = `translateY(-18px) scale(${k})`;
+  }
+  function steps(s) { return $$('.step', s); }
+  function show(i, fromEnd = false) {
+    cur = Math.max(0, Math.min(slides.length - 1, i));
+    slides.forEach((s, k) => s.classList.toggle('active', k === cur));
+    const s = slides[cur];
+    steps(s).forEach(x => x.classList.toggle('shown', fromEnd));
+    $('#count').textContent = `${cur + 1} / ${slides.length} · ${s.dataset.title}`;
+    $('#progress').style.width = `${((cur + 1) / slides.length) * 100}%`;
+    const notes = $('aside.notes', s);
+    $('#notes').innerHTML = notes ? notes.innerHTML : '<em>No notes for this slide.</em>';
+    try { history.replaceState(null, '', '#s' + (cur + 1)); } catch (e) { /* sandboxed */ }
+    document.dispatchEvent(new CustomEvent('slidechange', { detail: { index: cur, slide: s } }));
+  }
+  function next() {
+    const hidden = steps(slides[cur]).filter(x => !x.classList.contains('shown'));
+    if (hidden.length) { hidden[0].classList.add('shown'); return; }
+    show(cur + 1);
+  }
+  function prev() {
+    const shown = steps(slides[cur]).filter(x => x.classList.contains('shown'));
+    if (shown.length) { shown[shown.length - 1].classList.remove('shown'); return; }
+    show(cur - 1, true);
+  }
+  function overview(on) {
+    const ov = $('#overview');
+    if (on === undefined) on = ov.hidden;
+    if (on) {
+      ov.innerHTML = slides.map((s, i) => `<button data-i="${i}"><small>${i + 1} · ${s.dataset.section}</small>${s.dataset.title}</button>`).join('');
+      $$('button', ov).forEach(b => b.addEventListener('click', () => { overview(false); show(+b.dataset.i); }));
+    }
+    ov.hidden = !on;
+  }
+  document.addEventListener('keydown', (e) => {
+    const t = e.target;
+    if (t && (t.tagName === 'INPUT' && t.type === 'text' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA')) return;
+    if (t && t.tagName === 'INPUT' && t.type === 'range' && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) return;
+    if (['ArrowRight', 'PageDown', ' '].includes(e.key)) { e.preventDefault(); next(); }
+    else if (['ArrowLeft', 'PageUp'].includes(e.key)) { e.preventDefault(); prev(); }
+    else if (e.key === 'Home') show(0);
+    else if (e.key === 'End') show(slides.length - 1);
+    else if (e.key === 'n' || e.key === 'N') toggleNotes();
+    else if (e.key === 'o' || e.key === 'O' || e.key === 'Escape') overview(e.key === 'Escape' ? false : undefined);
+    else if (e.key === 'f' || e.key === 'F') { const el = document.documentElement; if (!document.fullscreenElement) el.requestFullscreen?.().catch(() => {}); else document.exitFullscreen?.(); }
+  });
+  function toggleNotes() { const n = $('#notes'); n.hidden = !n.hidden; $('#notesBtn').setAttribute('aria-pressed', String(!n.hidden)); }
+  $('#nextBtn').addEventListener('click', next);
+  $('#prevBtn').addEventListener('click', prev);
+  $('#notesBtn').addEventListener('click', toggleNotes);
+  $('#ovBtn').addEventListener('click', () => overview());
+  $('#themeBtn').addEventListener('click', () => {
+    const r = document.documentElement;
+    const dark = r.dataset.theme ? r.dataset.theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+    r.dataset.theme = dark ? 'light' : 'dark';
+    document.dispatchEvent(new Event('themechange'));
+  });
+  // swipe on touch screens
+  let tx = null;
+  $('#stage').addEventListener('touchstart', e => { tx = e.touches[0].clientX; }, { passive: true });
+  $('#stage').addEventListener('touchend', e => {
+    if (tx === null) return; const dx = e.changedTouches[0].clientX - tx; tx = null;
+    if (Math.abs(dx) > 60 && !e.target.closest('input,button,canvas,table.dp')) (dx < 0 ? next : prev)();
+  });
+  window.addEventListener('resize', fit);
+  window.addEventListener('hashchange', () => { const h = /^#s(\d+)$/.exec(location.hash); if (h && +h[1] - 1 !== cur) show(+h[1] - 1); });
+  fit();
+  const m = /^#s(\d+)$/.exec(location.hash);
+  return { show, start: () => show(m ? +m[1] - 1 : 0) };
+})();
+const redrawers = [];
+document.addEventListener('themechange', () => redrawers.forEach(f => f()));
+try { matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => redrawers.forEach(f => f())); } catch (e) { /* old browsers */ }
+
+/* ==================== Title read ==================== */
+(function titleRead() {
+  $('#titleRead').innerHTML = seqHTML(EX.read.split('').map((c, i) => ({ c, cls: SEGCLASS[truthLabel(i)] })));
+})();
+
+/* ==================== Recombine (slide 2) ==================== */
+(function recombine() {
+  let seed = 11;
+  function draw() {
+    const sim = simulate('mid', Algo.rng(seed++));
+    const germRow = (label, name, g, keepFrom, keepTo, cls) => {
+      const cells = g.split('').map((c, k) => ({ c, cls: (k >= keepFrom && k < keepTo) ? cls : '', title: (k >= keepFrom && k < keepTo) ? 'kept' : 'trimmed' }));
+      const html = seqHTML(cells).replace(/<b class=""/g, '<b class="" style="opacity:.28"');
+      return `<div class="seqrow"><span><strong class="${label.toLowerCase()}">${label}</strong> ${name}</span><div class="seq wrap">${html}</div></div>`;
+    };
+    let h = germRow('V', sim.vn, sim.vg, 0, sim.vg.length - sim.v3, 'bg-v');
+    if (sim.hasD) h += germRow('D', sim.dn, sim.dg, sim.d5, sim.dg.length - sim.d3, 'bg-d');
+    h += germRow('J', sim.jn, sim.jg, sim.j5, sim.jg.length, 'bg-j');
+    $('#recGerm').innerHTML = h;
+    $('#recRead').innerHTML = simReadHTML(sim);
+    const dlen = sim.hasD ? sim.dg.length - sim.d5 - sim.d3 : 0;
+    $('#recInfo').innerHTML = `V trimmed ${sim.v3} nt · ${sim.hasD ? `D kept ${dlen} of ${sim.dg.length} nt` : 'no D'} · J trimmed ${sim.j5} nt · N1 ${sim.n1.length} nt${sim.hasD ? `, N2 ${sim.n2.length} nt` : ''} · ${sim.rate ? `SHM ${(sim.rate * 100).toFixed(1)} %, ${sim.nmut} mutated bases` : 'no hypermutation'}`;
+  }
+  $('#recBtn').addEventListener('click', draw);
+  draw();
+})();
+
+/* ==================== Alignment example (slide 4) ==================== */
+(function alnExample() {
+  const top = 'GCCGTATATTACTGTGCGAAAGA', bot = 'GCCGTGTATTAC-GTGCGAGAGA';
+  const T = [], M = [], B = [];
+  for (let k = 0; k < top.length; k++) {
+    const a = top[k], b = bot[k];
+    const gap = a === '-' || b === '-', mm = !gap && a !== b;
+    T.push({ c: a, cls: 'bg-v' });
+    M.push({ c: gap ? '–' : (mm ? '×' : '|'), cls: mm ? 'mm' : (gap ? 'gap' : '') });
+    B.push({ c: b, cls: mm ? 'mm' : (gap ? 'gap' : '') });
+  }
+  $('#alnTop').innerHTML = seqHTML(T); $('#alnMid').innerHTML = seqHTML(M); $('#alnBot').innerHTML = seqHTML(B);
+})();
+
+/* ==================== Matrix intro (slide 5) ==================== */
+(function matrixIntro() {
+  const germ = 'GTATTACTGTGC';
+  const reads = { a: 'TATTACTGTG', b: 'TATTCTGTG' };
+  let which = 'a';
+  function draw() {
+    const read = reads[which];
+    const r = Algo.dp(read, germ, 'gotoh', { match: 2, mismatch: -3, open: -4, extend: -1 });
+    const on = new Set(r.path.map(([i, j]) => i + ',' + j));
+    let h = '<table class="dp"><tr><th></th>' + germ.split('').map((c, j) => `<th data-c="${j + 1}">${c}</th>`).join('') + '</tr>';
+    for (let i = 1; i <= read.length; i++) {
+      h += `<tr><th class="rowh" data-r="${i}">${read[i - 1]}</th>`;
+      for (let j = 1; j <= germ.length; j++) {
+        const p = on.has(i + ',' + j) && !(i === r.path[r.path.length - 1][0] && j === r.path[r.path.length - 1][1]);
+        const arrow = read[i - 1] === germ[j - 1] ? '=' : '';
+        h += `<td class="${p ? 'path' : ''}" data-i="${i}" data-j="${j}">${p ? (read[i - 1] === germ[j - 1] ? '↘' : '·') : arrow}</td>`;
+      }
+      h += '</tr>';
+    }
+    $('#mxGrid').innerHTML = h + '</table>';
+    $$('#mxGrid td').forEach(td => td.addEventListener('mouseenter', () => {
+      const i = +td.dataset.i, j = +td.dataset.j;
+      $$('#mxGrid td').forEach(x => x.classList.toggle('cur', x === td));
+      const same = read[i - 1] === germ[j - 1];
+      $('#mxInfo').innerHTML = `cell (${i}, ${j}): read <b class="mono">${read[i - 1]}</b> vs germline <b class="mono">${germ[j - 1]}</b> → ${same ? 'match' : 'mismatch'}`;
+    }));
+    const mid = r.top.split('').map((a, k) => { const b = r.bot[k]; return a === '-' || b === '-' ? '–' : (a === b ? '|' : '×'); }).join('');
+    $('#mxAln').innerHTML = `<div class="seqrow"><span>germline</span><div class="seq">${seqHTML(r.top.split('').map(c => ({ c, cls: 'bg-v' })))}</div></div>
+      <div class="seqrow"><span></span><div class="seq">${seqHTML(mid.split('').map(c => ({ c, cls: c === '×' ? 'mm' : '' })))}</div></div>
+      <div class="seqrow"><span>read</span><div class="seq">${seqHTML(r.bot.split('').map(c => ({ c })))}</div></div>`;
+    $('#mxInfo').textContent = which === 'a' ? 'The read sits on one diagonal.' : 'One → step: the read lost an A.';
+  }
+  $('#mxPath1').addEventListener('click', () => { which = 'a'; $('#mxPath1').setAttribute('aria-pressed', 'true'); $('#mxPath2').setAttribute('aria-pressed', 'false'); draw(); });
+  $('#mxPath2').addEventListener('click', () => { which = 'b'; $('#mxPath2').setAttribute('aria-pressed', 'true'); $('#mxPath1').setAttribute('aria-pressed', 'false'); draw(); });
+  draw();
+})();
+
+/* ==================== BLOSUM62 slice (slide 6) ==================== */
+(function blosum() {
+  const aa = ['C', 'S', 'G', 'D', 'E', 'I', 'L', 'F', 'Y', 'W'];
+  const names = { C: 'cysteine', S: 'serine', G: 'glycine', D: 'aspartate', E: 'glutamate', I: 'isoleucine', L: 'leucine', F: 'phenylalanine', Y: 'tyrosine', W: 'tryptophan' };
+  const upper = {
+    C: [9, -1, -3, -3, -4, -1, -1, -2, -2, -2], S: [4, 0, 0, 0, -2, -2, -2, -2, -3], G: [6, -1, -2, -4, -4, -3, -3, -2],
+    D: [6, 2, -3, -4, -3, -3, -4], E: [5, -3, -3, -3, -2, -3], I: [4, 2, 0, -1, -3], L: [4, 0, -1, -2], F: [6, 3, 1], Y: [7, 2], W: [11],
+  };
+  const M = {};
+  aa.forEach((a, i) => upper[a].forEach((v, k) => { const b = aa[i + k]; M[a + b] = v; M[b + a] = v; }));
+  function color(v) {
+    // diverging: negative -> bad hue, positive -> accent, 0 -> neutral
+    const t = Math.min(1, Math.abs(v) / (v > 0 ? 7 : 4));
+    const pos = css('--accent'), neg = css('--bad');
+    return `color-mix(in oklab, ${v > 0 ? pos : neg} ${Math.round(t * 85)}%, var(--soft))`;
+  }
+  function draw() {
+    let h = '<table class="dp"><tr><th></th>' + aa.map(a => `<th>${a}</th>`).join('') + '</tr>';
+    aa.forEach(a => {
+      h += `<tr><th>${a}</th>` + aa.map(b => {
+        const v = M[a + b], strong = Math.abs(v) >= (v > 0 ? 6 : 3);
+        return `<td data-a="${a}" data-b="${b}" style="background:${color(v)};${strong ? 'color:var(--paper);font-weight:700' : 'color:var(--ink)'}">${v}</td>`;
+      }).join('') + '</tr>';
+    });
+    $('#blosum').innerHTML = h + '</table>';
+    $$('#blosum td').forEach(td => td.addEventListener('mouseenter', () => {
+      const a = td.dataset.a, b = td.dataset.b, v = M[a + b], ratio = Math.pow(2, v / 2);
+      const why = a === b ? (v >= 9 ? 'Rare and structurally important residues are almost never replaced.' : 'A residue is most often aligned with itself.')
+        : (v > 0 ? 'Chemically similar residues swap often without breaking the protein.' : (v === 0 ? 'Swapped about as often as chance predicts.' : 'Chemically different residues rarely replace each other.'));
+      $('#blosumInfo').innerHTML = `<strong>${a}–${b}</strong> (${names[a]} / ${names[b]}) scores <strong>${v}</strong>: seen together ${ratio >= 1 ? `2<sup>${v / 2}</sup> ≈ ${ratio.toFixed(ratio < 10 ? 1 : 0)}× more` : `${(1 / ratio).toFixed(1)}× less`} often than chance. ${why}`;
+    }));
+  }
+  draw(); redrawers.push(draw);
+})();
+
+/* ==================== Divergence-dependent log-odds (slide 7) ==================== */
+(function divergence() {
+  const fig = $('#divFig'), W = 520, H = 300, L = 54, R = 16, T = 16, B = 40;
+  const xmax = 0.40, ymin = -8, ymax = 2;
+  const X = p => L + (p / xmax) * (W - L - R), Y = v => T + (ymax - v) / (ymax - ymin) * (H - T - B);
+  function draw() {
+    const p = +$('#divSlider').value / 1000;
+    $('#divOut').textContent = (p * 100).toFixed(1) + ' %';
+    fig.innerHTML = '';
+    const ink2 = css('--ink-2'), rule = css('--rule'), muted = css('--muted');
+    for (let v = ymin; v <= ymax; v += 2) {
+      fig.append(svgEl('line', { x1: L, x2: W - R, y1: Y(v), y2: Y(v), stroke: v === 0 ? muted : rule, 'stroke-width': v === 0 ? 1.2 : 1 }));
+      fig.append(svgEl('text', { x: L - 8, y: Y(v) + 4, 'text-anchor': 'end', 'font-size': 12, fill: muted }, v === 0 ? '0' : fmtMinus(v)));
+    }
+    for (let q = 0; q <= 0.4001; q += 0.1) fig.append(svgEl('text', { x: X(q), y: H - B + 18, 'text-anchor': 'middle', 'font-size': 12, fill: muted }, Math.round(q * 100) + ' %'));
+    fig.append(svgEl('text', { x: (L + W - R) / 2, y: H - 4, 'text-anchor': 'middle', 'font-size': 12, fill: ink2 }, 'read divergence p̂'));
+    fig.append(svgEl('text', { x: 14, y: T + (H - T - B) / 2, 'text-anchor': 'middle', 'font-size': 12, fill: ink2, transform: `rotate(-90 14 ${T + (H - T - B) / 2})` }, 'nats per column'));
+    const line = (f, color) => {
+      let d = '';
+      for (let k = 1; k <= 400; k++) { const q = k / 1000; const v = Math.max(ymin, f(q)); d += (k === 1 ? 'M' : 'L') + X(q).toFixed(1) + ',' + Y(v).toFixed(1); }
+      fig.append(svgEl('path', { d, fill: 'none', stroke: color, 'stroke-width': 2 }));
+    };
+    line(q => Math.log(4 * (1 - q)), css('--seg-j'));
+    line(q => Math.log(4 * q / 3), css('--bad'));
+    // fixed scale reference at 11.2 %
+    const d0 = 1 - 0.25 * Math.exp(2 * LAMBDA);
+    fig.append(svgEl('line', { x1: X(d0), x2: X(d0), y1: T, y2: H - B, stroke: muted, 'stroke-dasharray': '4 4' }));
+    fig.append(svgEl('text', { x: X(d0) + 4, y: T + 12, 'font-size': 11, fill: muted }, 'fixed +2/−3 scale'));
+    const vm = Math.log(4 * (1 - p)), vx = Math.log(4 * p / 3);
+    fig.append(svgEl('line', { x1: X(p), x2: X(p), y1: T, y2: H - B, stroke: css('--accent'), 'stroke-width': 1.5 }));
+    for (const [v, c] of [[vm, css('--seg-j')], [Math.max(ymin, vx), css('--bad')]]) fig.append(svgEl('circle', { cx: X(p), cy: Y(v), r: 5, fill: c, stroke: css('--paper'), 'stroke-width': 2 }));
+    fig.append(svgEl('text', { x: W - R - 4, y: Y(Math.log(4 * 0.6)) - 8, 'text-anchor': 'end', 'font-size': 12, fill: ink2 }, 'match  ln 4(1−p)'));
+    fig.append(svgEl('text', { x: W - R - 4, y: Y(Math.log(4 * 0.4 / 3)) + 18, 'text-anchor': 'end', 'font-size': 12, fill: ink2 }, 'mismatch  ln(4p/3)'));
+    const snp = Math.log(3 * (1 - p) / p);
+    $('#divInfo').innerHTML = `At p̂ = ${(p * 100).toFixed(1)} %: a match is worth <strong>${vm.toFixed(2)}</strong> nats, a mismatch <strong>−${Math.abs(vx).toFixed(2)}</strong>. One base that separates two alleles is worth <strong>${snp.toFixed(1)} nats</strong> (likelihood ratio ≈ ${Math.exp(snp) > 1000 ? Math.round(Math.exp(snp)).toLocaleString('en') : Math.exp(snp).toFixed(1)}), against ${(5 * LAMBDA).toFixed(2)} on the fixed scale.`;
+  }
+  $('#divSlider').addEventListener('input', draw);
+  draw(); redrawers.push(draw);
+})();
+
+/* ==================== Affine gaps (slide 8) ==================== */
+(function gaps() {
+  const fig = $('#gapFig'), W = 560, H = 320, L = 46, R = 10, T = 14, B = 40, NL = 10;
+  function draw() {
+    const go = +$('#goSlider').value, ge = +$('#geSlider').value, gl = +$('#glSlider').value;
+    $('#goOut').textContent = '−' + go; $('#geOut').textContent = ge ? '−' + ge : '0'; $('#glOut').textContent = '−' + gl;
+    const aff = l => go + (l - 1) * ge, lin = l => gl * l;
+    const ymax = Math.max(10, Math.ceil(Math.max(aff(NL), lin(NL)) / 10) * 10);
+    const X = l => L + (l - 0.5) * (W - L - R) / NL, Y = v => T + (1 - v / ymax) * (H - T - B);
+    fig.innerHTML = '';
+    const muted = css('--muted'), rule = css('--rule');
+    const step = ymax <= 40 ? 10 : 20;
+    for (let v = 0; v <= ymax; v += step) {
+      fig.append(svgEl('line', { x1: L, x2: W - R, y1: Y(v), y2: Y(v), stroke: rule }));
+      fig.append(svgEl('text', { x: L - 8, y: Y(v) + 4, 'text-anchor': 'end', 'font-size': 12, fill: muted }, v ? '−' + v : '0'));
+    }
+    const bw = (W - L - R) / NL / 2 - 3;
+    const tip = $('#gapFig');
+    for (let l = 1; l <= NL; l++) {
+      fig.append(svgEl('text', { x: X(l), y: H - B + 18, 'text-anchor': 'middle', 'font-size': 12, fill: muted }, l));
+      for (const [k, v, c] of [[0, aff(l), css('--series-a')], [1, lin(l), css('--series-b')]]) {
+        const x = X(l) - bw - 1 + k * (bw + 2), h = Math.max(1, Y(0) - Y(v));
+        const r = svgEl('path', { d: roundTop(x, Y(0) - h, bw, h, 3), fill: c });
+        r.append(svgEl('title', {}, `${k ? 'linear' : 'affine'} gap of ${l}: −${v}`));
+        fig.append(r);
+      }
+    }
+    fig.append(svgEl('text', { x: (L + W - R) / 2, y: H - 4, 'text-anchor': 'middle', 'font-size': 12, fill: css('--ink-2') }, 'gap length (nt)'));
+    void tip;
+  }
+  ['#goSlider', '#geSlider', '#glSlider'].forEach(s => $(s).addEventListener('input', () => {
+    if (+$('#geSlider').value > +$('#goSlider').value) $('#geSlider').value = $('#goSlider').value;
+    draw();
+  }));
+  draw(); redrawers.push(draw);
+})();
+function roundTop(x, y, w, h, r) {
+  r = Math.min(r, w / 2, h);
+  return `M${x},${y + h}V${y + r}Q${x},${y} ${x + r},${y}H${x + w - r}Q${x + w},${y} ${x + w},${y + r}V${y + h}Z`;
+}
+function roundRight(x, y, w, h, r) {
+  r = Math.min(r, h / 2, w);
+  return `M${x},${y}H${x + w - r}Q${x + w},${y} ${x + w},${y + r}V${y + h - r}Q${x + w},${y + h} ${x + w - r},${y + h}H${x}Z`;
+}
+
+/* ==================== DP widget (slide 9) ==================== */
+(function dpWidget() {
+  const st = { mode: 'nw', k: 0, sel: null, timer: null };
+  let R = null, A = '', B = '';
+  const clean = s => s.toUpperCase().replace(/[^ACGT]/g, '');
+  function params() {
+    return { match: +$('#smS').value, mismatch: -$('#sxS').value, gap: -$('#soS').value, open: -$('#soS').value, extend: -Math.min(+$('#seS').value, +$('#soS').value) };
+  }
+  function compute(keepK) {
+    A = clean($('#dpA').value) || 'A'; B = clean($('#dpB').value) || 'A';
+    R = Algo.dp(A, B, st.mode, params());
+    if (!keepK) st.k = 0;
+    st.k = Math.min(st.k, A.length * B.length);
+    $('#smOut').textContent = '+' + $('#smS').value; $('#sxOut').textContent = '−' + $('#sxS').value;
+    $('#soOut').textContent = '−' + $('#soS').value; $('#seOut').textContent = st.mode === 'gotoh' ? ('−' + Math.min(+$('#seS').value, +$('#soS').value)).replace('−0', '0') : 'n/a';
+    $('#seS').disabled = st.mode !== 'gotoh';
+    rule(); render();
+  }
+  function rule() {
+    const p = params();
+    const g = fmtMinus(p.gap);
+    const txt = {
+      nw: `<strong>Needleman–Wunsch</strong> (global, linear gap ${g})<br>H(i,j) = max {<br>&nbsp; H(i−1,j−1) + s(read<sub>i</sub>, germ<sub>j</sub>)<br>&nbsp; H(i−1,j) ${g} &nbsp;(↓ gap in germline)<br>&nbsp; H(i,j−1) ${g} &nbsp;(→ gap in read) }<br>edges: H(i,0) = i·(${g}); answer at bottom-right`,
+      sw: `<strong>Smith–Waterman</strong> (local, linear gap ${g})<br>H(i,j) = max {<br>&nbsp; <span style="color:var(--accent)">0</span> &nbsp;(start fresh here)<br>&nbsp; H(i−1,j−1) + s<br>&nbsp; H(i−1,j) ${g}<br>&nbsp; H(i,j−1) ${g} }<br>answer = the largest cell anywhere`,
+      gotoh: `<strong>Gotoh</strong> (local, affine: open ${fmtMinus(p.open)}, extend ${fmtMinus(p.extend)})<br>E(i,j) = max{ H(i,j−1) ${fmtMinus(p.open)}, E(i,j−1) ${fmtMinus(p.extend)} } &nbsp;→<br>F(i,j) = max{ H(i−1,j) ${fmtMinus(p.open)}, F(i−1,j) ${fmtMinus(p.extend)} } &nbsp;↓<br>H(i,j) = max{ 0, H(i−1,j−1) + s, E(i,j), F(i,j) }<br>E/F remember "already inside a gap"`,
+    };
+    $('#dpRule').innerHTML = txt[st.mode];
+  }
+  function filled(i, j) { return i === 0 || j === 0 || ((i - 1) * B.length + (j - 1)) < st.k; }
+  function render() {
+    const n = A.length, m = B.length, done = st.k >= n * m;
+    const onPath = new Set(done ? (st.mode === 'nw' ? R.path : R.path.slice(0, -1)).map(([i, j]) => i + ',' + j) : []);
+    const curCell = !done && st.k > 0 ? [Math.floor((st.k - 1) / m) + 1, ((st.k - 1) % m) + 1] : null;
+    const show = st.sel || curCell;
+    const srcs = new Set();
+    if (show && show[0] > 0 && show[1] > 0) { const [i, j] = show; srcs.add((i - 1) + ',' + (j - 1)); srcs.add((i - 1) + ',' + j); srcs.add(i + ',' + (j - 1)); }
+    // heat scale
+    let vmax = 1; for (let i = 0; i <= n; i++) for (let j = 0; j <= m; j++) vmax = Math.max(vmax, R.H[i][j]);
+    let h = '<table class="dp"><tr><th></th><th class="rowh">–</th>' + B.split('').map(c => `<th>${c}</th>`).join('') + '</tr>';
+    for (let i = 0; i <= n; i++) {
+      h += `<tr><th class="rowh">${i ? A[i - 1] : '–'}</th>`;
+      for (let j = 0; j <= m; j++) {
+        const f = filled(i, j), v = R.H[i][j];
+        const cls = [f ? 'done' : '', onPath.has(i + ',' + j) ? 'path' : '', show && show[0] === i && show[1] === j ? 'cur' : '',
+          srcs.has(i + ',' + j) ? 'src' : '', done && st.mode !== 'nw' && R.best.i === i && R.best.j === j ? 'best' : ''].join(' ');
+        const t = v > 0 ? Math.min(1, v / vmax) : 0;
+        const bg = f && v > 0 && !onPath.has(i + ',' + j) ? `style="background:color-mix(in oklab, var(--heat-1) ${Math.round(t * 38)}%, var(--heat-0))"` : '';
+        h += `<td class="${cls}" ${bg} data-i="${i}" data-j="${j}">${f ? v : ''}</td>`;
+      }
+      h += '</tr>';
+    }
+    $('#dpGrid').innerHTML = h + '</table>';
+    $$('#dpGrid td').forEach(td => td.addEventListener('click', () => {
+      const i = +td.dataset.i, j = +td.dataset.j;
+      if (!filled(i, j)) return;
+      st.sel = [i, j]; render();
+    }));
+    explain(show);
+    if (done) {
+      const mid = R.top.split('').map((a, k) => { const b = R.bot[k]; return a === '-' || b === '-' ? '–' : (a === b ? '|' : '×'); }).join('');
+      $('#dpAln').innerHTML = `<div class="seqrow"><span>germline</span><div class="seq">${seqHTML(R.top.split('').map(c => ({ c, cls: c === '-' ? 'gap' : 'bg-v' })))}</div></div>
+        <div class="seqrow"><span>score ${R.best.v}</span><div class="seq">${seqHTML(mid.split('').map(c => ({ c, cls: c === '×' ? 'mm' : '' })))}</div></div>
+        <div class="seqrow"><span>read</span><div class="seq">${seqHTML(R.bot.split('').map(c => ({ c, cls: c === '-' ? 'gap' : '' })))}</div></div>`;
+    } else $('#dpAln').innerHTML = `<div class="small">${st.k} of ${n * m} cells filled. The traceback appears when the matrix is complete.</div>`;
+  }
+  function explain(cell) {
+    const el = $('#dpExplain');
+    if (!cell) { el.innerHTML = 'Press <strong>Step</strong> to fill the next cell, or <strong>Fill all</strong>. Click any filled cell to see how its value was computed.'; return; }
+    const [i, j] = cell, p = params();
+    if (i === 0 || j === 0) { el.innerHTML = `Edge cell (${i}, ${j}) = <strong>${R.H[i][j]}</strong>. ${st.mode === 'nw' ? 'Global alignment must pay for gaps before the first base.' : 'Local alignment can start anywhere for free.'}`; return; }
+    const s = R.s(i, j), a = A[i - 1], b = B[j - 1];
+    const diag = R.H[i - 1][j - 1] + s;
+    let rows;
+    if (st.mode === 'gotoh') {
+      rows = [['0 (start fresh)', 0], [`↘ H(${i - 1},${j - 1}) ${fmtMinus(s)}`, diag], [`→ E: max(H(${i},${j - 1}) ${fmtMinus(p.open)}, E(${i},${j - 1}) ${fmtMinus(p.extend)})`, R.E[i][j]], [`↓ F: max(H(${i - 1},${j}) ${fmtMinus(p.open)}, F(${i - 1},${j}) ${fmtMinus(p.extend)})`, R.F[i][j]]];
+    } else {
+      rows = [[`↘ H(${i - 1},${j - 1}) ${fmtMinus(s)}`, diag], [`↓ H(${i - 1},${j}) ${fmtMinus(p.gap)}`, R.H[i - 1][j] + p.gap], [`→ H(${i},${j - 1}) ${fmtMinus(p.gap)}`, R.H[i][j - 1] + p.gap]];
+      if (st.mode === 'sw') rows.unshift(['0 (start fresh)', 0]);
+    }
+    const v = R.H[i][j];
+    const fmt = x => (x < -1e8 ? '−∞' : fmtMinus(x));
+    el.innerHTML = `Cell (${i}, ${j}): read <b class="mono">${a}</b> vs germline <b class="mono">${b}</b> → s = <strong>${fmtMinus(s)}</strong> (${a === b ? 'match' : 'mismatch'})<br>` +
+      rows.map(([t, x]) => `<div class="mono" style="font-size:13px;${x === v ? 'color:var(--accent);font-weight:600' : ''}">${t} = ${fmt(x)}${x === v ? '  ◀ max' : ''}</div>`).join('');
+  }
+  function step() { if (st.k < A.length * B.length) { st.k++; st.sel = null; render(); } else stop(); }
+  function stop() { clearInterval(st.timer); st.timer = null; $('#dpPlay').textContent = 'Play'; }
+  $('#dpStep').addEventListener('click', () => { stop(); step(); });
+  $('#dpPlay').addEventListener('click', () => {
+    if (st.timer) { stop(); return; }
+    if (st.k >= A.length * B.length) st.k = 0;
+    $('#dpPlay').textContent = 'Pause';
+    st.timer = setInterval(step, 260);
+  });
+  $('#dpAll').addEventListener('click', () => { stop(); st.k = A.length * B.length; st.sel = null; render(); });
+  $('#dpReset').addEventListener('click', () => { stop(); st.k = 0; st.sel = null; render(); });
+  $$('[data-mode]').forEach(b => b.addEventListener('click', () => {
+    $$('[data-mode]').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
+    st.mode = b.dataset.mode; st.sel = null;
+    if (st.mode === 'gotoh') { $('#soS').value = 5; $('#seS').value = 1; } else { $('#soS').value = 4; }
+    compute(true);
+  }));
+  ['#dpA', '#dpB'].forEach(s => $(s).addEventListener('input', () => { stop(); st.sel = null; compute(false); }));
+  ['#smS', '#sxS', '#soS', '#seS'].forEach(s => $(s).addEventListener('input', () => { st.sel = null; compute(true); }));
+  $('#dpA').value = 'GCATGCTAGCA'; $('#dpB').value = 'TGCATCGCTAGC';
+  compute(false);
+})();
+
+/* ==================== Band canvas (slide 11) ==================== */
+(function band() {
+  const cv = $('#bandCv'), ctx = cv.getContext('2d');
+  const ROWS = 80, COLS = 120;
+  function draw() {
+    const w = +$('#bwS').value, ind = +$('#biS').value;
+    $('#bwOut').textContent = w; $('#biOut').textContent = ind;
+    const cw = cv.width / COLS, ch = cv.height / ROWS;
+    ctx.fillStyle = css('--soft'); ctx.fillRect(0, 0, cv.width, cv.height);
+    // true path: read rows 0..79 start at column 14; deletion of `ind` germline bases after row 40
+    const path = [];
+    let j = 14;
+    for (let i = 0; i < ROWS; i++) {
+      if (i === 40) for (let k = 0; k < ind; k++) path.push([i, j++]);
+      path.push([i, j++]);
+    }
+    const d0 = 0 - 14; // diagonal i - j seen by seeds before the indel
+    let inBand = 0;
+    ctx.fillStyle = css('--accent-soft');
+    for (let i = 0; i < ROWS; i++) for (let c = 0; c < COLS; c++) {
+      const d = i - c;
+      if (d >= d0 - w && d <= d0 + w) { inBand++; ctx.fillRect(c * cw, i * ch, cw, ch); }
+    }
+    let escaped = 0;
+    for (const [i, c] of path) {
+      if (c >= COLS) continue;
+      const d = i - c, ok = d >= d0 - w && d <= d0 + w;
+      if (!ok) escaped++;
+      ctx.fillStyle = ok ? css('--accent') : css('--bad');
+      ctx.fillRect(c * cw, i * ch, Math.max(cw, 2), Math.max(ch, 2));
+    }
+    ctx.fillStyle = css('--muted'); ctx.font = '12px ' + css('--f-body');
+    ctx.fillText('germline →', cv.width - 78, 14);
+    ctx.save(); ctx.translate(12, cv.height - 8); ctx.rotate(-Math.PI / 2); ctx.fillText('read →', 0, 0); ctx.restore();
+    const pct = (100 * inBand / (ROWS * COLS)).toFixed(0);
+    $('#bandInfo').innerHTML = `Cells computed: <strong>${pct} %</strong> of the full matrix. ` +
+      (escaped ? `<span class="pill bad">path leaves the band</span> The ${ind}-nt deletion moves the path ${ind} diagonals; a band of ±${w} cannot follow it, so the alignment would be cut short.` :
+        `<span class="pill good">path stays inside</span> The deletion moves the path ${ind} diagonals, within ±${w}.`);
+  }
+  ['#bwS', '#biS'].forEach(s => $(s).addEventListener('input', draw));
+  draw(); redrawers.push(draw);
+})();
+
+/* ==================== k-mer widget (slide 12) ==================== */
+(function kmerWidget() {
+  const seq = 'GCCGTATATTACTGTGCGAAAGA';
+  let pos = 3;
+  const bits = c => Algo.CODE[c].toString(2).padStart(2, '0');
+  function draw() {
+    const k = +$('#kS').value; $('#kOut').textContent = k;
+    pos = Math.max(0, Math.min(seq.length - k, pos));
+    const keys = Algo.kmers(seq, k);
+    $('#kSeq').innerHTML = seqHTML(seq.split('').map((c, i) => ({ c, cls: i >= pos && i < pos + k ? (i === pos + k - 1 ? 'bg-d' : 'bg-v') : '' })));
+    const key = keys[pos].key, prev = pos > 0 ? keys[pos - 1].key : null;
+    const B = x => x.toString(2).padStart(2 * k, '0').replace(/(..)/g, '$1 ').trim();
+    const newBase = seq[pos + k - 1];
+    let h = `<div>window <strong>${seq.slice(pos, pos + k)}</strong> → ${seq.slice(pos, pos + k).split('').map(bits).join(' ')}</div>`;
+    if (prev !== null) {
+      h += `<div style="color:var(--muted)">previous key&nbsp;&nbsp;${B(prev)}</div>`;
+      h += `<div style="color:var(--muted)">&lt;&lt; 2, | ${newBase}=${bits(newBase)}, &amp; mask</div>`;
+    }
+    h += `<div>key&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;${B(key)}</div><div>as an integer = <strong>${key.toLocaleString('en')}</strong> (an index into an array of 4<sup>${k}</sup> = ${Math.pow(4, k).toLocaleString('en')} slots)</div>`;
+    $('#kBits').innerHTML = h;
+    $('#kInfo').textContent = `${keys.length} k-mers in this ${seq.length}-nt sequence. A mutation changes up to ${k} of them.`;
+  }
+  $('#kNext').addEventListener('click', () => { pos++; if (pos > seq.length - +$('#kS').value) pos = 0; draw(); });
+  $('#kPrev').addEventListener('click', () => { pos = Math.max(0, pos - 1); draw(); });
+  $('#kS').addEventListener('input', draw);
+  draw();
+})();
+
+/* ==================== Index figure (slide 13) ==================== */
+(function indexFig() {
+  const fig = $('#idxFig');
+  function draw() {
+    fig.innerHTML = '';
+    const ink = css('--ink'), muted = css('--muted'), rule = css('--rule'), acc = css('--accent'), soft = css('--soft'), v = css('--seg-v'), vsoft = css('--seg-v-soft');
+    fig.append(svgEl('text', { x: 20, y: 24, 'font-size': 14, 'font-weight': 600, fill: ink }, 'offsets[key]  (length 4^k + 1)'));
+    fig.append(svgEl('text', { x: 20, y: 236, 'font-size': 14, 'font-weight': 600, fill: ink }, 'postings  (one flat array, u32 each)'));
+    const keys = ['…', 'ACGTA', 'ACGTC', 'ACGTG', 'ACGTT', '…'], offs = ['', 1203, 1206, 1206, 1210, ''];
+    keys.forEach((k, i) => {
+      const x = 20 + i * 110;
+      fig.append(svgEl('rect', { x, y: 40, width: 104, height: 46, rx: 4, fill: i === 1 ? css('--accent-soft') : soft, stroke: i === 1 ? acc : rule }));
+      fig.append(svgEl('text', { x: x + 52, y: 60, 'text-anchor': 'middle', 'font-size': 13, 'font-family': css('--f-mono'), fill: ink }, k));
+      if (offs[i] !== '') fig.append(svgEl('text', { x: x + 52, y: 78, 'text-anchor': 'middle', 'font-size': 12, 'font-family': css('--f-mono'), fill: muted }, offs[i]));
+    });
+    const posts = [['IGHV3-23', 291], ['IGHV3-30', 291], ['IGHV3-74', 288], ['IGHV1-69', 140], ['IGHV4-34', 52], ['IGHV5-51', 17]];
+    posts.forEach((p, i) => {
+      const x = 20 + i * 110, hl = i < 3;
+      fig.append(svgEl('rect', { x, y: 252, width: 104, height: 54, rx: 4, fill: hl ? vsoft : soft, stroke: hl ? v : rule }));
+      fig.append(svgEl('text', { x: x + 52, y: 274, 'text-anchor': 'middle', 'font-size': 12, 'font-family': css('--f-mono'), fill: ink }, p[0]));
+      fig.append(svgEl('text', { x: x + 52, y: 293, 'text-anchor': 'middle', 'font-size': 12, 'font-family': css('--f-mono'), fill: muted }, 'pos ' + p[1]));
+    });
+    // arrows from offsets[ACGTA] and offsets[ACGTC] to postings range
+    const arrow = (x1, y1, x2, y2) => fig.append(svgEl('path', { d: `M${x1},${y1} C${x1},${(y1 + y2) / 2} ${x2},${(y1 + y2) / 2} ${x2},${y2}`, fill: 'none', stroke: acc, 'stroke-width': 1.6, 'marker-end': 'url(#ah)' }));
+    const defs = svgEl('defs'); const mk = svgEl('marker', { id: 'ah', viewBox: '0 0 10 10', refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: 'auto-start-reverse' });
+    mk.append(svgEl('path', { d: 'M0,0 L10,5 L0,10 z', fill: acc })); defs.append(mk); fig.append(defs);
+    arrow(182, 86, 24, 248); arrow(292, 86, 346, 248);
+    fig.append(svgEl('text', { x: 372, y: 150, 'font-size': 13, fill: acc }, 'ACGTA occurs 3 times:'));
+    fig.append(svgEl('text', { x: 372, y: 168, 'font-size': 13, 'font-family': css('--f-mono'), fill: acc }, 'postings[1203 .. 1206)'));
+    // packed u32
+    fig.append(svgEl('text', { x: 20, y: 344, 'font-size': 13, fill: muted }, 'one posting ='));
+    fig.append(svgEl('rect', { x: 120, y: 328, width: 330, height: 26, rx: 3, fill: vsoft, stroke: v }));
+    fig.append(svgEl('rect', { x: 450, y: 328, width: 198, height: 26, rx: 3, fill: css('--seg-d-soft'), stroke: css('--seg-d') }));
+    fig.append(svgEl('text', { x: 285, y: 346, 'text-anchor': 'middle', 'font-size': 12, 'font-family': css('--f-mono'), fill: ink }, 'gene frame id · 20 bits'));
+    fig.append(svgEl('text', { x: 549, y: 346, 'text-anchor': 'middle', 'font-size': 12, 'font-family': css('--f-mono'), fill: ink }, 'position · 12 bits'));
+  }
+  draw(); redrawers.push(draw);
+})();
+
+/* ==================== Dot plot + diagonal votes (slide 14) ==================== */
+(function dotPlot() {
+  const cv = $('#dotCv'), ctx = cv.getContext('2d');
+  let seed = 3;
+  const germ = IGHV323_FULL.slice(40, 240);
+  function makeRead() {
+    const rnd = Algo.rng(seed);
+    const mu = +$('#dmS').value / 100, del = +$('#ddS').value;
+    let body = germ.slice(20, 180);
+    body = body.slice(0, 80) + body.slice(80 + del);
+    const out = [];
+    for (const c of body) { if (rnd() < mu) { let n; do { n = 'ACGT'[Math.floor(rnd() * 4)]; } while (n === c); out.push(n); } else out.push(c); }
+    const flank = Array.from({ length: 16 }, () => 'ACGT'[Math.floor(rnd() * 4)]).join('');
+    return flank + out.join('');
+  }
+  function draw() {
+    const k = +$('#dkS').value; $('#dkOut').textContent = k; $('#dmOut').textContent = $('#dmS').value + ' %'; $('#ddOut').textContent = $('#ddS').value + ' nt';
+    const read = makeRead();
+    const W = cv.width, H = cv.height, PX = 44, PY = 18, PW = 420, PH = H - PY - 34, HX = PX + PW + 20, HW = W - HX - 10;
+    ctx.fillStyle = css('--paper'); ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = css('--soft'); ctx.fillRect(PX, PY, PW, PH);
+    const sx = PW / germ.length, sy = PH / read.length;
+    // index germline k-mers
+    const idx = new Map();
+    for (const { pos, key } of Algo.kmers(germ, k)) { if (!idx.has(key)) idx.set(key, []); idx.get(key).push(pos); }
+    const votes = new Map(); let hits = 0;
+    ctx.fillStyle = css('--accent');
+    for (const { pos: i, key } of Algo.kmers(read, k)) {
+      const ps = idx.get(key); if (!ps) continue;
+      if (ps.length > 1) continue; // one vote per seed per gene
+      for (const p of ps) {
+        hits++;
+        ctx.fillRect(PX + p * sx - 1, PY + i * sy - 1, 3, 3);
+        const d = i - p; votes.set(d, (votes.get(d) || 0) + 1);
+      }
+    }
+    ctx.strokeStyle = css('--rule'); ctx.strokeRect(PX, PY, PW, PH);
+    ctx.fillStyle = css('--muted'); ctx.font = '12px ' + css('--f-body');
+    ctx.fillText('germline position →', PX, H - 12);
+    ctx.save(); ctx.translate(16, PY + PH); ctx.rotate(-Math.PI / 2); ctx.fillText('read position →', 0, 0); ctx.restore();
+    // histogram over diagonals
+    const ds = [...votes.keys()];
+    const dmin = -germ.length, dmax = read.length;
+    const vmax = Math.max(1, ...votes.values());
+    ctx.fillStyle = css('--soft'); ctx.fillRect(HX, PY, HW, PH);
+    const sorted = [...votes.entries()].sort((a, b) => b[1] - a[1]);
+    for (const [d, c] of votes) {
+      const y = PY + (d - dmin) / (dmax - dmin) * PH, w = c / vmax * (HW - 4);
+      ctx.fillStyle = c >= Math.max(3, vmax * 0.3) ? css('--accent') : css('--muted');
+      ctx.fillRect(HX, y - 1, Math.max(1, w), 3);
+    }
+    ctx.fillStyle = css('--muted'); ctx.fillText('votes per diagonal', HX, H - 12);
+    const top = sorted.slice(0, 2);
+    const strong = top.filter(([, c]) => c >= 3);
+    $('#dotInfo').innerHTML = `${hits} shared ${k}-mers. Strongest diagonals: ${strong.length ? strong.map(([d, c]) => `<strong>d = ${d}</strong> (${c} votes)`).join(', ') : '<strong>none clear</strong>'}. ` +
+      (strong.length === 2 && Math.abs(strong[0][0] - strong[1][0]) <= 12 ? `Two nearby clusters ${Math.abs(strong[0][0] - strong[1][0])} diagonals apart: the far side of the deletion. Swig's band spans both.` :
+        (strong.length ? 'The read is placed; the band is that diagonal ± 8.' : 'Too few seeds survive: this is when 7-mers are added.'));
+    void ds;
+  }
+  ['#dkS', '#dmS', '#ddS'].forEach(s => $(s).addEventListener('input', draw));
+  $('#dNew').addEventListener('click', () => { seed++; draw(); });
+  draw(); redrawers.push(draw);
+})();
+
+/* ==================== SIMD figure (slide 16) ==================== */
+(function simdFig() {
+  const fig = $('#simdFig');
+  function draw() {
+    fig.innerHTML = '';
+    const muted = css('--muted'), soft = css('--soft'), acc = css('--accent'), ink = css('--ink');
+    const lanes = 8;
+    fig.append(svgEl('text', { x: 10, y: 18, 'font-size': 13, fill: muted }, 'one 256/512-bit register = 16/32 lanes (8 drawn)'));
+    for (let l = 0; l < lanes; l++) {
+      const y = 32 + l * 32;
+      fig.append(svgEl('text', { x: 10, y: y + 18, 'font-size': 12, 'font-family': css('--f-mono'), fill: muted }, `lane ${l}`));
+      for (let c = 0; c < 18; c++) {
+        const x = 70 + c * 26;
+        const active = c === 9;
+        fig.append(svgEl('rect', { x, y, width: 22, height: 24, rx: 3, fill: active ? acc : soft, opacity: active ? 1 : (c < 9 ? 0.95 : 0.45) }));
+      }
+      const labels = ['read 1 × V3-23*01', 'read 1 × V3-23*04', 'read 1 × V3-30*18', 'read 2 × V1-69*01', 'read 2 × V1-69*06', 'read 3 × V4-34*01', 'read 3 × V4-34*02', 'read 4 × V3-23*01'];
+      fig.append(svgEl('text', { x: 548, y: y + 17, 'font-size': 12, fill: ink }, labels[l]));
+    }
+    fig.append(svgEl('text', { x: 70 + 9 * 26 + 11, y: 300, 'text-anchor': 'middle', 'font-size': 12, fill: acc }, 'one instruction updates this cell in every lane'));
+  }
+  draw(); redrawers.push(draw);
+})();
+
+/* ==================== D prior (slide 17) ==================== */
+(function dPrior() {
+  const Ds = Object.values(GERM.D);
+  let seed = 101, last = null;
+  function pd() { return Math.log(+$('#pdNS').value * +$('#pdLS').value) / LAMBDA; }
+  function upd() {
+    $('#pdN').textContent = $('#pdNS').value; $('#pdL').textContent = $('#pdLS').value;
+    $('#pdVal').textContent = pd().toFixed(2);
+    if (last) hist(last);
+  }
+  function run() {
+    const rnd = Algo.rng(seed++), out = [];
+    for (let t = 0; t < 2000; t++) {
+      let s = ''; for (let i = 0; i < 25; i++) s += 'ACGT'[Math.floor(rnd() * 4)];
+      let best = 0; for (const g of Ds) best = Math.max(best, Algo.ungapped(s, g).score);
+      out.push(best);
+    }
+    last = out; hist(out);
+  }
+  function hist(arr) {
+    const fig = $('#pdFig'), W = 560, H = 220, L = 40, R = 10, T = 10, B = 34, MAXS = 22;
+    const counts = new Array(MAXS + 1).fill(0); arr.forEach(s => counts[Math.min(MAXS, s)]++);
+    const cmax = Math.max(...counts);
+    const X = s => L + (s / (MAXS + 1)) * (W - L - R), Y = c => T + (1 - c / cmax) * (H - T - B);
+    fig.innerHTML = '';
+    const muted = css('--muted'), rule = css('--rule'), thr = pd();
+    fig.append(svgEl('line', { x1: L, x2: W - R, y1: Y(0), y2: Y(0), stroke: rule }));
+    const bw = (W - L - R) / (MAXS + 1) - 2;
+    counts.forEach((c, s) => {
+      if (!c) return;
+      const h = Y(0) - Y(c);
+      const r = svgEl('path', { d: roundTop(X(s) + 1, Y(c), bw, h, 3), fill: s > thr ? css('--seg-d') : css('--seg-n') });
+      r.append(svgEl('title', {}, `best chance score ${s}: ${c} junctions`)); fig.append(r);
+    });
+    for (let s = 0; s <= MAXS; s += 2) fig.append(svgEl('text', { x: X(s) + bw / 2 + 1, y: H - B + 16, 'text-anchor': 'middle', 'font-size': 11, fill: muted }, s));
+    fig.append(svgEl('line', { x1: X(thr) + bw / 2, x2: X(thr) + bw / 2, y1: T, y2: Y(0), stroke: css('--bad'), 'stroke-width': 1.5, 'stroke-dasharray': '5 4' }));
+    fig.append(svgEl('text', { x: X(thr) + bw / 2 + 6, y: T + 12, 'font-size': 12, fill: css('--bad') }, `P*D = ${thr.toFixed(2)}`));
+    fig.append(svgEl('text', { x: (L + W - R) / 2, y: H - 4, 'text-anchor': 'middle', 'font-size': 12, fill: css('--ink-2') }, 'best D score in a random 25-nt junction'));
+    const any = arr.filter(s => s > 0).length, pass = arr.filter(s => s > thr).length;
+    $('#pdInfo').innerHTML = `Grey: chance hits the cost rejects, including every exact 5-mer (the spike at 10). Orange: <strong>${(100 * pass / arr.length).toFixed(0)} %</strong> of random junctions still clear it. The cost is a prior-odds decision, not a filter that removes all chance: it trades missed short Ds against D calls on D-free reads (see the results).`;
+  }
+  ['#pdNS', '#pdLS'].forEach(s => $(s).addEventListener('input', upd));
+  $('#pdRun').addEventListener('click', run);
+  upd(); run(); redrawers.push(() => last && hist(last));
+})();
+
+/* ==================== Placements for the worked example ==================== */
+const EXP = (() => {
+  const r = EX.read, n = r.length;
+  const V = Algo.placement(r, EX.V, 'IGHV3-23', 'V');
+  const J = Algo.placement(r, EX.J, 'IGHJ4', 'J');
+  const Ds = Object.entries(EX.Ds).map(([k, g]) => Algo.placement(r, g, k, 'D')).filter(p => p.score >= 8).sort((a, b) => b.score - a.score);
+  const PD = Math.log(32 * 25) / LAMBDA;
+  // sequential: whole V, whole J, best D in what is left
+  const left = r.slice(V.re, Math.max(V.re, J.rs));
+  let sd = { score: 0 };
+  for (const [k, g] of Object.entries(EX.Ds)) { const b = Algo.ungapped(left, g); if (b.score > sd.score) sd = { ...b, name: k }; }
+  const seq = { x1: V.re, y2: J.rs, D: null, leftover: left, dbest: sd };
+  if (sd.score > PD) { const D = Ds.find(d => d.name === sd.name); seq.D = D; seq.y1 = V.re + sd.rs; seq.x2 = V.re + sd.re; }
+  const best = Algo.joint(n, V, Ds, J, PD);
+  return { r, n, V, J, Ds, PD, seq, best };
+})();
+function segmentation(sol) {
+  // label each read base and whether it mismatches its assigned germline
+  const { r, V, J } = EXP; const lab = [], mm = [];
+  for (let i = 0; i < r.length; i++) {
+    let L = 'N', m = false;
+    if (i >= V.rs && i < sol.x1) { L = 'V'; m = r[i] !== V.g[i - V.d]; }
+    else if (sol.D && i >= sol.y1 && i < sol.x2) { L = 'D'; m = r[i] !== sol.D.g[i - sol.D.d]; }
+    else if (i >= sol.y2 && i < J.re) { L = 'J'; m = r[i] !== J.g[i - J.d]; }
+    lab.push(L); mm.push(m);
+  }
+  return { lab, mm };
+}
+function segHTML(sol) {
+  const { lab, mm } = segmentation(sol);
+  return seqHTML(EXP.r.split('').map((c, i) => ({ c, cls: (mm[i] ? 'mm ' : '') + SEGCLASS[lab[i]], title: lab[i] })));
+}
+function scoreOf(sol) {
+  const { V, J, PD } = EXP;
+  const v = V.P[sol.x1] - V.P[V.rs], j = J.P[J.re] - J.P[sol.y2];
+  const d = sol.D ? sol.D.P[sol.x2] - sol.D.P[sol.y1] : 0;
+  return { v, d, j, pd: sol.D ? PD : 0, total: v + d + j - (sol.D ? PD : 0) };
+}
+function matchesTruth(sol) {
+  const { lab } = segmentation(sol);
+  let wrong = 0; for (let i = 0; i < lab.length; i++) if (lab[i] !== truthLabel(i)) wrong++;
+  return wrong;
+}
+
+/* ==================== Eat-D slide (18) ==================== */
+(function eatD() {
+  const { r, V, J, seq } = EXP;
+  $('#eatTruth').innerHTML = seqHTML(r.split('').map((c, i) => ({ c: truthLabel(i), cls: SEGCLASS[truthLabel(i)] })));
+  $('#eatRead').innerHTML = seqHTML(r.split('').map(c => ({ c })));
+  const alnRow = (P) => seqHTML(r.split('').map((c, i) => {
+    if (i < P.rs || i >= P.re) return { c: ' ' };
+    const g = P.g[i - P.d];
+    return { c: g, cls: (g !== c ? 'mm ' : '') + (P.kind === 'V' ? 'bg-v' : 'bg-j') };
+  }));
+  $('#eatV').innerHTML = alnRow(V);
+  $('#eatJ').innerHTML = alnRow(J);
+  $('#eatSeq').innerHTML = segHTML(seq);
+  const wrong = matchesTruth(seq);
+  $('#eatVerdict').innerHTML = `Left between them: <span class="mono">${seq.leftover}</span>. The best D there scores ${seq.dbest.score}, below the D cost of ${EXP.PD.toFixed(2)}, so <strong>no D is called</strong>. ${wrong} bases end up with the wrong label, and the D allele is lost. <span class="pill bad">sequential fails</span>`;
+})();
+
+/* ==================== DAG slide (19) ==================== */
+(function dagSlide() {
+  const { V, J, Ds, best, seq, n } = EXP;
+  let mode = 'joint';
+  const mine = { x1: best.x1, y1: best.y1, x2: best.x2, y2: best.y2, D: best.D };
+  const fig = $('#dagFig');
+  const nodes = [{ id: 'S', label: 'start', x: 40, y: 150 }, { id: 'V', p: V, x: 180, y: 150 }];
+  Ds.slice(0, 4).forEach((d, k) => nodes.push({ id: 'D' + k, p: d, x: 380, y: 50 + k * 66 }));
+  nodes.push({ id: 'J', p: J, x: 560, y: 150 }, { id: 'E', label: 'end', x: 668, y: 150 });
+  const byId = Object.fromEntries(nodes.map(nd => [nd.id, nd]));
+  const edges = [['S', 'V'], ['V', 'J'], ['J', 'E']];
+  nodes.filter(nd => nd.id.startsWith('D')).forEach(nd => { edges.push(['V', nd.id]); edges.push([nd.id, 'J']); });
+  function currentSol() {
+    if (mode === 'seq') return seq;
+    if (mode === 'joint') return best;
+    return mine.D && mine.y1 < mine.x2 ? mine : { x1: mine.x1, y2: mine.y2, D: null };
+  }
+  function drawFig(sol) {
+    fig.innerHTML = '';
+    const rule = css('--rule'), acc = css('--accent'), ink = css('--ink'), muted = css('--muted');
+    const onPath = new Set(['S', 'V', 'J', 'E']);
+    let dnode = null;
+    if (sol.D) { dnode = nodes.find(nd => nd.p === sol.D); if (dnode) onPath.add(dnode.id); }
+    const pathEdges = new Set(dnode ? ['S>V', `V>${dnode.id}`, `${dnode.id}>J`, 'J>E'] : ['S>V', 'V>J', 'J>E']);
+    for (const [a, b] of edges) {
+      const A = byId[a], B = byId[b], on = pathEdges.has(a + '>' + b);
+      const ax = A.x + (A.p ? 62 : 26), bx = B.x - (B.p ? 62 : 26);
+      const dpath = a === 'V' && b === 'J' ? `M${ax},${A.y + 6} C${ax + 120},${A.y + 200} ${bx - 120},${B.y + 200} ${bx},${B.y + 6}` : `M${ax},${A.y} C${(ax + bx) / 2},${A.y} ${(ax + bx) / 2},${B.y} ${bx},${B.y}`;
+      fig.append(svgEl('path', { d: dpath, fill: 'none', stroke: on ? acc : rule, 'stroke-width': on ? 3 : 1.4 }));
+    }
+    for (const nd of nodes) {
+      const on = onPath.has(nd.id);
+      if (!nd.p) {
+        fig.append(svgEl('circle', { cx: nd.x, cy: nd.y, r: 24, fill: css('--soft'), stroke: on ? acc : rule, 'stroke-width': on ? 2.5 : 1 }));
+        fig.append(svgEl('text', { x: nd.x, y: nd.y + 4, 'text-anchor': 'middle', 'font-size': 12, fill: muted }, nd.label));
+        continue;
+      }
+      const kind = nd.p.kind.toLowerCase();
+      fig.append(svgEl('rect', { x: nd.x - 62, y: nd.y - 26, width: 124, height: 52, rx: 6, fill: css(`--seg-${kind}-soft`), stroke: on ? acc : css(`--seg-${kind}`), 'stroke-width': on ? 3 : 1 }));
+      fig.append(svgEl('text', { x: nd.x, y: nd.y - 7, 'text-anchor': 'middle', 'font-size': 13, 'font-weight': 600, fill: ink }, nd.p.name));
+      fig.append(svgEl('text', { x: nd.x, y: nd.y + 13, 'text-anchor': 'middle', 'font-size': 11, 'font-family': css('--f-mono'), fill: muted }, `read ${nd.p.rs}–${nd.p.re} · S ${nd.p.score}`));
+    }
+    fig.append(svgEl('text', { x: 370, y: 322, 'text-anchor': 'middle', 'font-size': 11, fill: muted }, 'V → J (no D)'));
+  }
+  function drawTable(sol) {
+    const s = scoreOf(sol), wrong = matchesTruth(sol);
+    const rowsHTML = [
+      [`<span class="v">V</span> keeps read ${V.rs}–${sol.x1}`, s.v],
+      sol.D ? [`<span class="d">D</span> ${sol.D.name} keeps ${sol.y1}–${sol.x2}`, s.d] : ['<span class="d">D</span> none', 0],
+      sol.D ? ['D presence cost −P*<sub>D</sub>', -s.pd] : ['D presence cost', 0],
+      [`<span class="j">J</span> keeps read ${sol.y2}–${J.re}`, s.j],
+    ];
+    const nN = (sol.D ? (sol.y1 - sol.x1) + (sol.y2 - sol.x2) : sol.y2 - sol.x1);
+    $('#dagScore').innerHTML = `<thead><tr><th>Term</th><th class="num">Score</th></tr></thead><tbody>` +
+      rowsHTML.map(([t, v]) => `<tr><td>${t}</td><td class="num">${Number.isInteger(v) ? fmtMinus(v) : (v < 0 ? '−' + Math.abs(v).toFixed(2) : v.toFixed(2))}</td></tr>`).join('') +
+      `<tr><td>N/P bases between cuts (score 0)</td><td class="num">${nN}</td></tr>` +
+      `<tr class="hl"><td><strong>Path score</strong></td><td class="num"><strong>${s.total.toFixed(2)}</strong></td></tr>` +
+      `<tr><td colspan="2">${wrong === 0 ? '<span class="pill good">every base matches the simulated truth</span>' : `<span class="pill bad">${wrong} base${wrong === 1 ? '' : 's'} differ${wrong === 1 ? 's' : ''} from the truth</span>`}${mode === 'mine' ? (Math.abs(s.total - best.score) < 1e-9 ? ' · ties the optimum: a base both segments explain equally goes to the later one' : ` · optimum is ${best.score.toFixed(2)}`) : ''}</td></tr></tbody>`;
+  }
+  const sl = { x1: $('#cx1'), y1: $('#cy1'), x2: $('#cx2'), y2: $('#cy2') };
+  const D0 = best.D;
+  function setupSliders() {
+    sl.x1.min = V.rs; sl.x1.max = V.re; sl.y1.min = D0.rs; sl.y1.max = D0.re - 1; sl.x2.min = D0.rs + 1; sl.x2.max = D0.re; sl.y2.min = J.rs; sl.y2.max = J.re;
+    for (const k in sl) sl[k].value = mine[k];
+  }
+  function readSliders(changed) {
+    for (const k in sl) mine[k] = +sl[k].value;
+    // keep cuts ordered: x1 <= y1 < x2 <= y2
+    if (changed === 'x1' && mine.y1 < mine.x1) mine.y1 = Math.min(mine.x1, D0.re - 1);
+    if (changed === 'y1') { if (mine.x1 > mine.y1) mine.x1 = mine.y1; if (mine.x2 <= mine.y1) mine.x2 = mine.y1 + 1; }
+    if (changed === 'x2') { if (mine.y1 >= mine.x2) mine.y1 = mine.x2 - 1; if (mine.y2 < mine.x2) mine.y2 = mine.x2; }
+    if (changed === 'y2' && mine.x2 > mine.y2) mine.x2 = Math.max(mine.y2, D0.rs + 1);
+    if (mine.x1 > mine.y1) mine.x1 = mine.y1;
+    if (mine.y2 < mine.x2) mine.y2 = mine.x2;
+    mine.D = D0;
+    for (const k in sl) sl[k].value = mine[k];
+  }
+  function draw() {
+    const sol = currentSol();
+    drawFig(sol); drawTable(sol);
+    $('#dagRead').innerHTML = segHTML(sol);
+    for (const k in sl) $('#c' + k + 'o').textContent = mine[k];
+  }
+  const modes = { dagSeq: 'seq', dagJoint: 'joint', dagMine: 'mine' };
+  for (const id in modes) $('#' + id).addEventListener('click', () => {
+    mode = modes[id];
+    for (const j in modes) $('#' + j).setAttribute('aria-pressed', String(j === id));
+    $('#dagCuts').hidden = mode !== 'mine';
+    draw();
+  });
+  for (const k in sl) sl[k].addEventListener('input', () => { readSliders(k); draw(); });
+  setupSliders(); draw(); redrawers.push(draw);
+  void n;
+})();
+
+/* ==================== Simulator slide (22) ==================== */
+(function simSlide() {
+  let preset = 'mid', seed = 501;
+  function draw() {
+    const sim = simulate(preset, Algo.rng(seed++));
+    $('#simRead').innerHTML = sim.cells.map(x => `<b class="${(x.mut ? 'mm ' : '') + (SEGCLASS[x.seg] || '')}">${x.c}<i>${x.seg === 'F' ? '·' : x.seg}</i></b>`).join('');
+    $('#simInfo').innerHTML = `Truth: <strong>${sim.vn}</strong>, ${sim.dn ? `<strong>${sim.dn}</strong> (${sim.dg.length - sim.d5 - sim.d3} nt kept)` : '<strong>no D</strong>'}, <strong>${sim.jn}</strong>; ${sim.rate ? `SHM ${(sim.rate * 100).toFixed(1)} % (${sim.nmut} red bases)` : 'no mutations'}. Each base above carries this label, so the evaluator can score any tool's boundaries base by base.`;
+  }
+  $$('[data-preset]').forEach(b => b.addEventListener('click', () => {
+    preset = b.dataset.preset; $$('[data-preset]').forEach(x => x.setAttribute('aria-pressed', String(x === b))); draw();
+  }));
+  $('#simBtn').addEventListener('click', draw);
+  draw();
+})();
+
+/* ==================== Results (slides 24–25) ==================== */
+const RESULTS = {
+  easy: { swig: [99.88, 100.00, 99.29, 99.84, 100.00], igb: [99.12, 99.78, 98.86, 99.86, 99.77], dfree: [0, 0], speed: [5200, 67] },
+  mid: { swig: [97.88, 99.72, 93.35, 98.74, 99.97], igb: [97.18, 99.62, 93.73, 98.60, 99.72], dfree: [23, 43], speed: [5100, 66] },
+  hard: { swig: [89.44, 98.84, 83.00, 92.80, 99.69], igb: [89.16, 98.90, 81.75, 91.84, 98.07], dfree: [16, 30], speed: [5200, 71] },
+};
+const METRICS = ['V allele', 'V gene', 'D allele', 'J allele', 'Junction'];
+(function results() {
+  let preset = 'hard';
+  const fig = $('#resFig');
+  function draw() {
+    const d = RESULTS[preset];
+    const W = 700, H = 360, L = 100, R = 70, T = 24, B = 36;
+    const lo = preset === 'hard' ? 80 : 90, hi = 100;
+    const X = v => L + (v - lo) / (hi - lo) * (W - L - R);
+    const rowH = (H - T - B) / METRICS.length;
+    fig.innerHTML = '';
+    const muted = css('--muted'), rule = css('--rule'), ink = css('--ink'), a = css('--series-a'), b = css('--series-b');
+    for (let v = lo; v <= hi; v += (hi - lo) / 4) {
+      fig.append(svgEl('line', { x1: X(v), x2: X(v), y1: T - 6, y2: H - B, stroke: rule }));
+      fig.append(svgEl('text', { x: X(v), y: H - B + 18, 'text-anchor': 'middle', 'font-size': 12, fill: muted }, v.toFixed(0) + ' %'));
+    }
+    METRICS.forEach((m, k) => {
+      const y = T + rowH * (k + 0.5);
+      fig.append(svgEl('text', { x: L - 12, y: y + 4, 'text-anchor': 'end', 'font-size': 14, fill: ink }, m));
+      const vs = d.swig[k], vi = d.igb[k];
+      fig.append(svgEl('line', { x1: X(Math.min(vs, vi)), x2: X(Math.max(vs, vi)), y1: y, y2: y, stroke: muted, 'stroke-width': 2 }));
+      for (const [v, c, name, other] of [[vi, b, 'IgBLAST', vs], [vs, a, 'Swig', vi]]) {
+        const g = svgEl('g', { style: 'cursor:default' });
+        g.append(svgEl('circle', { cx: X(v), cy: y, r: 14, fill: 'transparent' }));
+        g.append(name === 'Swig' ? svgEl('circle', { cx: X(v), cy: y, r: 6, fill: c, stroke: css('--paper'), 'stroke-width': 2 }) : svgEl('circle', { cx: X(v), cy: y, r: 9, fill: css('--paper'), stroke: c, 'stroke-width': 3 }));
+        g.addEventListener('mouseenter', () => { $('#resTip').innerHTML = `<strong>${name}</strong>, ${m}, ${preset}: ${v.toFixed(2)} % (${(v - other >= 0 ? '+' : '−') + Math.abs(v - other).toFixed(2)} pp vs the other tool)`; });
+        g.addEventListener('mouseleave', () => { $('#resTip').textContent = ''; });
+        fig.append(g);
+      }
+      const diff = vs - vi;
+      fig.append(svgEl('text', { x: W - R + 12, y: y + 4, 'font-size': 13, 'font-weight': 600, fill: Math.abs(diff) < 0.1 ? muted : ink }, (diff >= 0 ? '+' : '−') + Math.abs(diff).toFixed(2)));
+    });
+    fig.append(svgEl('text', { x: W - R + 12, y: T - 8, 'font-size': 11, fill: muted }, 'Δ pp'));
+    const t = $('#resTable');
+    t.innerHTML = `<thead><tr><th>${preset}</th><th class="num">Swig</th><th class="num">IgBLAST</th></tr></thead><tbody>` +
+      METRICS.map((m, k) => `<tr><td>${m}</td><td class="num ${d.swig[k] > d.igb[k] ? 'win' : ''}">${d.swig[k].toFixed(2)}</td><td class="num ${d.igb[k] > d.swig[k] ? 'win' : ''}">${d.igb[k].toFixed(2)}</td></tr>`).join('') +
+      `<tr><td>D-free reads given a D</td><td class="num ${d.dfree[0] < d.dfree[1] ? 'win' : ''}">${d.dfree[0]} %</td><td class="num ${d.dfree[1] < d.dfree[0] ? 'win' : ''}">${d.dfree[1]} %</td></tr>` +
+      `<tr><td>Reads/s, 4 threads</td><td class="num win">${d.speed[0].toLocaleString('en')}</td><td class="num">${d.speed[1]}</td></tr></tbody>`;
+  }
+  $$('#resPreset button').forEach(btn => btn.addEventListener('click', () => {
+    preset = btn.dataset.p; $$('#resPreset button').forEach(x => x.setAttribute('aria-pressed', String(x === btn))); draw();
+  }));
+  draw(); redrawers.push(draw);
+})();
+(function speedAndDfree() {
+  function bars(fig, rows, unit, max, fmt) {
+    const W = 560, H = 230, L = 150, R = 80, T = 10, B = 26;
+    fig.innerHTML = '';
+    const muted = css('--muted'), ink = css('--ink'), rule = css('--rule');
+    const rh = (H - T - B) / rows.length;
+    fig.append(svgEl('line', { x1: L, x2: L, y1: T, y2: H - B, stroke: rule }));
+    rows.forEach((r, k) => {
+      const y = T + k * rh + 3, h = rh - 6, w = r.v > 0 ? Math.max(2, (r.v / max) * (W - L - R)) : 0;
+      fig.append(svgEl('text', { x: L - 10, y: y + h / 2 + 4, 'text-anchor': 'end', 'font-size': 13, fill: ink }, r.label));
+      if (w > 0) { const p = svgEl('path', { d: roundRight(L, y, w, h, 4), fill: r.c }); p.append(svgEl('title', {}, `${r.label}: ${fmt(r.v)} ${unit}`)); fig.append(p); }
+      fig.append(svgEl('text', { x: L + w + 8, y: y + h / 2 + 4, 'font-size': 13, 'font-weight': 600, fill: ink }, fmt(r.v)));
+    });
+    fig.append(svgEl('text', { x: L, y: H - 6, 'font-size': 11, fill: muted }, unit));
+  }
+  function draw() {
+    const a = css('--series-a'), b = css('--series-b'), rows = [], dr = [];
+    for (const p of ['easy', 'mid', 'hard']) {
+      rows.push({ label: `Swig · ${p}`, v: RESULTS[p].speed[0], c: a }, { label: `IgBLAST · ${p}`, v: RESULTS[p].speed[1], c: b });
+      dr.push({ label: `Swig · ${p}`, v: RESULTS[p].dfree[0], c: a }, { label: `IgBLAST · ${p}`, v: RESULTS[p].dfree[1], c: b });
+    }
+    bars($('#spdFig'), rows, 'reads per second (linear scale)', 5600, v => v.toLocaleString('en'));
+    bars($('#dfFig'), dr, '% of D-free reads given a D', 50, v => v + ' %');
+  }
+  draw(); redrawers.push(draw);
+})();
+
+Deck.start();
+</script>
+</body>
+</html>
