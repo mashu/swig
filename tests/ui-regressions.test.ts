@@ -448,3 +448,12 @@ test("phylogenetic UCA posterior uses contour-bounded embedded glyphs and aligne
   const codon = logoGlyphRun("A-Q");
   assert.ok(codon && codon.paths.length === 3, "multi-character codon glyph runs must retain all contours");
 });
+
+test("a run is refused before it starts when an option lacks the germlines it needs", () => {
+  const app = fs.readFileSync(new URL("../src/swig-app.tsx", import.meta.url), "utf8");
+  const requestRun = app.slice(app.indexOf("function requestRun()"), app.indexOf("if (session && !window.confirm(", app.indexOf("function requestRun()")));
+  assert.ok(requestRun.length > 0);
+  // The engine would refuse both with its command-line wording; Swig Web says it first in its own.
+  assert.match(requestRun, /if \(constantPrefixIdentityEnabled && !compiled\.counts\.C\) \{\s*setRunError\("The covered C-prefix identity gate requires at least one C germline in the composed reference set\."\);\s*return;/);
+  assert.match(requestRun, /if \(!compiled\.counts\.D\) \{\s*setRunError\("Double-D screening requires at least one D germline in the composed reference set\."\);\s*return;/);
+});

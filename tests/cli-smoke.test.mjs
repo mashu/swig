@@ -495,6 +495,77 @@ test("--vdj refuses a D or J penalty outside the aligner's range",async()=>{
   }finally{await rm(temporary,{recursive:true,force:true});}
 });
 
+test("--vdj refuses the C-prefix gate without C germlines on either aligner, and names D tuning without D",async()=>{
+  const root=resolve(import.meta.dirname,"..");
+  const refs=join(root,"public/references/kimdb-1.1/Macaca_mulatta/IGH");
+  const temporary=await mkdtemp(join(root,"tmp-cli-databases-"));
+  try{
+    const env=nativeAlignerEnvironment(root,join(temporary,"cache"))??process.env;
+    const query=join(root,"tests/fixtures/kimdb-perfect-d-regression.fasta");
+    const vj=["--vdj","-query",query,"-germline_db_V",join(refs,"V.fasta"),"-germline_db_J",join(refs,"J.fasta"),"-outfmt","19","--workers","1"];
+    const messages=[];
+    for(const aligner of ["native","wasm"]){
+      const out=join(temporary,`${aligner}.tsv`);
+      const result=runRawCli(root,[...vj,"-germline_db_D",join(refs,"D.fasta"),"--aligner",aligner,"--minimum-c-prefix-identity","0.99","-out",out],env);
+      assert.notEqual(result.status,0,`--aligner ${aligner}: ${result.stderr}`);
+      assert.match(result.stderr,/--minimum-c-prefix-identity needs a constant-region database: add -c_region_db/);
+      assert.doesNotMatch(result.stderr,/did not start/);
+      assert.equal(existsSync(out),false);
+      messages.push(result.stderr.trim().split("\n").at(-1));
+    }
+    assert.equal(messages[0],messages[1]);
+    // 0 turns the gate off.
+    const off=runRawCli(root,[...vj,"-germline_db_D",join(refs,"D.fasta"),"--aligner","wasm","--minimum-c-prefix-identity","0","-out",join(temporary,"off.tsv")],env);
+    assert.equal(off.status,0,off.stderr);
+    // IgBLAST-style scripts pass D tuning for every chain: run, and say it changes nothing.
+    const tuned=runRawCli(root,[...vj,"--aligner","wasm","-min_D_match","5","-out",join(temporary,"tuned.tsv")],env);
+    assert.equal(tuned.status,0,tuned.stderr);
+    assert.match(tuned.stderr,/Warning: -min_D_match has no effect without -germline_db_D\./);
+    const plain=runRawCli(root,[...vj,"--aligner","wasm","-out",join(temporary,"plain.tsv")],env);
+    assert.equal(plain.status,0,plain.stderr);
+    assert.doesNotMatch(plain.stderr,/no effect/);
+    assert.deepEqual(await readFile(join(temporary,"tuned.tsv")),await readFile(join(temporary,"plain.tsv")));
+  }finally{await rm(temporary,{recursive:true,force:true});}
+});
+
+test("a pipeline config is refused when its reference set lacks the germlines an annotation option needs",async()=>{
+  const root=resolve(import.meta.dirname,"..");
+  const temporary=await mkdtemp(join(root,"tmp-cli-config-databases-"));
+  try{
+    let runs=0;
+    const run=async(references,annotation)=>{
+      const name=`run-${runs++}`,configPath=join(temporary,`${name}.json`);
+      await writeFile(configPath,JSON.stringify({inputs:[{path:join(root,"tests/fixtures/cli-smoke.fasta"),sampleId:"a",subjectId:"d"}],references,annotation:{workers:1,...annotation},pipeline:{collapse:{enabled:false},lineage:{enabled:false},shm:{enabled:false}},output:{directory:join(temporary,name),prefix:"run",writeLineageStudy:false}}));
+      return runCli(root,configPath);
+    };
+    // Checked before the aligner is chosen: the same answer on every route.
+    for(const aligner of ["auto","native","wasm"]){
+      const screened=await run({species:"Homo sapiens",scope:"IGK"},{aligner,doubleD:{mode:"all"}});
+      assert.notEqual(screened.status,0,screened.stderr);
+      assert.match(screened.stderr,/annotation\.doubleD needs D germlines, but the Homo sapiens IGK reference set has none; set annotation\.doubleD\.mode to "off"\./);
+      assert.doesNotMatch(screened.stderr,/runs only on WebAssembly/);
+      const gated=await run({species:"Mus musculus",scope:"TRA"},{aligner,minimumConstantPrefixIdentity:0.97});
+      assert.notEqual(gated.status,0,gated.stderr);
+      assert.match(gated.stderr,/annotation\.minimumConstantPrefixIdentity needs constant-region \(C\) germlines, but the Mus musculus TRA reference set has none; set it to null/);
+    }
+    // A blank C text is no C database on either route: the native child is not handed an
+    // empty C file (which it refuses), as WebAssembly is not.
+    const env=nativeAlignerEnvironment(root,join(temporary,"cache"));
+    if(env){
+      const blank={species:"Homo sapiens",scope:"IGH",prepareMetadata:false,inline:{C:" \n"}};
+      const tables=[];
+      for(const aligner of ["native","wasm"]){
+        const name=`blank-${aligner}`,configPath=join(temporary,`${name}.json`);
+        await writeFile(configPath,JSON.stringify({inputs:[{path:join(root,"tests/fixtures/cli-smoke.fasta"),sampleId:"a",subjectId:"d"}],references:blank,annotation:{workers:1,aligner},pipeline:{collapse:{enabled:false},lineage:{enabled:false},shm:{enabled:false}},output:{directory:join(temporary,name),prefix:"run",writeLineageStudy:false}}));
+        const result=runCli(root,configPath,[],env);
+        assert.equal(result.status,0,`${aligner}: ${result.stderr}`);
+        tables.push(await readFile(join(temporary,name,"run.annotated.airr.tsv")));
+      }
+      assert.deepEqual(tables[0],tables[1]);
+    }
+  }finally{await rm(temporary,{recursive:true,force:true});}
+});
+
 test("CLI exposes the embedded IMGT data notice",()=>{
   const root=resolve(import.meta.dirname,"..");
   const result=runRawCli(root,["notices"]);
