@@ -444,9 +444,18 @@ impl<A, RV, RJ, RD, W, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj> {
     /// path with a V and no J ends at most `reach` bases after the V
     /// placement's end, and every D of a path with a J and no V starts at
     /// most `reach` bases before the J placement's start, so that a J (V)
-    /// the guards drop no longer decides where the D lies; and its V and J
-    /// (when it has both) pair, with at most `max_junction_span` read bases
-    /// between the V's exit and the J's entry.
+    /// the guards drop no longer lets a D lie beyond the reach: it does not
+    /// widen where the D may lie. The placements are still those of the
+    /// window that J (V) bounds, one per D allele: an allele whose best
+    /// alignment there crosses or lies beyond the reach has none within it,
+    /// though a read without that J (V) would find one. A chance J between
+    /// the V and the D can still narrow where the D may lie: the D window
+    /// ends 12 bases after the first J placement, used or not, so a D at the
+    /// read's end beyond such a J is not found (on simulated IGH reads cut
+    /// after their D this costs about 5.5 points of right D calls, 92.2 %
+    /// against 97.8 %). The path's V and J (when it has both) pair, with at
+    /// most `max_junction_span` read bases between the V's exit and the J's
+    /// entry.
     fn keeps_guards(
         &self,
         guards: &PairGuards,
@@ -1108,8 +1117,9 @@ where
     /// with the D placements within their reach, and D placements with the
     /// J placements they lie within the reach of, are candidates too
     /// ([`Self::guard_subsets`]): a D at the open end of a read that holds
-    /// no J (no V) the V (J) pairs with is called, where a read without
-    /// that J (V) would have searched it, and pays for the J (V) it lacks. All
+    /// no J (no V) the V (J) pairs with can be called when its placement
+    /// lies where a read without that J (V) would have searched it, and
+    /// pays for the J (V) it lacks. All
     /// are read in the same context ([`ReadContext`]: the read's divergence,
     /// length and anchored columns), so they compare by
     /// [`CallPath::value`]; an exact tie keeps the earlier subset. The

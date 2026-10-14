@@ -893,8 +893,12 @@ rule is then skipped.)
    placement ends at most `r = 60` bases (`ExpandedResidual::reach`) after
    the V placement's end, with a J and no V every D placement starts at
    most `r` bases before the J placement's start. A J (V) the guards drop
-   thus no longer decides where the D may lie: the D window of a read
-   with a J runs up to that J;
+   thus no longer lets the D lie beyond `r` (the D window of a read with a
+   J runs up to that J). The D placements are still that window's, one
+   alignment per D allele (§5), so an allele that aligns best across or
+   beyond `r` has no placement within it. A real D ending more than `r`
+   bases after the V, or a D whose allele has a better copy farther on, is
+   then lost where a read without the J would call it;
 3. if `π` holds a V and a J, at most 225 read bases separate the V's exit
    from the J's entry and `pairs(v, j)` holds.
 

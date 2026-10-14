@@ -33,7 +33,7 @@ fixed:
 | 3.1.12 frame ties, σ series, trace memory, BOM and non-UTF-8 input, `--tail`, timing test, floors | fixed (σ as two binomial tails; scores up to 30,000 in lanes with a bound per traceback group) |
 | 4.1–4.3, 4.7, 4.8 | one acceptance mechanism; the adjudication mode as a validated type; the lattice recursion written once; typed notes; one test kit |
 | 4.5 (part) | the tandem-D grammar and the residual path are gone |
-| §0 13 (part) IGHT, IGHZ and IGHO without a locus | every IGH isotype letter names IGH; a custom-named V, J or C takes its relatives' locus (the database's named alleles, else an embedded panel, which places a J or C only in loci of the database's V), a custom D the loci with D genes, with a warning asking for `locus=`; C follows the locus the path shares; Swig Web and swig-cli write `locus=` for custom records |
+| §0 13 (part) IGHT, IGHZ and IGHO without a locus | every IGH isotype letter names IGH; a custom-named V, J or C takes its relatives' locus (the database's named alleles, else an embedded panel, which places a J or C only in loci of the database's V), a custom D the loci with D genes, with a warning asking for `locus=` in a database of several loci; C follows the locus the path shares; Swig Web and swig-cli write `locus=` for custom records |
 | §0 11 gene identity from allele names | a V name without `*` joins the gene of a `*`-named relative within about 2 %, or groups with other such names at that level (`gene=`; ALGORITHM §3a); the 8.2 pp V allele loss at 30 % SHM with every `*` replaced is now +0.10 pp (not significant); names with `*` keep their genes |
 | §0 13 (part) options without their database | `--c-evalue`, `--c-prefix-identity` above 0 and `--double-d all` or `long-span` are refused without `--c` or `--d`, on the command line and in the WebAssembly module; options that only tune a stage the run does not have are run and named in a warning, as are the D alleles the double-D screen cannot see |
 
@@ -100,8 +100,9 @@ open in part, from that review:
     real D of a read that stops before its J or starts after its V. Swig
     0.39.5 combines the two: under the guards a D at a read's open end is
     called when it pays the cost, and with `--d-open-flank off` not at all
-    (0.39.4's calls). The figures below are without the guards; with them
-    (0.39.5) a V followed by 100 random bases gets a D in 3.2 % of 600
+    (0.39.4's calls on the shipped references and the suite's databases).
+    The figures below are without the guards; with them (0.39.5) a V
+    followed by 100 random bases gets a D in 3.2 % of 600
     D-free reads, 100 random bases followed by a J in 9.5 %, 60 random
     bases after the V in 77.3 %, 30 after the V in 72.8 % and 30 before the
     J in 79.3 % (`--calls fixed`: 2.2, 10.7, 86.7, 82.8 and 88.2 %; 0.39.3:
@@ -124,7 +125,24 @@ open in part, from that review:
     before the J in 79.8 %. Such a chance D sits where the real D of a
     truncated read sits, so no length or window term separates them; only
     `P*_D` itself moves them, along the curve of D accuracy against D-free
-    specificity (ASSESSMENT §9.9). The cost assumes N/P regions of at most
+    specificity (ASSESSMENT §9.9).
+
+    Also open since 0.39.5, under the guards: when a full-length read's J
+    (or V) is not found or fails them, the V (J) the read keeps may be
+    called with a D within 60 bases of it (ALGORITHM §4c rule 2). At high
+    SHM that D is often a chance hit, because a heavily mutated V aligns
+    short of its end. On the 3,000 IGH reads at 30 % SHM, 250 reads get a D
+    call that 0.39.4 did not make: 240 called with a V and no J (on 118 of
+    them 0.39.3 found no J either) and 10 with a J and no V. Of the 250, 82
+    are right (D allele 37.76 → 40.61 %), 155 name a wrong allele (96 of
+    them away from the true D) and 13 fall on D-free reads (right "no D"
+    calls 46.51 → 36.43 %). Against 0.39.3, the set loses 28 right D calls
+    and gains 2; on all 28, 0.39.3 called a J that 0.39.5 does not, and 21
+    of them are among the 250. The 60-base reach trades these wrong calls
+    against right Ds far behind a short V alignment: without the reach the
+    set has 25 more right D calls and 1 fewer.
+
+    The cost assumes N/P regions of at most
     about 24 bases: real D calls behind a 26–30-base N2 at a read that
     ends in its J drop by 1.1 pp, behind 31–40 bases by 3.8 pp (N1 of
     31–40 bases at a read that starts there: 1.1 pp); reads that end
@@ -249,6 +267,50 @@ items 10 and 12, it leaves open:
     documentation gives the gate as `S ≥ 19` for the 10 human IGHC genes at
     `s = 7`, and `tests/simulated.rs` describes the hard preset as IgG-like
     SHM (mean 7.7 %), not 30 %.
+
+The final claim check of 0.39.5 found two limits of the D window under
+the guards, left to a later release:
+
+24. **An open-end D lost to a better copy of its allele.** The subsets
+    with an open-end D (item 19) filter the D placements of the window
+    that the V and the dropped J bound, and that window keeps one
+    alignment per D allele. When an allele aligns best across or beyond
+    the 60-base reach, its part within the reach is not a placement, so
+    the read keeps no D of that allele where the same read without the J
+    calls one (ALGORITHM §4c rule 2). On constructed reads with
+    IGHD3-3\*01 or IGHD2-15\*01 ending 67–79 bases after the V and a J
+    beyond the 225-base span, no D is called on 48 of 48; without the J
+    the right D is called on 43 of 48. On igh_shm30, six of the D-call
+    changes among the 277 calls with a V and no J fit this pattern (3
+    would turn right, 3 would gain a wrong D). A fix: for reads whose
+    unguarded optimum breaks the guards, also search the D window of the
+    read without that J (V), per locus, and offer its new placements only
+    to the open-end subsets. The unguarded pass and 0.39.4's paired subsets
+    keep their placements, so reads that keep the guards,
+    `--d-open-flank off` and `--no-pair-guards` stay byte-identical. The D
+    is then searched as on the read without the J, but not always called
+    as on it (`p̂` still counts the dropped J's columns, and the open flank
+    is charged to the read's end). igh_shm30, the cut sets and CPU need
+    measuring first: a proxy suggests about as many new wrong D calls as
+    right ones.
+25. **A chance J narrows the D window.** `d_windows` ends the D window 12
+    bases after the start of the first J placement (window.rs `residual`),
+    even when the call does not use that J because the guards drop it or
+    the adjudicator skips it. A chance J of 10 or more columns between the
+    V and a D at the read's end therefore stops the D search before that
+    D, although it lies within the 60-base reach a read without that J
+    would search; a D already found is cut short there. The window rule
+    predates 0.39.5. A fix, measured on a patched build: when the
+    adjudicator charges the open-flank cost and the J that bounds the
+    window is not significant on its own, also search the window of the
+    read without that J (`bounding_v` already lets only a V significant on
+    its own bound the window). Right D calls on reads cut at the end of
+    their D then rise from 92.2 to 97.8 % (mid) and from 86.3 to 90.3 %
+    (hard), and on reads ending 0–20 bases into their J by 1.7 and 1.5
+    points. The trade-off is more chance Ds on D-free reads (a V then 60
+    random bases: 77.3 → 83.7 %) and about 3 % more CPU, and the
+    D-presence bounds of `tests/open_flank.rs` would need relaxing. Adding
+    that window for every read instead costs 82 TCR D calls.
 
 ## 1. Verdict
 

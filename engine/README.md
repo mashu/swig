@@ -335,7 +335,15 @@ Web and swig-cli always run with them.
   would have searched it: it ends at most 60 bases (the D window's reach,
   `ExpandedResidual::reach`) after the end of the V placement, or starts at
   most 60 bases before the start of the J placement. A J (V) that the guards
-  drop therefore no longer decides where the D may lie. With
+  drop therefore no longer lets the D lie beyond that reach. It still bounds
+  the window the D placements come from, one alignment per D allele: an
+  allele that aligns best across or beyond the 60 bases has no placement
+  within them. The read then keeps no D of that allele there, where the
+  same read without the J would. A chance J between the V and the D can
+  also narrow where the D may lie: the D window ends 12 bases after the
+  first J placement, used or not, so a D at the read's end beyond such a J
+  is not found (on simulated IGH reads cut after their D this costs about
+  5.5 points of right D calls, 92.2 % against 97.8 %). With
   `--d-open-flank off` a D needs a V and a J that pair, as in SwiftIG,
   which paired V and J before it looked for a D, and as in 0.39.4. A path
   of a D alone is never a call.
@@ -356,13 +364,15 @@ value in the read's context (every subset is read at the same divergence
 `p̂`, and its open ends are charged over the whole read's length); an exact
 tie keeps the earlier subset, and a read none of whose subset optima keeps
 the guards is not called. A read whose J does not pair with its V (a
-chance J, or one beyond the junction span) thus keeps its V–D path when
-the D lies within 60 bases of the V's end and pays for the bases after
-it; a D further on is not called beside the V, as on the same read
-without the J. The posteriors are those of the subset that gives the call. As
-in SwiftIG, a chimeric read, a V fragment that stops short of its 3′ end, a
-J aligned only deep inside, or a V and a J hundreds of bases apart then
-keeps its better segment instead of becoming a rearrangement. On 20,000
+chance J, or one beyond the junction span) thus can keep its V–D path
+when the D's alignment ends within 60 bases of the V's end and pays for
+the bases after it. A D further on is not called beside the V, as on the
+same read without the J. Nor is the part within the 60 bases of a D whose
+allele aligns best across or beyond them. The posteriors are those of
+the subset that gives the call. As in SwiftIG, a chimeric read, a V
+fragment that stops short of its 3′ end, a J aligned only deep inside, or
+a V and a J hundreds of bases apart then keeps its better segment instead
+of becoming a rearrangement. On 20,000
 simulated human BCR reads per preset the guards changed the V, D or J call
 or its coordinates on 0 mid and 9 hard reads, and CPU time is unchanged
 (within ±2 % on 10,000 simulated reads, one thread).
@@ -407,18 +417,21 @@ on D-free reads (600 mid reads each):
 | D called, a V then 100 random bases / 100 random bases then a J | 93.5 / 97.7 % | 0.2 / 0.0 % | 3.2 / 9.5 % |
 | D called, a V then 30 random bases / 30 random bases then a J | 72.0 / 79.8 % | 0.0 / 0.0 % | 72.8 / 79.3 % |
 
-On full-length reads 0.39.5 calls as 0.39.4 does, except where the J of a
-read is missed or fails the guards: on the frozen suite only 3 IGH hard
-reads (3 right D gained) and 250 IGH reads at 30 % SHM change a D call
-(82 right D gained, none lost; the D-presence Brier score falls from 0.123
-to 0.042). Most of these new D calls are wrong: of the 250, 155 name a
+On full-length reads 0.39.5 calls as 0.39.4 does, except where the J (or
+V) of a read is missed or fails the guards: on the frozen suite only 3 IGH
+hard reads (3 right D gained) and 250 IGH reads at 30 % SHM change a D
+call (82 right D gained, none lost; the D-presence Brier score falls from
+0.123 to 0.042). Of the 250, 240 are called with a V and no J and 10 with
+a J and no V. Most of these new D calls are wrong: of the 250, 155 name a
 wrong allele (96 of them away from the true D) and 13 fall on D-free reads,
 because a heavily mutated V aligns short of its end and the D found within
-60 bases of it is often a chance hit. Against 0.39.3, which kept the J,
-those reads lose 28 right D calls and gain 2. With `--no-pair-guards`
-the calls are those of 0.39.3 with the open-flank cost, except for C and
-FWR3; with `--d-open-flank off` they are 0.39.4's, byte for byte on the
-suite's databases.
+60 bases of it is often a chance hit. Against 0.39.3, the set's 3,000
+reads lose 28 right D calls and gain 2. On all 28, 0.39.3 called a J that
+0.39.5 does not. 21 are among the 250, and on the other 7 neither 0.39.4
+nor 0.39.5 calls a D. With `--no-pair-guards` the calls are those of
+0.39.3 with the open-flank cost, except for C and FWR3; with
+`--d-open-flank off` they are 0.39.4's, byte for byte on the suite's
+databases.
 
 One cost remains: a V of 30–60 bases before a J of another locus can still
 pair with a J of its own locus that aligns to the read well enough to be

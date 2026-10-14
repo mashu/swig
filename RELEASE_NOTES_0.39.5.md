@@ -26,13 +26,16 @@ they apply to.
 
 With the shipped references, calls change against 0.39.4 only on reads
 where a D has no J after it or no V before it: reads that stop at their D or
-start after their V, and full-length reads whose J (or V) the guards drop.
+start after their V, and full-length reads whose J (or V) is not found or
+fails the guards.
 On the 29,500 simulated reads of the frozen suite:
 - the IGH easy and mid, BCR and TCR sets, and 1,000 IGK reads run against
   the IGH database, give 0.39.4's AIRR byte for byte;
 - on IGH hard, 3 reads gain a right D call and some posteriors move;
-- on the IGH set at 30 % SHM, 250 reads whose J is mutated beyond pairing
-  change their D call (see "Full-length reads whose J the guards drop").
+- on the IGH set at 30 % SHM, 250 full-length reads gain a D call: 240
+  called with a V and no J (on 122 of them the guards drop the J that
+  0.39.3 called; on the other 118, 0.39.3 found no J either) and 10 called
+  with a J and no V (see "Full-length reads whose J the guards drop").
 
 ## What changes for users
 
@@ -51,8 +54,12 @@ On the 29,500 simulated reads of the frozen suite:
   The cost has a ceiling (6.2 nats), so a database that lacks the read's J
   or V cannot erase every D. Such a D must also lie where a read without
   that J (V) would have searched it: it ends at most 60 bases after the V
-  (starts at most 60 bases before the J). A V and a J are still paired only
-  under 0.39.4's guards.
+  (starts at most 60 bases before the J). The D is still one of the
+  alignments found in the window up to that J (back to that V), one per D
+  allele. So a D that ends more than 60 bases after the V, or whose allele
+  aligns better farther on, is not called even in part, where the same
+  read without the J calls its part within the 60 bases. A V and a J are
+  still paired only under 0.39.4's guards.
 
   With the frozen suite's IGH database (per read; `--calls fixed` in
   brackets where measured):
@@ -101,7 +108,7 @@ On the 29,500 simulated reads of the frozen suite:
     TRB J alleles from the TCR database.
   - **J posteriors at high SHM.** Paths without a J lose posterior mass, so
     a called J gains some, right or not: at 30 % SHM the J posterior rises
-    on 755 of 2,597 reads with the same J call as 0.39.4 (falls on 8), and
+    on 802 of 2,597 reads with the same J call as 0.39.4 (falls on 8), and
     its Brier score on them goes from 0.2797 to 0.2814.
 
   `--d-open-flank off` turns the cost off and with it the D at a read's open
@@ -117,15 +124,27 @@ On the 29,500 simulated reads of the frozen suite:
   from the V), 0.39.4 called the V alone, 0.39.3 the V, a D and the J.
   0.39.5 may also call the V with a D within 60 bases of it, which pays the
   open-flank cost over the bases after it; a D further on is not called
-  beside the V, as on the same read without the J. On the 3,000 IGH reads
-  at 30 % SHM against 0.39.4, 250 reads change their D call: 82 gain a
-  right D (none lose one), and D allele accuracy rises from 37.76 to
-  40.61 %, the D-presence Brier score falls from 0.123 to 0.042. But most
-  of the new calls are wrong: 155 name a wrong allele (96 of them away
-  from the true D) and 13 fall on D-free reads (right "no D" calls 46.51 →
-  36.43 %), because a heavily mutated V aligns short of its end and the D
-  found within 60 bases of it is often a chance hit. Against 0.39.3, which
-  kept the J, those reads lose 28 right D calls and gain 2 (−0.91 points).
+  beside the V, as on the same read without the J. Unlike that read, it
+  also loses a D that runs past the 60 bases, or whose allele aligns better
+  past them; the read without the J calls the part within them.
+
+  On the 3,000 IGH reads at 30 % SHM against 0.39.4, 250 reads gain a D
+  call. 240 of them are called with a V and no J. On 122 of these 0.39.3
+  had called the J; on the other 118 it found no J either and called the V
+  and a D. The other 10 are called with a J and no V (5 had a V in 0.39.3).
+  82 gain a right D (23 of the 122, 54 of the 118 and 5 of the 10; none
+  lose one), and D allele accuracy rises from 37.76 to 40.61 %, the
+  D-presence Brier score falls from 0.123 to 0.042. But most of the new
+  calls are wrong: 155 name a wrong allele (96 of them away from the true
+  D) and 13 fall on D-free reads (right "no D" calls 46.51 → 36.43 %),
+  mostly because a heavily mutated V aligns short of its end and the D
+  found within 60 bases of it is often a chance hit.
+
+  Against 0.39.3, the 3,000 reads lose 28 right D calls and gain 2 (−0.91
+  points). On all 28, 0.39.3 called a J that 0.39.5 does not. 21 of them,
+  and both gains, are among the 250. On the other 7, neither 0.39.4 nor
+  0.39.5 calls a D: on 6 the D lies more than 60 bases past the V, and the
+  seventh gets no call at all.
 - **IgT, IgZ and IgO constant genes.** An IGH constant gene is now
   recognised by any isotype letter: A, D, E, F, G, M, O, T, W, X, Y, Z
   (`IGHT2D`, `IGHZ`, `IGHO`).
@@ -165,14 +184,15 @@ On the 29,500 simulated reads of the frozen suite:
   | Custom-named alleles | 0.39.4 (as 0.39.3) | 0.39.5 |
   |---|---|---|
   | every D of the BCR database: light-chain reads with a D | 1,077 of 5,000 | 0, as with IMGT names |
-  | every D of the TCR database: TRA reads with a D | 839 | 0 |
+  | every D of the TCR database: TRA reads with a D | 839 | 0; TRB reads still get TRD D alleles, as in 0.39.4: D allele accuracy is 3.63 points below IMGT names (76 reads), and 53 TRB reads with no D get one (see Limits) |
   | every J of the BCR database: calls against IMGT names | 4 junctions lost (0.39.3: C allele −0.74 points) | equal |
-  | every V of the BCR database: calls against IMGT names | same accuracy; 7 of 7,500 reads change their tied alleles (0.39.3: 4) | equal on all 7,500 reads |
+  | every V of the BCR database: calls against IMGT names | 4 junctions lost, as with custom J names; 7 of 7,500 reads change: 6 lose their junction, 4 list more tied alleles (0.39.3: same accuracy; 4 reads list more tied alleles) | equal on all 7,500 reads |
   | every allele of an IGH database: reads with no `locus` | all 5,000 | none |
 
   Limits:
   - D genes are too short to place by relatives. Custom-named TRB and TRD D
-    alleles both fall back to TRB and TRD, so they need a `locus=` key.
+    alleles both fall back to TRB and TRD, so they need a `locus=` key. With
+    the key, calls on the suite's 5,000 TCR reads equal those with IMGT names.
   - Loading 20 custom-named alleles takes about 12 ms more. Loading 705
     custom-named human BCR V alleles takes about 60 ms more, but a run on
     such a database is now faster: 7,500 BCR reads take 3.2 s instead of
@@ -185,10 +205,10 @@ On the 29,500 simulated reads of the frozen suite:
     gene with the other V alleles without `*` that it reaches through steps
     of about 2 % or less.
   - On the suite's IGH reads at 30 % SHM, with every `*` removed, V allele
-    accuracy is now 0.10 points above IMGT names; in 0.39.3 it was 8.20
-    points below.
+    accuracy is now 0.10 points above IMGT names; in 0.39.4, as in 0.39.3,
+    it was 8.20 points below.
   - With 20 % of names hidden, it is 0.03 points above; it was 1.77 points
-    below.
+    below in both.
   - Names with `*`, as in every shipped reference, keep their genes.
 - **Custom references in Swig Web and `swig-cli`.**
   - A Swig Web reference cell is one locus, so a custom record in it
@@ -215,7 +235,9 @@ On the 29,500 simulated reads of the frozen suite:
 
   Where the refusal happens on each route:
   - `swig` binary: exit 2 with the usage, before any database is read.
-  - WebAssembly module: refuses to start.
+  - WebAssembly module: `swig_init_database` returns −1 with the message in
+    the error buffer. When the option is set after the database is loaded,
+    the next `swig_annotate` does this instead.
   - Swig Web: refuses the C gate before a run without a C reference.
   - `swig-cli`: on the config route, `annotation.minimumConstantPrefixIdentity`
     above 0 needs C germlines and `annotation.doubleD` (`all` or
@@ -260,16 +282,24 @@ paired on the same reads and scored by the 0.39.1 evaluator:
 | IGK reads against the IGH database | 1,000 | 0 (same bytes) | — |
 
 Against 0.39.3 the losses are 0.39.4's: junctions from aligned anchors
-(IGH hard −3.46 points, 30 % SHM −40.94), its C rules (−1.90 and −5.80)
-and its pair guards (J allele at 30 % SHM −1.80 points, 57 lost and 3
-gained; 1 V and 1 J elsewhere), plus 28 D calls lost and 2 gained at 30 %
-SHM where the guards drop the J (above).
+(IGH mid −0.49 points, hard −3.46, 30 % SHM −40.94, BCR −0.61, TCR 1
+read), its C rules (C allele on IGH easy −1.27 points, mid −1.50, hard
+−1.90, 30 % SHM −5.80, BCR −2.11, TCR −1.86, and 1 C called on a C-free
+IGH hard read) and its pair guards (at 30 % SHM, J allele −1.80 points with
+57 lost and 3 gained, and 1 V lost; on IGH hard, 1 J lost). At 30 % SHM the
+reads whose J the guards drop (above) also lose 28 right D calls and gain 2
+(−0.91 points; 0.39.4 lost 108). Their D allele and D-presence Brier
+scores rise from 0.2085 to 0.2109 and from 0.0367 to 0.0424 (paired t 3.21
+and 3.52), almost all of it on those reads.
 
 Other real and simulated data:
 - **Macaque.** On two macaque repertoires of 12,229 and 13,698 D calls, no D
   call changes against 0.39.4.
-- **Shipped references of other species.** On the IMGT pack's sets, 1 call
-  of 22,000 changes against 0.39.4 (a D on the platyfish set).
+- **Shipped references.** On 11 sets of 2,000 reads simulated from the IMGT
+  pack's references (human and mouse BCR and TCR, six sets of four fish
+  species and one of the platypus), 1 call of 22,000 changes against
+  0.39.4: a platypus read with no J call gains a D, the true allele tied
+  with one other. Elsewhere only J posteriors move, on 17 reads.
 
 ## Timing
 
@@ -282,9 +312,10 @@ against 0.39.4:
 Loading a database does a little more work even when every allele names
 its locus: each header is checked for a `gene=` key, and the open-flank
 cost is set up for each locus. On the suite's human references that adds
-about 0.2 % to the load's instructions for IGH, 0.4 % for BCR and 0.9 % for
-TCR, under 1 ms. Alleles that name no locus add more (see "Alleles with
-custom names").
+about 0.2 % to the load's instructions for IGH, 0.3 % for BCR and 0.9 % for
+TCR (callgrind, one thread, no reads; each figure moves by up to 0.1 point
+with memory layout), under 1 ms. Alleles that name no locus add more (see
+"Alleles with custom names").
 
 ## For developers
 
@@ -323,6 +354,9 @@ custom names").
 `engine/docs/REVIEW.md` §0 lists what this release does not fix. Among them:
 - chance Ds within about 30 bases of the V or J of a truncated read;
 - wrong D calls beside a heavily mutated V whose J the guards drop (above);
+- a chance J between the V and a D at the read's end, which ends the D
+  window before that D (on simulated IGH reads cut after their D, about 5.5
+  points of right D calls);
 - real Ds behind N regions longer than about 24 bases at a read's open end,
   and the J-posterior calibration at high SHM described above;
 - custom-named D alleles in a database holding TRB and TRD, which need a
