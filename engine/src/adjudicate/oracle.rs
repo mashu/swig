@@ -6,10 +6,10 @@
 use std::collections::{HashMap, HashSet};
 
 use super::decode::{Topology, Within};
-use super::units::ReadModel;
+use super::units::{Columns, Flank, FlankTable, ReadContext, ReadModel};
 use super::{
-    Adjudicator, CalledSegment, DagScratch, EngineeringObjective, EvidenceModel, Grammar, Mode,
-    PathModel, PathScore, PlacementDag, Units, VdjGrammar, divergence,
+    Adjudicator, CallModel, CalledSegment, DagScratch, EngineeringObjective, EvidenceModel,
+    Grammar, Mode, PathModel, PathScore, PlacementDag, Units, VdjGrammar, divergence,
 };
 use crate::alphabet::encode;
 use crate::config::{DefaultAssigner, EngineConfig};
@@ -28,12 +28,14 @@ const TANDEM_D: VdjGrammar = VdjGrammar {
 /// Exhaustive search of the segmentation model: every path of `grammar`, and
 /// for every transition every canonical exit cut `x` and every canonical
 /// entry cut `y ≥ x` of the next placement, with no shortcut, valued term by
-/// term under `read`. Memoised on `(placement, entry, D count, first)`.
+/// term under `read` and the open-flank costs `flank`. Memoised on
+/// `(placement, entry, D count, first)`.
 struct Brute<'a, G = VdjGrammar> {
     dag: &'a PlacementDag,
     grammar: &'a G,
     placements: &'a [Placement],
     read: ReadModel,
+    flank: &'a FlankTable,
     memo: HashMap<(usize, u32, u8, SegmentKind), Option<PathScore<Units>>>,
 }
 
@@ -43,8 +45,13 @@ fn cuts(p: &Placement) -> (Vec<u32>, Vec<u32>) {
 }
 
 impl<'a> Brute<'a> {
-    fn new(dag: &'a PlacementDag, placements: &'a [Placement], read: ReadModel) -> Self {
-        Self::within(dag, &dag.grammar, placements, read)
+    fn new(
+        dag: &'a PlacementDag,
+        placements: &'a [Placement],
+        read: ReadModel,
+        flank: &'a FlankTable,
+    ) -> Self {
+        Self::within(dag, &dag.grammar, placements, read, flank)
     }
 }
 
@@ -55,14 +62,21 @@ impl<'a, G: Grammar> Brute<'a, G> {
         grammar: &'a G,
         placements: &'a [Placement],
         read: ReadModel,
+        flank: &'a FlankTable,
     ) -> Self {
         Self {
             dag,
             grammar,
             placements,
             read,
+            flank,
             memo: HashMap::new(),
         }
+    }
+
+    /// The open-flank cost of a path that starts or ends at `p`.
+    fn open(&self, side: Flank, p: &Placement) -> Units {
+        self.flank.units(side, p.kind, p.q_start(), p.q_end())
     }
 
     fn min(&self, kind: SegmentKind) -> u32 {
@@ -119,7 +133,8 @@ impl<'a, G: Grammar> Brute<'a, G> {
             consider(PathScore {
                 score: self.clip(pb, entry, pb.q_end())
                     + bonus
-                    + self.read.prior(model.end(first, pb.kind, d_used)),
+                    + self.read.prior(model.end(first, pb.kind, d_used))
+                    - self.open(Flank::End, pb),
                 d_count: d_used,
                 support: pb.score(),
             });
@@ -130,6 +145,17 @@ impl<'a, G: Grammar> Brute<'a, G> {
             // in order of start.
             let same_kind_before = pe.kind == pb.kind && pe.q_start() <= pb.q_start();
             if same_kind_before || !grammar.can_follow(pb.kind, pe.kind, d_used) {
+                continue;
+            }
+            // A V that cannot open a D's flank, a J that cannot close one.
+            let closes = self.flank.closes();
+            let blocked = !closes.is_empty()
+                && match (pb.kind, pe.kind) {
+                    (SegmentKind::V, SegmentKind::D) => !closes[b],
+                    (SegmentKind::D, SegmentKind::J) => !closes[e],
+                    _ => false,
+                };
+            if blocked {
                 continue;
             }
             let d_next = d_used + u8::from(pe.kind == SegmentKind::D);
@@ -171,7 +197,13 @@ impl<'a, G: Grammar> Brute<'a, G> {
             .filter(|&s| self.grammar.can_start(self.placements[s].kind))
             .filter_map(|s| {
                 let p = &self.placements[s];
-                self.best_from(s, p.q_start(), u8::from(p.kind == SegmentKind::D), p.kind)
+                let start = self.open(Flank::Start, p);
+                let rest =
+                    self.best_from(s, p.q_start(), u8::from(p.kind == SegmentKind::D), p.kind)?;
+                Some(PathScore {
+                    score: rest.score - start,
+                    ..rest
+                })
             })
             .max()
     }
@@ -193,7 +225,12 @@ impl<'a, G: Grammar> Brute<'a, G> {
             }
         }
         let (first, last) = (kind(&segments[0]), kind(&segments[segments.len() - 1]));
-        value + self.read.prior(self.dag.model.end(first, last, d_used))
+        let start = self.open(Flank::Start, &self.placements[segments[0].placement]);
+        let end = self.open(
+            Flank::End,
+            &self.placements[segments[segments.len() - 1].placement],
+        );
+        value + self.read.prior(self.dag.model.end(first, last, d_used)) - start - end
     }
 }
 
@@ -210,8 +247,19 @@ fn dag_and_brute(
     read: ReadModel,
     scratch: &mut DagScratch,
 ) -> (Option<PathScore<Units>>, Option<PathScore<Units>>) {
-    let fast = dag.viterbi(placements, &read, scratch);
-    let mut brute = Brute::new(dag, placements, read);
+    dag_and_brute_with(dag, placements, read, &FlankTable::default(), scratch)
+}
+
+/// [`dag_and_brute`] with the open-flank costs of `flank`.
+fn dag_and_brute_with(
+    dag: &PlacementDag,
+    placements: &[Placement],
+    read: ReadModel,
+    flank: &FlankTable,
+    scratch: &mut DagScratch,
+) -> (Option<PathScore<Units>>, Option<PathScore<Units>>) {
+    let fast = dag.viterbi(placements, &read, flank, scratch);
+    let mut brute = Brute::new(dag, placements, read, flank);
     if let Some((key, segments)) = &fast {
         assert_eq!(brute.rescore(segments), key.score, "traced path re-scored");
     }
@@ -229,14 +277,9 @@ fn dag_equals_brute_force_on_hypermutated_igsim_reads() {
     let assigner =
         DefaultAssigner::from_config(&config, db.v.clone(), Some(db.d.clone()), db.j.clone())
             .unwrap();
-    let base = config.objective.resolve(
-        &db.v,
-        &config.v.scoring,
-        Some(&db.d),
-        &config.d,
-        &db.j,
-        &config.j.scoring,
-    );
+    let base = config
+        .objective
+        .resolve(&db.v, &config.v, Some(&db.d), &config.d, &db.j, &config.j);
     let sim = Simulator::new(&db.v, Some(&db.d), &db.j, SimParams::hard()).unwrap();
     let mut ws = assigner.workspace();
     let mut scratch = DagScratch::default();
@@ -288,14 +331,9 @@ fn per_read_dag_equals_exhaustive_enumeration() {
     let assigner =
         DefaultAssigner::from_config(&config, db.v.clone(), Some(db.d.clone()), db.j.clone())
             .unwrap();
-    let base = config.objective.resolve(
-        &db.v,
-        &config.v.scoring,
-        Some(&db.d),
-        &config.d,
-        &db.j,
-        &config.j.scoring,
-    );
+    let base = config
+        .objective
+        .resolve(&db.v, &config.v, Some(&db.d), &config.d, &db.j, &config.j);
     let evidence =
         EvidenceModel::new([&config.v.scoring, &config.d.scoring, &config.j.scoring]).unwrap();
     let delta0 = evidence.log_odds_divergence(SegmentKind::D);
@@ -315,9 +353,12 @@ fn per_read_dag_equals_exhaustive_enumeration() {
                     ..base
                 };
                 let dag = PlacementDag::new(TANDEM_D, objective, config.min_retained, Mode::Fixed);
-                let Some((fixed_key, fixed_path)) =
-                    dag.viterbi(&placements, &fixed(&dag), &mut scratch)
-                else {
+                let Some((fixed_key, fixed_path)) = dag.viterbi(
+                    &placements,
+                    &fixed(&dag),
+                    &FlankTable::default(),
+                    &mut scratch,
+                ) else {
                     continue;
                 };
                 let own = divergence(&placements);
@@ -325,7 +366,9 @@ fn per_read_dag_equals_exhaustive_enumeration() {
                     let model = ReadModel::at(&evidence, p, objective.presence);
                     let (fast, exhaustive) = dag_and_brute(&dag, &placements, model, &mut scratch);
                     assert_eq!(fast, exhaustive, "p {p}, iota {iota}");
-                    let (_, path) = dag.viterbi(&placements, &model, &mut scratch).unwrap();
+                    let (_, path) = dag
+                        .viterbi(&placements, &model, &FlankTable::default(), &mut scratch)
+                        .unwrap();
                     differs += usize::from(path != fixed_path);
                     checked += 1;
                 }
@@ -342,7 +385,9 @@ fn per_read_dag_equals_exhaustive_enumeration() {
                 let model = ReadModel::at(&evidence, delta0, integer.model.presence);
                 let (fast, exhaustive) = dag_and_brute(&integer, &placements, model, &mut scratch);
                 assert_eq!(fast, exhaustive, "δ0, iota {iota}");
-                let (key, path) = integer.viterbi(&placements, &model, &mut scratch).unwrap();
+                let (key, path) = integer
+                    .viterbi(&placements, &model, &FlankTable::default(), &mut scratch)
+                    .unwrap();
                 assert_eq!(path, fixed_path, "the fixed-scale path at δ0");
                 assert_eq!(
                     (key.score, key.d_count, key.support),
@@ -376,14 +421,10 @@ fn conditioned_dag_equals_exhaustive_enumeration() {
     let assigner =
         DefaultAssigner::from_config(&config, db.v.clone(), Some(db.d.clone()), db.j.clone())
             .unwrap();
-    let objective = config.objective.resolve(
-        &db.v,
-        &config.v.scoring,
-        Some(&db.d),
-        &config.d,
-        &db.j,
-        &config.j.scoring,
-    );
+    let objective =
+        config
+            .objective
+            .resolve(&db.v, &config.v, Some(&db.d), &config.d, &db.j, &config.j);
     let evidence =
         EvidenceModel::new([&config.v.scoring, &config.d.scoring, &config.j.scoring]).unwrap();
     let dag = PlacementDag::new(VdjGrammar::VDJ, objective, config.min_retained, Mode::Fixed);
@@ -397,7 +438,8 @@ fn conditioned_dag_equals_exhaustive_enumeration() {
         placements.extend(top_by_kind(&call.placements, SegmentKind::D, 6));
         placements.extend(top_by_kind(&call.placements, SegmentKind::J, 3));
         let model = ReadModel::at(&evidence, divergence(&placements), objective.presence);
-        let Some((key, path)) = dag.viterbi(&placements, &model, &mut scratch) else {
+        let none = FlankTable::default();
+        let Some((key, path)) = dag.viterbi(&placements, &model, &none, &mut scratch) else {
             continue;
         };
         let kind = |s: &CalledSegment| placements[s.placement].kind;
@@ -406,7 +448,7 @@ fn conditioned_dag_equals_exhaustive_enumeration() {
             last: kind(&path[path.len() - 1]),
             d_count: key.d_count,
         };
-        let all = dag.conditioned(&placements, |_| true, topology, &model, &mut scratch);
+        let all = dag.conditioned(&placements, |_| true, topology, &model, &none, &mut scratch);
         assert_eq!(all, Some((key, path.clone())));
         let within = Within {
             grammar: &dag.grammar,
@@ -414,12 +456,12 @@ fn conditioned_dag_equals_exhaustive_enumeration() {
         };
         for d in (0..placements.len()).filter(|&i| placements[i].kind == SegmentKind::D) {
             let keep = |i: usize| placements[i].kind != SegmentKind::D || i == d;
-            let fast = dag.conditioned(&placements, keep, topology, &model, &mut scratch);
+            let fast = dag.conditioned(&placements, keep, topology, &model, &none, &mut scratch);
             let kept: Vec<Placement> = (0..placements.len())
                 .filter(|&i| keep(i))
                 .map(|i| placements[i].clone())
                 .collect();
-            let exhaustive = Brute::within(&dag, &within, &kept, model).best();
+            let exhaustive = Brute::within(&dag, &within, &kept, model, &none).best();
             assert_eq!(fast.as_ref().map(|(key, _)| *key), exhaustive);
             if let Some((key, segments)) = fast {
                 assert!(segments.iter().all(|s| keep(s.placement)));
@@ -454,14 +496,9 @@ fn dag_equals_brute_force_over_all_paths_and_cuts() {
             .unwrap();
     let model = EngineeringObjective {
         insertion_per_base: -1,
-        ..config.objective.resolve(
-            &db.v,
-            &config.v.scoring,
-            Some(&db.d),
-            &config.d,
-            &db.j,
-            &config.j.scoring,
-        )
+        ..config
+            .objective
+            .resolve(&db.v, &config.v, Some(&db.d), &config.d, &db.j, &config.j)
     };
     let dag = PlacementDag::new(TANDEM_D, model, [10, 3, 6], Mode::Fixed);
     let params = SimParams {
@@ -509,5 +546,135 @@ fn dag_equals_brute_force_over_all_paths_and_cuts() {
     assert!(
         distinct_topologies.len() >= 3,
         "test should exercise VJ, VDJ and VDDJ paths"
+    );
+}
+
+/// The open-flank cost at a path's ends ([`FlankTable`]) on the pipeline's
+/// placements of mid and hypermutated reads cut 0–80 bases before and after
+/// a D, so that paths start or end on a D with or without a V or J, at
+/// random anchored columns, at two allowances, with the cost on and
+/// off: the DAG's key equals the exhaustive search under the per-read and
+/// the fixed model, its traced path re-scores to it, and `path_score`
+/// reports the oracle's fixed-scale value of that path. Some reads hold a
+/// V or J that cannot pay for itself, which then neither opens nor closes
+/// a D's flank ([`FlankTable::closes`]).
+#[test]
+fn open_flank_dag_equals_exhaustive_enumeration() {
+    let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 11);
+    let config = EngineConfig::default();
+    let assigner =
+        DefaultAssigner::from_config(&config, db.v.clone(), Some(db.d.clone()), db.j.clone())
+            .unwrap();
+    let base = config
+        .objective
+        .resolve(&db.v, &config.v, Some(&db.d), &config.d, &db.j, &config.j);
+    let resolved = base
+        .open_flank
+        .expect("the open-flank cost is on by default");
+    let evidence =
+        EvidenceModel::new([&config.v.scoring, &config.d.scoring, &config.j.scoring]).unwrap();
+    let mut rng = crate::sim::Rng::new(29);
+    let mut ws = assigner.workspace();
+    let mut scratch = DagScratch::default();
+    let (mut table, mut fixed_table) = (FlankTable::default(), FlankTable::default());
+    let (mut checked, mut charged, mut differs, mut blocked) = (0, 0, 0, 0);
+    for preset in [SimParams::mid(), SimParams::hard()] {
+        let sim = Simulator::new(&db.v, Some(&db.d), &db.j, preset).unwrap();
+        for read in sim.reads(30, 13).unwrap() {
+            let call = assigner.assign(&encode(&read.sequence), &mut ws);
+            let Some(d) = top_by_kind(&call.placements, SegmentKind::D, 1).pop() else {
+                continue;
+            };
+            let (lead, trail) = (rng.below(81) as u32, rng.below(81) as u32);
+            let lo = d.q_start().saturating_sub(lead) as usize;
+            let hi = (d.q_end() + trail).min(call.query.len() as u32) as usize;
+            let cut = assigner.assign(&call.query[lo..hi], &mut ws);
+            let mut all = top_by_kind(&cut.placements, SegmentKind::V, 3);
+            all.extend(top_by_kind(&cut.placements, SegmentKind::D, 6));
+            all.extend(top_by_kind(&cut.placements, SegmentKind::J, 3));
+            // With and without the V or the J: paths that start or end on a D.
+            for dropped in [None, Some(SegmentKind::V), Some(SegmentKind::J)] {
+                let placements: Vec<Placement> = all
+                    .iter()
+                    .filter(|p| Some(p.kind) != dropped)
+                    .cloned()
+                    .collect();
+                if !placements.iter().any(|p| p.kind == SegmentKind::D) {
+                    continue;
+                }
+                let mut context = ReadContext::of(&placements, cut.query.len() as u32);
+                let columns = 30 + rng.below(120);
+                context.anchored = Columns {
+                    columns,
+                    mismatches: rng.below(columns * 2 / 5),
+                };
+                for n_open in [24, 12] {
+                    let flank = super::ResolvedOpenFlank { n_open, ..resolved };
+                    let objective = EngineeringObjective {
+                        open_flank: Some(flank),
+                        ..base
+                    };
+                    let dag =
+                        PlacementDag::new(TANDEM_D, objective, config.min_retained, Mode::Fixed);
+                    for calls in [CallModel::PerRead, CallModel::FixedScale] {
+                        let read = match calls {
+                            CallModel::PerRead => {
+                                ReadModel::at(&evidence, context.divergence, objective.presence)
+                            }
+                            CallModel::FixedScale => fixed(&dag),
+                        };
+                        let mut keys = [None, None];
+                        for (k, on) in [true, false].into_iter().enumerate() {
+                            let model = on.then_some(&flank);
+                            table.fill(
+                                model,
+                                objective.presence,
+                                &read,
+                                calls,
+                                &context,
+                                &placements,
+                            );
+                            blocked += usize::from(table.closes().iter().any(|&c| !c));
+                            let (fast, exhaustive) =
+                                dag_and_brute_with(&dag, &placements, read, &table, &mut scratch);
+                            assert_eq!(fast, exhaustive, "{n_open} {calls:?} on {on}");
+                            keys[k] = fast;
+                            let Some((_, segments)) =
+                                dag.viterbi(&placements, &read, &table, &mut scratch)
+                            else {
+                                continue;
+                            };
+                            checked += 1;
+                            // The reported fixed score is the oracle's fixed value.
+                            fixed_table.fill(
+                                model,
+                                objective.presence,
+                                &fixed(&dag),
+                                CallModel::FixedScale,
+                                &context,
+                                &placements,
+                            );
+                            let oracle = Brute::new(&dag, &placements, fixed(&dag), &fixed_table)
+                                .rescore(&segments);
+                            let reported = dag.path_score(&placements, &segments, &table);
+                            assert_eq!(Units::from(reported.score), oracle);
+                            let ends = [
+                                (Flank::Start, &segments[0]),
+                                (Flank::End, &segments[segments.len() - 1]),
+                            ];
+                            charged += usize::from(ends.iter().any(|(side, s)| {
+                                let p = &placements[s.placement];
+                                table.units(*side, p.kind, p.q_start(), p.q_end()) > 0
+                            }));
+                        }
+                        differs += usize::from(keys[0] != keys[1]);
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        checked >= 600 && charged >= 50 && differs >= 20 && blocked >= 20,
+        "{checked} optima, {charged} charged, {differs} changed by the cost, {blocked} blocking"
     );
 }

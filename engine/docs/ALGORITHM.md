@@ -77,6 +77,7 @@ order of their alignment starts.
 ```text
 score(path) = Σ_segments S_clip(segment)
             − P_V · #V − P_D · #D − P_J · #J
+            − c_open(first) − c_open(last)                       (D-first / D-last paths)
             + pair_bonus · [path starts with V and ends with J]  (0 by default)
             + insertion_per_base · #N/P bases                    (0 by default)
 ```
@@ -141,6 +142,69 @@ The non-alignment terms are log prior odds in score units:
 - **`pair_bonus`**: the prior odds of a complete V…J rearrangement against a
   partial read. It is 0 by default: on full-length reads the J's own clip
   score completes the path, and values 0–48 changed no call.
+- **`c_open`, the open flank** (`ObjectiveConfig::open_flank`,
+  `--d-open-flank on|off`, on by default). A path whose last segment is a D
+  asserts a junction whose J the read does not show in the `x = |read| −
+  d.q_end` bases after the D; one whose first segment is a D, a V missed in
+  the `x = d.q_start` bases before it. That D pays the log-likelihood ratio
+  of the read's bases there under "no junction, or a junction whose J (V)
+  was missed" against "a junction whose J (V) was missed":
+
+  ```text
+  c(x)  = ln(1 + π·(1 − ε_eff(x))/ε_eff(x))          ε_eff(x) = ε(x − N_open)
+  ε(ℓ)  = max(ε_min, min_{ℓ' ≤ ℓ} P[X_ℓ' ≥ k(ℓ')]),   X_ℓ ~ BetaBinomial(min(ℓ, 64), a, b)
+  k(ℓ)  = ⌊(m·ℓ − S_acc)/(m − μ)⌋ + 1                 (ε = 1 while m·ℓ < S_acc)
+  ```
+
+  `k(ℓ)` is the number of mismatches among `ℓ` visible bases of the missing
+  segment, scored ungapped `(m, μ) = (2, −3)`, that keeps them below
+  `S_acc`, the smallest score that segment's stage keeps in a 64-base window
+  (`Significance::min_score(64, accept)`: 24 for the V and 16 for the J of
+  the frozen suite's IGH database). A segment shows when any prefix of its
+  bases does, hence the running minimum. The mismatch rate is uncertain, so
+  it is integrated over `Beta(a, b)` with `a = k + ½`, `b = n − k + ½` from
+  the read's anchored columns: the `k` mismatches among the `n` columns
+  that `p̂` counts (§4, *Divergence*), restricted to V and J placements that
+  reached the anchor gate (all of them when none did), so that junk V or J
+  hits in random sequence cannot inflate the rate. Parameters, none fitted
+  to the chance-D sets:
+
+  | parameter | value | source |
+  |---|---|---|
+  | `N_open` | 24 | simulated distance from a called D to the true J start (V end to D start): p99 18–19, p99.9 22–24; real macaque N1 p99 20 |
+  | `π` | ½ | even odds, as `DPrior::DERIVED` |
+  | visible cap | 64 | `ε` is below 10⁻¹⁰ by 40 bases at `p ≤ 0.2`; bounds the table |
+  | `ε_min` | 10⁻³ | the anchor E-value gate; bounds the cost at `ln(1 + π/ε_min)` = 6.2 nats when the J or V is present but missing from the database |
+  | `S_acc`, `(m, μ)` | per stage | the V and J stages' accept gates and scorings; measured on 300 igh_mid reads cut inside their V (J), Swig 0.39.3 calls the V in 2 % of reads with 9 visible bases, 44 % with 12 and 87 % with 13, the J in 34 % with 7 and 87 % with 8: the stages hide 12 V and 8 J bases, as `S_acc` = 24 and 16 say |
+
+  A locus whose database part has no J (V) cannot show one, so in a
+  multi-locus database its end (start) side costs nothing. A V or J none
+  of whose clips (keeping its outer end) is worth more than its presence
+  cost under the call's model never pays for itself, so it is no evidence
+  of the junction's V or J: it neither precedes nor follows a D
+  (`FlankTable::closes`). Without that rule a junk J of a base or two
+  right after the D closed its flank for less than the cost, and reads
+  that stop before their J got twice as many J calls. At high
+  divergence the missing segment could well have been missed: at 45 anchored
+  columns with 13 mismatches (a J-only read at 30 % SHM) 64 visible bases
+  cost 0.93 nats, against 6.2 on a clean read. With `π = ½` and the cap the
+  cost lies in `[0, 6.2]` nats; it is 0 within the allowance
+  (`x < N_open + ⌈S_acc/m⌉`) and non-decreasing in `x`. It is read once per
+  read into a table (`adjudicate/units.rs`, `FlankTable`): per-read model
+  `round(c·F)` units, fixed scale `Δ = ⌊P*_D + c/λ_D⌋ − ⌊P*_D⌋` (so an
+  integer `S` beats `⌊P*_D⌋ + Δ` exactly when it beats `P*_D + c/λ_D`), the
+  fixed-scale posterior `c` nats. A real D lies within its N/P region and
+  its own unaligned tail of the read end, a chance D anywhere in the
+  window: on 600 D-free reads of a V followed by 100 random bases (vcut100)
+  the D-call rate falls from 93.5 % to 6.8 %, on 100 random bases followed
+  by a J (jcut100) from 97.7 % to 10.2 %, and every full-length suite set
+  keeps its calls (§8, item 2). That needs a derived `P*_D`: the profiles
+  `truth` and `igblast` fix it at 0, a chance D of a dozen points then
+  outweighs the 6.2-nat ceiling, and most stay (vcut100 92.8 %). A geometric N/P length (`ε_eff(x) = Σ_n
+  P(n)·ε(x − 9 − n) + P(N > x − 9)`, mean 6) was measured as the
+  alternative allowance: it traced the same trade-off between far chance
+  Ds and real Ds behind long N regions, and the step won at the stated
+  parameters (REVIEW §0 item 10).
 
 The adjudicator returns the path maximising, lexicographically:
 
@@ -159,7 +223,7 @@ best-supported of those that span the called read bases first: on the fixed
 scale a clip that starts later or ends earlier can tie (the bases it leaves
 net 0), and the row's coordinates and alignment, taken from the first, would
 then drop read bases the N/P regions do not hold. The reported `path_score` is the fixed-scale score
-above, whichever model chose the path.
+above, open-flank terms included, whichever model chose the path.
 
 ### 2.4 Significance
 
@@ -363,9 +427,19 @@ support) of a path prefix that enters there. With a linear N/P score
 
 ```text
 X(b, x)  = exit_b(x) + bonus(b) + max_{y ≤ x − min(b)} [F(b, y) − entry_b(y)]
-F(e, y') = max_b max_{x ≤ y'} [X(b, x) + ι·(y' − x)]          (0 at a path start)
-best     = max_b X(b, end of b) + end(g, b)
+F(e, y') = max_b max_{x ≤ y'} [X(b, x) + ι·(y' − x)]          (−c_open(e) at a path start)
+best     = max_b X(b, end of b) + end(g, b) − c_open(b)
 ```
+
+`c_open` is §2.3's open-flank cost of a D node (0 for V and J): a constant
+of the node and the read, added once where a path starts and once where it
+ends, as `end(g, b)` is. The first segment keeps its start and the last its
+end, so the read bases beyond them are fixed per node and the term breaks no
+separability: Theorem 1 holds with it, and `path_score` (the reported fixed
+score) subtracts the same fixed-scale `Δ` at the two ends. A V or J that
+cannot pay for itself is barred from preceding or following a D when the
+lattice opens its slots (`Lattice::open`), a property of the node pair, so
+both passes read the same domain.
 
 over every exit cut `x` of `b` and every entry cut `y' ≥ x` of `e`. Each term
 depends on one cut only (separability, §3), so:
@@ -477,7 +551,17 @@ paths, placements and pairs of canonical cuts. Checks:
 - two constructed per-read cases: an exact 7-mer D (score 14) against a
   10-mer with a mismatch (15), where the fixed scale takes the 10-mer and the
   read's model at `p̂ = 1.2 %` the 7-mer (9.6 against 8.3 nats); and a D at
-  the fixed floor that wins at `p̂ = 0.3`.
+  the fixed floor that wins at `p̂ = 0.3`;
+- the open-flank cost (`open_flank_dag_equals_exhaustive_enumeration`): mid
+  and hard IgSim reads cut 0–80 bases before and after a D, with all their
+  placements and without the V or the J (so that optima start or end on a
+  D), at random anchored columns, at the step allowances `N_open` = 24 and
+  12, in the per-read and the fixed model, and with the cost on and off:
+  the key equals the oracle's, the traced path re-scores to it, and
+  `path_score` equals the oracle's fixed value of that path.
+  `d_floor_bounds_pruning_with_the_open_flank_cost`
+  checks that pruning every D below `P_D + 1` leaves the fixed-scale call
+  unchanged with the cost on (it is non-negative and D-only).
 
 The exhaustive test on synthetic reads alone separates neither restricted
 search from the exact one: its reads never put mismatches right after a
@@ -528,9 +612,13 @@ entry,
 
 ```text
 X(b, x)  = e^{exit(x) + bonus} · Σ_{y ≤ x − min} F(b, y) · e^{−entry(y)}
-F(e, y') = Σ_b Σ_{x ≤ y'} X(b, x) · e^{ι(y' − x)}          (+ 1 at a path start)
-Z        = Σ_b X(b, end of b) · e^{end(g, b)}
+F(e, y') = Σ_b Σ_{x ≤ y'} X(b, x) · e^{ι(y' − x)}          (+ e^{−c_open(e)} at a path start)
+Z        = Σ_b X(b, end of b) · e^{end(g, b) − c_open(b)}
 ```
+
+The backward pass starts each path end at `e^{end(g, b) − c_open(b)}`.
+`c_open` is read in the call's units over `F` under the per-read call (the
+same quantised value as §4), and as `c` nats under `--calls fixed`.
 
 (all terms in nats), the sum-product twin of §4, and the backward pass mirrors
 them. Every inner sum is a prefix or suffix sum where §4 has a running
@@ -621,7 +709,14 @@ passes (`per_read_call_is_a_mode_of_the_posterior`), the marginals equal the
 exhaustive sums of `e^{units/F}` and the Viterbi key their maximum, on the
 three junction fixtures under VJ, VDJ and VDDJ grammars, with and without an
 N/P cost, at `p̂` = 0.5 %, `δ` and 30 %: the call is a mode of the reported
-posterior.
+posterior. With the open-flank cost on
+(`marginals_equal_exhaustive_summation_with_open_flanks`,
+`call_is_a_posterior_mode_with_open_flank`) the same holds on the fixtures
+with and without their V or J and with up to 60 read bases past them, at
+the step allowances `N_open` = 0 and 2, with and without the floor, at
+clean and mutated anchors, in the fixed-scale and the per-read pair; the
+cost changes some optima, so
+the tests discriminate.
 
 ## 4b. Constant region (`constant.rs`)
 
@@ -727,7 +822,7 @@ step can lose.
 | J scoring | `segment.rs`, `family_bound.rs` | lossless | The same bounds with each gene one frame, its alleles at offset 0 (sound because J is unbanded); ties in allele order. |
 | V/J keep | `segment.rs` | defined | Keep the top 3 alignments with E ≤ 1 by extended score and the top 3 by local score, each plus ties; trace back until the next local score is below the 3rd extended one, which bounds the 3rd local one from below. No length or identity floor: a positive `(2, −3)` local alignment has identity > 3/5 and the E-value implies a length. |
 | J | `retrieve/exhaustive.rs`, `window.rs` | bounded | Every J allele, unbanded, in `[min V end − 12, read end)` when some V placement is an anchor (E ≤ 10⁻³), or the whole read when none is: a chance V hit on a read without V (one starting in CDR3) no longer pushes the window past the J, and only anchors choose the locus of the J and D candidates. Each locus the anchors choose is searched and kept on its own (top 3 per locus), so on a read holding two chains (an scFv) one chain's J alleles cannot crowd out the other's: on 800 scFv reads, light-chain calls without a J went from 20 to 0, and the BCR and TCR suite sets are unchanged. A J can reach back into V only through chance edge matches. Whole-read J search is 18 % slower and changes a few hard-preset calls (D −0.04 pp, J −0.02 pp), none on mid. The J is not placed jointly with the D, yet it does not "eat" it: the D windows reach 12 bases into J and include the conserved-anchor window, and the DAG orders segments by kind, so a D can precede a J whose alignment reaches back over it and the cuts give any J/D overlap to whichever explains it better. With a D remnant ≥ 8 nt (`examples/d_errors.rs`, human IGH), a missing D whose bases the called J covers is 0.00 % of reads on mid and hard, and a true D outside the windows 0 %; whole-read J lets 0.05 % fall outside. |
-| D windows | `window.rs` | bounded | `[V end − 12, best J start + 12)` plus the conserved-anchor window `[V Cys104 + 3, J Trp/Phe118)`, where V is the best V placement that is an anchor (E ≤ 10⁻³). As for J, a V hit that is not an anchor may be a chance hit downstream of the real D (a read that starts in CDR3), so without an anchor the residual starts at the read's start and there is no anchor window; a V stage without E-value gates bounds D by its best hit. On 1,913 simulated IGH reads that start after V, this called 209 more D alleles correctly (+10.9 pp, none lost) and lowered the D-presence Brier score from 0.109 to 0.005; the frozen suite changed one read. Without a J the residual ends 60 bases after V's end, and without a V it starts 60 bases before J's start: a D lies within its N and its own length of the segment the read has (N1 + D and D + N2 are at most 55 in 99.9 % of simulated IGH junctions). This bounds where a chance D can lie on a read that stops before its J or starts after its V, not how often one is called: `P_D` is priced for 25 junction positions, so 30 random bases after V still give a D in 72 % of such reads, and 100 bases in 93.5 % (97.2 % unbounded); the D lies at most 73 bases from the called V instead of 94. That rate is open problem 2 (§8): an N/P length prior. When the anchors share no locus (a read holding two chains, as an scFv does), the best V and the first J may belong to different chains, and the window between them holds neither chain's D; each anchored locus with D genes then bounds a window by its own best anchoring V and first J. On 750 simulated heavy-first scFv reads (BCR suite reads joined by a linker), heavy calls with a D went from 412 to 498 and right D calls from 355 to 429; the frozen suite keeps every call. |
+| D windows | `window.rs` | bounded | `[V end − 12, best J start + 12)` plus the conserved-anchor window `[V Cys104 + 3, J Trp/Phe118)`, where V is the best V placement that is an anchor (E ≤ 10⁻³). As for J, a V hit that is not an anchor may be a chance hit downstream of the real D (a read that starts in CDR3), so without an anchor the residual starts at the read's start and there is no anchor window; a V stage without E-value gates bounds D by its best hit. On 1,913 simulated IGH reads that start after V, this called 209 more D alleles correctly (+10.9 pp, none lost) and lowered the D-presence Brier score from 0.109 to 0.005; the frozen suite changed one read. Without a J the residual ends 60 bases after V's end, and without a V it starts 60 bases before J's start: a D lies within its N and its own length of the segment the read has (N1 + D and D + N2 are at most 55 in 99.9 % of simulated IGH junctions). This bounds where a chance D can lie on a read that stops before its J or starts after its V, not how often one is called: `P_D` is priced for 25 junction positions, so 30 random bases after V still give a D in 72 % of such reads, and 100 bases gave one in 93.5 % (97.2 % unbounded); the D lies at most 73 bases from the called V instead of 94. The open-flank cost (§2.3) removes the far ones (100 bases: 6.8 %); the near ones are open problem 2 (§8). When the anchors share no locus (a read holding two chains, as an scFv does), the best V and the first J may belong to different chains, and the window between them holds neither chain's D; each anchored locus with D genes then bounds a window by its own best anchoring V and first J. On 750 simulated heavy-first scFv reads (BCR suite reads joined by a linker), heavy calls with a D went from 412 to 498 and right D calls from 355 to 429; the frozen suite keeps every call. |
 | D prefilter | `retrieve/lmer_mask.rs` | lossless w.r.t. gates | Shares ≥ 1 L-mer, with `L` derived from the gates (`min_d_match`; 4 with the optional distributed-D gate, by pigeonhole). |
 | D floor | `config.rs`, `adjudicate/model.rs` | lossless for the call | Only for a fixed-scale call without posteriors (`--no-posterior --calls fixed`): score ≥ max(gate floor, `P_D + 1`). By Lemma 1 a D at or below `P_D` adds ≤ 0, and dropping it leaves its neighbours' cuts valid (exit ≤ entry), so the no-D path is at least as good (requires `ι = 0`, the default). With posteriors every admissible D is kept: a D below the floor cannot be called but carries mass `e^{s − P_D}`, and dropping it would bias `d_presence_posterior` down; a per-read call can call it. With several loci the floor is the lowest `P_D` of a locus that has D genes. |
 | C | `constant.rs`, `retrieve/reach.rs` | exact for `\|δ\| ≤ s` | One anchored job per reach class, window `[x − s − 1, n)`, band `[0, 2s]`; the anchor column makes the local optimum the anchored one. Net indel drift inside C beyond `s ∓ δ` truncates the alignment. |
@@ -873,6 +968,22 @@ this objective can do better.
    residual miscalibration tracks is junction length (short junctions want
    1–2 nats more cost, long ones less), which points to a prior on N/P
    lengths, not to the D search.
+
+   *Chance Ds on reads without one.* The far ones are solved by the
+   open-flank cost (§2.3): a chance D more than about 30 bases from the read
+   end it would have to explain (vcut100 93.5 → 6.8 %, jcut100 97.7 →
+   10.2 %, vcut60 89.5 → 73.5 %), with no call changed on the full-length
+   suite sets. The near ones (vcut10/25/30, jcut30, most of vcut60) stay:
+   they sit where a real D in a truncated read sits, so no length or window
+   term separates them; only `P*_D` itself moves them, along the curve
+   above. The open-flank cost assumes N/P regions of at most about 24 bases
+   (the simulator caps N at 18): a real D behind a 26–30-base N2 at a read
+   that ends in its J loses 1.1 pp of D allele calls, behind 31–40 bases
+   3.8 pp (the long-N sets of REVIEW §0 item 10). An N1/N2 gap hinge, the
+   form this item first named, was measured and rejected: −8 to −12 pp D
+   allele at 30 % SHM, where V and J alignments stop early so measured gaps
+   are long while true N regions are short, and little reach on the far
+   chance Ds.
 3. **Calibrated statistics.** Fit gapped λ and K, and an effective database
    size for near-identical alleles, by simulation.
 4. **Annotation without labels.** The FR3 model assumes CDR2 and FR3 lengths

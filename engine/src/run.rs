@@ -111,6 +111,10 @@ pub struct RunOptions {
     pub d_allele: Option<DAlleleDecoding>,
     /// D prior from the D search at this D-presence rate ([`DPrior::Search`]).
     pub d_presence_rate: Option<f64>,
+    /// Charge a D that ends (starts) its path for the J (V) the read would
+    /// show beyond it ([`crate::config::OpenFlank`]); `false` turns the cost
+    /// off.
+    pub d_open_flank: bool,
     /// Call C at an anchored E-value at most this (needs a C database).
     pub c_evalue: Option<f64>,
     /// Report C only where the germline from its first base reaches this
@@ -144,6 +148,7 @@ impl Default for RunOptions {
             calls: None,
             d_allele: None,
             d_presence_rate: None,
+            d_open_flank: true,
             c_evalue: None,
             c_prefix_identity: None,
             min_identity: None,
@@ -194,7 +199,7 @@ fn with_mismatch(scoring: AffineScoring, mismatch: Score) -> AffineScoring {
 
 impl RunOptions {
     /// Every option [`Self::set`] reads, and whether it takes a value.
-    pub const NAMES: [(&'static str, bool); 23] = [
+    pub const NAMES: [(&'static str, bool); 24] = [
         ("profile", true),
         ("chain", true),
         ("strand", true),
@@ -203,6 +208,7 @@ impl RunOptions {
         ("calls", true),
         ("d-allele", true),
         ("d-presence-rate", true),
+        ("d-open-flank", true),
         ("c-evalue", true),
         ("c-prefix-identity", true),
         ("min-identity", true),
@@ -288,6 +294,13 @@ impl RunOptions {
             "d-presence-rate" => {
                 let rate = |v: &str| v.parse().ok().filter(|r: &f64| *r > 0.0 && *r < 1.0);
                 self.d_presence_rate = Some(parsed(name, value, "a rate in (0, 1)", rate)?);
+            }
+            "d-open-flank" => {
+                self.d_open_flank = parsed(name, value, "on or off", |v| match v {
+                    "on" => Some(true),
+                    "off" => Some(false),
+                    _ => None,
+                })?;
             }
             "c-evalue" => {
                 let evalue = |v: &str| v.parse().ok().filter(|e: &f64| *e > 0.0);
@@ -446,6 +459,9 @@ impl RunOptions {
         }
         if let Some(presence) = self.d_presence_rate {
             config.objective.d_prior = DPrior::search(presence);
+        }
+        if !self.d_open_flank {
+            config.objective.open_flank = None;
         }
         if let Some(evalue) = self.c_evalue {
             config.c.evalue = evalue;
@@ -842,6 +858,7 @@ mod tests {
             ("calls", Some("fixed")),
             ("d-allele", Some("max-marginal")),
             ("d-presence-rate", Some("0.9")),
+            ("d-open-flank", Some("off")),
             ("c-evalue", Some("0.01")),
             ("c-prefix-identity", Some("0.97")),
             ("min-identity", Some("0.7")),
@@ -869,6 +886,7 @@ mod tests {
             calls: Some(CallModel::FixedScale),
             d_allele: Some(DAlleleDecoding::MaxMarginal),
             d_presence_rate: Some(0.9),
+            d_open_flank: false,
             c_evalue: Some(0.01),
             c_prefix_identity: Some(0.97),
             min_identity: Some(0.7),
@@ -892,6 +910,7 @@ mod tests {
         assert_eq!(config.options.orientation, OrientationPolicy::REVERSE_ONLY);
         assert_eq!(config.options.min_identity, 0.7);
         assert_eq!(config.objective.d_prior, DPrior::search(0.9));
+        assert_eq!(config.objective.open_flank, None);
         assert!(!config.posterior && !config.anchor_window);
         assert_eq!(config.c.evalue, 0.01);
         assert_eq!(config.d.min_exact_run, 5);
@@ -914,6 +933,8 @@ mod tests {
             ("d-mismatch", Some("-1001")),
             ("j-mismatch", Some("-2147483648")),
             ("double-d", Some("some")),
+            ("d-open-flank", Some("yes")),
+            ("d-open-flank", None),
             ("simd", Some("mmx")),
             ("profile", None),
             ("no-posterior", Some("yes")),

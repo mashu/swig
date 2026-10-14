@@ -9,6 +9,7 @@
 //! separability is what lets running maxima (or sums) evaluate every pair of
 //! cuts in O(1) amortised per cut (see [`super::PlacementDag`]).
 
+use super::units::ResolvedOpenFlank;
 use crate::germline::SegmentKind;
 use crate::scoring::Score;
 
@@ -120,6 +121,13 @@ pub trait PathModel: Send + Sync {
     fn end(&self, _first: SegmentKind, _last: SegmentKind, _d_count: u8) -> Score {
         0
     }
+
+    /// The cost at the open end of a path whose first or last segment is a
+    /// D ([`super::units::FlankTable`]), read per read at the path's two
+    /// ends beside [`PathModel::end`]; `None`: no such cost.
+    fn open_flank(&self) -> Option<&ResolvedOpenFlank> {
+        None
+    }
 }
 
 impl<M: PathModel> PathModel for &M {
@@ -137,6 +145,10 @@ impl<M: PathModel> PathModel for &M {
 
     fn end(&self, first: SegmentKind, last: SegmentKind, d_count: u8) -> Score {
         (**self).end(first, last, d_count)
+    }
+
+    fn open_flank(&self) -> Option<&ResolvedOpenFlank> {
+        (**self).open_flank()
     }
 }
 
@@ -163,6 +175,11 @@ impl<M: PathModel> PathModel for &M {
 /// * `pair_bonus` — prior odds of a complete V…J rearrangement over a partial
 ///   read. 0 by default: on full-length reads the J's own clip score already
 ///   completes the path, and 0–48 changed no call.
+/// * `open_flank` — a path that ends on a D asserts a junction whose J was
+///   missed in the read bases after it (and one that starts on a D, a V
+///   missed before it). It pays the log-likelihood ratio of that miss
+///   against "no junction there" ([`super::units::FlankTable`]), which
+///   removes chance Ds far from the anchor of reads without a D.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EngineeringObjective {
     pub pair_bonus: Score,
@@ -171,6 +188,8 @@ pub struct EngineeringObjective {
     pub presence: [f64; 3],
     /// Score per unassigned junction base (0 = no N/P length prior).
     pub insertion_per_base: Score,
+    /// The cost at the open end of a D-first or D-last path (`None` = off).
+    pub open_flank: Option<ResolvedOpenFlank>,
 }
 
 #[cfg(test)]
@@ -182,6 +201,7 @@ impl EngineeringObjective {
             pair_bonus: 0,
             presence,
             insertion_per_base: 0,
+            open_flank: None,
         }
     }
 }
@@ -203,7 +223,9 @@ impl PathModel for EngineeringObjective {
     /// valid (the exit before it is ≤ the entry after it), so the no-D path
     /// scores at least as much and "with-D must strictly beat no-D" rejects
     /// it. With a negative per-base junction score a D could pay for itself
-    /// by replacing N bases, so no floor is derived then.
+    /// by replacing N bases, so no floor is derived then. The open-flank
+    /// cost is non-negative and charges only a D, so it only lowers a path
+    /// that keeps such a D: the floor holds with it.
     fn d_floor(&self) -> Score {
         if self.insertion_per_base < 0 {
             Score::MIN
@@ -222,5 +244,123 @@ impl PathModel for EngineeringObjective {
         } else {
             0
         }
+    }
+
+    fn open_flank(&self) -> Option<&ResolvedOpenFlank> {
+        self.open_flank.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adjudicate::units::{CallModel, FlankTable, ReadContext, ReadModel};
+    use crate::adjudicate::{CalledSegment, DagScratch, Mode, PlacementDag};
+    use crate::alphabet::encode;
+    use crate::config::{DefaultAssigner, EngineConfig};
+    use crate::pipeline::VdjAssigner;
+    use crate::placement::Placement;
+    use crate::sim::{Rng, SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
+
+    /// The open-flank cost is non-negative and charges D only, so the D
+    /// floor `P_D + 1` still bounds a fixed-scale call: on mid and
+    /// hypermutated reads cut 0–80 bases around a D, with the cost on,
+    /// pruning every D below the floor leaves the call (path and key)
+    /// unchanged.
+    #[test]
+    fn d_floor_bounds_pruning_with_the_open_flank_cost() {
+        let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 11);
+        let config = EngineConfig::default();
+        let assigner =
+            DefaultAssigner::from_config(&config, db.v.clone(), Some(db.d.clone()), db.j.clone())
+                .unwrap();
+        let objective =
+            config
+                .objective
+                .resolve(&db.v, &config.v, Some(&db.d), &config.d, &db.j, &config.j);
+        assert!(objective.open_flank.is_some());
+        let dag = PlacementDag::new(VdjGrammar::VDJ, objective, config.min_retained, Mode::Fixed);
+        let floor = dag.model.d_floor();
+        let read_model = ReadModel::fixed(1.0, objective.presence);
+        let (mut ws, mut scratch, mut table) = (
+            assigner.workspace(),
+            DagScratch::default(),
+            FlankTable::default(),
+        );
+        let mut rng = Rng::new(31);
+        let (mut checked, mut pruned, mut charged) = (0, 0, 0);
+        for preset in [SimParams::mid(), SimParams::hard()] {
+            let sim = Simulator::new(&db.v, Some(&db.d), &db.j, preset).unwrap();
+            for read in sim.reads(40, 17).unwrap() {
+                let call = assigner.assign(&encode(&read.sequence), &mut ws);
+                let Some(d) = call.placements.iter().find(|p| p.kind == SegmentKind::D) else {
+                    continue;
+                };
+                let lo = d.q_start().saturating_sub(rng.below(81) as u32) as usize;
+                let hi = (d.q_end() + rng.below(81) as u32).min(call.query.len() as u32) as usize;
+                let cut = assigner.assign(&call.query[lo..hi], &mut ws);
+                for dropped in [None, Some(SegmentKind::J), Some(SegmentKind::V)] {
+                    let all: Vec<Placement> = cut
+                        .placements
+                        .iter()
+                        .filter(|p| Some(p.kind) != dropped)
+                        .cloned()
+                        .collect();
+                    let kept: Vec<Placement> = all
+                        .iter()
+                        .filter(|p| p.kind != SegmentKind::D || p.score() >= floor)
+                        .cloned()
+                        .collect();
+                    pruned += all.len() - kept.len();
+                    let context = ReadContext::of(&all, cut.query.len() as u32);
+                    let flank = objective.open_flank.as_ref();
+                    table.fill(
+                        flank,
+                        objective.presence,
+                        &read_model,
+                        CallModel::FixedScale,
+                        &context,
+                        &all,
+                    );
+                    let full = dag.viterbi(&all, &read_model, &table, &mut scratch);
+                    table.fill(
+                        flank,
+                        objective.presence,
+                        &read_model,
+                        CallModel::FixedScale,
+                        &context,
+                        &kept,
+                    );
+                    let fewer = dag.viterbi(&kept, &read_model, &table, &mut scratch);
+                    // The calls by what they hold, as the placement lists differ.
+                    let held = |placements: &[Placement], path: &Option<(_, Vec<_>)>| {
+                        path.as_ref()
+                            .map(|(key, segments): &(_, Vec<CalledSegment>)| {
+                                let spans: Vec<_> = segments
+                                    .iter()
+                                    .map(|s| {
+                                        let p = &placements[s.placement];
+                                        (p.kind, p.alleles.clone(), p.q_start(), s.entry, s.exit)
+                                    })
+                                    .collect();
+                                (*key, spans)
+                            })
+                    };
+                    if let Some((_, path)) = &full {
+                        charged += usize::from(path.iter().any(|s| {
+                            let p = &all[s.placement];
+                            table.units(super::super::Flank::End, p.kind, p.q_start(), p.q_end())
+                                > 0
+                        }));
+                    }
+                    assert_eq!(held(&all, &full), held(&kept, &fewer));
+                    checked += 1;
+                }
+            }
+        }
+        assert!(
+            checked >= 150 && pruned >= 100 && charged >= 10,
+            "{checked} reads, {pruned} D pruned, {charged}"
+        );
     }
 }
