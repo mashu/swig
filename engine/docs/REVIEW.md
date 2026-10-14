@@ -32,6 +32,7 @@ items, these are now fixed:
 | 3.1.12 frame ties, σ series, trace memory, BOM and non-UTF-8 input, `--tail`, timing test, floors | fixed (σ as two binomial tails; scores up to 30,000 in lanes with a bound per traceback group) |
 | 4.1–4.3, 4.7, 4.8 | one acceptance mechanism; the adjudication mode as a validated type; the lattice recursion written once; typed notes; one test kit |
 | 4.5 (part) | the tandem-D grammar and the residual path are gone |
+| §0 13 (part) IGHT, IGHZ and IGHO without a locus | every IGH isotype letter names IGH; a custom-named V, J or C takes its relatives' locus (the database's named alleles, else an embedded panel, which places a J or C only in loci of the database's V), a custom D the loci with D genes, with a warning asking for `locus=`; C follows the locus the path shares; Swig Web and swig-cli write `locus=` for custom records |
 
 The audit's own fixes are listed in the commit log; the README and
 ALGORITHM describe the behaviour they changed. Still open, by priority:
@@ -95,18 +96,16 @@ that review:
     reads cut after V) but also raises chance Ds on D-free ones: 79.8 %
     instead of 68.7 % behind 30 random bases. Needs the N/P length prior of
     item 2.
-11. **Gene identity from allele names.** A gene is the name's part before
-    `*`. A database without `*` names now gets a warning, but it still loses
-    V accuracy at high SHM: 8.2 pp of V allele at 30 % SHM on the suite's IGH
-    set with every `*` replaced. Grouping alleles by sequence would change
-    the gene ids that gene frames, the retrieval budget, tie order and the
-    family bounds key on.
+11. **Gene identity from allele names.** *Resolved:* a V name without `*`
+    joins the gene of a `*`-named relative within about 2 %, or groups with
+    other such names at that level (`gene=`; ALGORITHM §3a). The 8.2 pp V
+    allele loss at 30 % SHM with every `*` replaced is now +0.10 pp (not
+    significant); names with `*` keep their genes.
 12. **Junk V by circular divergence.** With the V presence cost, 7 of 1,200
     V-less test reads still get a V: the read's divergence is estimated
     partly from the junk V's own columns, which raises its per-read value.
 13. **Smaller items.** `write_batches` drops the valid reads that precede a
-    malformed record in the same batch; locus inference misses the IGHT,
-    IGHZ and IGHO isotypes, so those constant alleles are `Loci::ANY`;
+    malformed record in the same batch;
     `join_indel` compares weighted votes after the 7-mer fallback, not the
     primary seed counts its guard describes; `swig_version` and
     `AlignerEngine.version()` have no caller.

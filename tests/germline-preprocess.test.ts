@@ -9,6 +9,8 @@ import {
   applyIgblastInternalData,
   prepareIgblastStyleGermlineFasta,
   preprocessGermlineFasta,
+  headerLoci,
+  namedLoci,
   preprocessGermlineFastaAcrossTiers,
   type MetadataAllele,
 } from "../src/germline-preprocess.ts";
@@ -241,4 +243,98 @@ test("every bundled KIMDB macaque V and J record receives validated in-browser a
       assert.equal((report.fasta.match(/SWIGMETA=/g) ?? []).length, report.count);
     }
   }
+});
+
+test("the host reads a locus from an allele name exactly as the engine does", () => {
+  for (const [label, loci] of [
+    ["IGHV1-2*02", ["IGH"]],
+    ["IGHT2D*01", ["IGH"]],
+    ["IGHZ*01", ["IGH"]],
+    ["IGHO*01", ["IGH"]],
+    ["IGHG2A*01", ["IGH"]],
+    ["IGHEP1*01", ["IGH"]],
+    ["IGHD1-1*01", ["IGH"]],
+    ["TRAV14/DV4*01", ["TRA", "TRD"]],
+    ["Homo_sapiens_IGKV1-5*01", ["IGK"]],
+    ["IGHTEST1", []],
+    ["IgNAR*01", []],
+    ["novel_1", []],
+    ["myIGHV1", []],
+    ["TRANSFER", []],
+  ] as const) {
+    assert.deepEqual(namedLoci(label), loci, label);
+  }
+});
+
+test("a custom-named allele is written with the locus of its template", () => {
+  const template = firstAnnotated(humanIghV, "V");
+  const changed = `${template[1].slice(0, 145)}${template[1][145] === "A" ? "C" : "A"}${template[1].slice(146)}`;
+  const report = preprocessGermlineFasta(
+    `>novel_7 IGH sample allele\n${changed}\n>${template[0]}\n${template[1]}\n`,
+    "V",
+    humanIghV,
+    ["IGH"],
+  );
+  assert.equal(report.transferred, 2);
+  assert.match(report.fasta, /^>novel_7 SWIGMETA=[\d,-]+ locus=IGH$/m);
+  // A name the engine places carries no key.
+  assert.doesNotMatch(report.fasta, new RegExp(`^>${template[0].replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*locus=`, "m"));
+  // A declared locus is kept, and survives the next template tier.
+  const declared = preprocessGermlineFastaAcrossTiers(">sample_d1 locus=TRB,TRD\nGGGACAGGGGGC\n", "D", [], ["TRB", "TRD"]);
+  assert.match(declared.fasta, /^>sample_d1 locus=TRB,TRD$/m);
+});
+
+test("the locus key of a custom allele follows its template and the header's words, not substrings", () => {
+  // Regression: 'LIGHT' holds IGH and 'STRAIN' holds TRA, which the
+  // substring test that admits a record (inferLocus) reads as loci.
+  const oneChange = (sequence: string, at: number) => `${sequence.slice(0, at)}${sequence[at] === "A" ? "C" : "A"}${sequence.slice(at + 1)}`;
+  const bcrV = (["IGH", "IGK", "IGL"] as const).flatMap((locus) => human.loci[locus].V as MetadataAllele[]);
+  const igkv = bcrV.find((allele) => allele[0] === "IGKV1-5*01");
+  assert.ok(igkv);
+  const keyOf = (fasta: string, name: string) => new RegExp(`^>${name}\\b.*?(?: locus=([A-Z,]+))?$`, "m").exec(fasta)?.[1] ?? "";
+  for (const [header, key] of [
+    ["sample_k1 IGK light chain", "IGK"],
+    ["sample_k1 light chain", "IGK"],
+    ["sample_k1 IGK", "IGK"],
+    // The header and the template disagree: no key, the engine decides.
+    ["sample_k1 IGL light chain", ""],
+  ] as const) {
+    const report = preprocessGermlineFasta(`>${header}\n${oneChange(igkv[1], 145)}\n`, "V", bcrV, ["IGH", "IGK", "IGL"]);
+    assert.equal(report.transferred, 1, header);
+    assert.equal(keyOf(report.fasta, "sample_k1"), key, header);
+  }
+  const balbc = pack.species.find((entry: { name: string }) => entry.name === "Mus musculus_BALB/c");
+  const tcrV = (["TRA", "TRB", "TRD", "TRG"] as const).flatMap((locus) => (balbc.loci[locus]?.V ?? []) as MetadataAllele[]);
+  const trbv = tcrV.find((allele) => allele[0] === "TRBV12-2*02");
+  assert.ok(trbv);
+  const mouse = preprocessGermlineFasta(`>novel_b1 TRB strain BALB/c\n${oneChange(trbv[1], 145)}\n`, "V", tcrV, ["TRA", "TRB", "TRD", "TRG"]);
+  assert.equal(keyOf(mouse.fasta, "novel_b1"), "TRB");
+  // No template and no locus word: no key.
+  const d = preprocessGermlineFasta(">sample_d2 light chain D\nGGTATAACTGGAACGAC\n", "D", [], ["IGH", "IGK", "IGL"]);
+  assert.equal(keyOf(d.fasta, "sample_d2"), "");
+  const stated = preprocessGermlineFasta(">sample_d3 TRB\nGGGACAGGGGGC\n", "D", [], ["TRB", "TRD"]);
+  assert.equal(keyOf(stated.fasta, "sample_d3"), "TRB");
+  for (const [header, loci] of [
+    ["x IGK light chain", ["IGK"]],
+    ["x light STRAIN transfer", []],
+    ["x similar to IGKV1-5*01", ["IGK"]],
+    ["x TRA TRD", ["TRA", "TRD"]],
+    ["IGK annotation=transfer:IGHV1-2*01", []],
+  ] as const) {
+    assert.deepEqual(headerLoci(header), loci, header);
+  }
+});
+
+test("a custom FASTA in a reference cell is given the cell's locus", () => {
+  const custom = ">sample_k1\nACGTACGTACGT\n>IGKV1-5*99\nACGTACGTACGA\n>other locus=IGL\nACGTACGTACGC\n";
+  const composed = composeReferenceOverrides(
+    ["IGH", "IGK", "IGL"],
+    { [referenceCellKey("IGK", "V")]: { text: custom } },
+    (locus, segment) => (human.loci[locus]?.[segment] ?? []).map((allele: MetadataAllele) => `>${allele[0]}\n${allele[1]}\n`).join(""),
+  );
+  assert.match(composed.V ?? "", /^>sample_k1 locus=IGK$/m);
+  assert.match(composed.V ?? "", /^>IGKV1-5\*99$/m);
+  assert.match(composed.V ?? "", /^>other locus=IGL$/m);
+  // Pack records are untouched.
+  assert.doesNotMatch(composed.V ?? "", /^>IGHV.* locus=/m);
 });

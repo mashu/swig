@@ -831,7 +831,7 @@ impl AirrRecord {
                     .alleles
                     .iter()
                     .fold(crate::locus::Loci::NONE, |l, &a| {
-                        l.union(set.allele(a).loci)
+                        l.union(set.allele(a).definite_loci())
                     });
                 loci = loci.intersection(own);
             }

@@ -97,13 +97,18 @@ fn junctions_end_at_the_j_motif_a_swigmeta_anchor_misplaces() {
 
 /// Kappa V alleles labelled without their locus code (`KV…`) in a heavy +
 /// kappa database, whose headers read "human kappa light chain": `LIGHT`
-/// holds `IGH` but names no locus. The kappa reads keep kappa J calls and
-/// get no D, as with the IMGT names.
+/// holds `IGH` but names no locus, so their loci come from their sequences
+/// ([`swig::locus_infer`]), never from the header word. These synthetic
+/// kappa V are built like the heavy ones, so their relatives place many in
+/// IGH; the rest take every locus the database names, IGH and IGK (a
+/// fallback, no definite locus). (Reads of these kappa V are heavy-like
+/// too, so their calls are not checked here; `tests/loci.rs` covers the
+/// calls of custom names.)
 #[test]
 fn header_words_name_no_locus() {
-    use swig::germline::GermlineSet;
+    use swig::germline::{GermlineSet, LocusSource};
     use swig::locus::{Loci, Locus};
-    use swig::sim::{SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
+    use swig::sim::{SyntheticDatabase, SyntheticSpec};
     let heavy = SyntheticDatabase::generate(&SyntheticSpec::default(), 1);
     let light = SyntheticDatabase::generate(&SyntheticSpec::default(), 2);
     let fasta = |set: &GermlineSet, rename: &dyn Fn(&str) -> String| {
@@ -133,32 +138,22 @@ fn header_words_name_no_locus() {
         .iter()
         .filter(|a| a.name.starts_with("KV"));
     assert!(kappa_v.clone().count() > 0);
-    assert!(kappa_v.into_iter().all(|a| a.loci == Loci::ANY));
-    let reads_v = GermlineSet::from_fasta(SegmentKind::V, &light_v).unwrap();
-    let reads_j = GermlineSet::from_fasta(SegmentKind::J, &light_j).unwrap();
-    let reads = Simulator::new(&reads_v, None, &reads_j, SimParams::mid())
-        .unwrap()
-        .reads(150, 12)
-        .unwrap();
-    let config = CallingProfile::ROptimized.config();
-    let assigner =
-        DefaultAssigner::from_config(&config, database.v, database.d, database.j).unwrap();
-    let mut ws = assigner.workspace();
-    let (mut kappa_j, mut d_calls) = (0, 0);
-    for read in &reads {
-        let call = assigner.assign(&encode(&read.sequence), &mut ws);
-        let Some(path) = &call.path else { continue };
-        for segment in &path.segments {
-            let placement = &call.placements[segment.placement];
-            let set = assigner.segment(placement.kind).unwrap().set();
-            let loci = set.allele(placement.alleles[0]).loci;
-            kappa_j +=
-                usize::from(placement.kind == SegmentKind::J && loci == Loci::of(Locus::Igk));
-            d_calls += usize::from(placement.kind == SegmentKind::D);
+    let heavy_kappa = Loci::of(Locus::Igh).union(Loci::of(Locus::Igk));
+    for a in kappa_v {
+        match a.locus_source {
+            LocusSource::Relative => assert_eq!(a.loci, Loci::of(Locus::Igh), "{}", a.name),
+            LocusSource::Fallback => assert_eq!(a.loci, heavy_kappa, "{}", a.name),
+            source => panic!("{} has loci from {source:?}", a.name),
         }
     }
-    assert_eq!(d_calls, 0);
-    assert!(kappa_j >= 145, "{kappa_j} of 150 reads called a kappa J");
+    // The kappa J alleles keep the locus their names give.
+    let kappa_j = database
+        .j
+        .alleles()
+        .iter()
+        .filter(|a| a.name.starts_with("IGKJ"));
+    assert!(kappa_j.clone().count() > 0);
+    assert!(kappa_j.into_iter().all(|a| a.loci == Loci::of(Locus::Igk)));
 }
 
 /// A prepared database read back keeps what its annotation knew: values
@@ -235,4 +230,74 @@ fn a_prepared_database_reloads_with_its_annotation() {
         assert_eq!(allele.anchor, before.anchor, "{}", allele.name);
         assert_eq!(allele.regions, before.regions, "{}", allele.name);
     }
+}
+
+/// V names without `*` are genes of their own by name (REVIEW §0 item 11).
+/// One within 2 % of IGHV1-2*02 joins gene IGHV1-2; two close copies of a
+/// relative-less sequence form one gene; an unrelated one stays alone. The
+/// prepared database keeps the grouping (`gene=`).
+#[test]
+fn v_names_without_a_star_join_the_gene_of_a_close_relative() {
+    const IGHV1_2: &str = "CAGGTGCAGCTGGTGCAGTCTGGGGCTGAGGTGAAGAAGCCTGGGGCCTCAGTGAAGGTCTCCTGCAAGGCTTCTGGATACACCTTCACCGGCTACTATATGCACTGGGTGCGACAGGCCCCTGGACAAGGGCTTGAGTGGATGGGATGGATCAACCCTAACAGTGGTGGCACAAACTATGCACAGAAGTTTCAGGGCAGGGTCACCATGACCAGGGACACGTCCATCAGCACAGCCTACATGGAGCTGAGCAGGCTGAGATCTGACGACACGGCCGTGTATTACTGTGCGAGAGA";
+    // `sequence` with every `step`-th base changed.
+    let mutated = |sequence: &str, step: usize, phase: usize| -> String {
+        sequence
+            .bytes()
+            .enumerate()
+            .map(|(i, b)| match (i % step == phase, b) {
+                (true, b'A') => 'C',
+                (true, _) => 'A',
+                (false, b) => b as char,
+            })
+            .collect()
+    };
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut random = |len: usize| -> String {
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ['A', 'C', 'G', 'T'][(state % 4) as usize]
+            })
+            .collect()
+    };
+    let lone = random(290);
+    let other = random(290);
+    let v = [
+        format!(">IGHV1-2*02\n{IGHV1_2}\n"),
+        // 5 of 296 bases changed: 98.3 % identity.
+        format!(">IGHV1-2_novel\n{}\n", mutated(IGHV1_2, 60, 7)),
+        format!(">sample_a\n{lone}\n"),
+        format!(">sample_b\n{}\n", mutated(&lone, 60, 3)),
+        format!(">sample_c\n{other}\n"),
+    ]
+    .concat();
+    let j = ">IGHJ4*02\nACTACTTTGACTACTGGGGCCAGGGAACCCTGGTCACCGTCTCCTCAG\n";
+    let texts = GermlineTexts {
+        v: &v,
+        d: None,
+        j,
+        c: None,
+    };
+    let gene_names = |db: &PreparedDatabase| -> Vec<String> {
+        db.v.alleles()
+            .iter()
+            .map(|a| db.v.gene_name(a.gene).to_string())
+            .collect()
+    };
+    let first = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+    let expected = ["IGHV1-2", "IGHV1-2", "sample_a", "sample_a", "sample_c"];
+    assert_eq!(gene_names(&first), expected);
+    let files: std::collections::HashMap<&str, String> = first.files().into_iter().collect();
+    let texts = GermlineTexts {
+        v: &files["V.fasta"],
+        d: None,
+        j: &files["J.fasta"],
+        c: None,
+    };
+    let again = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+    assert_eq!(gene_names(&again), expected);
+    // Reported names do not change.
+    assert_eq!(again.v.allele(1).name, "IGHV1-2_novel");
 }

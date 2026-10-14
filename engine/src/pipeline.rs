@@ -32,7 +32,9 @@
 
 use std::ops::Range;
 
-use crate::adjudicate::{Adjudicator, CallPath, DagScratch, Marginals, PlacementDag, divergence};
+use crate::adjudicate::{
+    Adjudicator, CallPath, CalledSegment, DagScratch, Marginals, PlacementDag, divergence,
+};
 use crate::admission::{Admission, DefaultAdmission};
 use crate::align::{Aligner, InterSequenceGotoh, InterSequenceWorkspace};
 use crate::alphabet::reverse_complement_into;
@@ -805,14 +807,24 @@ where
         let first = out.len();
         self.stage_adjudicate(reads, placements, adjudication, out);
         if let Some(stage) = &self.c {
-            // C follows the J of its own locus.
+            // C follows the J of its own locus: the loci the path's V, D
+            // and J share (an allele of unknown locus constrains nothing),
+            // else those of its last segment.
             let loci: Vec<Loci> = out[first..]
                 .iter()
                 .map(|call| {
-                    let last = call.path.as_ref().and_then(|p| p.segments.last());
-                    last.map_or(Loci::ANY, |s| {
-                        self.placement_loci(&call.placements[s.placement])
-                    })
+                    let Some(path) = &call.path else {
+                        return Loci::ANY;
+                    };
+                    let of = |s: &CalledSegment| self.placement_loci(&call.placements[s.placement]);
+                    let shared = path
+                        .segments
+                        .iter()
+                        .fold(Loci::ANY, |loci, s| loci.intersection(of(s)));
+                    match path.segments.last() {
+                        Some(last) if shared.is_empty() => of(last),
+                        _ => shared,
+                    }
                 })
                 .collect();
             stage.assign(

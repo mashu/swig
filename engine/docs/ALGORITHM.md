@@ -270,6 +270,85 @@ silent error. The bit is set for:
 - the bounds of a CDR of unusual length;
 - a start transferred from a flagged one.
 
+**Locus of each allele** (`locus.rs`, `locus_infer.rs`, `prepare.rs`). The
+locus decides which alleles may form one rearrangement, which locus' gene
+counts price a segment (`P*_V`, `P*_D`, `P*_J`, `N_C`), which annotation
+context (chain type, FR3 model) a V or J gets, and the AIRR `locus`. It is
+settled once per database, in this order:
+
+1. a `locus=` header key;
+2. the label: a locus code starting a word, followed by a segment letter
+   or, for IGH, an isotype letter `A D E F G M O T W X Y Z` with at most one
+   more letter after it (`IGHG2A`, `IGHT2D`, not `IGHTEST1`); else a gene
+   name in the header's free text. On the IMGT pack (5,472 labels) and
+   kimdb every label gives exactly its pack locus;
+3. relatives, for a V, J or C allele steps 1–2 leave open. Candidates are
+   the database's alleles of the kind placed by steps 1–2, the 8 sharing
+   most distinct 5-mers. Each is aligned locally (`AffineScoring(2, −3,
+   −5, −1)`) in a band of ±16 diagonals around the diagonal most shared
+   5-mers lie on; the allele takes the loci of every candidate within 15 of
+   the best score `S`, when `S ≥ max(30, 0.3·S_self)` (`S_self = 2·length`).
+   Undecided alleles are compared the same way with an embedded panel of
+   human and mouse family representatives (122 V, 118 J, 29 C from the IMGT
+   pack) at `S ≥ max(30, 0.1·S_self)` for V and C and `0.5·S_self` for J.
+   A placement narrows pairing (a light-chain V loses D, a J or C pairs
+   only with V of its loci), and for most databases the panel is of
+   another species, so it is held to what it places reliably: a J or C
+   it places keeps only the loci of the database's V alleles of steps 1–3
+   (none left: step 4), and a V whose best panel relative scores below
+   `0.25·S_self` in TRA alone or TRD alone takes both, as the two loci
+   share V genes. In the design's leave-one-allele-out test over the pack
+   (unbanded scores), the database rule placed 6,670 of 8,027 BCR/TCR V,
+   J and C alleles in their locus or a superset of it, wrongly only 12 of
+   1,277 TCR J. Over all distinct alleles of the pack's species outside
+   the panel (5,846 V, 1,530 J, 491 C; banded scores), the panel places
+   5,254 V (140 with an extra locus, 33 of them by the TRA/TRD rule),
+   1,102 J (39 with an extra locus) and 362 C, none outside its locus.
+   Without the TRA/TRD rule, 4 V lost their locus (TRDV5 of rabbit, ferret
+   and sheep placed in TRA at 0.10–0.14 `S_self`, ferret TRAV33 in TRD at
+   0.22); at a J floor of 0.1, 7 J did (TRBJ1-2 of cat, camel and sheep
+   placed in IGL, cat TRGJ2-2 and TRGJ3-2 in IGH|TRA|TRB, ferret TRBJ1-5
+   and trout TRBJ3 in TRA|TRD), and 74 J were placed across IG and TR. On
+   all-custom TCR databases of rabbit and cat, those placements cost up to
+   12.6 pp of D allele, 2.3 pp of J allele and 2.2 pp of C allele against
+   the IMGT names. On all-custom databases of nine species outside the
+   panel (pig, cow, lemur, chicken BCR, Salmo IGH; cat, dog, naked mole-rat,
+   rabbit TCR; 2,000 simulated reads each) the calls now equal 0.39.3's on
+   J allele and junction, differ from them by at most 1.9 pp of D allele
+   (rabbit: 4 reads with a D of at most 7 nt, McNemar p = 0.13) and 0.3 pp
+   of C allele (dog, p = 0.18), and gain 19–35 pp of no-D accuracy where
+   the database has a locus without D. The 0.1 floor sits above the 30–40
+   that unrelated V sequences reach by chance;
+4. otherwise the loci the database names (steps 1–3, any kind): a D, too
+   short for step 3, takes those with D genes. Such an allele stays callable
+   in each of its loci but counts in no locus' gene numbers when the locus
+   has alleles of steps 1–3, so it cannot inflate a prior or a C gate. Only
+   when nothing names a locus does an allele keep every locus.
+
+A merged identical copy keeps the known locus of its partner (a custom
+name for a named sequence once made it of every locus). C takes the loci
+the path's V, D and J share, else its J's. Steps 3 and 4 run only for
+alleles steps 1–2 leave open, so a database of IMGT names pays nothing;
+`swig prepare` writes their result (`locus=`, `locus_source=`). The
+fallback cannot separate loci that share D genes' role: custom TRBD and
+TRDD both become TRB|TRD, and TRDD then competes on TRB reads (−3.6 pp TRB D
+allele on the suite's TCR set); a `locus=` key removes it.
+
+**Gene of a V name without `*`** (`locus_infer::group_genes`). Gene
+identity keys the retrieval budget, gene frames, tie order, family bounds
+and the gene counts of `P*_V`. A name without `*` used to be a gene of its
+own, which cost 8.2 pp of V allele at 30 % SHM on the suite's IGH set with
+every `*` replaced. Such an allele now joins the gene of its nearest
+`*`-named relative (the same 5-mer prefilter and banded local alignment as
+above) when `S / min(S_self(a), S_self(b)) ≥ 0.95`, about 2 % divergence
+under (2, −3) scoring; the rest are grouped among themselves at the same
+level by single linkage, each group named after its first allele.
+`prepare` writes `gene=`. Names with `*`, as in every shipped reference,
+keep their genes, so nothing changes for them. Measured (paired against
+the IMGT-named run): every `*` replaced, V allele +0.10 pp at 30 % SHM
+(was −8.20) and ±0.00 on igh_mid; 20 % of the names hidden, +0.03 (was
+−1.77) and +0.02.
+
 ## 4. Adjudication: exact semi-Markov Viterbi (`adjudicate/dag.rs`)
 
 Placements are nodes, sorted by segment kind (V, D, J), then read start.
@@ -642,7 +721,7 @@ step can lose.
 |---|---|---|---|
 | Strand | `orient.rs` | heuristic + fallback | Count read positions whose 11-mer occurs in the V/J germline, per strand. Trusted when the winner exceeds its Poisson null `λ₀ + 3√λ₀` (`λ₀` = k-mers × germline k-mer density); otherwise compare V seed votes on both strands. |
 | V seeds | `seed.rs` | bounded | Every 9-mer (7-mers as below). `SeedSampling` also offers closed syncmers (a seed is kept when the first smallest `s`-mer of its key, `s = k − w`, in a fixed random order, is first or last; context-free; on a contiguous shape any `w` consecutive k-mers hold one, so every unmutated `k + w − 1` bases yield a shared seed), open syncmers (smallest `s`-mer in the middle, the conservation-optimal offset; context-free, no window guarantee) and minimisers (window guarantee, not context-free). Under the gene margin below, closed syncmers (`w = 4`) are 1.1 points of mean V gene behind every k-mer (4.4 at 30 % SHM) for 0.4 % fewer instructions, so every k-mer is the default. |
-| V retrieval | `retrieve/seed_vote.rs`, `retrieve/budget.rs`, `retrieve/frames.rs` | heuristic | Seed votes per gene frame (4 per 9-mer, 1 per 7-mer), best diagonal cluster per frame. 7-mers vote while the leader holds fewer than 25 nine-mer seeds, where a count's Poisson relative error `1/√n` exceeds 20 %. Keep 3 genes, and up to 16 while votes are within `z·√(2·4·L)` of the leader's `L` (z = 2): two standard deviations of the difference between two seed counts near the leader's, so relative to the leader but proportionally wider for weakly supported (mutated) reads. A fixed margin (8 votes, 5 %) or a proportional one (10–30 % of `L`) loses 4–9 points of V gene at 30 % SHM (same seeds and short-seed rule); accuracy saturates at z ≈ 2 (the 16-gene cap binds). Every allele of a kept gene becomes a candidate. A gene is the allele name's part before `*`; a name without one is a gene of its own, so the cap then binds on alleles (preparation warns when more than 16 V names lack it). |
+| V retrieval | `retrieve/seed_vote.rs`, `retrieve/budget.rs`, `retrieve/frames.rs` | heuristic | Seed votes per gene frame (4 per 9-mer, 1 per 7-mer), best diagonal cluster per frame. 7-mers vote while the leader holds fewer than 25 nine-mer seeds, where a count's Poisson relative error `1/√n` exceeds 20 %. Keep 3 genes, and up to 16 while votes are within `z·√(2·4·L)` of the leader's `L` (z = 2): two standard deviations of the difference between two seed counts near the leader's, so relative to the leader but proportionally wider for weakly supported (mutated) reads. A fixed margin (8 votes, 5 %) or a proportional one (10–30 % of `L`) loses 4–9 points of V gene at 30 % SHM (same seeds and short-seed rule); accuracy saturates at z ≈ 2 (the 16-gene cap binds). Every allele of a kept gene becomes a candidate. A gene is the allele name's part before `*`; a V name without one gets a gene by sequence (§3a), and only one with no close relative is a gene of its own, on which the cap then binds (preparation warns when more than 16 such names remain). |
 | V band | `retrieve/seed_vote.rs` | bounded | Cluster's diagonal range, shifted by the allele's frame offset, ± 8 diagonals: holds unless an indel longer than 8 escapes the seeds. |
 | V scoring | `segment.rs`, `family_bound.rs` | lossless | Score-only DP on one representative `R` per gene frame (most votes, then the frame's medoid, then lowest id). A sibling `A` in `R`'s frame diagonals satisfies `L ≤ S*(A) ≤ S*(R) + Δ(R, A)`: `Δ` sums the best profile gain per frame position both cover plus the best score where only `A` does; `L` is a traced representative path clipped to `A`'s span and rescored with `A`'s profile. The cutoff `c` is the 3rd largest of one lower bound per candidate, so `c ≤` the exact 3rd score. `A` is skipped when `U < c`, known when `U = L`, aligned outright when `L ≥ c` (its traceback reused), scored otherwise. The ranking from the 3rd score up is that of full scoring; ties follow an explicit key (gene leaders first, then retrieval order), never the schedule. Under a length or identity floor only `U <` floor prunes. |
 | J scoring | `segment.rs`, `family_bound.rs` | lossless | The same bounds with each gene one frame, its alleles at offset 0 (sound because J is unbanded); ties in allele order. |
