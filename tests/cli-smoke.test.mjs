@@ -849,3 +849,48 @@ test("--vdj keeps the locus a custom D's header gives on the default route",asyn
     if(tables.length===2)assert.deepEqual(tables[0],tables[1]);
   }finally{await rm(temporary,{recursive:true,force:true});}
 });
+
+test("both aligner routes print the aligner's database and run warnings once",async()=>{
+  // Regression: neither route showed the engine's warnings (the WebAssembly pool dropped them
+  // with the init reply, and the native child's stderr was read only for exit messages).
+  const root=resolve(import.meta.dirname,"..");
+  const temporary=await mkdtemp(join(root,"tmp-cli-aligner-warnings-"));
+  try{
+    const env=nativeAlignerEnvironment(root,join(temporary,"cache"));
+    const pack=JSON.parse(gunzipSync(await readFile(join(root,"public/references/imgt-202632-7-swig-0.7.json.gz"))).toString("utf8"));
+    const human=pack.species.find((entry)=>entry.name==="Homo sapiens");
+    const paths={query:join(temporary,"reads.fasta")};
+    for(const segment of ["V","J","C"]){
+      paths[segment]=join(temporary,`${segment}.fasta`);
+      await writeFile(paths[segment],human.loci.TRA[segment].map(([name,sequence])=>`>${name}\n${sequence}\n`).join(""));
+    }
+    const v=human.loci.TRA.V[0][1],j=human.loci.TRA.J[0][1];
+    await writeFile(paths.query,Array.from({length:40},(_,index)=>`>read_${index}\n${v}GGCA${j}\n`).join(""));
+    // The TRA J set holds TRAJ35*01, whose bases past the splice donor keep reads from a C call.
+    const warning=/^Aligner warning: J allele TRAJ35\*01 ends 52 bases after its anchor where most end 34 after: .* reads with it get no C call$/m;
+    for(const aligner of env?["native","wasm"]:["wasm"]){
+      const result=runRawCli(root,["--vdj","--aligner",aligner,"--workers","2","--batch-records","10","-query",paths.query,"-germline_db_V",paths.V,"-germline_db_J",paths.J,"-c_region_db",paths.C,"-outfmt","19","-out",join(temporary,`${aligner}.tsv`)],env??process.env);
+      assert.equal(result.status,0,result.stderr);
+      assert.match(result.stderr,warning,aligner);
+      assert.equal(result.stderr.match(new RegExp(warning.source,"gm")).length,1,`${aligner}: once, though two workers load the database`);
+      assert.doesNotMatch(result.stderr,/^swig: /m);
+    }
+    // The pipeline prints them too, once per run though each dataset starts its own aligner, and
+    // keeps them in its summary.
+    const config=(name,aligner,annotation={})=>({inputs:[1,2].map((sample)=>({path:join(root,"tests/fixtures/cli-smoke.fasta"),sampleId:`s${sample}`,subjectId:"d"})),references:{species:"Homo sapiens",scope:"TCR"},annotation:{workers:2,aligner,...annotation},pipeline:{collapse:{enabled:false},lineage:{enabled:false},shm:{enabled:false}},output:{directory:join(temporary,name),prefix:"run",writeLineageStudy:false}});
+    const runs=[["wasm-dd","wasm",{doubleD:{mode:"all"}}]];
+    if(env)runs.push(["native","native",{}]);
+    for(const [name,aligner,annotation] of runs){
+      const configPath=join(temporary,`${name}.json`);
+      await writeFile(configPath,JSON.stringify(config(name,aligner,annotation)));
+      const result=runCli(root,configPath,[],env??process.env);
+      assert.equal(result.status,0,result.stderr);
+      const summary=JSON.parse(await readFile(join(temporary,name,"run.summary.json"),"utf8"));
+      const printed=[...result.stderr.matchAll(/^Aligner warning: (.*)$/gm)].map((match)=>match[1]);
+      assert.deepEqual(summary.references.alignerWarnings,printed,name);
+      assert.ok(printed.some((text)=>/^J allele TRAJ35\*01 ends 52 bases after its anchor/.test(text)),name);
+      assert.equal(new Set(printed).size,printed.length,`${name}: each warning once`);
+      if(annotation.doubleD)assert.ok(printed.some((text)=>/^the double-D screen cannot see 2 of 6 D alleles, shorter than --double-d-seed-length 11: TRDD1\*01, TRDD2\*01$/.test(text)),name);
+    }
+  }finally{await rm(temporary,{recursive:true,force:true});}
+});

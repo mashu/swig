@@ -351,8 +351,21 @@ function bunWorker(name){
   return new globalThis.Worker(standalone?`./${name}.mjs`:new URL(`./${name}.js`,import.meta.url));
 }
 
+/**
+ * The aligner's database and run warnings, written once each as "Aligner warning: …" on either
+ * route (a WebAssembly worker returns them when it loads the germlines, the native child writes
+ * them as "swig: warning: …"), and kept for the run summary.
+ */
+function alignerWarnings(){
+  const seen=new Set();
+  return {
+    report(warning){if(seen.has(warning))return;seen.add(warning);process.stderr.write(`Aligner warning: ${warning}\n`);},
+    list(){return [...seen];},
+  };
+}
+
 class WasmPool {
-  constructor(size,init){this.size=size;this.init=init;this.workers=[];this.available=[];this.queued=[];this.pending=new Map();this.nextId=1;this.failed=null;}
+  constructor(size,init,onWarning=()=>{}){this.size=size;this.init=init;this.onWarning=onWarning;this.workers=[];this.available=[];this.queued=[];this.pending=new Map();this.nextId=1;this.failed=null;}
   async start(){
     for(let index=0;index<this.size;index+=1){
       const webWorker=Boolean(process.versions.bun&&globalThis.Worker);
@@ -376,7 +389,9 @@ class WasmPool {
     // One compilation shared by every worker: per-worker compiles compete with the workers for the
     // CPU (under Bun 1.3, four workers ran no faster than two).
     const module=await WebAssembly.compile(readFileSync(this.init.wasmPath));
-    await Promise.all(this.workers.map((worker)=>this.request(worker,{type:"init",...this.init,module})));
+    const replies=await Promise.all(this.workers.map((worker)=>this.request(worker,{type:"init",...this.init,module})));
+    // Every worker loads the same germlines and options: the first one's warnings are all of them.
+    for(const warning of replies[0]?.summary?.warnings??[])this.onWarning(warning);
     this.available.push(...this.workers);
   }
   request(worker,message,release=false){
@@ -976,12 +991,13 @@ async function runPipeline(config,base,assets){
   const settings={callingProfile:config.annotation.callingProfile,minimumIdentity:config.annotation.minimumIdentity,minimumConstantPrefixIdentity:config.annotation.minimumConstantPrefixIdentity,strand:config.annotation.strand,doubleD:config.annotation.doubleD};
   const init=workerInitialization(assets.wasmPath,references,settings);
   const mode=config.annotation.aligner;
+  const warnings=alignerWarnings();
   let nativeBinary=needsAnnotation?chooseNativeAligner(mode,assets,config.annotation.doubleD.mode!=="off"?"the double-D screen":"",config.annotation.alignerLabel):null;
   let pool=null;
   const wasmPool=async()=>{
     if(!pool){
       process.stderr.write(`Starting the WebAssembly aligner pool (${config.annotation.workers} worker${config.annotation.workers===1?"":"s"}; ${annotationBatchRecords.toLocaleString()} records/batch).\n`);
-      pool=new WasmPool(config.annotation.workers,init);
+      pool=new WasmPool(config.annotation.workers,init,warnings.report);
       try{await pool.start();}
       catch(error){const failed=pool;pool=null;await failed.close().catch(()=>{});throw error;}
     }
@@ -1008,7 +1024,7 @@ async function runPipeline(config,base,assets){
       if(needsAnnotation&&!preserveAirr){
         if(nativeBinary){
           // One child per dataset: the engine detects FASTA, FASTQ or AIRR once per stream.
-          const native=new NativePool(nativeBinary,config.annotation.workers,init,annotationBatchRecords);
+          const native=new NativePool(nativeBinary,config.annotation.workers,init,annotationBatchRecords,warnings.report);
           try{await native.start();datasetPool=native;}
           catch(error){
             await native.close().catch(()=>{});
@@ -1153,7 +1169,7 @@ async function runPipeline(config,base,assets){
   }
 
   const retained=activeMask.reduce((sum,value)=>sum+(value?1:0),0);
-  const summary={application:"swig-cli",version:VERSION,completedAt:new Date().toISOString(),inputRecords,eligibleRecords,annotatedRecords,retainedRecords:retained,lineages:lineages?.lineageCount??0,outputs:{annotated:config.output.writeAnnotatedAirr?annotatedName:null,processed:processedName,airrCompression:config.output.airrCompression},references:{metadataPreparation:{enabled:config.references.prepareMetadata,segments:loadedReferences.preparation}},preprocessing:{subsample:config.preprocessing.subsample,fastqFilter:{options:config.preprocessing.fastqFilter,stats:fastqFilterStats}},collapse:collapseResult?{mode:collapseResult.mode,inputRecords:collapseResult.inputRecords,inputAbundance:collapseResult.inputAbundance,uniqueRecords:collapseResult.uniqueRecords,collapsedRecords:collapseResult.collapsedRecords,warnings:collapseResult.warnings}:null,chimera:chimeraSummary,alleleRefinement:alleleResult?compactAlleleResult(alleleResult):null,shm:shm?{analyzedRecords:shm.analyzedRecords,analyzedAbundance:shm.analyzedAbundance,skippedRecords:shm.skippedRecords,metric:shm.metric}:null,missingAlleles:missingAlleles?{candidates:missingAlleles.candidates.length,warnings:missingAlleles.warnings}:null,lineageStudy:lineageStudy?{manifest:`${prefix}.swig-lineage-study.json.gz`,airr:`${prefix}.lineages.airr.tsv`,records:lineageStudy.linkedAirr.records}:null};
+  const summary={application:"swig-cli",version:VERSION,completedAt:new Date().toISOString(),inputRecords,eligibleRecords,annotatedRecords,retainedRecords:retained,lineages:lineages?.lineageCount??0,outputs:{annotated:config.output.writeAnnotatedAirr?annotatedName:null,processed:processedName,airrCompression:config.output.airrCompression},references:{metadataPreparation:{enabled:config.references.prepareMetadata,segments:loadedReferences.preparation},alignerWarnings:warnings.list()},preprocessing:{subsample:config.preprocessing.subsample,fastqFilter:{options:config.preprocessing.fastqFilter,stats:fastqFilterStats}},collapse:collapseResult?{mode:collapseResult.mode,inputRecords:collapseResult.inputRecords,inputAbundance:collapseResult.inputAbundance,uniqueRecords:collapseResult.uniqueRecords,collapsedRecords:collapseResult.collapsedRecords,warnings:collapseResult.warnings}:null,chimera:chimeraSummary,alleleRefinement:alleleResult?compactAlleleResult(alleleResult):null,shm:shm?{analyzedRecords:shm.analyzedRecords,analyzedAbundance:shm.analyzedAbundance,skippedRecords:shm.skippedRecords,metric:shm.metric}:null,missingAlleles:missingAlleles?{candidates:missingAlleles.candidates.length,warnings:missingAlleles.warnings}:null,lineageStudy:lineageStudy?{manifest:`${prefix}.swig-lineage-study.json.gz`,airr:`${prefix}.lineages.airr.tsv`,records:lineageStudy.linkedAirr.records}:null};
   await writeFile(join(outputDirectory,`${prefix}.summary.json`),JSON.stringify(summary,null,2));
   await writeFile(join(outputDirectory,`${prefix}.resolved-config.json`),JSON.stringify(config,null,2));
   process.stdout.write(`${JSON.stringify(summary,null,2)}\n`);
@@ -1247,14 +1263,15 @@ async function runVdj(rawArgs,assets){
   }
   const init=workerInitialization(assets.wasmPath,prepared.references,{callingProfile,minimumIdentity,minimumConstantPrefixIdentity,strand,tuning});
   const nativeBinary=chooseNativeAligner(mode,assets,"",alignerLabel);
-  let pool=nativeBinary?new NativePool(nativeBinary,workers,init,batchRecords):new WasmPool(workers,init);
+  const warnings=alignerWarnings();
+  let pool=nativeBinary?new NativePool(nativeBinary,workers,init,batchRecords,warnings.report):new WasmPool(workers,init,warnings.report);
   try{await pool.start();}
   catch(error){
     await pool.close().catch(()=>{});
     // Germline errors would stop WebAssembly too; anything else falls back to it.
     if(!nativeBinary||mode==="native"||/database/i.test(error.message))throw error;
     process.stderr.write(`The native aligner did not start (${error.message}); using WebAssembly.\n`);
-    pool=new WasmPool(workers,init);
+    pool=new WasmPool(workers,init,warnings.report);
     try{await pool.start();}
     catch(fallbackError){await pool.close().catch(()=>{});throw fallbackError;}
   }

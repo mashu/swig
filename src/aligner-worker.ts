@@ -54,6 +54,8 @@ interface ComputeSlot {
   index: number;
   worker: Worker;
   busy: boolean;
+  /** The aligner's database and run warnings, from loading the germlines. */
+  warnings: string[];
   resolve?: (batch: ComputeBatch) => void;
   reject?: (error: Error) => void;
 }
@@ -114,7 +116,7 @@ async function initializeSlot(
   settings: AlignerSettings,
 ): Promise<ComputeSlot> {
   const worker = new Worker(new URL("./aligner-compute-worker.ts", import.meta.url), { type: "module" });
-  const slot: ComputeSlot = { index, worker, busy: false };
+  const slot: ComputeSlot = { index, worker, busy: false, warnings: [] };
   return new Promise((resolve, reject) => {
     const fail = (error: Error) => {
       worker.terminate();
@@ -122,11 +124,12 @@ async function initializeSlot(
     };
     worker.onerror = (event) => fail(new Error(event.message || `Compute worker ${index + 1} stopped unexpectedly.`));
     worker.onmessage = (event) => {
-      const message = event.data as { type: "ready" | "error"; records?: number; message?: string };
+      const message = event.data as { type: "ready" | "error"; records?: number; warnings?: string[]; message?: string };
       if (message.type === "error") {
         fail(new Error(message.message || `Compute worker ${index + 1} could not initialize.`));
         return;
       }
+      slot.warnings = message.warnings ?? [];
       resolve(slot);
     };
     worker.postMessage({ type: "initialize", worker: index, module, references, settings });
@@ -402,6 +405,8 @@ async function handleRequest(request: StartRequest) {
       inputRecords,
       workers: workerCount,
       fastqFilter: fastqFilterStats,
+      // Every worker loads the same germlines and options: the first one's warnings are all of them.
+      warnings: slots[0]?.warnings ?? [],
     });
   } catch (error) {
     self.postMessage({

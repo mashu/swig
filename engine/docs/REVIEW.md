@@ -153,7 +153,8 @@ that review:
     TRDD2 are never seeded; every human TRD tandem holds one of them. On
     4,000 simulated TCR reads it found 0 of 199 TRD tandem-D reads at seed
     11 and 38 (19 %) at seed 8 (TRB: 52 % and 83 %). A run now names the
-    alleles the screen cannot see. A per-locus default seed length (or
+    alleles the screen cannot see, on the command line, in swig-cli and in
+    Swig Web's run summary. A per-locus default seed length (or
     indexing short alleles at their own length) needs a false-positive
     measurement on single-D TRD reads first.
 

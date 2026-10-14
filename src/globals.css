@@ -3983,6 +3983,8 @@ label[data-field-help] > span:first-child { cursor: help; text-decoration: under
 .results-rail-error { color: var(--coral); }
 .results-new-analysis { margin-top: 2px; color: var(--muted); font-size: 8px; font-weight: 760; }
 
+.aligner-warnings { grid-column: 1 / -1; display: grid; gap: 6px; margin: 10px 0; }
+.aligner-warnings > .scientific-note { margin: 0; }
 .repertoire-run-summary {
   margin: 0 0 20px;
   padding: 15px;

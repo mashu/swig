@@ -1165,3 +1165,47 @@ test("Swig Web's default settings start on reference sets without D or without C
     assert.deepEqual(engine.summary.warnings.filter((warning) => /no effect|cannot see/.test(warning)), [], missing);
   }
 });
+
+test("Swig Web's compute worker reports the aligner's warnings when it loads the germlines", async () => {
+  // Regression: the worker posted only its record count, so no Swig Web run showed the
+  // engine's database and run warnings, such as the D alleles the double-D screen cannot see.
+  const { registerHooks } = await import("node:module");
+  // Vite resolves the worker's extensionless import of the engine wrapper.
+  const hooks = registerHooks({
+    resolve(specifier, context, next) {
+      if (specifier === "./aligner-engine" && context.parentURL?.endsWith("/src/aligner-compute-worker.ts")) {
+        return next(`${specifier}.ts`, context);
+      }
+      return next(specifier, context);
+    },
+  });
+  const listeners = [];
+  const posted = [];
+  const previous = globalThis.self;
+  globalThis.self = {
+    addEventListener: (type, listener) => { if (type === "message") listeners.push(listener); },
+    postMessage: (message) => posted.push(message),
+  };
+  try {
+    await import("../src/aligner-compute-worker.ts");
+    assert.equal(listeners.length, 1);
+    const human = pack.species.find((entry) => entry.name === "Homo sapiens");
+    const settings = {
+      callingProfile: "r_optimized",
+      minimumIdentity: 0.6,
+      minimumConstantPrefixIdentity: null,
+      strand: 0,
+      doubleD: { mode: "all", minimumVjSpan: 40, seedLength: 11, pseudoTrim: 5, maximumPseudoMismatches: 3, minimumScoreGain: 8 },
+    };
+    listeners[0]({ data: { type: "initialize", worker: 0, module: await WebAssembly.compile(wasmBytes), references: compileReferences(human, "TCR"), settings } });
+    for (let wait = 0; !posted.length && wait < 200; wait += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(posted[0]?.type, "ready", JSON.stringify(posted[0]));
+    assert.ok(posted[0].records > 0);
+    assert.ok(Array.isArray(posted[0].warnings));
+    assert.ok(posted[0].warnings.includes("the double-D screen cannot see 2 of 6 D alleles, shorter than --double-d-seed-length 11: TRDD1*01, TRDD2*01"), posted[0].warnings.join("\n"));
+    assert.ok(posted[0].warnings.some((warning) => warning.startsWith("J allele TRAJ35*01 ends 52 bases after its anchor")), posted[0].warnings.join("\n"));
+  } finally {
+    globalThis.self = previous;
+    hooks.deregister();
+  }
+});

@@ -23,7 +23,8 @@ let engine: AlignerEngine | null = null;
 async function initialize(request: InitializeRequest) {
   const created = await AlignerEngine.create(request.module, request.settings, request.references);
   engine = created.engine;
-  self.postMessage({ type: "ready", worker: request.worker, records: created.records });
+  // The database and run warnings, which the scheduler passes on with the run's result.
+  self.postMessage({ type: "ready", worker: request.worker, records: created.records, warnings: created.engine.summary.warnings });
 }
 
 function annotate(request: AnnotateRequest) {

@@ -199,6 +199,8 @@ interface ResultSession {
   strand: 0 | 1 | 2;
   doubleD: DoubleDScreenOptions;
   doubleDCount: number;
+  /** The aligner's database and run warnings, each once. */
+  alignerWarnings?: string[];
   sampleColors: SampleColorMap;
   postAnalysis?: PostAnalysisSessionSnapshot;
   restored?: boolean;
@@ -1345,6 +1347,8 @@ function ResultsPage({ session, onNewAnalysis }: { session: ResultSession; onNew
     </div>;
   }
 
+  const alignerNotes=session.alignerWarnings?.length?<div className="aligner-warnings" role="status" aria-label="Aligner warnings">{session.alignerWarnings.map((warning)=><div key={warning} className="scientific-note warning"><span>!</span><p>{warning}</p></div>)}</div>:null;
+
   const repertoireOverview=<section className="repertoire-run-summary" aria-label="Run summary">
     <header><div><span className="section-kicker">Run summary</span><h2>{session.total.toLocaleString()} rearrangements</h2><p>{session.restored?"Saved state restored":`Completed in ${session.seconds.toFixed(2)} s · ${Math.round(session.total/Math.max(session.seconds,0.001)).toLocaleString()} reads/s`}</p></div><strong className="run-state">Complete</strong></header>
     <div className="result-summary app-result-summary">
@@ -1354,6 +1358,7 @@ function ResultsPage({ session, onNewAnalysis }: { session: ResultSession; onNew
       <article><span>Loci observed</span><strong>{facets.loci.length}</strong><small>{facets.loci.map((item)=>item.value).join(" · ")||"none"}</small></article>
       {session.doubleD.mode!=="off"&&<article><span>Supported Double-D</span><strong>{session.doubleDCount.toLocaleString()}</strong><small>opt-in evidence screen</small></article>}
     </div>
+    {alignerNotes}
     <details className="run-technical-details"><summary>Run settings</summary><div><span>{datasets.length.toLocaleString()} dataset{datasets.length===1?"":"s"}</span><span>{callingProfileLabel(session.callingProfile)} calling</span><span>{session.workers} WASM worker{session.workers===1?"":"s"}</span><span>{bytes(session.outputBytes)} AIRR</span>{session.minimumConstantPrefixIdentity!==null&&<span>covered C-prefix identity ≥ {Math.round(session.minimumConstantPrefixIdentity*100)}%</span>}{session.subsampleSize&&<span>subsampled from {session.inputTotal.toLocaleString()} input records · seed {session.subsampleSeed}</span>}{fastqQualityResultText(session)&&<span>{fastqQualityResultText(session).replace(/^ · /,"")}</span>}{session.doubleD.mode!=="off"&&<span>Double-D: {session.doubleD.mode==="all"?"all eligible junctions":`V–J span ≥ ${session.doubleD.minimumVjSpan} nt`}</span>}</div></details>
     {session.project&&<div className="repertoire-project-status"><strong>{session.project.root.name}</strong><span>{projectSaveStatus}</span></div>}
   </section>;
@@ -1362,6 +1367,7 @@ function ResultsPage({ session, onNewAnalysis }: { session: ResultSession; onNew
     <div><span className="section-kicker">{session.webMode === "lineage" ? "Single lineage ready" : "VDJ annotation complete"}</span><h1>{session.total.toLocaleString()} sequence{session.total === 1 ? "" : "s"}</h1><p>{session.summary.assigned.toLocaleString()} V+J assigned · {session.summary.withCdr3.toLocaleString()} CDR3 called · {session.seconds.toFixed(2)} s · {callingProfileLabel(session.callingProfile)}</p></div>
     <div className="focused-results-actions"><label><span>Download format</span><select value={downloadFormat} onChange={(event)=>setDownloadFormat(event.target.value as TableExportFormat)}><option value="tsv">AIRR TSV</option><option value="csv">CSV</option><option value="jsonl">JSON Lines</option></select></label><label><span>Compression</span><select value={downloadCompression} onChange={(event)=>setDownloadCompression(event.target.value as OutputCompression)}><option value="none">None</option><option value="gzip">Gzip (.gz)</option></select></label><button className={downloading?"post-cancel":"post-primary"} type="button" onClick={()=>downloading?exportAbortRef.current?.abort():void downloadAll()}>{downloading?"Cancel export":`Download ${downloadFormat.toUpperCase()}${downloadCompression==="gzip"?".GZ":""}`}</button><button className={savingSession?"post-cancel":undefined} type="button" onClick={()=>savingSession?sessionSaveAbortRef.current?.abort():void saveAnalysisSession()}>{savingSession?"Cancel session save":"Save session"}</button><button type="button" onClick={onNewAnalysis}>New analysis</button></div>
     {downloadError && <p className="run-error" role="alert">{downloadError}</p>}
+    {alignerNotes}
   </section>;
 
   return (
@@ -2489,6 +2495,7 @@ export default function SwigApp() {
         let inputRecords = 0;
         let workers = 1;
         let fastqFilterStats = emptyFastqQualityFilterStats(fastqFilterSnapshot.enabled, false);
+        const alignerWarnings = new Set<string>();
         // Never mix exact read counts with a one-read placeholder for unknown inputs.
         const allCounted = datasetSnapshot.every((input) => input.count !== null);
         const estimates = allCounted ? datasetSnapshot.map((input) => input.count!)
@@ -2549,6 +2556,7 @@ export default function SwigApp() {
           inputRecords += completed.inputRecords;
           workers = Math.max(workers, completed.workers);
           fastqFilterStats = addFastqQualityFilterStats(fastqFilterStats, completed.fastqFilter);
+          for (const warning of completed.warnings) alignerWarnings.add(warning);
           completedWeight += weight;
         }
         setAssignmentTelemetry((current) => current ? {
@@ -2558,7 +2566,7 @@ export default function SwigApp() {
           recordsOutstanding: 0,
         } : current);
         await store.finalize();
-        return { count, inputRecords, workers, fastqFilterStats };
+        return { count, inputRecords, workers, fastqFilterStats, alignerWarnings: [...alignerWarnings] };
       });
       setProgress({ stage: "Results ready", value: 1 });
       const resultSession:ResultSession={
@@ -2591,6 +2599,7 @@ export default function SwigApp() {
         strand,
         doubleD,
         doubleDCount: store.doubleDCount,
+        alignerWarnings: result.alignerWarnings,
         sampleColors: createSampleColorMap(datasetSnapshot),
         project:preparedProject?.workspace,
       };
