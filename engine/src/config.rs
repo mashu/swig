@@ -10,8 +10,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::adjudicate::{
-    Adjudicator, CallModel, DAlleleDecoding, EngineeringObjective, EvidenceModel, Flank,
-    FlankAllowance, Mode, PlacementDag, ResolvedOpenFlank, VdjGrammar,
+    Adjudicator, CallModel, DAlleleDecoding, EngineeringObjective, EvidenceModel, Flank, Mode,
+    PlacementDag, ResolvedOpenFlank, VdjGrammar,
 };
 use crate::admission::{AnyOf, DefaultAdmission, DistributedEvidence, ExactRunFloor};
 use crate::align::{Backend, InterSequenceGotoh};
@@ -250,9 +250,11 @@ impl DPrior {
 /// could have been missed, nearly nothing.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OpenFlank {
-    /// Read bases beyond the D explained without a missing segment: N/P
-    /// bases and the D's unaligned germline.
-    pub allowance: FlankAllowance,
+    /// `N_open`: read bases beyond the D explained without a missing
+    /// segment, N/P bases and the D's unaligned germline (24: the simulated
+    /// distance from a called D to the true J start, or from the V end to
+    /// the D, has p99.9 22–24; real macaque N1 has p99 20).
+    pub n_open: u32,
     /// `π`, the prior that the bases past an anchor are no junction (½,
     /// the even odds of [`DPrior::DERIVED`]).
     pub junk_prior: f64,
@@ -265,14 +267,8 @@ pub struct OpenFlank {
 }
 
 impl OpenFlank {
-    /// The step allowance of the measured design: 24 free bases.
-    pub const STEP: FlankAllowance = FlankAllowance::Step { n_open: 24 };
-    /// The survival allowance: a 9-base D tail (p90 of real Ds' unaligned
-    /// 3′ germline), then N/P bases of mean 6 (the real N1 mean).
-    pub const SURVIVAL: FlankAllowance = FlankAllowance::Survival { mu: 6.0, tail: 9 };
-
     pub const DEFAULT: Self = Self {
-        allowance: Self::STEP,
+        n_open: 24,
         junk_prior: 0.5,
         max_visible: 64,
         miss_floor: Some(1e-3),
@@ -296,23 +292,12 @@ impl OpenFlank {
                 .and_then(|gates| Significance::new(set, scoring, gates))
                 .map(|s| s.min_score(window, s.gates.accept))
         };
-        let mut accept = [
+        let accept = [
             accept(v, &v_config.scoring, v_config.evalue),
             accept(j, &j_config.scoring, j_config.evalue),
         ];
-        // PROTOTYPE: SWIG_OF_SACC=V:J overrides the accept scores.
-        if let Ok(spec) = std::env::var("SWIG_OF_SACC") {
-            let f: Vec<Score> = spec
-                .split(':')
-                .map(|x| x.parse().expect("SWIG_OF_SACC"))
-                .collect();
-            accept = [Some(f[0]), Some(f[1])];
-        }
-        if std::env::var("SWIG_OF_DEBUG").is_ok() {
-            eprintln!("open flank accept {accept:?}");
-        }
         ResolvedOpenFlank {
-            allowance: self.allowance,
+            n_open: self.n_open,
             junk_prior: self.junk_prior,
             max_visible: self.max_visible,
             miss_floor: self.miss_floor.unwrap_or(0.0),

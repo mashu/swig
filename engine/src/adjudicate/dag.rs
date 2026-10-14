@@ -208,9 +208,11 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         placements: &[Placement],
         keep: impl Fn(usize) -> bool,
         read: &ReadModel,
+        flank: &FlankTable,
         s: &mut DagScratch,
     ) {
         s.lattice.layout(placements, keep);
+        s.lattice.set_closes(flank.closes());
         s.entry.clear();
         s.entry.resize(s.lattice.cells(), None);
         s.exit.clear();
@@ -499,7 +501,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         flank: &FlankTable,
         s: &mut DagScratch,
     ) -> Option<(PathScore<Units>, Vec<CalledSegment>)> {
-        self.layout(placements, keep, read, s);
+        self.layout(placements, keep, read, flank, s);
         let mut best: Option<(PathScore<Units>, Cell)> = None;
         for e in 0..s.lattice.nodes.len() {
             // The open-flank costs of a path that starts or ends here, if on a D.
@@ -570,16 +572,19 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         SegmentKind::REARRANGED.map(|kind| self.model.presence(kind))
     }
 
-    /// The open-flank costs of a read in `context` with `placements`.
+    /// The open-flank costs of a read in `context` with `placements`,
+    /// under `read`, the model the call maximises.
     pub(crate) fn flank_table(
         &self,
         context: &ReadContext,
         placements: &[Placement],
+        read: &ReadModel,
         table: &mut FlankTable,
     ) {
         table.fill(
             self.model.open_flank(),
-            self.model.presence(SegmentKind::D),
+            self.presence(),
+            read,
             self.calls(),
             context,
             placements,
@@ -633,8 +638,8 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
         scratch: &mut DagScratch,
     ) -> Option<CallPath> {
         let mut flank = std::mem::take(&mut scratch.flank);
-        self.flank_table(context, placements, &mut flank);
         let read = self.read_model(context.divergence);
+        self.flank_table(context, placements, &read, &mut flank);
         let call = self
             .viterbi(placements, &read, &flank, scratch)
             .map(|(value, segments)| CallPath {
@@ -655,7 +660,8 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
         scratch: &mut DagScratch,
     ) -> Option<Marginals> {
         let nats = self.nats(path.context.divergence)?;
-        self.flank_table(&path.context, placements, &mut scratch.flank);
+        let read = self.read_model(path.context.divergence);
+        self.flank_table(&path.context, placements, &read, &mut scratch.flank);
         self.posterior(placements, &nats, &scratch.flank, &mut scratch.posterior)
     }
 
@@ -709,7 +715,7 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
         };
         let read = self.read_model(path.context.divergence);
         let mut flank = std::mem::take(&mut scratch.flank);
-        self.flank_table(&path.context, placements, &mut flank);
+        self.flank_table(&path.context, placements, &read, &mut flank);
         let decoded = self
             .conditioned(placements, keep, topology, &read, &flank, scratch)
             .map(|(_, mut segments)| {

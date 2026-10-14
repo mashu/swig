@@ -280,7 +280,6 @@ mod tests {
         let dag = PlacementDag::new(VdjGrammar::VDJ, objective, config.min_retained, Mode::Fixed);
         let floor = dag.model.d_floor();
         let read_model = ReadModel::fixed(1.0, objective.presence);
-        let d_presence = objective.presence[SegmentKind::D.index()];
         let (mut ws, mut scratch, mut table) = (
             assigner.workspace(),
             DagScratch::default(),
@@ -313,9 +312,23 @@ mod tests {
                     pruned += all.len() - kept.len();
                     let context = ReadContext::of(&all, cut.query.len() as u32);
                     let flank = objective.open_flank.as_ref();
-                    table.fill(flank, d_presence, CallModel::FixedScale, &context, &all);
+                    table.fill(
+                        flank,
+                        objective.presence,
+                        &read_model,
+                        CallModel::FixedScale,
+                        &context,
+                        &all,
+                    );
                     let full = dag.viterbi(&all, &read_model, &table, &mut scratch);
-                    table.fill(flank, d_presence, CallModel::FixedScale, &context, &kept);
+                    table.fill(
+                        flank,
+                        objective.presence,
+                        &read_model,
+                        CallModel::FixedScale,
+                        &context,
+                        &kept,
+                    );
                     let fewer = dag.viterbi(&kept, &read_model, &table, &mut scratch);
                     // The calls by what they hold, as the placement lists differ.
                     let held = |placements: &[Placement], path: &Option<(_, Vec<_>)>| {

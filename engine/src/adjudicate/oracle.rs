@@ -9,8 +9,7 @@ use super::decode::{Topology, Within};
 use super::units::{Columns, Flank, FlankTable, ReadContext, ReadModel};
 use super::{
     Adjudicator, CallModel, CalledSegment, DagScratch, EngineeringObjective, EvidenceModel,
-    FlankAllowance, Grammar, Mode, PathModel, PathScore, PlacementDag, Units, VdjGrammar,
-    divergence,
+    Grammar, Mode, PathModel, PathScore, PlacementDag, Units, VdjGrammar, divergence,
 };
 use crate::alphabet::encode;
 use crate::config::{DefaultAssigner, EngineConfig};
@@ -146,6 +145,17 @@ impl<'a, G: Grammar> Brute<'a, G> {
             // in order of start.
             let same_kind_before = pe.kind == pb.kind && pe.q_start() <= pb.q_start();
             if same_kind_before || !grammar.can_follow(pb.kind, pe.kind, d_used) {
+                continue;
+            }
+            // A V that cannot open a D's flank, a J that cannot close one.
+            let closes = self.flank.closes();
+            let blocked = !closes.is_empty()
+                && match (pb.kind, pe.kind) {
+                    (SegmentKind::V, SegmentKind::D) => !closes[b],
+                    (SegmentKind::D, SegmentKind::J) => !closes[e],
+                    _ => false,
+                };
+            if blocked {
                 continue;
             }
             let d_next = d_used + u8::from(pe.kind == SegmentKind::D);
@@ -542,10 +552,12 @@ fn dag_equals_brute_force_over_all_paths_and_cuts() {
 /// The open-flank cost at a path's ends ([`FlankTable`]) on the pipeline's
 /// placements of mid and hypermutated reads cut 0–80 bases before and after
 /// a D, so that paths start or end on a D with or without a V or J, at
-/// random anchored columns, under both allowances, with the cost on and
+/// random anchored columns, at two allowances, with the cost on and
 /// off: the DAG's key equals the exhaustive search under the per-read and
 /// the fixed model, its traced path re-scores to it, and `path_score`
-/// reports the oracle's fixed-scale value of that path.
+/// reports the oracle's fixed-scale value of that path. Some reads hold a
+/// V or J that cannot pay for itself, which then neither opens nor closes
+/// a D's flank ([`FlankTable::closes`]).
 #[test]
 fn open_flank_dag_equals_exhaustive_enumeration() {
     let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 11);
@@ -565,7 +577,7 @@ fn open_flank_dag_equals_exhaustive_enumeration() {
     let mut ws = assigner.workspace();
     let mut scratch = DagScratch::default();
     let (mut table, mut fixed_table) = (FlankTable::default(), FlankTable::default());
-    let (mut checked, mut charged, mut differs) = (0, 0, 0);
+    let (mut checked, mut charged, mut differs, mut blocked) = (0, 0, 0, 0);
     for preset in [SimParams::mid(), SimParams::hard()] {
         let sim = Simulator::new(&db.v, Some(&db.d), &db.j, preset).unwrap();
         for read in sim.reads(30, 13).unwrap() {
@@ -596,21 +608,14 @@ fn open_flank_dag_equals_exhaustive_enumeration() {
                     columns,
                     mismatches: rng.below(columns * 2 / 5),
                 };
-                for allowance in [
-                    FlankAllowance::Step { n_open: 24 },
-                    FlankAllowance::Survival { mu: 6.0, tail: 9 },
-                ] {
-                    let flank = super::ResolvedOpenFlank {
-                        allowance,
-                        ..resolved
-                    };
+                for n_open in [24, 12] {
+                    let flank = super::ResolvedOpenFlank { n_open, ..resolved };
                     let objective = EngineeringObjective {
                         open_flank: Some(flank),
                         ..base
                     };
                     let dag =
                         PlacementDag::new(TANDEM_D, objective, config.min_retained, Mode::Fixed);
-                    let d_presence = objective.presence[SegmentKind::D.index()];
                     for calls in [CallModel::PerRead, CallModel::FixedScale] {
                         let read = match calls {
                             CallModel::PerRead => {
@@ -621,10 +626,18 @@ fn open_flank_dag_equals_exhaustive_enumeration() {
                         let mut keys = [None, None];
                         for (k, on) in [true, false].into_iter().enumerate() {
                             let model = on.then_some(&flank);
-                            table.fill(model, d_presence, calls, &context, &placements);
+                            table.fill(
+                                model,
+                                objective.presence,
+                                &read,
+                                calls,
+                                &context,
+                                &placements,
+                            );
+                            blocked += usize::from(table.closes().iter().any(|&c| !c));
                             let (fast, exhaustive) =
                                 dag_and_brute_with(&dag, &placements, read, &table, &mut scratch);
-                            assert_eq!(fast, exhaustive, "{allowance:?} {calls:?} on {on}");
+                            assert_eq!(fast, exhaustive, "{n_open} {calls:?} on {on}");
                             keys[k] = fast;
                             let Some((_, segments)) =
                                 dag.viterbi(&placements, &read, &table, &mut scratch)
@@ -635,7 +648,8 @@ fn open_flank_dag_equals_exhaustive_enumeration() {
                             // The reported fixed score is the oracle's fixed value.
                             fixed_table.fill(
                                 model,
-                                d_presence,
+                                objective.presence,
+                                &fixed(&dag),
                                 CallModel::FixedScale,
                                 &context,
                                 &placements,
@@ -660,7 +674,7 @@ fn open_flank_dag_equals_exhaustive_enumeration() {
         }
     }
     assert!(
-        checked >= 600 && charged >= 50 && differs >= 20,
-        "{checked} optima, {charged} charged, {differs} changed by the cost"
+        checked >= 600 && charged >= 50 && differs >= 20 && blocked >= 20,
+        "{checked} optima, {charged} charged, {differs} changed by the cost, {blocked} blocking"
     );
 }

@@ -366,9 +366,9 @@ pub fn divergence_counts(placements: &[Placement]) -> DivergenceCounts {
         (None, None) => true,
         _ => false,
     };
-    let anchored = if anchored_v.is_none() && anchored_j.is_none() {
-        all
-    } else if same(anchored_v, v) && same(anchored_j, j) {
+    // Nothing anchored, or the anchored bests are the bests: the same count.
+    let unchanged = same(anchored_v, v) && same(anchored_j, j);
+    let anchored = if (anchored_v.is_none() && anchored_j.is_none()) || unchanged {
         all
     } else {
         count(anchored_v, anchored_j)
@@ -418,42 +418,13 @@ pub enum Flank {
     End = 1,
 }
 
-/// How many read bases beyond an open D are explained without a missing
-/// segment ([`ResolvedOpenFlank`]).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum FlankAllowance {
-    /// A hard allowance: the first `n_open` bases are N/P and the D's
-    /// unaligned germline, the rest would show the missing segment.
-    Step { n_open: u32 },
-    /// The D's unaligned tail of `tail` bases, then an N/P region of
-    /// geometric length, `P(N = n) = (1 − q)·qⁿ` with `q = e^{−1/mu}`.
-    Survival { mu: f64, tail: u32 },
-}
-
-impl FlankAllowance {
-    /// Bases that are free whatever the rest.
-    fn reach(self) -> u32 {
-        match self {
-            Self::Step { n_open } => n_open,
-            Self::Survival { tail, .. } => tail,
-        }
-    }
-
-    /// Bases past the visible cap at which the table is truncated: the
-    /// survival tail beyond it is below `e^{−10}`.
-    fn spill(self) -> u32 {
-        match self {
-            Self::Step { .. } => 0,
-            Self::Survival { mu, .. } => (10.0 * mu).ceil() as u32,
-        }
-    }
-}
-
 /// The open-flank model with the V and J stages' gates
 /// ([`crate::config::OpenFlank`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ResolvedOpenFlank {
-    pub allowance: FlankAllowance,
+    /// `N_open`: read bases beyond a D explained without a missing segment
+    /// (N/P bases and the D's unaligned germline).
+    pub n_open: u32,
     /// `π`: prior that the bases beyond an anchor are no junction.
     pub junk_prior: f64,
     /// Most visible bases of the missing segment the miss model reads.
@@ -541,13 +512,10 @@ struct FlankEntry {
 /// the log-ratio of "no junction there, or one whose V or J was missed"
 /// against "a junction whose V or J was missed". `ε(ℓ)` is the probability
 /// that `ℓ` visible bases of the missing segment stay undetected
-/// ([`FlankTable::miss_probabilities`]), at least `ε_min`. With the
-/// allowance [`FlankAllowance::Step`] `ε_eff(x) = ε(x − n_open)`; with
-/// [`FlankAllowance::Survival`] `ε_eff(x) = Σ_n P(n)·ε(x − tail − n) +
-/// P(N > x − tail)`, filled by `E(m) = (1 − q)·ε(m) + q·E(m − 1)`,
-/// `E(−1) = 1`, and constant from `X_max = tail + ℓ_max + ⌈10μ⌉` on (the
-/// rest of the geometric tail is below `e^{−10}`). Every cost is
-/// non-negative, non-decreasing in `x`, 0 within the allowance and at most
+/// ([`FlankTable::miss_probabilities`]), at least `ε_min`, and the first
+/// `N_open` bases are free: `ε_eff(x) = ε(min(x − N_open, ℓ_max))`
+/// (`ε(ℓ ≤ 0) = 1`). Every cost is non-negative, non-decreasing in `x`, 0
+/// within the allowance, constant from `x = N_open + ℓ_max` on and at most
 /// `ln(1 + π/ε_min)`.
 ///
 /// Each cost is kept in three scales: the call's units (per-read:
@@ -562,19 +530,20 @@ pub(crate) struct FlankTable {
     key: Option<(ReadContext, ResolvedOpenFlank)>,
     /// The D presence cost `P*_D` and call model the scales were derived for.
     scale: Option<(f64, CallModel)>,
-    /// Per side: `ε_eff` by visible length `ℓ` (step) or by `x` (survival),
-    /// the last one standing for every later index.
+    /// Per side: `ε` by visible length `ℓ`, the last one standing for every
+    /// longer one.
     missed: [Vec<f64>; 2],
     /// Per side and index: the cost, computed for the indices a D uses
     /// (`cost` NaN elsewhere).
     entries: [Vec<FlankEntry>; 2],
-    /// Per side: the indices `missed` covers.
+    /// Per side: the visible lengths the entries cover.
     covers: [usize; 2],
-    /// [`index`] of the model: `x − shift`, at most `cap`.
-    shift: u32,
-    cap: u32,
-    /// `ε(ℓ)` while filling.
-    eps: Vec<f64>,
+    /// Per placement of the last [`FlankTable::fill`]: whether it can open
+    /// (a V) or close (a J) a D's flank ([`FlankTable::closes`]).
+    closes: Vec<bool>,
+    /// `N_open` and `ℓ_max` of the model ([`index`]).
+    n_open: u32,
+    max_visible: u32,
 }
 
 impl FlankTable {
@@ -586,7 +555,8 @@ impl FlankTable {
     pub fn fill(
         &mut self,
         flank: Option<&ResolvedOpenFlank>,
-        d_presence: f64,
+        presence: [f64; 3],
+        read: &ReadModel,
         calls: CallModel,
         context: &ReadContext,
         placements: &[Placement],
@@ -596,19 +566,28 @@ impl FlankTable {
             self.clear();
             return;
         };
+        let d_presence = presence[SegmentKind::D.index()];
+        // A V or J that cannot pay its own presence cost under the call's
+        // model is no evidence of the junction's V or J.
+        self.closes.clear();
+        self.closes.extend(placements.iter().map(|p| match p.kind {
+            SegmentKind::V => pays(p, read, flank.substitution[Flank::Start as usize]),
+            SegmentKind::J => pays(p, read, flank.substitution[Flank::End as usize]),
+            _ => true,
+        }));
         let ds = || placements.iter().filter(|p| p.kind == SegmentKind::D);
         // The farthest D from each read end.
         let beyond = |p: &Placement| [p.q_start(), context.query_len.saturating_sub(p.q_end())];
         let mut needed = [None::<u32>; 2];
         for x in ds().map(beyond) {
-            for side in 0..2 {
-                needed[side] = Some(needed[side].map_or(x[side], |n: u32| n.max(x[side])));
+            for (needed, x) in needed.iter_mut().zip(x) {
+                *needed = Some(needed.map_or(x, |n| n.max(x)));
             }
         }
         self.prepare(flank, d_presence, calls, context, needed);
         for x in ds().map(beyond) {
-            for side in 0..2 {
-                self.cost(flank, side, index(flank, x[side]));
+            for (side, x) in x.into_iter().enumerate() {
+                self.cost(flank, side, index(flank, x));
             }
         }
     }
@@ -643,10 +622,7 @@ impl FlankTable {
         needed: [Option<u32>; 2],
     ) {
         self.query_len = context.query_len;
-        (self.shift, self.cap) = match flank.allowance {
-            FlankAllowance::Step { n_open } => (n_open, flank.max_visible),
-            FlankAllowance::Survival { .. } => (0, index(flank, u32::MAX) as u32),
-        };
+        (self.n_open, self.max_visible) = (flank.n_open, flank.max_visible);
         let key = (*context, *flank);
         let covered = (0..2).all(|side| {
             flank.accept[side].is_none()
@@ -684,9 +660,9 @@ impl FlankTable {
         }
     }
 
-    /// `ε_eff` of `side` for up to `needed` bases beyond a D, from the
-    /// anchored columns `counts`, with its entries uncomputed; none when
-    /// the side is off or no D needs it.
+    /// `ε` of `side` for up to `needed` bases beyond a D, from the anchored
+    /// columns `counts`, with its entries uncomputed; none when the side is
+    /// off or no D needs it.
     fn misses(
         &mut self,
         flank: &ResolvedOpenFlank,
@@ -694,133 +670,27 @@ impl FlankTable {
         side: usize,
         needed: Option<u32>,
     ) {
-        let mut missed = std::mem::take(&mut self.missed[side]);
-        missed.clear();
+        self.missed[side].clear();
         self.covers[side] = 0;
         self.entries[side].clear();
         let (m, mu) = flank.substitution[side];
         if let (Some(accept), Some(needed), true) = (flank.accept[side], needed, m > 0 && m > mu) {
-            let reach = flank.allowance.reach();
-            let visible = needed.saturating_sub(reach).min(flank.max_visible);
-            self.miss_probabilities(accept, (m, mu), counts, visible, flank.miss_floor);
             let covers = index(flank, needed) + 1;
+            let missed = &mut self.missed[side];
+            miss_probabilities(
+                missed,
+                accept,
+                (m, mu),
+                counts,
+                covers as u32 - 1,
+                flank.miss_floor,
+            );
             self.covers[side] = covers;
-            match flank.allowance {
-                // By visible length: ε itself, ending at the floor.
-                FlankAllowance::Step { .. } => missed.extend_from_slice(&self.eps),
-                FlankAllowance::Survival { mu, .. } => {
-                    let q = (-1.0 / mu).exp();
-                    let last = self.eps.len() - 1;
-                    let mut survival = 1.0;
-                    for x in 0..covers as u32 {
-                        if x >= reach {
-                            let l = ((x - reach) as usize).min(last);
-                            survival = (1.0 - q) * self.eps[l] + q * survival;
-                        }
-                        missed.push(survival);
-                    }
-                }
-            }
             let uncomputed = FlankEntry {
                 cost: f64::NAN,
                 ..FlankEntry::default()
             };
             self.entries[side].resize(covers, uncomputed);
-        }
-        self.missed[side] = missed;
-    }
-
-    /// `ε(ℓ)` for `ℓ = 0..=upto` into `self.eps`: the probability that `ℓ`
-    /// visible bases of a missing segment stay below its accept score
-    /// `S_acc` = `accept`, scored ungapped `(m, μ)`, when each base
-    /// mismatches with a probability drawn from `Beta(k + ½, n − k + ½)`
-    /// of the read's anchored columns (`k` of `n` mismatch). The span then
-    /// needs `k(ℓ) = ⌊(m·ℓ − S_acc)/(m − μ)⌋ + 1` mismatches (none can hide
-    /// it while `m·ℓ < S_acc`), which `X_ℓ ~ BetaBinomial(ℓ, a, b)` reaches
-    /// with probability `P(X_ℓ ≥ k(ℓ))`. A segment shows in `ℓ` bases when
-    /// any prefix of them does, so `ε(ℓ)` is the smallest of these over
-    /// `ℓ' ≤ ℓ` (non-increasing, still an upper bound of the true miss
-    /// probability), and at least `floor`.
-    ///
-    /// The pmf at `(ℓ, k(ℓ))` is carried along `ℓ` by one ratio each, and
-    /// each tail summed from it until its terms fall below `10⁻⁷` of the
-    /// sum or the sum reaches the running minimum; with `k(ℓ)` unchanged
-    /// the tail only grows, so `ε` changes only where `k` steps. Once `ε`
-    /// reaches `floor` it stays there, and the list ends.
-    fn miss_probabilities(
-        &mut self,
-        accept: Score,
-        (m, mu): (Score, Score),
-        counts: Columns,
-        upto: u32,
-        floor: f64,
-    ) {
-        let a = counts.mismatches as f64 + 0.5;
-        let b = counts.columns.saturating_sub(counts.mismatches) as f64 + 0.5;
-        // Both below 1 (no anchored columns): the pmf is U-shaped, so a
-        // tail is summed whole.
-        let unimodal = a >= 1.0 || b >= 1.0;
-        let eps = &mut self.eps;
-        eps.clear();
-        // P(X_ℓ = 0), and P(X_ℓ = k) at the last k reached.
-        let mut zero = 1.0;
-        let mut walk: Option<(u32, f64)> = None;
-        let mut best = 1.0f64;
-        // The k of the last tail: with k fixed, P(X_ℓ ≥ k) only grows
-        // with ℓ, so ε changes only where k does.
-        let mut last_k = None;
-        for l in 0..=upto {
-            let lf = f64::from(l);
-            if l > 0 {
-                let n = lf - 1.0;
-                let step = 1.0 / (a + b + n);
-                zero *= (b + n) * step;
-                // P(X_ℓ = k) = P(X_{ℓ−1} = k) · ℓ/(ℓ − k) · (ℓ − 1 − k + b)/(a + b + ℓ − 1).
-                walk = walk.map(|(k, p)| {
-                    let k_f = f64::from(k);
-                    (k, p * lf / (lf - k_f) * (n - k_f + b) * step)
-                });
-            }
-            let score = m * l as Score;
-            if score >= accept {
-                let k = ((score - accept) / (m - mu)) as u32 + 1;
-                let tail = if last_k == Some(k) {
-                    best
-                } else if k > l {
-                    0.0
-                } else {
-                    let (mut at, mut p) = walk.unwrap_or((0, zero));
-                    while at < k {
-                        let x = f64::from(at);
-                        p *= (lf - x) / (x + 1.0) * (x + a) / (lf - x - 1.0 + b);
-                        at += 1;
-                    }
-                    walk = Some((at, p));
-                    last_k = Some(k);
-                    // Only a tail below the running minimum changes ε.
-                    let (mut tail, mut term) = (0.0, p);
-                    for x in k..=l {
-                        tail += term;
-                        if x == l || tail >= best {
-                            break;
-                        }
-                        let xf = f64::from(x);
-                        let next =
-                            term * ((lf - xf) * (xf + a)) / ((xf + 1.0) * (lf - xf - 1.0 + b));
-                        if unimodal && next < term && next < 1e-7 * tail {
-                            break;
-                        }
-                        term = next;
-                    }
-                    tail
-                };
-                best = best.min(tail);
-            }
-            let missed = best.max(floor);
-            eps.push(missed);
-            if floor > 0.0 && missed <= floor {
-                break;
-            }
         }
     }
 
@@ -831,6 +701,18 @@ impl FlankTable {
         self.entries.iter_mut().for_each(Vec::clear);
         self.missed.iter_mut().for_each(Vec::clear);
         self.covers = [0; 2];
+        self.closes.clear();
+    }
+
+    /// Per placement of the last [`FlankTable::fill`]: whether a V can open
+    /// a D's flank (precede a D) and a J close one (follow a D); empty when
+    /// the cost is off. A V or J none of whose clips (keeping its outer end)
+    /// is worth more than its presence cost under the call's model never
+    /// pays for itself, so it is no evidence of the junction's V or J:
+    /// without this, a junk J of a base or two after the D would close its
+    /// flank for less than the cost.
+    pub fn closes(&self) -> &[bool] {
+        &self.closes
     }
 
     /// The entry of a segment of `kind` on `[q_start, q_end)` at the
@@ -851,7 +733,7 @@ impl FlankTable {
             Flank::Start => q_start,
             Flank::End => self.query_len.saturating_sub(q_end),
         };
-        let entry = entries.get(x.saturating_sub(self.shift).min(self.cap) as usize);
+        let entry = entries.get(x.saturating_sub(self.n_open).min(self.max_visible) as usize);
         debug_assert!(
             entries.is_empty() || entry.is_some_and(|e| !e.cost.is_nan()),
             "a D whose open-flank cost was not computed"
@@ -882,6 +764,98 @@ impl FlankTable {
     }
 }
 
+/// `ε(ℓ)` for `ℓ = 0..=upto` into `eps`: the probability that `ℓ`
+/// visible bases of a missing segment stay below its accept score
+/// `S_acc` = `accept`, scored ungapped `(m, μ)`, when each base
+/// mismatches with a probability drawn from `Beta(k + ½, n − k + ½)`
+/// of the read's anchored columns (`k` of `n` mismatch). The span then
+/// needs `k(ℓ) = ⌊(m·ℓ − S_acc)/(m − μ)⌋ + 1` mismatches (none can hide
+/// it while `m·ℓ < S_acc`), which `X_ℓ ~ BetaBinomial(ℓ, a, b)` reaches
+/// with probability `P(X_ℓ ≥ k(ℓ))`. A segment shows in `ℓ` bases when
+/// any prefix of them does, so `ε(ℓ)` is the smallest of these over
+/// `ℓ' ≤ ℓ` (non-increasing, still an upper bound of the true miss
+/// probability), and at least `floor`.
+///
+/// The pmf at `(ℓ, k(ℓ))` is carried along `ℓ` by one ratio each, and
+/// each tail summed from it until its terms fall below `10⁻⁷` of the
+/// sum or the sum reaches the running minimum; with `k(ℓ)` unchanged
+/// the tail only grows, so `ε` changes only where `k` steps. Once `ε`
+/// reaches `floor` it stays there, and the list ends.
+fn miss_probabilities(
+    eps: &mut Vec<f64>,
+    accept: Score,
+    (m, mu): (Score, Score),
+    counts: Columns,
+    upto: u32,
+    floor: f64,
+) {
+    let a = counts.mismatches as f64 + 0.5;
+    let b = counts.columns.saturating_sub(counts.mismatches) as f64 + 0.5;
+    // Both below 1 (no anchored columns): the pmf is U-shaped, so a
+    // tail is summed whole.
+    let unimodal = a >= 1.0 || b >= 1.0;
+    eps.clear();
+    // P(X_ℓ = 0), and P(X_ℓ = k) at the last k reached.
+    let mut zero = 1.0;
+    let mut walk: Option<(u32, f64)> = None;
+    let mut best = 1.0f64;
+    // The k of the last tail: with k fixed, P(X_ℓ ≥ k) only grows
+    // with ℓ, so ε changes only where k does.
+    let mut last_k = None;
+    for l in 0..=upto {
+        let lf = f64::from(l);
+        if l > 0 {
+            let n = lf - 1.0;
+            let step = 1.0 / (a + b + n);
+            zero *= (b + n) * step;
+            // P(X_ℓ = k) = P(X_{ℓ−1} = k) · ℓ/(ℓ − k) · (ℓ − 1 − k + b)/(a + b + ℓ − 1).
+            walk = walk.map(|(k, p)| {
+                let k_f = f64::from(k);
+                (k, p * lf / (lf - k_f) * (n - k_f + b) * step)
+            });
+        }
+        let score = m * l as Score;
+        if score >= accept {
+            let k = ((score - accept) / (m - mu)) as u32 + 1;
+            let tail = if last_k == Some(k) {
+                best
+            } else if k > l {
+                0.0
+            } else {
+                let (mut at, mut p) = walk.unwrap_or((0, zero));
+                while at < k {
+                    let x = f64::from(at);
+                    p *= (lf - x) / (x + 1.0) * (x + a) / (lf - x - 1.0 + b);
+                    at += 1;
+                }
+                walk = Some((at, p));
+                last_k = Some(k);
+                // Only a tail below the running minimum changes ε.
+                let (mut tail, mut term) = (0.0, p);
+                for x in k..=l {
+                    tail += term;
+                    if x == l || tail >= best {
+                        break;
+                    }
+                    let xf = f64::from(x);
+                    let next = term * ((lf - xf) * (xf + a)) / ((xf + 1.0) * (lf - xf - 1.0 + b));
+                    if unimodal && next < term && next < 1e-7 * tail {
+                        break;
+                    }
+                    term = next;
+                }
+                tail
+            };
+            best = best.min(tail);
+        }
+        let missed = best.max(floor);
+        eps.push(missed);
+        if floor > 0.0 && missed <= floor {
+            break;
+        }
+    }
+}
+
 /// The entry of cost `c` nats in each scale ([`FlankTable`]).
 #[inline]
 fn scaled(c: f64, flank: &ResolvedOpenFlank, d_presence: f64, calls: CallModel) -> FlankEntry {
@@ -902,17 +876,61 @@ fn scaled(c: f64, flank: &ResolvedOpenFlank, d_presence: f64, calls: CallModel) 
     }
 }
 
-/// Where the cost of `x` bases beyond a D sits in a side's entries: its
-/// visible length (step), or `x` up to `X_max` (survival).
-#[inline]
-fn index(flank: &ResolvedOpenFlank, x: u32) -> usize {
-    let reach = flank.allowance.reach();
-    match flank.allowance {
-        FlankAllowance::Step { .. } => x.saturating_sub(reach).min(flank.max_visible) as usize,
-        FlankAllowance::Survival { .. } => {
-            x.min(reach + flank.max_visible + flank.allowance.spill()) as usize
+/// Whether a clip of V or J placement `p` that keeps its outer end (a V
+/// keeps its start, a J its end, as the first and last segment of a path)
+/// is worth more than the kind's presence cost under `read`, its match and
+/// mismatch scores being `(m, μ)`.
+fn pays(p: &Placement, read: &ReadModel, (m, mu): (Score, Score)) -> bool {
+    let cost = read.presence(p.kind);
+    // The whole alignment, one such clip: its substitution columns and its
+    // gaps (the rest of its score; `N` columns score 0 and are worth 0).
+    let evidence = &p.evidence;
+    let (matches, mismatches) = (evidence.matches as Score, evidence.mismatches as Score);
+    let gaps = p.score() - m * matches - mu * mismatches;
+    let whole = Units::from(matches) * read.column(p.kind, m)
+        + Units::from(mismatches) * read.column(p.kind, mu)
+        + read.prior(gaps);
+    if whole > cost {
+        return true;
+    }
+    // Otherwise every clip, along the columns.
+    let mut steps = super::lattice::column_steps(p);
+    match p.kind {
+        // The best prefix: from the start (after any leading gap) to an exit.
+        SegmentKind::V => {
+            let Some((_, _, first)) = steps.next() else {
+                return false;
+            };
+            let mut value = read.column(p.kind, first);
+            if value > cost {
+                return true;
+            }
+            for (_, gap, column) in steps {
+                value += read.prior(gap) + read.column(p.kind, column);
+                if value > cost {
+                    return true;
+                }
+            }
+            false
+        }
+        // The best suffix: from its best entry to the end.
+        _ => {
+            let (mut value, mut lowest) = (0, Units::MAX);
+            for (_, gap, column) in steps {
+                value += read.prior(gap);
+                lowest = lowest.min(value);
+                value += read.column(p.kind, column);
+            }
+            lowest != Units::MAX && value - lowest > cost
         }
     }
+}
+
+/// Where the cost of `x` bases beyond a D sits in a side's entries: its
+/// visible length, `min(x − N_open, ℓ_max)`.
+#[inline]
+fn index(flank: &ResolvedOpenFlank, x: u32) -> usize {
+    x.saturating_sub(flank.n_open).min(flank.max_visible) as usize
 }
 
 #[cfg(test)]
@@ -1183,7 +1201,7 @@ mod tests {
         }
         // The table's walk along ℓ gives the same tails up to 64 bases,
         // as their running minimum over prefixes, and with a floor.
-        let mut table = FlankTable::default();
+        let mut eps = Vec::new();
         for (mismatches, columns) in [(0, 0), (0, 45), (13, 45), (3, 300), (60, 120), (2, 4000)] {
             let counts = Columns {
                 columns,
@@ -1191,17 +1209,17 @@ mod tests {
             };
             let (a, b) = (mismatches as f64 + 0.5, (columns - mismatches) as f64 + 0.5);
             for floor in [0.0, 1e-3] {
-                table.miss_probabilities(16, (2, -3), counts, 64, floor);
+                miss_probabilities(&mut eps, 16, (2, -3), counts, 64, floor);
                 // The list ends where it reaches the floor.
-                let len = table.eps.len();
-                assert!(len == 65 || table.eps[len - 1] == floor);
+                let len = eps.len();
+                assert!(len == 65 || eps[len - 1] == floor);
                 let mut best = 1.0f64;
                 for l in 0..=64u32 {
                     if 2 * l >= 16 {
                         best = best.min(beta_binomial_tail(l, a, b, (2 * l - 16) / 5 + 1));
                     }
                     let want = best.max(floor);
-                    let got = table.eps[(l as usize).min(len - 1)];
+                    let got = eps[(l as usize).min(len - 1)];
                     assert!(
                         close_to(got, want, 1e-6),
                         "{columns} {mismatches} {l}: {got} {want}"
@@ -1212,10 +1230,11 @@ mod tests {
     }
 
     /// The open-flank model of the tests: IGH-like accept scores (V 24,
-    /// J 16), `(2, −3)`, `π = ½`, 64 visible bases, `ε_min = 10⁻³`.
-    fn open_flank(allowance: FlankAllowance) -> ResolvedOpenFlank {
+    /// J 16), `(2, −3)`, `N_open = 24`, `π = ½`, 64 visible bases,
+    /// `ε_min = 10⁻³`.
+    fn open_flank() -> ResolvedOpenFlank {
         ResolvedOpenFlank {
-            allowance,
+            n_open: 24,
             junk_prior: 0.5,
             max_visible: 64,
             miss_floor: 1e-3,
@@ -1225,15 +1244,12 @@ mod tests {
         }
     }
 
-    const ALLOWANCES: [FlankAllowance; 2] = [
-        FlankAllowance::Step { n_open: 24 },
-        FlankAllowance::Survival { mu: 6.0, tail: 9 },
-    ];
+    /// `X_max = N_open + ℓ_max`, from which the cost is constant.
+    const X_MAX: u32 = 24 + 64;
 
     /// `c(x)` per side for a read of anchored `columns` with `mismatches`,
     /// up to 40 bases past `X_max`, read through the table's lookups.
     fn costs(flank: &ResolvedOpenFlank, columns: usize, mismatches: usize) -> [Vec<f64>; 2] {
-        let x_max = flank.allowance.reach() + flank.max_visible + flank.allowance.spill();
         let context = ReadContext {
             divergence: 0.01,
             query_len: 1000,
@@ -1248,112 +1264,70 @@ mod tests {
             10.77,
             CallModel::FixedScale,
             &context,
-            [Some(x_max); 2],
+            [Some(X_MAX); 2],
         );
         let at = |side: Flank, x: u32| match side {
             Flank::Start => table.nats(side, SegmentKind::D, x, x + 10),
             Flank::End => table.nats(side, SegmentKind::D, 990 - x, 1000 - x),
         };
-        [Flank::Start, Flank::End].map(|side| (0..=x_max + 40).map(|x| at(side, x)).collect())
+        [Flank::Start, Flank::End].map(|side| (0..=X_MAX + 40).map(|x| at(side, x)).collect())
     }
 
     #[test]
     fn open_flank_cost_shape() {
         let ceiling = (1.0f64 + 0.5 * (1.0 - 1e-3) / 1e-3).ln();
-        for allowance in ALLOWANCES {
-            let flank = open_flank(allowance);
-            let x_max = (allowance.reach() + 64 + allowance.spill()) as usize;
-            let clean = costs(&flank, 300, 1);
-            for (side, accept) in [(0, 24), (1, 16)] {
-                let c = &clean[side];
-                // 0 while fewer than S_acc/m bases of the segment can show.
-                let free = allowance.reach() as usize + accept / 2;
-                assert!(c[..free].iter().all(|&c| c == 0.0), "{allowance:?} {c:?}");
-                assert!(c[free] > 0.0);
-                // Non-decreasing, constant past X_max, bounded by ln(1 + π/ε_min),
-                // which a clean read far out reaches (survival: but for the
-                // geometric tail beyond X_max, e^{−10}·(1 − ε_min) in ε).
-                assert!(c.windows(2).all(|w| w[0] <= w[1]), "{allowance:?} {c:?}");
-                assert!(c[x_max..].iter().all(|&v| v == c[x_max]));
-                assert!(c.iter().all(|&v| v <= ceiling));
-                let short = match allowance {
-                    FlankAllowance::Step { .. } => 1e-12,
-                    FlankAllowance::Survival { .. } => (1.0f64 + (-10.0f64).exp() / 1e-3).ln(),
-                };
-                assert!(ceiling - c[x_max] <= short, "{allowance:?} {}", c[x_max]);
-            }
-            // Non-increasing in the mismatch rate.
-            let by_rate: Vec<[Vec<f64>; 2]> = (0..=30)
-                .map(|mismatches| costs(&flank, 60, mismatches))
-                .collect();
-            for pair in by_rate.windows(2) {
-                for side in 0..2 {
-                    let (lo, hi) = (&pair[0][side], &pair[1][side]);
-                    assert!(lo.iter().zip(hi).all(|(a, b)| b <= a), "{allowance:?}");
-                }
-            }
-            // A J-only anchor at 30 % SHM (45 columns, 13 mismatches): the
-            // J could have been missed, so 64 visible bases cost under a nat,
-            // against the 6.2-nat ceiling of a clean read.
-            let mutated = costs(&flank, 45, 13);
-            let far = mutated[1][x_max];
-            assert!(far < 1.0, "{allowance:?}: {far}");
-            assert!(costs(&flank, 45, 0)[1][x_max] > 6.0);
-            // A stage without significance: no cost on its side.
-            let blind = ResolvedOpenFlank {
-                accept: [None, Some(16)],
-                ..flank
-            };
-            let c = costs(&blind, 300, 1);
-            assert!(c[0].iter().all(|&v| v == 0.0) && c[1][x_max] > 0.0);
+        let flank = open_flank();
+        let x_max = X_MAX as usize;
+        let clean = costs(&flank, 300, 1);
+        for (side, accept) in [(0, 24), (1, 16)] {
+            let c = &clean[side];
+            // 0 while fewer than S_acc/m bases of the segment can show.
+            let free = 24 + accept / 2;
+            assert!(c[..free].iter().all(|&c| c == 0.0), "{c:?}");
+            assert!(c[free] > 0.0);
+            // Non-decreasing, constant past X_max, bounded by ln(1 + π/ε_min),
+            // which a clean read far out reaches.
+            assert!(c.windows(2).all(|w| w[0] <= w[1]), "{c:?}");
+            assert!(c[x_max..].iter().all(|&v| v == c[x_max]));
+            assert!(c.iter().all(|&v| v <= ceiling));
+            assert!(ceiling - c[x_max] <= 1e-12, "{}", c[x_max]);
         }
+        // Non-increasing in the mismatch rate.
+        let by_rate: Vec<[Vec<f64>; 2]> = (0..=30)
+            .map(|mismatches| costs(&flank, 60, mismatches))
+            .collect();
+        for pair in by_rate.windows(2) {
+            for (lo, hi) in pair[0].iter().zip(&pair[1]) {
+                assert!(lo.iter().zip(hi).all(|(a, b)| b <= a));
+            }
+        }
+        // A J-only anchor at 30 % SHM (45 columns, 13 mismatches): the J
+        // could have been missed, so 64 visible bases cost under a nat,
+        // against the 6.2-nat ceiling of a clean read.
+        let mutated = costs(&flank, 45, 13);
+        let far = mutated[1][x_max];
+        assert!(far < 1.0, "{far}");
+        assert!(costs(&flank, 45, 0)[1][x_max] > 6.0);
+        // A stage without significance: no cost on its side.
+        let blind = ResolvedOpenFlank {
+            accept: [None, Some(16)],
+            ..flank
+        };
+        let c = costs(&blind, 300, 1);
+        assert!(c[0].iter().all(|&v| v == 0.0) && c[1][x_max] > 0.0);
         // No model: an empty table, every cost 0.
         let mut table = FlankTable::default();
         let context = ReadContext::of(&[], 100);
-        table.fill(None, 10.0, CallModel::PerRead, &context, &[]);
+        let read = ReadModel::fixed(1.0, [0.0, 10.0, 7.0]);
+        table.fill(
+            None,
+            [0.0, 10.0, 7.0],
+            &read,
+            CallModel::PerRead,
+            &context,
+            &[],
+        );
         assert_eq!(table.units(Flank::End, SegmentKind::D, 0, 10), 0);
-    }
-
-    /// The survival recurrence `E(m) = (1 − q)·ε(m) + q·E(m − 1)` is the
-    /// convolution `Σ_n P(n)·ε(m − n) + P(N > m)` of the geometric N/P
-    /// length with the miss probability.
-    #[test]
-    fn survival_recurrence_equals_convolution() {
-        for (mu, tail) in [(6.0, 9), (4.3, 6), (8.0, 12)] {
-            let flank = ResolvedOpenFlank {
-                miss_floor: 0.0,
-                ..open_flank(FlankAllowance::Survival { mu, tail })
-            };
-            for (columns, mismatches) in [(300, 1), (45, 13), (60, 6)] {
-                let c = costs(&flank, columns, mismatches)[1].clone();
-                let (a, b) = (mismatches as f64 + 0.5, (columns - mismatches) as f64 + 0.5);
-                // ε(ℓ): the running minimum of the beta-binomial tails.
-                let eps = |l: u32| {
-                    (8..=l.min(64))
-                        .map(|l| beta_binomial_tail(l, a, b, (2 * l - 16) / 5 + 1))
-                        .fold(1.0, f64::min)
-                };
-                let q = (-1.0 / mu).exp();
-                let x_max = tail + 64 + (10.0 * mu).ceil() as u32;
-                for x in 0..=x_max {
-                    let missed = if x < tail {
-                        1.0
-                    } else {
-                        let m = x - tail;
-                        (0..=m)
-                            .map(|n| (1.0 - q) * q.powi(n as i32) * eps(m - n))
-                            .sum::<f64>()
-                            + q.powi(m as i32 + 1)
-                    };
-                    let want = (0.5 * (1.0 - missed) / missed).ln_1p();
-                    assert!(
-                        (c[x as usize] - want).abs() <= 1e-6 * (1.0 + want),
-                        "mu {mu} tail {tail} x {x}: {} {want}",
-                        c[x as usize]
-                    );
-                }
-            }
-        }
     }
 
     /// The fixed scale charges `Δ = ⌊P*_D + c/λ_D⌋ − ⌊P*_D⌋`: an integer
@@ -1362,8 +1336,8 @@ mod tests {
     /// and its posterior those units in nats; the fixed posterior `c`.
     #[test]
     fn fixed_scale_flank_is_exact() {
-        let flank = open_flank(FlankAllowance::Step { n_open: 24 });
-        let x_max = 24 + 64;
+        let flank = open_flank();
+        let x_max = X_MAX;
         let context = ReadContext {
             divergence: 0.01,
             query_len: 1000,

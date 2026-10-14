@@ -377,27 +377,6 @@ impl RunOptions {
         if !self.d_open_flank {
             config.objective.open_flank = None;
         }
-        // PROTOTYPE: SWIG_OF_ALLOWANCE=step:N | survival:MU:TAIL picks the
-        // open-flank allowance; SWIG_OF_FLOOR the miss floor.
-        if let Some(flank) = &mut config.objective.open_flank {
-            if let Ok(spec) = std::env::var("SWIG_OF_ALLOWANCE") {
-                let f: Vec<&str> = spec.split(':').collect();
-                flank.allowance = match f.as_slice() {
-                    ["step", n] => crate::adjudicate::FlankAllowance::Step {
-                        n_open: n.parse().expect("SWIG_OF_ALLOWANCE"),
-                    },
-                    ["survival", mu, tail] => crate::adjudicate::FlankAllowance::Survival {
-                        mu: mu.parse().expect("SWIG_OF_ALLOWANCE"),
-                        tail: tail.parse().expect("SWIG_OF_ALLOWANCE"),
-                    },
-                    _ => panic!("SWIG_OF_ALLOWANCE: {spec}"),
-                };
-            }
-            if let Ok(floor) = std::env::var("SWIG_OF_FLOOR") {
-                let floor: f64 = floor.parse().expect("SWIG_OF_FLOOR");
-                flank.miss_floor = (floor > 0.0).then_some(floor);
-            }
-        }
         if let Some(evalue) = self.c_evalue {
             config.c.evalue = evalue;
         }

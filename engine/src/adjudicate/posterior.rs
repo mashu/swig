@@ -275,7 +275,9 @@ fn normalise(values: &mut [f64]) -> f64 {
 }
 
 /// Slots of the `successors` of kind `kind` that continue `group` and have
-/// completions.
+/// completions. A J that cannot close a D's flank has no slot after a D
+/// ([`Lattice::open`]); a V that cannot open one is followed by no D
+/// ([`Lattice::opens`]).
 fn outgoing<'a>(
     lattice: &'a Lattice,
     scales: &'a [Scales],
@@ -397,6 +399,7 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
         let grammar = &self.dag.grammar;
         let lambda0 = self.w.lambda;
         s.lattice.layout(placements, |_| true);
+        s.lattice.set_closes(self.flank.closes());
         let cells = s.lattice.cells();
         for (weights, fill) in [(&mut s.entry_w, 0.0), (&mut s.exit_w, 0.0)]
             .into_iter()
@@ -707,7 +710,10 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
         let width = node.width();
         let successors = &s.lattice.nodes[s.lattice.successors(b)..];
         let can_end = grammar.can_end(first, node.kind, d_used);
-        let follows = |kind: SegmentKind| grammar.can_follow(node.kind, kind, d_used);
+        let opens = s.lattice.opens(&node);
+        let follows = |kind: SegmentKind| {
+            grammar.can_follow(node.kind, kind, d_used) && (opens || kind != SegmentKind::D)
+        };
         // As in the forward pass, an N/P gap to a successor that starts after
         // this node's end joins the log scale.
         let gap = |e: &Node| {
@@ -840,8 +846,8 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
 mod tests {
     use super::*;
     use crate::adjudicate::units::{
-        CallModel, Columns, EvidenceModel, Flank, FlankAllowance, FlankTable, ReadContext,
-        ReadModel, ResolvedOpenFlank, Units,
+        CallModel, Columns, EvidenceModel, Flank, FlankTable, ReadContext, ReadModel,
+        ResolvedOpenFlank, Units,
     };
     use crate::adjudicate::{
         CalledSegment, DagScratch, EngineeringObjective, Mode, PathScore, VdjGrammar,
@@ -931,6 +937,19 @@ mod tests {
             (self.nats.lambda * f64::from(k), self.read.prior(k))
         }
 
+        /// Whether a path may step from placement `b` to `e`: a V that
+        /// cannot open a D's flank does not precede a D, a J that cannot
+        /// close one does not follow a D.
+        fn joins(&self, b: usize, e: usize) -> bool {
+            let closes = self.flank.closes();
+            match (self.placements[b].kind, self.placements[e].kind) {
+                _ if closes.is_empty() => true,
+                (SegmentKind::V, SegmentKind::D) => closes[b],
+                (SegmentKind::D, SegmentKind::J) => closes[e],
+                _ => true,
+            }
+        }
+
         /// The open-flank term of a path that starts or ends at `b`.
         fn open(&self, side: Flank, b: &Placement) -> (f64, Units) {
             let (q_start, q_end) = (b.q_start(), b.q_end());
@@ -978,7 +997,10 @@ mod tests {
                     // Kinds in grammar order wherever they start; one kind
                     // (tandem D) in order of start.
                     let same_kind_before = e.kind == b.kind && e.q_start() <= b.q_start();
-                    if same_kind_before || !dag.grammar.can_follow(b.kind, e.kind, d_used) {
+                    if same_kind_before
+                        || !dag.grammar.can_follow(b.kind, e.kind, d_used)
+                        || !self.joins(*path.last().expect("non-empty"), j)
+                    {
                         continue;
                     }
                     let iota = dag.model.junction_per_base(b.kind, e.kind);
@@ -1481,9 +1503,9 @@ mod tests {
 
     /// An open-flank model whose costs reach the fixtures' short reads: 2
     /// free bases, accept scores of 6 (V) and 4 (J).
-    fn short_flank(allowance: FlankAllowance, miss_floor: f64) -> ResolvedOpenFlank {
+    fn short_flank(n_open: u32, miss_floor: f64) -> ResolvedOpenFlank {
         ResolvedOpenFlank {
-            allowance,
+            n_open,
             junk_prior: 0.5,
             max_visible: 64,
             miss_floor,
@@ -1515,60 +1537,64 @@ mod tests {
     /// Forward–backward with the open-flank cost at the path ends equals
     /// the exhaustive sum, and the call its exhaustive maximum, under the
     /// fixed-scale pair (`Δ` in the call, `c` nats in the posterior), for
-    /// both allowances, with and without a floor, at clean and at mutated
+    /// two allowances, with and without a floor, at clean and at mutated
     /// anchors.
     #[test]
     fn marginals_equal_exhaustive_summation_with_open_flanks() {
-        let model = EngineeringObjective::priced([0.0, 4.5, 3.5]);
         let mut table = FlankTable::default();
-        let mut charged = 0;
-        for allowance in [
-            FlankAllowance::Step { n_open: 2 },
-            FlankAllowance::Survival { mu: 3.0, tail: 1 },
-        ] {
-            for floor in [0.0, 1e-3] {
-                let flank = short_flank(allowance, floor);
-                let objective = EngineeringObjective {
-                    open_flank: Some(flank),
-                    ..model
-                };
-                for (query_len, placements) in open_fixtures() {
-                    for anchored in [(40, 0), (40, 12)] {
-                        let context = ReadContext {
-                            divergence: 0.02,
-                            query_len,
-                            anchored: Columns {
-                                columns: anchored.0,
-                                mismatches: anchored.1,
-                            },
-                        };
-                        for grammar in [VdjGrammar::VDJ, TANDEM_D] {
-                            let dag = PlacementDag::new(grammar, objective, [4, 3, 4], Mode::Fixed);
-                            table.fill(
-                                Some(&flank),
-                                4.5,
-                                CallModel::FixedScale,
-                                &context,
-                                &placements,
-                            );
-                            charged += usize::from(placements.iter().any(|p| {
-                                table.nats(Flank::End, p.kind, p.q_start(), p.q_end()) > 0.0
-                                    && table.nats(Flank::Start, p.kind, p.q_start(), p.q_end())
-                                        > 0.0
-                            }));
-                            let nats = PathNats {
-                                lambda: LAMBDA,
-                                evidence: [EvidenceScale::at_divergence(0.02, 2, -3); 3],
-                                presence: model.presence.map(|cost| LAMBDA * cost),
+        let (mut charged, mut blocked) = (0, 0);
+        // J and V presence costs no J (V) of the fixtures pays: no D→J
+        // (V→D) step then (`FlankTable::closes`).
+        for presence in [[0.0, 4.5, 3.5], [0.0, 4.5, 30.0], [40.0, 4.5, 3.5]] {
+            let model = EngineeringObjective::priced(presence);
+            for n_open in [0, 2] {
+                for floor in [0.0, 1e-3] {
+                    let flank = short_flank(n_open, floor);
+                    let objective = EngineeringObjective {
+                        open_flank: Some(flank),
+                        ..model
+                    };
+                    for (query_len, placements) in open_fixtures() {
+                        for anchored in [(40, 0), (40, 12)] {
+                            let context = ReadContext {
+                                divergence: 0.02,
+                                query_len,
+                                anchored: Columns {
+                                    columns: anchored.0,
+                                    mismatches: anchored.1,
+                                },
                             };
-                            let read = ReadModel::fixed(LAMBDA, model.presence);
-                            check_with(&dag, &placements, nats, read, &table);
+                            for grammar in [VdjGrammar::VDJ, TANDEM_D] {
+                                let dag =
+                                    PlacementDag::new(grammar, objective, [4, 3, 4], Mode::Fixed);
+                                table.fill(
+                                    Some(&flank),
+                                    model.presence,
+                                    &ReadModel::fixed(LAMBDA, model.presence),
+                                    CallModel::FixedScale,
+                                    &context,
+                                    &placements,
+                                );
+                                blocked += usize::from(table.closes().iter().any(|&c| !c));
+                                charged += usize::from(placements.iter().any(|p| {
+                                    table.nats(Flank::End, p.kind, p.q_start(), p.q_end()) > 0.0
+                                        && table.nats(Flank::Start, p.kind, p.q_start(), p.q_end())
+                                            > 0.0
+                                }));
+                                let nats = PathNats {
+                                    lambda: LAMBDA,
+                                    evidence: [EvidenceScale::at_divergence(0.02, 2, -3); 3],
+                                    presence: model.presence.map(|cost| LAMBDA * cost),
+                                };
+                                let read = ReadModel::fixed(LAMBDA, model.presence);
+                                check_with(&dag, &placements, nats, read, &table);
+                            }
                         }
                     }
                 }
             }
         }
-        assert!(charged > 20, "{charged}");
+        assert!(charged > 20 && blocked > 20, "{charged} {blocked}");
     }
 
     /// Under the per-read model with the open-flank cost, the call is a
@@ -1581,12 +1607,9 @@ mod tests {
         let model = EngineeringObjective::priced([0.0, 4.5, 3.5]);
         let mut table = FlankTable::default();
         let mut changed = 0;
-        for allowance in [
-            FlankAllowance::Step { n_open: 2 },
-            FlankAllowance::Survival { mu: 3.0, tail: 1 },
-        ] {
+        for n_open in [0, 2] {
             for floor in [0.0, 1e-3] {
-                let flank = short_flank(allowance, floor);
+                let flank = short_flank(n_open, floor);
                 for (query_len, placements) in open_fixtures() {
                     for p in [0.005, 0.05, 0.3] {
                         let context = ReadContext {
@@ -1610,7 +1633,8 @@ mod tests {
                             );
                             table.fill(
                                 Some(&flank),
-                                4.5,
+                                model.presence,
+                                &read,
                                 CallModel::PerRead,
                                 &context,
                                 &placements,
