@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { _ as annotateDoubleDBatch, a as deduplicate, c as parseFasta$2, d as runDenoisePartitionJob, f as runExactDedupJob, g as annotateAirrBatch, h as DEFAULT_PIPELINE_PLAN, i as createExactDedupPlan, l as prepareReferenceMsa, n as assignLineages, o as finishExactDedupPlan, p as sequenceFingerprint, s as normalizeNt, t as DenoiseAccumulator, v as datasetScopeValue, y as stableDatasetSeed } from "./chunks/post-analysis-core-DJA1I-YZ.mjs";
+import { _ as DEFAULT_PIPELINE_PLAN, a as createExactDedupPlan, b as datasetScopeValue, c as finishExactDedupPlan, d as prepareReferenceMsa, h as sequenceFingerprint, l as normalizeNt, m as runExactDedupJob, n as assignLineages, o as deduplicate, p as runDenoisePartitionJob, r as chmmJunctionFlank, t as DenoiseAccumulator, u as parseFasta$2, v as annotateAirrBatch, x as stableDatasetSeed, y as annotateDoubleDBatch } from "./chunks/post-analysis-core-B8-vIT7N.mjs";
 import { i as isCallingProfile, n as CALLING_PROFILES, r as alignerOptions } from "./chunks/aligner-engine-BHdxJCoP.mjs";
 import { chmodSync, createReadStream, createWriteStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -12491,9 +12491,20 @@ function airrRowToPostAnalysisRecord(row, intern = (value) => value) {
 		inputCount: Math.max(1, Math.floor(Number(value("duplicate_count")) || 1))
 	};
 }
-/** Exact V-to-J slice used by every denoising front end. AIRR coordinates are one-based. */
+const COMPLEMENT = {
+	A: "T",
+	C: "G",
+	G: "C",
+	T: "A"
+};
+/**
+* Exact V-to-J slice used by every denoising front end. AIRR coordinates are
+* one-based and refer to the read as aligned: its reverse complement when
+* `rev_comp` is true.
+*/
 function denoiseVdjSequence(row) {
-	const raw = row.values.sequence ?? "";
+	const given = row.values.sequence ?? "";
+	const raw = /^(?:T|TRUE|1)$/i.test(row.values.rev_comp ?? "") ? [...given.toUpperCase()].reverse().map((base) => COMPLEMENT[base] ?? "N").join("") : given;
 	const start = Math.floor(Number(row.values.v_sequence_start));
 	const end = Math.floor(Number(row.values.j_sequence_end));
 	if (raw && Number.isFinite(start) && Number.isFinite(end) && start >= 1 && end >= start && end <= raw.length) return raw.slice(start - 1, end);
@@ -12685,7 +12696,7 @@ function computeShmMetric(row, ordinal = 0, lineageId = 0, stratum = "all") {
 			else vAaReplacements += 1;
 		}
 	};
-	let codingBases = (frame - 1) % 3;
+	let codingBases = ((queryStart - frame) % 3 + 3) % 3;
 	for (let column = 0; column < length; column += 1) {
 		const q = query[column], g = germline[column];
 		if (q !== "-") queryPosition += 1;
@@ -13285,7 +13296,7 @@ var NativePool = class {
 };
 //#endregion
 //#region cli-src/swig-cli.mjs
-const VERSION = "0.39.3";
+const VERSION = "0.39.4";
 const CLI_STREAM_HIGH_WATER_MARK = 8388608;
 const CLI_GZIP_CHUNK_SIZE = 1048576;
 const CLI_DIRECTORY = dirname(fileURLToPath(import.meta.url));
@@ -14510,12 +14521,15 @@ async function runChimera(rows, activeMask, config, scope, headers, references, 
 	let batch = [];
 	for (let ordinal = 0; ordinal < rows.length; ordinal += 1) {
 		if (!activeMask[ordinal]) continue;
-		const row = rows[ordinal], call = row[`${segment}_call`] ?? "", sequence = row[`${segment}_sequence_alignment`] ?? "", germline = row[`${segment}_germline_alignment`] ?? "";
+		const row = rows[ordinal], call = row[`swig_original_${segment}_call`] || row[`${segment}_call`] || "", sequence = row[`${segment}_sequence_alignment`] ?? "", germline = row[`${segment}_germline_alignment`] ?? "";
+		const flank = chmmJunctionFlank(selectedSegment, row.sequence, row.rev_comp, row[`${segment}_sequence_start`], row[`${segment}_sequence_end`]);
 		batch.push({
 			ordinal,
 			call,
 			sequenceAlignment: sequence,
-			germlineAlignment: germline
+			germlineAlignment: germline,
+			segment: selectedSegment,
+			flank
 		});
 		if (batch.length >= 250) {
 			batches.push(batch);

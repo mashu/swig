@@ -1,4 +1,4 @@
-import { l as prepareReferenceMsa, m as threadSequenceToMsa, r as chmmairraDistanceFromReference, u as runChmm } from "./chunks/post-analysis-core-DJA1I-YZ.mjs";
+import { d as prepareReferenceMsa, f as runChmm, g as threadSequenceToMsa, i as chmmairraDistanceFromReference, s as extendChmmAlignment } from "./chunks/post-analysis-core-B8-vIT7N.mjs";
 import { parentPort } from "node:worker_threads";
 //#region cli-src/chmmairra-worker.mjs
 let msa = null;
@@ -19,10 +19,10 @@ function initialize(message) {
 function batch(rows) {
 	if (!msa || !options) throw new Error("CHMMAIRRa worker is not initialized.");
 	const results = [];
-	for (const row of rows) {
-		if (!row.call || !row.sequenceAlignment || !row.germlineAlignment) {
+	for (const input of rows) {
+		if (!input.call || !input.sequenceAlignment || !input.germlineAlignment) {
 			results.push({
-				ordinal: row.ordinal,
+				ordinal: input.ordinal,
 				probability: NaN,
 				dfr: 0,
 				startingReference: "",
@@ -31,6 +31,10 @@ function batch(rows) {
 			});
 			continue;
 		}
+		const row = input.segment && input.flank ? {
+			...input,
+			...extendChmmAlignment(input.segment, input.sequenceAlignment, input.germlineAlignment, input.call, input.flank, msa)
+		} : input;
 		const dfr = chmmairraDistanceFromReference(row.sequenceAlignment, row.germlineAlignment);
 		if (dfr < minDfr) {
 			results.push({
