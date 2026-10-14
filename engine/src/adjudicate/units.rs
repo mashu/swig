@@ -622,10 +622,8 @@ impl FlankTable {
                 flank, presence, read, calls, context, placements,
             ))
         {
-            return self.fill(flank, presence, read, calls, context, placements);
-        }
-        #[cfg(debug_assertions)]
-        {
+            self.fill(flank, presence, read, calls, context, placements);
+        } else if cfg!(debug_assertions) {
             let mut fresh = FlankTable::default();
             fresh.fill(flank, presence, read, calls, context, placements);
             debug_assert!(
@@ -636,7 +634,6 @@ impl FlankTable {
     }
 
     /// Whether `self` and `other` charge every D of `placements` alike.
-    #[cfg(debug_assertions)]
     fn same_costs(&self, other: &Self, placements: &[Placement]) -> bool {
         placements.iter().all(|p| {
             [Flank::Start, Flank::End].into_iter().all(|side| {
