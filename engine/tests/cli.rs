@@ -247,3 +247,67 @@ fn missing_inputs_are_usage_errors() {
     }
     fs::remove_dir_all(dir).unwrap();
 }
+
+/// Fixture (a) of `tests/open_flank.rs` on this database: each full V
+/// allele followed by 100 random bases (a fixed linear congruential stream).
+fn v_then_random() -> String {
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut base = || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        b"ACGT"[(state >> 62) as usize] as char
+    };
+    let v: Vec<&str> = V.lines().filter(|l| !l.starts_with('>')).collect();
+    (0..20)
+        .map(|i| {
+            let tail: String = (0..100).map(|_| base()).collect();
+            format!(">vcut{i}\n{}{tail}\n", v[i % v.len()])
+        })
+        .collect()
+}
+
+/// The `d_call` column of an AIRR TSV.
+fn d_column(tsv: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(tsv);
+    let mut lines = text.lines();
+    let header: Vec<&str> = lines.next().unwrap().split('\t').collect();
+    let d = header.iter().position(|&c| c == "d_call").unwrap();
+    lines
+        .map(|l| l.split('\t').nth(d).unwrap_or("").to_string())
+        .collect()
+}
+
+/// FNV-1a of Swig 0.39.3's AIRR rows on [`v_then_random`].
+const FNV_0393: u64 = 0x9186_e1b9_be7f_d846;
+
+/// (e) `--d-open-flank off` turns the open-flank cost off and gives Swig
+/// 0.39.3's rows on fixture (a), byte for byte: a chance D on all 20
+/// reads, where the cost leaves 2.
+#[test]
+fn the_open_flank_cost_can_be_turned_off() {
+    let dir = workspace("open-flank");
+    fs::write(dir.join("reads.fa"), v_then_random()).unwrap();
+    let call = |extra: &[&str]| {
+        let mut args = GERMLINES.to_vec();
+        args.extend_from_slice(extra);
+        args.push("reads.fa");
+        let output = run(&dir, &args);
+        assert!(output.status.success(), "{}", stderr(&output));
+        output.stdout
+    };
+    let (on, off) = (call(&[]), call(&["--d-open-flank", "off"]));
+    // Swig 0.39.3's output on these reads.
+    assert_eq!(fnv(&off), FNV_0393);
+    let count = |tsv: &[u8]| d_column(tsv).iter().filter(|d| !d.is_empty()).count();
+    assert_eq!((count(&on), count(&off)), (2, 20));
+    assert_eq!(call(&["--d-open-flank", "on"]), on);
+    let bad = run(&dir, &["--d-open-flank", "maybe", "reads.fa"]);
+    assert_eq!(bad.status.code(), Some(2));
+    assert!(
+        stderr(&bad).contains("--d-open-flank expects on or off"),
+        "{}",
+        stderr(&bad)
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}

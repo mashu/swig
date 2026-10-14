@@ -75,7 +75,7 @@ use super::lattice::{Group, KINDS, Lattice, Node, column_steps};
 use super::model::{Grammar, PathModel};
 #[cfg(doc)]
 use super::units::CallModel;
-use super::units::{EvidenceScale, PathNats};
+use super::units::{EvidenceScale, Flank, FlankTable, PathNats};
 use crate::germline::SegmentKind;
 use crate::placement::Placement;
 use crate::scoring::Score;
@@ -302,10 +302,11 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
     /// `None` when no grammatical path exists, or when linear arithmetic
     /// cannot hold the read: a placement's evidence range ([`MAX_SPREAD`]) or
     /// an overlap's ([`OVERLAP_SPREAD`]) is too wide.
-    pub fn posterior(
+    pub(crate) fn posterior(
         &self,
         placements: &[Placement],
         nats: &PathNats,
+        flank: &FlankTable,
         scratch: &mut PosteriorScratch,
     ) -> Option<Marginals> {
         let weights = match scratch.weights.take() {
@@ -316,6 +317,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
             dag: self,
             placements,
             w: &weights,
+            flank,
             presence: nats.presence.map(|cost| (-cost).exp()),
             steps: nats.evidence.map(Steps::new),
         }
@@ -331,6 +333,8 @@ struct Pass<'a, G, M> {
     placements: &'a [Placement],
     /// Prior weights.
     w: &'a Weights,
+    /// The open-flank costs at the path ends, in nats.
+    flank: &'a FlankTable,
     /// `e^{−c_k}`, the weight of a segment's presence cost, per kind.
     presence: [f64; 3],
     /// Evidence steps per rearranged segment kind.
@@ -341,6 +345,12 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
     /// Weight of `node`'s cut-independent term, its kind's presence cost.
     fn presence(&self, node: Node) -> f64 {
         self.presence[node.kind.index()]
+    }
+
+    /// The open-flank cost, in nats, of a path that starts (`Flank::Start`)
+    /// or ends (`Flank::End`) at `node`.
+    fn open(&self, side: Flank, node: Node) -> f64 {
+        self.flank.nats(side, node.kind, node.q_start, node.q_end())
     }
 
     fn run(&self, s: &mut PosteriorScratch) -> Option<Marginals> {
@@ -569,7 +579,7 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
             f.clear();
             f.resize(width, 0.0);
             if starts_here {
-                f[0] = (-reference).exp();
+                f[0] = (-reference - self.open(Flank::Start, node)).exp();
             }
             for (b, u) in s.lattice.incoming(t) {
                 let factor = (scales[u].exit + gap(&b) - reference).exp();
@@ -676,7 +686,7 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
                 let bonus = self.w.of(self.dag.model.end(first, node.kind, d_used));
                 end = Some((
                     usize::from(d_used),
-                    exit_scale + (x[width - 1] * bonus).ln(),
+                    exit_scale + (x[width - 1] * bonus).ln() - self.open(Flank::End, node),
                 ));
             }
         }
@@ -719,7 +729,9 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
         inner.clear();
         inner.resize(width, 0.0);
         if can_end {
-            inner[width - 1] = self.w.of(model.end(first, node.kind, d_used)) * (-reference).exp();
+            let open = self.open(Flank::End, node);
+            inner[width - 1] =
+                self.w.of(model.end(first, node.kind, d_used)) * (-reference - open).exp();
         }
         let mut tails = std::mem::take(&mut s.tails);
         for kind in SegmentKind::REARRANGED.into_iter().filter(|&k| follows(k)) {
@@ -827,7 +839,10 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adjudicate::units::{EvidenceModel, ReadModel, Units};
+    use crate::adjudicate::units::{
+        CallModel, Columns, EvidenceModel, Flank, FlankAllowance, FlankTable, ReadContext,
+        ReadModel, ResolvedOpenFlank, Units,
+    };
     use crate::adjudicate::{
         CalledSegment, DagScratch, EngineeringObjective, Mode, PathScore, VdjGrammar,
     };
@@ -861,6 +876,7 @@ mod tests {
         placements: &'a [Placement],
         nats: PathNats,
         read: ReadModel,
+        flank: &'a FlankTable,
         z: f64,
         best: Option<PathScore<Units>>,
         placement: Vec<f64>,
@@ -915,6 +931,15 @@ mod tests {
             (self.nats.lambda * f64::from(k), self.read.prior(k))
         }
 
+        /// The open-flank term of a path that starts or ends at `b`.
+        fn open(&self, side: Flank, b: &Placement) -> (f64, Units) {
+            let (q_start, q_end) = (b.q_start(), b.q_end());
+            (
+                -self.flank.nats(side, b.kind, q_start, q_end),
+                -self.flank.units(side, b.kind, q_start, q_end),
+            )
+        }
+
         /// `path` so far is worth `nats` and `units`, its last segment entered at `entry`.
         #[allow(clippy::too_many_arguments)]
         fn visit(
@@ -935,10 +960,11 @@ mod tests {
                 let (nats, units) = (nats + evidence.0 + bonus.0, units + evidence.1 + bonus.1);
                 if dag.grammar.can_end(first, b.kind, d_used) && x == b.q_end() {
                     let end = self.prior(dag.model.end(first, b.kind, d_used));
-                    let weight = (nats + end.0).exp();
+                    let open = self.open(Flank::End, b);
+                    let weight = (nats + end.0 + open.0).exp();
                     self.z += weight;
                     let key = PathScore {
-                        score: units + end.1,
+                        score: units + end.1 + open.1,
                         d_count: d_used,
                         support: path.iter().map(|&p| placements[p].score()).sum(),
                     };
@@ -979,12 +1005,14 @@ mod tests {
             placements: &'a [Placement],
             nats: PathNats,
             read: ReadModel,
+            flank: &'a FlankTable,
         ) -> Self {
             let mut brute = Brute {
                 dag,
                 placements,
                 nats,
                 read,
+                flank,
                 z: 0.0,
                 best: None,
                 placement: vec![0.0; placements.len()],
@@ -993,7 +1021,8 @@ mod tests {
             for (s, p) in placements.iter().enumerate() {
                 if dag.grammar.can_start(p.kind) {
                     let d0 = u8::from(p.kind == SegmentKind::D);
-                    brute.visit(&mut vec![s], p.q_start(), d0, p.kind, 0.0, 0);
+                    let open = brute.open(Flank::Start, p);
+                    brute.visit(&mut vec![s], p.q_start(), d0, p.kind, open.0, open.1);
                 }
             }
             brute
@@ -1016,7 +1045,16 @@ mod tests {
             }
             let kind = |s: &CalledSegment| placements[s.placement].kind;
             let (first, last) = (kind(&segments[0]), kind(&segments[segments.len() - 1]));
-            units + self.read.prior(dag.model.end(first, last, d_used))
+            let start = self
+                .open(Flank::Start, &placements[segments[0].placement])
+                .1;
+            let end = self
+                .open(
+                    Flank::End,
+                    &placements[segments[segments.len() - 1].placement],
+                )
+                .1;
+            units + self.read.prior(dag.model.end(first, last, d_used)) + start + end
         }
     }
 
@@ -1030,9 +1068,20 @@ mod tests {
     /// Marginals under `nats` and the Viterbi key under `read` against
     /// exhaustive search; the traced path re-scores to its key.
     fn check(dag: &PlacementDag, placements: &[Placement], nats: PathNats, read: ReadModel) {
-        let brute = Brute::run(dag, placements, nats, read);
+        check_with(dag, placements, nats, read, &FlankTable::default());
+    }
+
+    /// [`check`] with the open-flank costs of `flank`.
+    fn check_with(
+        dag: &PlacementDag,
+        placements: &[Placement],
+        nats: PathNats,
+        read: ReadModel,
+        flank: &FlankTable,
+    ) {
+        let brute = Brute::run(dag, placements, nats, read, flank);
         let m = dag
-            .posterior(placements, &nats, &mut PosteriorScratch::default())
+            .posterior(placements, &nats, flank, &mut PosteriorScratch::default())
             .expect("a path exists");
         assert_close(m.log_partition, brute.z.ln(), "ln Z");
         for (i, (&got, &want)) in m.placement.iter().zip(&brute.placement).enumerate() {
@@ -1043,7 +1092,7 @@ mod tests {
             assert_close(got, want / brute.z, &format!("D count {k}"));
         }
         let (key, segments) = dag
-            .viterbi(placements, &read, &mut DagScratch::default())
+            .viterbi(placements, &read, flank, &mut DagScratch::default())
             .expect("a path exists");
         assert_eq!(Some(key), brute.best);
         assert_eq!(brute.rescore(&segments), key.score);
@@ -1304,7 +1353,12 @@ mod tests {
             Mode::Fixed,
         );
         let nats = EVIDENCE.nats(0.01, dag.model.presence);
-        let m = dag.posterior(&placements, &nats, &mut PosteriorScratch::default());
+        let m = dag.posterior(
+            &placements,
+            &nats,
+            &FlankTable::default(),
+            &mut PosteriorScratch::default(),
+        );
         assert!(m.is_none(), "{m:?}");
         // A junction-sized overlap is fine.
         let short = vec![
@@ -1338,12 +1392,22 @@ mod tests {
             (&big, &junction[..]),
         ] {
             let fresh = (
-                dag.viterbi(placements, &read, &mut DagScratch::default()),
-                dag.posterior(placements, &nats, &mut PosteriorScratch::default()),
+                dag.viterbi(
+                    placements,
+                    &read,
+                    &FlankTable::default(),
+                    &mut DagScratch::default(),
+                ),
+                dag.posterior(
+                    placements,
+                    &nats,
+                    &FlankTable::default(),
+                    &mut PosteriorScratch::default(),
+                ),
             );
             let reused = (
-                dag.viterbi(placements, &read, &mut dag_scratch),
-                dag.posterior(placements, &nats, &mut scratch),
+                dag.viterbi(placements, &read, &FlankTable::default(), &mut dag_scratch),
+                dag.posterior(placements, &nats, &FlankTable::default(), &mut scratch),
             );
             assert!(fresh.0.is_some() && fresh.1.is_some());
             assert_eq!(fresh, reused);
@@ -1367,7 +1431,12 @@ mod tests {
             presence: dag.model.presence.map(|cost| LAMBDA * cost),
         };
         let m = dag
-            .posterior(&placements, &nats, &mut PosteriorScratch::default())
+            .posterior(
+                &placements,
+                &nats,
+                &FlankTable::default(),
+                &mut PosteriorScratch::default(),
+            )
             .expect("a path exists");
         assert_eq!(m.d_count.len(), 1);
         assert!(m.d_present().is_sign_positive(), "{}", m.d_present());
@@ -1389,7 +1458,12 @@ mod tests {
             presence: dag.model.presence.map(|cost| LAMBDA * cost),
         };
         let m = dag
-            .posterior(&placements, &nats, &mut PosteriorScratch::default())
+            .posterior(
+                &placements,
+                &nats,
+                &FlankTable::default(),
+                &mut PosteriorScratch::default(),
+            )
             .expect("a path exists");
         assert_close(m.d_count.iter().sum(), 1.0, "D counts sum to 1");
         for kind in [SegmentKind::V, SegmentKind::J] {
@@ -1403,5 +1477,155 @@ mod tests {
         }
         // The better V allele dominates.
         assert!(m.placement[0] > 0.9, "V marginal {}", m.placement[0]);
+    }
+
+    /// An open-flank model whose costs reach the fixtures' short reads: 2
+    /// free bases, accept scores of 6 (V) and 4 (J).
+    fn short_flank(allowance: FlankAllowance, miss_floor: f64) -> ResolvedOpenFlank {
+        ResolvedOpenFlank {
+            allowance,
+            junk_prior: 0.5,
+            max_visible: 64,
+            miss_floor,
+            accept: [Some(6), Some(4)],
+            substitution: [(2, -3); 2],
+            d_lambda: LAMBDA,
+        }
+    }
+
+    /// The fixtures with and without their V or J: paths that start or end
+    /// on a D, which the open-flank cost charges.
+    fn open_fixtures() -> Vec<(u32, Vec<Placement>)> {
+        let (query, junction) = junction();
+        let (_, gapped) = gapped_junction();
+        let (over_query, over) = j_reaching_over_d();
+        let len = query.len() as u32;
+        vec![
+            (len, junction.clone()),
+            (len, junction[..4].to_vec()),
+            (len, junction[2..].to_vec()),
+            (len + 30, junction[..4].to_vec()),
+            (len + 60, junction[..4].to_vec()),
+            (len, gapped[2..].to_vec()),
+            (over_query.len() as u32, over[..2].to_vec()),
+            (over_query.len() as u32, over[1..].to_vec()),
+        ]
+    }
+
+    /// Forward–backward with the open-flank cost at the path ends equals
+    /// the exhaustive sum, and the call its exhaustive maximum, under the
+    /// fixed-scale pair (`Δ` in the call, `c` nats in the posterior), for
+    /// both allowances, with and without a floor, at clean and at mutated
+    /// anchors.
+    #[test]
+    fn marginals_equal_exhaustive_summation_with_open_flanks() {
+        let model = EngineeringObjective::priced([0.0, 4.5, 3.5]);
+        let mut table = FlankTable::default();
+        let mut charged = 0;
+        for allowance in [
+            FlankAllowance::Step { n_open: 2 },
+            FlankAllowance::Survival { mu: 3.0, tail: 1 },
+        ] {
+            for floor in [0.0, 1e-3] {
+                let flank = short_flank(allowance, floor);
+                let objective = EngineeringObjective {
+                    open_flank: Some(flank),
+                    ..model
+                };
+                for (query_len, placements) in open_fixtures() {
+                    for anchored in [(40, 0), (40, 12)] {
+                        let context = ReadContext {
+                            divergence: 0.02,
+                            query_len,
+                            anchored: Columns {
+                                columns: anchored.0,
+                                mismatches: anchored.1,
+                            },
+                        };
+                        for grammar in [VdjGrammar::VDJ, TANDEM_D] {
+                            let dag = PlacementDag::new(grammar, objective, [4, 3, 4], Mode::Fixed);
+                            table.fill(
+                                Some(&flank),
+                                4.5,
+                                CallModel::FixedScale,
+                                &context,
+                                &placements,
+                            );
+                            charged += usize::from(placements.iter().any(|p| {
+                                table.nats(Flank::End, p.kind, p.q_start(), p.q_end()) > 0.0
+                                    && table.nats(Flank::Start, p.kind, p.q_start(), p.q_end())
+                                        > 0.0
+                            }));
+                            let nats = PathNats {
+                                lambda: LAMBDA,
+                                evidence: [EvidenceScale::at_divergence(0.02, 2, -3); 3],
+                                presence: model.presence.map(|cost| LAMBDA * cost),
+                            };
+                            let read = ReadModel::fixed(LAMBDA, model.presence);
+                            check_with(&dag, &placements, nats, read, &table);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(charged > 20, "{charged}");
+    }
+
+    /// Under the per-read model with the open-flank cost, the call is a
+    /// mode of the reported posterior: both passes read the same quantised
+    /// costs, and the Viterbi key is the exhaustive maximum of
+    /// `e^{units/F}`. The cost changes some optima, so the test
+    /// discriminates.
+    #[test]
+    fn call_is_a_posterior_mode_with_open_flank() {
+        let model = EngineeringObjective::priced([0.0, 4.5, 3.5]);
+        let mut table = FlankTable::default();
+        let mut changed = 0;
+        for allowance in [
+            FlankAllowance::Step { n_open: 2 },
+            FlankAllowance::Survival { mu: 3.0, tail: 1 },
+        ] {
+            for floor in [0.0, 1e-3] {
+                let flank = short_flank(allowance, floor);
+                for (query_len, placements) in open_fixtures() {
+                    for p in [0.005, 0.05, 0.3] {
+                        let context = ReadContext {
+                            divergence: p,
+                            query_len,
+                            anchored: Columns {
+                                columns: 60,
+                                mismatches: (60.0 * p) as usize,
+                            },
+                        };
+                        for grammar in [VdjGrammar::VDJ, TANDEM_D] {
+                            let read = ReadModel::at(&EVIDENCE, p, model.presence);
+                            let dag = PlacementDag::new(
+                                grammar,
+                                EngineeringObjective {
+                                    open_flank: Some(flank),
+                                    ..model
+                                },
+                                [4, 3, 4],
+                                Mode::Fixed,
+                            );
+                            table.fill(
+                                Some(&flank),
+                                4.5,
+                                CallModel::PerRead,
+                                &context,
+                                &placements,
+                            );
+                            check_with(&dag, &placements, read.nats(), read, &table);
+                            let none = FlankTable::default();
+                            let mut scratch = DagScratch::default();
+                            let with = dag.viterbi(&placements, &read, &table, &mut scratch);
+                            let without = dag.viterbi(&placements, &read, &none, &mut scratch);
+                            changed += usize::from(with.map(|c| c.1) != without.map(|c| c.1));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(changed > 0, "the cost never changed a call");
     }
 }

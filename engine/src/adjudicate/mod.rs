@@ -34,7 +34,9 @@ pub use model::{EngineeringObjective, Grammar, PathModel, VdjGrammar};
 pub use posterior::{MAX_SPREAD, Marginals, OVERLAP_SPREAD, PosteriorScratch};
 pub(crate) use ties::{CoOptimal, co_optimal};
 pub use units::{
-    CallModel, EvidenceModel, EvidenceScale, PathNats, UNITS_PER_NAT, Units, divergence,
+    CallModel, Columns, DivergenceCounts, EvidenceModel, EvidenceScale, Flank, FlankAllowance,
+    PathNats, ReadContext, ResolvedOpenFlank, UNITS_PER_NAT, Units, beta_binomial_tail, divergence,
+    divergence_counts,
 };
 
 use std::cmp::Ordering;
@@ -99,14 +101,15 @@ pub struct CallPath {
     pub segments: Vec<CalledSegment>,
     /// The path's fixed-scale objective, whichever model chose it.
     pub score: PathScore,
-    /// The key the call maximised: its value in `model`'s units at
-    /// `divergence` (the fixed scores under [`CallModel::FixedScale`]), then
+    /// The key the call maximised: its value in `model`'s units for
+    /// `context` (the fixed scores under [`CallModel::FixedScale`]), then
     /// fewer D, then support. A path decoded from the posterior keeps its
     /// call's.
     pub value: PathScore<Units>,
-    /// The read's divergence `p̂` ([`divergence`]): the posterior reads
-    /// alignment evidence at it, and so does a [`CallModel::PerRead`] call.
-    pub divergence: f64,
+    /// The read the call was made for: its divergence `p̂` ([`divergence`]),
+    /// at which the posterior reads alignment evidence, and so does a
+    /// [`CallModel::PerRead`] call, and what the open-flank cost reads.
+    pub context: ReadContext,
     /// The model the call maximised.
     pub model: CallModel,
 }
@@ -114,22 +117,23 @@ pub struct CallPath {
 pub trait Adjudicator: Send + Sync {
     type Scratch: Default + Send;
 
+    /// The call of `placements` in the context of their own
+    /// ([`ReadContext::of_placements`]: the read ends where they end).
     fn adjudicate(&self, placements: &[Placement], scratch: &mut Self::Scratch)
     -> Option<CallPath>;
 
-    /// [`Adjudicator::adjudicate`] for a read whose divergence `p̂` is
-    /// `divergence` ([`divergence`] of all its placements, of which
-    /// `placements` may be a part): paths of one read's placement subsets
-    /// adjudicated at one divergence are hypotheses of one model, and
-    /// compare by [`CallPath::value`]. Adjudicators without a per-read
-    /// model ignore it.
+    /// [`Adjudicator::adjudicate`] for a read with context `context` (of
+    /// all its placements, of which `placements` may be a part, and its
+    /// length): paths of one read's placement subsets adjudicated in one
+    /// context are hypotheses of one model, and compare by
+    /// [`CallPath::value`]. Adjudicators without a per-read model ignore it.
     fn adjudicate_at(
         &self,
         placements: &[Placement],
-        divergence: f64,
+        context: &ReadContext,
         scratch: &mut Self::Scratch,
     ) -> Option<CallPath> {
-        let _ = divergence;
+        let _ = context;
         self.adjudicate(placements, scratch)
     }
 

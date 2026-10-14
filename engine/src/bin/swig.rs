@@ -90,6 +90,9 @@ options:
   --d-presence-rate R  D prior from the D search's own chance-hit count (alleles x
                        offsets x positions) at D-presence rate R, 0 < R < 1, instead
                        of genes x positions at even odds (docs/ALGORITHM.md 2.3)
+  --d-open-flank on|off  charge a D that ends (starts) its path for the J (V) the
+                       read would show in the bases after (before) it (default on;
+                       docs/ALGORITHM.md 2.3)
   --min-d-match N      shortest exact run of an admissible D (default: the profile's)
   --d-mismatch S       D mismatch score, -1000 to -1 (default: the profile's)
   --j-mismatch S       J mismatch score, -1000 to -1 (default: the profile's)
