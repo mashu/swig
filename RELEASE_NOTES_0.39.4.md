@@ -1,29 +1,40 @@
 # Swig 0.39.4
 
-Swig 0.39.4 fixes three problems that `engine/docs/REVIEW.md` listed as open
-after 0.39.3:
-- chance D calls on reads that hold no D;
-- constant and custom-named alleles that got no locus;
+Swig 0.39.4 fixes four problems that `engine/docs/REVIEW.md` listed as open
+after 0.39.3, one of them only in part:
+- chance D calls on D-free reads that stop before their J or start after
+  their V (in part: a chance D within about 30 bases of the V or J stays);
+- IgT, IgZ and IgO constant alleles that got no locus;
+- V names without `*`, which cost V accuracy on mutated reads;
 - options that were silently ignored without the database they need.
 
-Checking these fixes end to end also turned up four gaps in how Swig Web and
-`swig-cli` prepare custom references and report the aligner's warnings.
-Those are fixed too. Every fix has a regression test that fails on 0.39.3.
+It also gives a locus to alleles with custom names, which used to pair with
+every locus.
+
+Checking these fixes end to end also turned up five gaps in how Swig Web and
+`swig-cli` prepare references and report the aligner's warnings. Those are
+fixed too. Every fix has a regression test that fails on 0.39.3.
 
 The aligner runs in Swig Web, in `swig-cli` (native and WebAssembly) and in
-the `swig` binary. Every change to calls and AIRR columns below applies to
-all three. Changes to reading files, options and messages name the route
-they apply to.
+the `swig` binary. Every change the aligner itself makes to calls and AIRR
+columns below applies to all three, given the same reference. Changes to
+reading files, preparing references, options and messages name the route
+they apply to; the fixes to how Swig Web and `swig-cli` prepare custom
+references also change calls, but only on the routes they name.
 
-On ordinary full-length reads the calls do not change. On the 28,500
-simulated IGH, BCR and TCR reads of the frozen suite:
+With the shipped references, calls change only on reads where 0.39.3
+called a D with no J after it or no V before it. On full-length reads that
+happens only when the aligner misses the J or V. On the 29,500 simulated
+reads of the frozen suite:
 - the IGH easy, mid and hard, BCR and TCR sets, and 1,000 IGK reads run
   against the IGH database, keep every call. On IGH hard only posteriors
   move;
-- on the IGH set at 30 % SHM, 14 rows change a call (13 D, 1 J). No right D
-  call is lost, and right "no D" calls rise from 33.33 % to 34.11 %.
+- on the IGH set at 30 % SHM, 14 rows change a call (13 D, 1 J), all reads
+  in which 0.39.3 found no J. No right D call is lost, and right "no D"
+  calls rise from 33.33 % to 34.11 %.
 
-Speed is unchanged.
+With databases whose alleles name their locus, as every shipped reference
+does, speed is unchanged.
 
 ## What changes for users
 
@@ -66,17 +77,23 @@ Speed is unchanged.
   What it costs:
   - **Real D behind a long N region.** The cost assumes non-templated
     regions of at most about 24 bases. On 1,500 simulated reads per bin
-    that end a few bases into their J, right D calls fall by 1.07 points
+    that end 0–20 bases into their J, right D calls fall by 1.07 points
     with an N2 of 26–30 bases (17 lost, 1 gained) and by 3.80 points with
-    31–40 bases. With 20–25 bases nothing changes. Reads that start inside
-    a long N1 lose 0.07 points at 26–30 bases and 1.13 points at 31–40.
-  - **D-presence calibration on truncated reads.** On simulated reads that
-    end inside their J, D calls do not change, but the D-presence Brier
-    score rises by 0.0045 (mid) and 0.0015 (hard).
+    31–40 bases. With 20–25 bases the share of right D calls does not
+    change (2 lost, 2 gained), but 5 of the 1,500 reads lose their D call
+    and the D-presence Brier score rises from 0.0056 to 0.0126. Reads that
+    start inside a long N1 lose 0.07 points at 26–30 bases and 1.13 points
+    at 31–40.
+  - **D-presence calibration on truncated reads.** On 1,500 simulated
+    reads per set that end inside their J, 3 D calls change per set and
+    right D calls stay at 91.20 % (mid) and 83.13 % (hard, 1 lost and 1
+    gained), but the D-presence Brier score rises by 0.0045 (mid) and
+    0.0014 (hard).
   - **J posteriors at high SHM.** Paths without a J lose posterior mass, so
     a called J gains some, right or not. At 30 % SHM the J posterior rises on
-    908 of 2,742 reads with the same J call, and its Brier score goes from
-    0.1870 to 0.1890 (paired t = 3.8); J calls do not change.
+    908 of 2,742 reads with the same J call, and on those reads its Brier
+    score goes from 0.1870 to 0.1887 (paired t = 3.8). No right J call
+    changes; one read that had no J now gets a wrong one.
   - **A database with no J of the read's locus.** On IGH reads run against a
     database whose J alleles are all from another locus under custom names,
     7.3 % of right D calls are lost.
@@ -84,14 +101,25 @@ Speed is unchanged.
     - So does replacing the IGH J alleles with TRB J alleles under their
       own names, or removing the TRB J alleles from the TCR database.
 
-  `--d-open-flank off` turns the cost off. On a database whose allele names
-  all name their locus and gene, as every shipped reference does, that gives
-  0.39.3's calls.
+  `--d-open-flank off` turns the cost off. On the suite's databases and the
+  shipped references, that gives 0.39.3's calls. Names that 0.39.4 reads
+  differently can still change calls: IGH constant genes of isotype F, O,
+  T, W, X, Y or Z, which 0.39.3 left without a locus; alleles whose name,
+  `locus=` key and header give no locus; and V names without `*`, which can
+  now join a relative's gene.
 - **IgT, IgZ and IgO constant genes.** An IGH constant gene is now
-  recognised by any isotype letter: A, D, E, F, G, M, O, T, W, X, Y, Z,
-  optionally followed by one more letter (`IGHG2A`, `IGHT2D`, `IGHMD`). In
-  Swig's IMGT reference pack, 8 constant alleles in 6 species had no locus:
-  IGHT (6), IGHZ (1) and IGHO (1). They are now IGH.
+  recognised by any isotype letter: A, D, E, F, G, M, O, T, W, X, Y, Z
+  (`IGHT2D`, `IGHZ`, `IGHO`).
+  - After any of these letters except D, which also starts D gene names
+    (`IGHD1-1`), at most one more letter may come before the next digit,
+    `*` or other non-letter (`IGHMD`, `IGHGP`). A word such as `IGHTEST1`
+    therefore names no locus.
+  - That limit is new for A, E, G and M, which 0.39.3 accepted with any
+    number of letters after them, so `IGHGPX1` no longer names IGH. No name
+    in Swig's IMGT reference pack loses its locus.
+  - In that pack, 8 constant alleles in 6 of its 64 species and strain sets
+    (5 species) had no locus: IGHT (6), IGHZ (1) and IGHO (1). They are now
+    IGH.
   - Calls on the shipped references do not change.
   - In a database of several loci, an allele of no locus could join any
     locus' segments and counted in every locus' C gate.
@@ -106,30 +134,37 @@ Speed is unchanged.
   3. the header's gene names;
   4. the allele's closest named relative in the database, or in a small
      built-in panel of human and mouse V, J and C genes;
-  5. failing all of these, the loci the database names, with a warning
-     that lists the alleles and asks for a `locus=` key.
+  5. failing all of these, the loci the database names; a D takes only
+     those of them with D genes (IGH, TRB, TRD). In a database of several
+     loci, a warning names these alleles and asks for a `locus=` key. When
+     steps 1–4 place no allele of the database in a locus, the alleles
+     still pair with every locus, now with a warning.
 
   `swig prepare` writes the result as `locus=`. On the suite's databases
   with custom names:
 
   | Custom-named alleles | 0.39.3 | 0.39.4 |
   |---|---|---|
-  | every D of the BCR database: light-chain reads correctly without a D | 78.50 % | 99.51 %, as with IMGT names |
+  | every D of the BCR database: light-chain reads with a D | 1,077 of 5,000 | 0, as with IMGT names |
   | every D of the TCR database: TRA reads with a D | 839 | 0 |
   | every J of the BCR database: C allele against IMGT names | −0.74 points | equal |
-  | every V of the BCR database | | calls equal to IMGT names |
+  | every V of the BCR database: calls against IMGT names | same accuracy; 4 of 7,500 reads list 1 or 2 extra tied alleles | equal on all 7,500 reads |
   | every allele of an IGH database: reads with no `locus` | all 5,000 | none |
 
   Limits:
   - D genes are too short to place by relatives. Custom-named TRB and TRD D
     alleles both fall back to TRB and TRD, so they need a `locus=` key.
   - Loading 20 custom-named alleles takes about 12 ms more. Loading 705
-    unnamed human BCR V alleles takes about 55 ms more.
+    custom-named human BCR V alleles takes about 60 ms more, but a run on
+    such a database is now faster: 7,500 BCR reads take 3.2 s instead of
+    5.8 s on one thread.
 - **V names without `*`.** A gene is the allele name's part before `*`.
   With no `*`, each allele counted as a gene of its own, which costs V
   accuracy on mutated reads.
-  - A V name without `*` now joins the gene of a `*`-named relative within
-    about 2 %, or forms a gene with similar names that also lack `*`.
+  - A V name without `*` now joins the gene of its closest `*`-named
+    relative within about 2 % sequence divergence. Otherwise it forms a
+    gene with the other V alleles without `*` that it reaches through steps
+    of about 2 % or less.
   - On the suite's IGH reads at 30 % SHM, with every `*` removed, V allele
     accuracy is now 0.10 points above IMGT names; it was 8.20 points below.
   - With 20 % of names hidden, it is 0.03 points above; it was 1.77 points
@@ -149,22 +184,26 @@ Speed is unchanged.
   - The later template tiers of reference preparation read each record's
     original header, so a record placed in the first tier is not refused in
     a later one.
-  - `swig-cli` reference preparation accepts IMGT's IgD constant gene
-    (`IGHD*01`) and J–C orphon records (`IGLJ-C/OR18*01`) in a C database.
-    Before, they were refused as a D or J gene.
-- **Options without their database.** Three options were ignored when the
+  - Reference preparation in Swig Web and `swig-cli` accepts IMGT's IgD
+    constant gene (`IGHD*01`) and J–C orphon records (`IGLJ-C/OR18*01`) in
+    a C database. Before, they were refused as a D or J gene.
+- **Options without their database.** Two options were ignored when the
   run had no database for them; they are now refused, as `--c-evalue`
   already was:
   - `--c-prefix-identity` above 0 needs a C database;
-  - `--double-d all` or `long-span` needs a D database;
-  - `--c-evalue` still needs a C database.
+  - `--double-d all` or `long-span` needs a D database.
 
   Where the refusal happens on each route:
   - `swig` binary: exit 2 with the usage, before any database is read.
   - WebAssembly module: refuses to start.
   - Swig Web: refuses the C gate before a run without a C reference.
-  - `swig-cli`: refuses them on the config and `--vdj` routes, with the
-    same message on the native and WebAssembly aligners.
+  - `swig-cli`: on the config route, `annotation.minimumConstantPrefixIdentity`
+    above 0 needs C germlines and `annotation.doubleD` (`all` or
+    `long-span`) needs D germlines. On the `--vdj` route,
+    `--minimum-c-prefix-identity` above 0 needs a C database
+    (`-c_region_db`); that route has no double-D screen. `swig-cli` checks
+    these before it starts the aligner, so its message is the same with
+    `--aligner native` and `--aligner wasm`.
 
   Options that only tune a stage the run lacks are run with a warning. These
   are the D options without a D database (`--min-d-match`, `--d-mismatch`,
@@ -172,8 +211,8 @@ Speed is unchanged.
   `--d-open-flank off`) and the double-D rules without `--double-d`. So is
   `--d-allele max-marginal` with `--no-posterior`, and a D allele too short
   for the double-D screen's seeds (TRDD1 and TRDD2 at the default seed
-  length). Every command line that is still accepted gives byte-identical
-  output to 0.39.3.
+  length). These warnings change no calls: a warned option is ignored, so
+  the run writes the same AIRR as without it.
 - **Aligner warnings are shown.** Swig Web and `swig-cli` never showed the
   aligner's database and run warnings: unknown or fallback loci, names
   without `*`, J and C convention problems, and the warnings above.
@@ -201,16 +240,18 @@ paired on the same reads and scored by the 0.39.1 evaluator:
 Other real and simulated data:
 - **Macaque.** On two macaque repertoires of 12,229 and 13,698 D calls, no D
   call changes.
-- **Reads cut after their V.** On 1,913 simulated IGH reads that start after
-  their V, no D call changes.
+- **Reads that start after their V.** On 1,913 simulated IGH reads that hold
+  a D and a J but no V, no call changes; only some D and J posteriors
+  move.
 - **Shipped references of other species.** Calls on the IMGT pack's sets do
   not change. Some posteriors change in their last digits, from the
   chance-D cost.
 
 ## Timing
 
-Speed is unchanged. Instruction counts (callgrind, one thread) against
-0.39.3:
+With databases whose alleles name their locus, as every shipped reference
+does, speed is unchanged. Instruction counts (callgrind, one thread)
+against 0.39.3:
 - 1,000 IGH hard reads: +0.39 %;
 - the 600 reads of a V followed by 100 random bases: −0.46 %.
 
@@ -222,13 +263,16 @@ interleaved runs on a 4-core cloud VM, database preparation included.
 |---|---|---|---|
 | IGH mid | 1 | 3.25 s | 3.19 s |
 | IGH hard | 1 | 3.13 s | 3.05 s |
-| IGH mid | 4 | 0.97 s | 0.99 s |
+| IGH mid | 4 | 0.97 s | 1.00 s |
 | IGH hard | 4 | 0.91 s | 0.91 s |
 
 Single runs varied by up to 20 % from the median (one 0.39.3 run by 49 %),
-so the differences are noise. Loading a database does extra work only for
-alleles that name no locus; on the shipped references it adds well under
-1 % of the load's instructions.
+so the differences are noise. Loading a database does a little more work
+even when every allele names its locus: each header is checked for a
+`gene=` key, and the open-flank cost is set up for each locus. On the
+suite's human references that adds about 0.2 % to the load's instructions
+for IGH, 0.4 % for BCR and 0.9 % for TCR, under 1 ms. Alleles that name no
+locus add more (see "Alleles with custom names").
 
 ## For developers
 
@@ -244,8 +288,11 @@ alleles that name no locus; on the shipped references it adds well under
   (269 human and mouse V, J and C records, built from the shipped IMGT pack
   by `scripts/build-locus-data.mjs`). `public/swig.wasm` grows from 1.0 to
   1.16 MB.
-- `RunOptions::check_databases` and `Run::warnings` expose the refusals and
-  warnings; the WebAssembly summary carries them in `warnings`.
+- `RunOptions::check_databases` returns an option's refusal as an error,
+  or else its warnings, and `Run::warnings` returns the run's warnings. The
+  WebAssembly summary adds the run's warnings to the database's in
+  `warnings`. A refusal fails `swig_init_database` (or, after an option
+  change, the next `swig_annotate`) with its message in the error buffer.
 
 ## Still open
 
@@ -253,7 +300,8 @@ alleles that name no locus; on the shipped references it adds well under
 - chance Ds within about 30 bases of the V or J of a truncated read;
 - real Ds behind N regions longer than about 24 bases at a read's open end,
   and the J-posterior calibration at high SHM described above;
-- custom-named TRB and TRD D alleles, which need a `locus=` key;
+- custom-named D alleles in a database holding TRB and TRD, which need a
+  `locus=` key;
 - the double-D screen's seed length, which cannot see TRDD1 and TRDD2 (it is
   now reported, not changed);
 - the strand test's null model, posterior overconfidence at high SHM, and

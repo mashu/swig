@@ -155,6 +155,11 @@ open in part, from that review:
     Swig Web's run summary. A per-locus default seed length (or
     indexing short alleles at their own length) needs a false-positive
     measurement on single-D TRD reads first.
+17. **Custom-named D alleles of a TCR database.** D genes are too short to
+    place by relatives, so a custom-named D takes the database's loci that
+    have D genes. In a database holding TRB and TRD, a custom TRD D then
+    competes on TRB reads (and the reverse) until its header carries a
+    `locus=` key; the load warning says so.
 
 ## 1. Verdict
 
