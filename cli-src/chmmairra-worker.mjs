@@ -1,6 +1,6 @@
 import { parentPort } from "node:worker_threads";
 
-import { chmmairraDistanceFromReference, prepareReferenceMsa, runChmm, threadSequenceToMsa } from "../src/post-analysis-core.ts";
+import { chmmairraDistanceFromReference, extendChmmAlignment, prepareReferenceMsa, runChmm, threadSequenceToMsa } from "../src/post-analysis-core.ts";
 
 let msa=null,options=null,minDfr=1;
 const cache=new Map();
@@ -10,8 +10,9 @@ function initialize(message){msa=prepareReferenceMsa(message.msa);options=messag
 function batch(rows){
   if(!msa||!options)throw new Error("CHMMAIRRa worker is not initialized.");
   const results=[];
-  for(const row of rows){
-    if(!row.call||!row.sequenceAlignment||!row.germlineAlignment){results.push({ordinal:row.ordinal,probability:Number.NaN,dfr:0,startingReference:"",recombinations:[],status:"missing_alignment"});continue;}
+  for(const input of rows){
+    if(!input.call||!input.sequenceAlignment||!input.germlineAlignment){results.push({ordinal:input.ordinal,probability:Number.NaN,dfr:0,startingReference:"",recombinations:[],status:"missing_alignment"});continue;}
+    const row=input.segment&&input.flank?{...input,...extendChmmAlignment(input.segment,input.sequenceAlignment,input.germlineAlignment,input.call,input.flank,msa)}:input;
     const dfr=chmmairraDistanceFromReference(row.sequenceAlignment,row.germlineAlignment);
     if(dfr<minDfr){results.push({ordinal:row.ordinal,probability:Number.NaN,dfr,startingReference:"",recombinations:[],status:"low_dfr"});continue;}
     const key=`${row.call}\0${row.sequenceAlignment}\0${row.germlineAlignment}`;const cached=cache.get(key);

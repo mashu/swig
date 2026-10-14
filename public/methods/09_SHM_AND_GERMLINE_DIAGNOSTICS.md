@@ -12,7 +12,7 @@ Reported choices are:
 - CDR1/2 nucleotide mismatch rate;
 - framework 1/2/3 nucleotide mismatch rate.
 
-Codons use the AIRR `sequence_frame`/`v_frame`; an indel clears the partial aligned codon and resumes at the next frame boundary. A changed codon is counted once as synonymous or replacement, not once per changed nucleotide. Missing/ambiguous codons are excluded.
+Codons use the AIRR `sequence_frame`/`v_frame`, counted from the read's first base, so the V alignment's first codon may be partial; rows without a frame (IgBLAST's) take the V germline's, whose codons start at germline base 1 (`v_germline_start`); an indel clears the partial aligned codon and resumes at the next frame boundary. A changed codon is counted once as synonymous or replacement, not once per changed nucleotide. Missing/ambiguous codons are excluded.
 
 `duplicate_count` weights abundance summaries, means, medians, and 95th percentiles. Scalar analyzed/skipped counts cover every active row. Plot/session records are memory bounded: at most the configured number per lineage × sample and a deterministic global reservoir of 100,000. Thus a plotted point sample can be bounded even while aggregate record/abundance totals remain complete.
 

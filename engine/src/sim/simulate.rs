@@ -40,11 +40,15 @@ use super::params::SimParams;
 use super::random::{Count, Rng};
 use crate::alphabet::decode_base;
 use crate::annotate::{AlleleAnnotation, AnchorSource};
-use crate::config::CSegmentConfig;
 use crate::germline::{GermlineSet, SegmentKind};
 use crate::locus::Loci;
 use crate::prepare::{ConstantWarning, PreparedDatabase};
 use crate::translate::open_frames;
+
+/// How many of its gene's first bases a C allele may lack and still be
+/// drawn ([`Simulator::from_database`]): the conventions of C records
+/// differ by up to this, independent of the C stage's splice spread.
+const SPLICED_C_OFFSET: u32 = 3;
 
 /// The C stream's seed is the read stream's seed XOR this
 /// ([`Simulator::reads`]): C draws never shift V(D)J draws.
@@ -316,9 +320,10 @@ impl<'a> Simulator<'a> {
     /// only the alleles a rearranged, spliced transcript carries: no V or J
     /// allele whose anchor was not found (a 3′-partial V record) or is a
     /// low-confidence guess, since a junction truth built on it would rest
-    /// on the annotation it is meant to test; and no C allele the C stage
-    /// cannot call (5′-truncated or genomic records,
-    /// [`PreparedDatabase::constant_warnings`]).
+    /// on the annotation it is meant to test; and no C allele that is not a
+    /// splice product: genomic records, and records lacking more than
+    /// 3 of their gene's first bases
+    /// ([`PreparedDatabase::constant_warnings`]).
     pub fn from_database(
         database: &'a PreparedDatabase,
         params: SimParams,
@@ -338,8 +343,12 @@ impl<'a> Simulator<'a> {
         sim.leave_out(SegmentKind::J, guessed(&database.annotation.j));
         if let Some(c) = &database.c {
             sim = sim.with_constant(c)?;
+            // A read reaches C's base 0 right after its J: an allele that
+            // lacks more of its gene's start than reference conventions
+            // differ by (3 bases) is a partial record, not a splice
+            // product, however far the C stage searches.
             let refused: Vec<String> = database
-                .constant_warnings(CSegmentConfig::default().spread)
+                .constant_warnings(SPLICED_C_OFFSET)
                 .into_iter()
                 .filter_map(|warning| match warning {
                     ConstantWarning::Truncated { allele, .. }

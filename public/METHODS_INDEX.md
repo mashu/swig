@@ -1,6 +1,6 @@
 # Swig methods index
 
-This index is the implementation-facing methods map for Swig 0.39.3. It covers every runnable analysis block from file intake through phylogenetic UCA inference. The UI may summarize a method in one sentence; the linked document is the specification.
+This index is the implementation-facing methods map for Swig 0.39.4. It covers every runnable analysis block from file intake through phylogenetic UCA inference. The UI may summarize a method in one sentence; the linked document is the specification.
 
 ## Evidence labels used in these documents
 
@@ -17,7 +17,7 @@ This index is the implementation-facing methods map for Swig 0.39.3. It covers e
 |---|---|
 | Datasets, concatenated gzip choice, study names, FASTA/FASTQ/AIRR parsing, FASTQ QC, random subsampling | [Input, QC, and study structure](methods/01_INPUT_QC_AND_STUDY.md) |
 | Biological search space, reference matrix, online/local reference preparation, allele exclusion | [Reference preparation](methods/02_REFERENCE_PREPARATION.md) |
-| Swig aligner, calling profile, strand, identity floor, C gate, segment E-values and posteriors, workers, AIRR fields, record detail | [V(D)J assignment](methods/03_VDJ_ASSIGNMENT.md) |
+| Swig aligner, calling profile, strand, identity floor, V–J plausibility guards and junction rule, C gate and floors, segment E-values and posteriors, workers, AIRR fields, record detail | [V(D)J assignment](methods/03_VDJ_ASSIGNMENT.md) |
 | Optional two-D/VDDJ screen and Double-D explorer | [Double-D evidence screen](methods/04_DOUBLE_D_SCREEN.md) |
 | AIRR result index, repertoire dashboard, sequence filters, metadata re-indexing, cumulative working set, repertoire selection | [Storage, summaries, and selection](methods/05_STORAGE_DASHBOARD_SELECTION.md) |
 | Resolve ambiguous germline calls by pooling repertoire evidence | [Repertoire allele refinement](REPERTOIRE_ALLELE_REFINEMENT.md) |

@@ -323,9 +323,12 @@ export function inferIsotype(
   identity: number | null,
   support: number | null = null,
 ): string {
+  // An isotype needs 90 % identity and either 30 aligned C bases, or 12 with
+  // the Rust aligner's anchored gate (c_support, E ≤ 1e-3; SwiftIG used
+  // 1e-4 on its own E-value).
   const alignedBases = alignedSequence.replace(/[-.\s]/g, "").length;
   const longLocalEvidence = alignedBases >= 30;
-  const shortAnchoredEvidence = alignedBases >= 12 && support !== null && support <= 1e-4;
+  const shortAnchoredEvidence = alignedBases >= 12 && support !== null && support <= 1e-3;
   if (!call || (identity ?? 0) < 0.90 || (!longLocalEvidence && !shortAnchoredEvidence)) return "";
   const labels = [...new Set(calls(call).map(isotypeLabel).filter(Boolean))];
   if (labels.length <= 1) return labels[0] ?? "";

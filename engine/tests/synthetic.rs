@@ -302,14 +302,18 @@ fn the_identity_floor_judges_the_local_alignment() {
 }
 
 /// AIRR names N/P regions by their neighbours: `np1` follows V and `np2`
-/// the D, so a read without V reports its D–J bases as `np2`.
+/// the D, so a read without V reports its D–J bases as `np2`. Such a call
+/// exists only without the pair guards: under them, as in SwiftIG, a D
+/// needs a V before it, and the read gets its J alone.
 #[test]
 fn np_regions_are_named_by_their_neighbours() {
     let db = Db::new();
-    let assigner = db.assigner(&EngineConfig::default());
+    let mut config = EngineConfig::default();
+    config.options.guards = None;
     let (d_name, d) = &db.d[7];
     let (j_name, j) = &db.j[0];
-    let rec = record(&assigner, &format!("{d}GTA{j}"));
+    let read = format!("{d}GTA{j}");
+    let rec = record(&db.assigner(&config), &read);
     assert!(rec.v.is_none());
     assert_eq!(first_label(&rec.d).as_deref(), Some(d_name.as_str()));
     assert_eq!(first_label(&rec.j).as_deref(), Some(j_name.as_str()));
@@ -317,6 +321,10 @@ fn np_regions_are_named_by_their_neighbours() {
         (rec.np1.as_deref(), rec.np2.as_deref()),
         (None, Some("GTA"))
     );
+    let rec = record(&db.assigner(&EngineConfig::default()), &read);
+    assert!(rec.v.is_none() && rec.d.is_none());
+    assert_eq!(first_label(&rec.j).as_deref(), Some(j_name.as_str()));
+    assert_eq!((rec.np1.as_deref(), rec.np2.as_deref()), (None, None));
 }
 
 #[test]

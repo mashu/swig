@@ -273,6 +273,28 @@ impl ClipIndex {
         i64::from(self.columns[k.min(self.columns.len() - 1)].q)
     }
 
+    /// Query position aligned to reference position `r` within `span`, a
+    /// clip of this alignment: `None` when `r` lies outside the span's
+    /// reference range or the read deletes it. Unlike
+    /// [`Self::project_reference`] it never extrapolates.
+    pub fn aligned_query_in(&self, span: &ClipSpan, r: u32) -> Option<u32> {
+        if r < span.r_lo || r >= span.r_hi {
+            return None;
+        }
+        let (first, last) = (span.first_col as usize, span.last_col as usize);
+        let columns = &self.columns[first..=last];
+        let k = columns.partition_point(|c| c.r < r || (c.r == r && c.op == Op::Ins));
+        columns
+            .get(k)
+            .filter(|c| c.r == r && c.op == Op::Match)
+            .map(|c| c.q)
+    }
+
+    /// [`Self::aligned_query_in`] over the whole alignment.
+    pub fn aligned_query(&self, r: u32) -> Option<u32> {
+        self.aligned_query_in(&self.full(), r)
+    }
+
     /// `true` when both indices describe the same query columns with the same
     /// per-column scores, so every clip of one scores exactly like the other.
     /// Reference coordinates may differ (e.g. alleles with different 5' lengths).

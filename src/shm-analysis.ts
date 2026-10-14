@@ -96,7 +96,6 @@ export function computeShmMetric(row: Record<string,string>, ordinal = 0, lineag
   if (!query || !germline) return null;
   const length = Math.min(query.length, germline.length);
   const queryStart = Math.max(1, rangeValue(row, "v_sequence_start") || 1);
-  const frame = Math.max(1, rangeValue(row, "sequence_frame") || rangeValue(row, "v_frame") || 1);
   let queryPosition = queryStart - 1;
   let comparedNt = 0, vNtMutations = 0, cdrNtCompared = 0, cdrNtMutations = 0, frameworkNtCompared = 0, frameworkNtMutations = 0;
   const codonQuery: string[] = [], codonGermline: string[] = [];
@@ -113,7 +112,13 @@ export function computeShmMetric(row: Record<string,string>, ordinal = 0, lineag
     }
   };
 
-  let codingBases = (frame - 1) % 3;
+  // Bases of the current codon before the V alignment's first base: codons
+  // start at read positions ≡ sequence_frame (mod 3), one-based. Rows
+  // without a frame (IgBLAST's) take the V germline's: IMGT V genes start
+  // with a whole codon, so v_germline_start − 1 bases precede the alignment.
+  const frame = rangeValue(row, "sequence_frame") || rangeValue(row, "v_frame");
+  const germlineStart = rangeValue(row, "v_germline_start");
+  let codingBases = frame ? (((queryStart - frame) % 3) + 3) % 3 : germlineStart ? (germlineStart - 1) % 3 : 0;
   for (let column = 0; column < length; column += 1) {
     const q = query[column], g = germline[column];
     if (q !== "-") queryPosition += 1;

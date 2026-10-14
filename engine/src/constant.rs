@@ -43,7 +43,7 @@
 //! by default `10⁻³`, the gate of a hit that must stand on its own
 //! ([`crate::segment::EvalueGates::anchor`]): C is not implied by V(D)J, it
 //! depends on the library. For `(2, −3)` scoring
-//! (`λ = 0.634`) that is `S ≥ 18` for the 10 human IGHC genes. `N_C`
+//! (`λ = 0.634`) that is `S ≥ 19` for the 10 human IGHC genes at `s = 7`. `N_C`
 //! counts the C genes of the read's (J's) locus: a database of several loci
 //! gets one gate per locus. This is not the K·m·n E-value of V, D and J.
 //!
@@ -78,7 +78,9 @@ use crate::pipeline::Call;
 use crate::placement::{Placement, merge_identical};
 use crate::retrieve::{Candidate, ReachClasses, RetrievalScratch};
 use crate::scoring::{AffineScoring, AnchorColumn, GapCosts, Score};
-use crate::segment::{BatchScratch, KeepPolicy, PreparedSegment, SegmentRequest, SegmentStage};
+use crate::segment::{
+    BatchScratch, HitAcceptance, KeepPolicy, PreparedSegment, SegmentRequest, SegmentStage,
+};
 use crate::stats::KarlinAltschul;
 
 /// The anchored E-value of a clipped C score (see the module documentation):
@@ -148,6 +150,9 @@ pub struct ConstantStage {
     pub model: AnchorColumn,
     /// `s`: C's base 0 lies within `s` bases of the J exit.
     pub spread: u32,
+    /// Columns and identity a C placement needs to be called
+    /// ([`CSegmentConfig::accept`]).
+    pub accept: HitAcceptance,
     pub significance: AnchoredSignificance,
     /// For a C database of several loci, the gate of each: `N_C` counts the
     /// C genes of the read's locus only ([`crate::locus`]).
@@ -194,6 +199,7 @@ impl ConstantStage {
             plain: Arc::new(PreparedSegment::new(set, &scoring, scoring.gaps)),
             model,
             spread: config.spread,
+            accept: config.accept,
             significance,
             locus_significance,
         })
@@ -329,8 +335,9 @@ impl ConstantStage {
             placement.alleles.sort_unstable();
             placement.alleles.dedup();
             // Members of a reach class align identically, so the first of
-            // the locus reports for the class.
-            if placement.alleles.is_empty() {
+            // the locus reports for the class. Below the floors (SwiftIG's
+            // 12 columns at 90 %) a placement gives way to the next.
+            if placement.alleles.is_empty() || !self.accept.allows(&placement.evidence) {
                 continue;
             }
             call.constant.push(placement);

@@ -1374,7 +1374,7 @@ input[type="range"] { width: 100%; accent-color: var(--teal); }
 .segment-chip { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 3px; color: var(--ink); background: var(--segment-color); font-size: 14px; font-weight: 900; }
 .alignment-card header > div { min-width: 0; }
 .alignment-card header strong { display: block; overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
-.alignment-card header small { display: block; margin-top: 4px; color: #7d8c86; font-size: 7px; }
+.alignment-card header small { display: block; margin-top: 4px; color: #7d8c86; font-size: 7px; overflow-wrap: anywhere; }
 .alignment-card header dl { display: flex; margin: 0; border-left: 1px solid #40504b; }
 .alignment-card header dl div { min-width: 77px; padding-left: 13px; }
 .alignment-card header dt { color: #6e7e78; font-size: 6px; font-weight: 800; text-transform: uppercase; }

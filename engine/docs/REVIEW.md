@@ -11,7 +11,7 @@ quoted. Findings marked *suspected* were reasoned about but not
 reproduced. File and function names are given rather than line numbers,
 since the fixes moved lines.
 
-## 0. Status after the 0.39.1 audit and the 0.39.2 review
+## 0. Status after the 0.39.1 audit, the 0.39.2 review and 0.39.4
 
 A second audit, made after Swig 0.39.1, covered the input layer, retrieval,
 alignment, adjudication, the pipeline, the interfaces and the simulator. It
@@ -87,31 +87,44 @@ A third review, after Swig 0.39.2, found 2 major and 13 minor defects. Swig
 that fails on 0.39.2; `RELEASE_NOTES_0.39.3.md` lists them. Still open from
 that review:
 
-10. **Chance D on reads without a J or a V.** The D window of such a read now
-    ends 60 bases after the V (or starts 60 bases before the J), but `P*_D`
-    is priced for 25 junction positions, so 30 random bases after the V still
-    give a D in 72 % of D-free reads. Reads that start in CDR3 now search
-    for a D from their start, which recovers real Ds (+11 pp of D allele on
-    reads cut after V) but also raises chance Ds on D-free ones: 79.8 %
-    instead of 68.7 % behind 30 random bases. Needs the N/P length prior of
-    item 2.
+10. ~~**Chance D on reads without a J or a V.**~~ Addressed in 0.39.4 by
+    the pair guards: a call with a D must also hold a V and a J that pair
+    (ALGORITHM §4c), and a best path that breaks this is replaced by the
+    best path over subsets of the read's placements that keeps the guards.
+    On 1,000 mid IGH reads
+    cut 30 or 100 random bases after their V, a D is called on 0.3 and
+    0.5 % of reads (0.39.3: 70.0 and 92.5 %), each with a chance J;
+    behind 30 or 100 random bases before their J, on none (0.39.3: 81.0
+    and 95.9 %). Before: the D window of such a read ended 60 bases after
+    the V (or started 60 bases before the J), but `P*_D` is priced for 25
+    junction positions, so 30 random bases after the V still gave a D in
+    72 % of D-free reads. The rule also takes the D of reads that hold one
+    but start after their V, which 0.39.3 had recovered (item 20). The
+    chance-D rate on D-free full junctions remains item 2's N/P length
+    prior.
 11. **Gene identity from allele names.** A gene is the name's part before
     `*`. A database without `*` names now gets a warning, but it still loses
     V accuracy at high SHM: 8.2 pp of V allele at 30 % SHM on the suite's IGH
     set with every `*` replaced. Grouping alleles by sequence would change
     the gene ids that gene frames, the retrieval budget, tie order and the
     family bounds key on.
-12. **Junk V by circular divergence.** With the V presence cost, 7 of 1,200
-    V-less test reads still get a V: the read's divergence is estimated
-    partly from the junk V's own columns, which raises its per-read value.
+12. ~~**Junk V by circular divergence.**~~ Addressed in effect in 0.39.4.
+    With the V presence cost, 7 of 1,200 V-less test reads still got a V:
+    the read's divergence is estimated partly from the junk V's own
+    columns, which raises its per-read value. Those V were 13–35 bases
+    long; the pair guards' 24-column V floor and pairing rule drop them, and
+    on 2,000 mid IGH reads behind 30 or 100 random bases before their J, 7
+    got a V in 0.39.3 and none do now. The estimate itself is unchanged, so
+    a chance V long enough to pass the floor and pair with the read's J
+    would still raise its own value.
 13. **Smaller items.** `write_batches` drops the valid reads that precede a
     malformed record in the same batch; locus inference misses the IGHT,
     IGHZ and IGHO isotypes, so those constant alleles are `Loci::ANY`;
     `join_indel` compares weighted votes after the 7-mer fallback, not the
-    primary seed counts its guard describes; `--c-prefix-identity` and
-    `--double-d` are ignored without the database they need, while
-    `--c-evalue` is refused; `swig_version` and `AlignerEngine.version()`
-    have no caller.
+    primary seed counts its guard describes; `--c-prefix-identity`,
+    `--c-min-identity` (0.39.4) and `--double-d` are ignored without the
+    database they need, while `--c-evalue` is refused; `swig_version` and
+    `AlignerEngine.version()` have no caller.
 14. **V keep on reads holding two chains.** The V stage keeps the top 3
     alignments over the whole read, so a lightly mutated light V can crowd
     every heavy V out (seen on synthetic scFv reads with a mutated heavy
@@ -120,6 +133,57 @@ that review:
 15. **swig-cli and prepared databases** (outside the aligner). With
     `prepareMetadata` on, swig-cli rejects a V database written by
     `swig prepare` ("contains invalid SWIGMETA coordinates").
+
+Swig 0.39.4 restores SwiftIG's plausibility guards and constant-region
+rules, which 0.39.0 had dropped (`RELEASE_NOTES_0.39.4.md`; README,
+*Plausibility guards*; ALGORITHM §4b–§4c; ASSESSMENT §7.1 and §11.4):
+V and J hit floors (24 and 10 columns), SwiftIG's `supports_rearranged_pair`
+with a 225-base junction span, a D only between a V and a J, junctions only
+from aligned anchors at most 231 bases apart, FWR3 to the V's end when
+Cys104 is not placed, and C anchored within 7 bases of the J's exit and
+called on at least 12 columns at 90 % identity. `tests/guards.rs` checks
+each guard on constructed reads, with and without the guards. Besides
+items 10 and 12, it leaves open:
+
+16. **Short-V cross-locus chimeras.** J is searched only in the locus of
+    the read's anchoring V. A V under 80 columns now pairs only with a J
+    significant on its own, but a J of the V's locus that aligns to another
+    locus' J well enough passes: of 168 constructed reads with 30–60 bases
+    of an IGHV before an IGK J, 10 are called productive (0.39.3: 30;
+    SwiftIG, which searched J in every locus: none). Searching J in every
+    locus of the database when the V is short would close it.
+17. **The guards are outside the model.** Their thresholds are SwiftIG's,
+    not derived, and the guarded call is the best of the subset optima
+    that keep them (V alone, J alone, each J with the V placements that
+    pair with it and every D), not an exact maximum over every admissible
+    path: a subset whose optimum breaks a guard contributes nothing. The
+    posteriors are those of the chosen subset. No oracle measures how
+    often a better admissible path is missed.
+18. **Junctions withheld on mutated anchors.** The anchor rule withholds
+    the junction of a read whose Cys104 or Trp/Phe118 codon is mutated so
+    that its alignment stops before the codon: 0.84 points of templated
+    junctions on simulated mid reads, 3.95 on hard ones. Projecting an
+    anchor across a short, mismatched alignment end, as far as a bound on
+    unexplained bases allows, would recover some without the spurious
+    junctions the rule removed.
+19. **J-mode CHMMAIRRa** (outside the aligner). Swig's chimera filter now
+    extends the V and J alignments toward the junction before threading,
+    which restores V mode, but J mode flags 35 of 60 and 130 of 200
+    simulated J chimeras against SwiftIG's 38 and 138: the engine prefers
+    the 3′ parent's J with a hard 5′ clip.
+20. **D on reads that start after their V.** SwiftIG called a D only
+    between a V and a J, and so does the engine under the guards. A read
+    that starts in CDR3, or keeps too few bases of its V for the 24-column
+    floor, therefore gets no D: on 952 mid IGH reads with a D, cut where their V ends, the
+    right D was called on 878 in 0.39.3 and on none now; keeping the last
+    20, 30, 40 or 60 V bases, on 879, 881, 881 and 880 in 0.39.3 and on 50,
+    805, 866 and 880 now. A D-only path for reads whose V is absent, priced
+    by an N/P length prior so that random bases before a J do not get one,
+    would recover them.
+21. ~~**Stale comments.**~~ Fixed in 0.39.4: `constant.rs`'s module
+    documentation gives the gate as `S ≥ 19` for the 10 human IGHC genes at
+    `s = 7`, and `tests/simulated.rs` describes the hard preset as IgG-like
+    SHM (mean 7.7 %), not 30 %.
 
 ## 1. Verdict
 

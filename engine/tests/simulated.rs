@@ -117,11 +117,28 @@ fn igm_like_reads_keep_their_accuracy() {
     segments_at_least(&e, [99.20, 100.00, 83.18, 99.60, 100.00]);
 }
 
+/// The junction is reported only from anchors the called V and J align
+/// (SwiftIG's rule, [`swig::pipeline::PairGuards`]): at IgG-like SHM a mutated
+/// Cys104 or Trp118 ends some alignments before their anchor, so 8 of 197
+/// templated junctions go unreported, while reads whose anchors were
+/// trimmed away get far fewer junctions than projecting the anchors
+/// however far gives them.
 #[test]
 fn igg_like_hypermutated_reads_keep_their_accuracy() {
-    let e = Setup::new().evaluate(SimParams::hard(), 500, 3, &EngineConfig::default());
+    let setup = Setup::new();
+    let e = setup.evaluate(SimParams::hard(), 500, 3, &EngineConfig::default());
     at_least("orientation", e.oriented, e.reads, 100.00);
-    segments_at_least(&e, [97.60, 100.00, 76.04, 97.20, 100.00]);
+    segments_at_least(&e, [97.60, 100.00, 76.04, 97.20, 95.94]);
+    let mut unguarded = EngineConfig::default();
+    unguarded.options.guards = None;
+    let u = setup.evaluate(SimParams::hard(), 500, 3, &unguarded);
+    assert_eq!(e.junction_absent, u.junction_absent);
+    assert!(
+        e.junction_spurious * 2 < u.junction_spurious,
+        "spurious junctions {} guarded, {} unguarded",
+        e.junction_spurious,
+        u.junction_spurious
+    );
 }
 
 #[test]
@@ -164,10 +181,12 @@ fn posteriors_are_calibrated() {
 fn constant_regions_are_called_from_the_splice() {
     let setup = Setup::new();
     let config = EngineConfig::default();
-    // (preset, seed, measured 8-15 nt C, 16+ nt C, 16+ nt first gene)
+    // (preset, seed, measured 8-15 nt C, 16+ nt C, 16+ nt first gene).
+    // C needs 12 columns at 90 % (SwiftIG's floors), so C of 8-11 nt is
+    // not called.
     let presets = [
-        (SimParams::mid(), 21, [78.26, 99.86, 95.88]),
-        (SimParams::hard(), 22, [91.67, 100.00, 96.03]),
+        (SimParams::mid(), 21, [47.83, 99.86, 95.88]),
+        (SimParams::hard(), 22, [63.89, 100.00, 96.03]),
     ];
     for (params, seed, [medium_c, longer_c, longer_gene]) in presets {
         let e = setup.evaluate_with(params, 1000, seed, &config, true);
@@ -344,7 +363,9 @@ fn airr_tsv_rows_score_like_the_records_they_were_written_from() {
 #[ignore = "20,000 reads per preset; run with `cargo test --release -- --ignored`"]
 fn accuracy_at_scale() {
     let setup = Setup::new();
-    // (preset, seed, measured V, V gene, D, J, junction; V and J ECE bounds)
+    // (preset, seed, measured V, V gene, D, J, junction; V and J ECE bounds).
+    // The junction is reported only from anchors the called V and J align
+    // (SwiftIG's rule): a mutated or trimmed anchor codon withholds a few.
     let presets = [
         (
             SimParams::easy(),
@@ -356,14 +377,14 @@ fn accuracy_at_scale() {
         (
             SimParams::mid(),
             22,
-            [99.53, 100.00, 84.08, 99.41, 99.99],
+            [99.53, 100.00, 84.08, 99.41, 99.27],
             0.3,
             0.5,
         ),
         (
             SimParams::hard(),
             23,
-            [97.62, 99.92, 75.50, 95.95, 99.73],
+            [97.62, 99.92, 75.50, 95.95, 95.93],
             0.5,
             0.8,
         ),
