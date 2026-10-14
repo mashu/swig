@@ -262,18 +262,43 @@ function declaredLocus(header: string): string | undefined {
 }
 
 /**
- * The `locus=` value to write for a record the engine cannot place by its
- * name: the one its header declares, else the loci of the template its
- * metadata came from when they hold the record's locus (TRA,TRD for a
- * TRAV…/DV… relative), else the record's own locus. Empty when the name
- * places the record.
+ * The loci a FASTA header's free text states, word by word: a token that is
+ * a locus code (`IGK`) or names a gene of one (`IGKV1-5`, {@link namedLoci}).
+ * The identifier and `key=value` attributes are skipped, and a code inside a
+ * word (`LIGHT`, `STRAIN`) states none, unlike the substring test that
+ * admits a record ({@link inferLocus}).
  */
-function locusKey(name: string, header: string, locus: GermlineLocus, template?: string): string {
+export function headerLoci(header: string): GermlineLocus[] {
+  const found = new Set<GermlineLocus>();
+  for (const token of header.trim().split(/\s+/).slice(1)) {
+    if (token.includes("=")) continue;
+    for (const word of token.split(/[|,;:()[\]]+/)) {
+      const upper = word.toUpperCase();
+      const loci = (LOCI as string[]).includes(upper) ? [upper as GermlineLocus] : namedLoci(word);
+      for (const locus of loci) found.add(locus);
+    }
+  }
+  return LOCI.filter((locus) => found.has(locus));
+}
+
+/**
+ * The `locus=` value to write for a record the engine cannot place by its
+ * name: the one its header declares; else the loci of the template its
+ * metadata came from (TRA,TRD for a TRAV…/DV… relative), narrowed to those
+ * the header's words state when it states some of them; else the loci the
+ * header's words state. Empty when the name places the record, and when the
+ * template and the header disagree or neither places it: the engine then
+ * infers the locus from the record's relatives.
+ */
+function locusKey(name: string, header: string, template?: string): string {
   const declared = declaredLocus(header);
   if (declared) return declared;
   if (namedLoci(name).length) return "";
+  const stated = headerLoci(header);
   const relative = template ? namedLoci(template) : [];
-  return relative.includes(locus) ? relative.join(",") : locus;
+  if (!relative.length) return stated.join(",");
+  if (!stated.length) return relative.join(",");
+  return relative.filter((locus) => stated.includes(locus)).join(",");
 }
 
 function inferSegment(name: string): GermlineSegment | null {
@@ -1001,7 +1026,7 @@ export function preprocessGermlineFasta(
       rawSequence: input.rawSequence,
       sequence: normalized.sequence,
       locus,
-      locusKey: locusKey(name, input.header, locus, transfer?.template),
+      locusKey: locusKey(name, input.header, transfer?.template),
       metadata,
     });
     if (matchOptions.includeDiagnostics) {
