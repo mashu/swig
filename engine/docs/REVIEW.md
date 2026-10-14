@@ -11,7 +11,7 @@ quoted. Findings marked *suspected* were reasoned about but not
 reproduced. File and function names are given rather than line numbers,
 since the fixes moved lines.
 
-## 0. Status after the 0.39.1 audit, the 0.39.2 review and 0.39.4
+## 0. Status after the 0.39.1 audit, the 0.39.2 review, 0.39.4 and 0.39.5
 
 A second audit, made after Swig 0.39.1, covered the input layer, retrieval,
 alignment, adjudication, the pipeline, the interfaces and the simulator. It
@@ -94,7 +94,20 @@ open in part, from that review:
 10. **Chance D on reads without a J or a V.** *Partly resolved,* for chance
     Ds more than about 30 bases from the anchor: a D that ends its path (no J after
     it) or starts it (no V before it) now pays for the J (V) its read would
-    show in the bases beyond it (ALGORITHM §2.3, `--d-open-flank`). This
+    show in the bases beyond it (ALGORITHM §2.3, `--d-open-flank`). Swig
+    0.39.4 took another route, the pair guards' rule that a D needs a V and
+    a J (ALGORITHM §4c): it removed near and far chance Ds alike, and every
+    real D of a read that stops before its J or starts after its V. Swig
+    0.39.5 combines the two: under the guards a D at a read's open end is
+    called when it pays the cost, and with `--d-open-flank off` not at all
+    (0.39.4's calls). The figures below are without the guards; with them
+    (0.39.5) a V followed by 100 random bases gets a D in 6.0 % of 600
+    D-free reads, 100 random bases followed by a J in 9.5 % (`--calls
+    fixed`: 5.0 and 10.7 %), 60 random bases after the V in 77.3 %, 30
+    after the V in 72.8 % and 30 before the J in 79.3 %; reads cut at the
+    end of their D keep 92.2 % (mid) and 86.3 % (hard) right D calls
+    (0.39.3: 90.2 and 84.2 %, 0.39.4: none), reads ending 0–20 bases into
+    their J 91.7 and 83.8 % (0.39.4: 49.7 and 41.5 %). This
     holds with a derived D prior (the default profile and `sensitive-d`);
     `--profile truth` and `igblast` charge no D prior, so a chance D of a
     dozen points outweighs the cost's 6.2-nat ceiling and most stay (92.8
@@ -171,8 +184,9 @@ Swig 0.39.4 restores SwiftIG's plausibility guards and constant-region
 rules, which 0.39.0 had dropped (`RELEASE_NOTES_0.39.4.md`; README,
 *Plausibility guards*; ALGORITHM §4b–§4c; ASSESSMENT §7.1 and §11.4):
 V and J hit floors (24 and 10 columns), SwiftIG's `supports_rearranged_pair`
-with a 225-base junction span, a D only between a V and a J, junctions only
-from aligned anchors at most 231 bases apart, FWR3 to the V's end when
+with a 225-base junction span, a D only between a V and a J (since 0.39.5
+also at a read's open end where it pays the open-flank cost, item 10),
+junctions only from aligned anchors at most 231 bases apart, FWR3 to the V's end when
 Cys104 is not placed, and C anchored within 7 bases of the J's exit and
 called on at least 12 columns at 90 % identity. `tests/guards.rs` checks
 each guard on constructed reads, with and without the guards. Besides
@@ -188,10 +202,16 @@ items 10 and 12, it leaves open:
 19. **The guards are outside the model.** Their thresholds are SwiftIG's,
     not derived, and the guarded call is the best of the subset optima
     that keep them (V alone, J alone, each J with the V placements that
-    pair with it and every D), not an exact maximum over every admissible
-    path: a subset whose optimum breaks a guard contributes nothing. The
-    posteriors are those of the chosen subset. No oracle measures how
-    often a better admissible path is missed.
+    pair with it and every D, and, under the open-flank cost since 0.39.5,
+    V with every D and every D with J), not an exact maximum over every
+    admissible path: a subset whose optimum breaks a guard contributes
+    nothing. The posteriors are those of the chosen subset, so a read that
+    falls back to its V–D subset has no chance-J paths in its D-presence
+    posterior. An oracle test now checks each subset optimum against
+    exhaustive enumeration and the call's value against the oracle's value
+    of its path (`guarded_calls_with_open_flanks_equal_the_exhaustive_
+    subset_optima`), but none measures how often a better admissible path
+    is missed.
 20. **Junctions withheld on mutated anchors.** The anchor rule withholds
     the junction of a read whose Cys104 or Trp/Phe118 codon is mutated so
     that its alignment stops before the codon: 0.84 points of templated
@@ -204,15 +224,19 @@ items 10 and 12, it leaves open:
     which restores V mode, but J mode flags 35 of 60 and 130 of 200
     simulated J chimeras against SwiftIG's 38 and 138: the engine prefers
     the 3′ parent's J with a hard 5′ clip.
-22. **D on reads that start after their V.** SwiftIG called a D only
-    between a V and a J, and so does the engine under the guards. A read
-    that starts in CDR3, or keeps too few bases of its V for the 24-column
-    floor, therefore gets no D: on 952 mid IGH reads with a D, cut where their V ends, the
-    right D was called on 878 in 0.39.3 and on none now; keeping the last
-    20, 30, 40 or 60 V bases, on 879, 881, 881 and 880 in 0.39.3 and on 50,
-    805, 866 and 880 now. A D-only path for reads whose V is absent, priced
-    by an N/P length prior so that random bases before a J do not get one,
-    would recover them.
+22. ~~**D on reads that start after their V.**~~ Addressed in 0.39.5.
+    SwiftIG called a D only between a V and a J, and so did the engine
+    under the guards in 0.39.4: a read that starts in CDR3, or keeps too
+    few bases of its V for the 24-column floor, got no D (on 952 mid IGH
+    reads with a D, cut where their V ends, 878 right D calls in 0.39.3 and
+    none in 0.39.4; keeping the last 20, 30, 40 or 60 V bases, 879, 881,
+    881 and 880 in 0.39.3 and 50, 805, 866 and 880 in 0.39.4). Since 0.39.5
+    a D that starts its path is called when it pays the open-flank cost,
+    which charges it for the V the read would show before it, so that
+    random bases before a J rarely get one (item 10): on 1,913 mid IGH
+    reads cut inside CDR3, the right D is called on 93.1 % (0.39.3: 93.1 %,
+    0.39.4: none). A chance D within about 30 bases of the J stays (item
+    10).
 23. ~~**Stale comments.**~~ Fixed in 0.39.4: `constant.rs`'s module
     documentation gives the gate as `S ≥ 19` for the 10 human IGHC genes at
     `s = 7`, and `tests/simulated.rs` describes the hard preset as IgG-like

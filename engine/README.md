@@ -118,11 +118,11 @@ options (`swig --help` prints them):
 | `--min-identity F` | drop V, D and J hits whose local alignment, before the stitched outer flank, is below identity F (0–1; default none); under the pair guards, also a call that keeps a part of a V or J below F |
 | `--no-anchor-window` | do not add the conserved-anchor D window |
 | `--no-posterior` | skip the V, D, J and D-presence posteriors (~30 % faster) |
-| `--no-pair-guards` | turn off SwiftIG's plausibility guards, on by default (see *Plausibility guards*): hit floors, V–J pairing, the junction span, D only between V and J, junctions only from aligned anchors |
+| `--no-pair-guards` | turn off SwiftIG's plausibility guards, on by default (see *Plausibility guards*): hit floors, V–J pairing, the junction span, a D only beside a V or a J (both, paired, without the open-flank cost), junctions only from aligned anchors |
 | `--calls per-read\|fixed` | the model the call maximises: each read's own (default; the model its posteriors come from) or the fixed `(2, −3)` scores |
 | `--d-allele map\|max-marginal` | report the call's D allele (default) or the one of largest posterior marginal given the call's D presence and topology (needs posteriors) |
 | `--d-presence-rate R` | D prior from the D search's own chance-hit count at D-presence rate R, 0 < R < 1 (see *The model in brief*) |
-| `--d-open-flank on\|off` | charge a D that ends (starts) its path for the J (V) the read would show in the bases after (before) it (default `on`; see *The model in brief*) |
+| `--d-open-flank on\|off` | charge a D that ends (starts) its path for the J (V) the read would show in the bases after (before) it, and call such a D under the pair guards (default `on`; `off`: a D only between a V and a J that pair, 0.39.4's rule; see *The model in brief* and *Plausibility guards*) |
 | `--min-d-match N` | shortest exact run of an admissible D (default: the profile's) |
 | `--d-mismatch S`, `--j-mismatch S` | D or J mismatch score, negative (default: the profile's) |
 | `--min-j-length N` | fewest aligned J columns of a J hit (default none) |
@@ -326,11 +326,14 @@ Web and swig-cli always run with them.
 - **Clipped segments stay viable.** Where the call clips a V or J, the part
   of its local alignment that the call keeps scores above 0 and meets
   `--min-identity` (0.6 in Swig Web and swig-cli).
-- **A D only between a V and a J.** A call with a D also holds a V and a
-  J, and they pair. SwiftIG paired V and J before it looked for a D; here
-  a path whose D stands beside only a V or only a J breaks the guards, and
-  the read is re-adjudicated as below, so a D on a read without a V or a J
-  is not called.
+- **A D beside a V or a J, charged for the one it lacks.** A call with a D
+  also holds a V or a J; when it holds both, they pair. A path whose D ends
+  it (no J after it) or starts it (no V before it) keeps the guards only
+  under the open-flank cost (`--d-open-flank on`, the default; *The model in
+  brief*), which charges that D for the J or V the read would show in the
+  bases beyond it. With `--d-open-flank off` a D needs a V and a J that
+  pair, as in SwiftIG, which paired V and J before it looked for a D, and
+  as in 0.39.4. A path of a D alone is never a call.
 
 **When the best path breaks a guard.** The guards are not part of the
 DAG's objective. Each read is adjudicated as before; when its best path
@@ -338,11 +341,15 @@ keeps the guards, checking it is their whole cost. Otherwise
 the read's placements are adjudicated again in subsets: the V placements
 alone, the J placements alone, and, for each J placement, the V placements
 that pair with it and that J, once with every D placement and once
-without. The call is the best of
-the subsets' optima that keep the guards, compared by value at the read's
-divergence (every subset is read at the same `p̂`); an exact tie keeps the
-earlier subset, and a read none of whose subset optima keeps the guards is
-not called. The posteriors are those of the subset that gives the call. As
+without; under the open-flank cost also the V placements with every D
+placement, and every D placement with the J placements (listed last). The
+call is the best of the subsets' optima that keep the guards, compared by
+value in the read's context (every subset is read at the same divergence
+`p̂`, and its open ends are charged over the whole read's length); an exact
+tie keeps the earlier subset, and a read none of whose subset optima keeps
+the guards is not called. A read whose J does not pair with its V (a
+chance J, or one beyond the junction span) thus keeps its V–D path when
+the D pays for the bases after it. The posteriors are those of the subset that gives the call. As
 in SwiftIG, a chimeric read, a V fragment that stops short of its 3′ end, a
 J aligned only deep inside, or a V and a J hundreds of bases apart then
 keeps its better segment instead of becoming a rearrangement. On 20,000
@@ -374,17 +381,35 @@ against 0.39.3, which had no guards:
 On 1,000 mid IGH reads cut 30 or 100 random bases after their V, 0.39.3
 called a D on 70.0 and 92.5 % of reads, and 0.39.4 on 0.3 and 0.5 % (each
 with a chance J); behind 30 or 100 random bases before their J, a D on 81.0
-and 95.9 % and a V on 7 of 2,000 reads, and now on none. With
-`--no-pair-guards` the calls are those of 0.39.3 except for C and FWR3.
+and 95.9 % and a V on 7 of 2,000 reads, and 0.39.4 on none. 0.39.4 thereby
+also took the D of every read that holds one but stops before its J or
+starts after its V, as SwiftIG did. Since 0.39.5 such a D is called again
+when it pays the open-flank cost, which removes most chance Ds far from
+the read's V or J but not those within about 30 bases of it. With the
+frozen suite's IGH database, D right on reads that hold a D, and D called
+on D-free reads (600 mid reads each):
 
-Two costs remain. The D rule also takes the D of a read that holds one but
-starts after its V, as SwiftIG did: on 952 mid IGH reads with a D, cut
-where their V ends, 0.39.3 called the right D on 878 and 0.39.4 on none;
-keeping the last 30, 40 or 60 V bases, 0.39.4 calls it on 805, 866 and 880
-reads (0.39.3: 881, 881 and 880). And a V of 30–60 bases before a J of
-another locus can still pair with a J of its own locus that aligns to the
-read well enough to be significant on its own: of 168 such constructed
-reads, 10 are called productive (0.39.3: 30; SwiftIG: none).
+| | 0.39.3 | 0.39.4 | 0.39.5 |
+|---|---|---|---|
+| right D, reads cut at their D's end (4,309 mid / 4,251 hard) | 90.2 / 84.2 % | 0.0 / 0.0 % | 92.2 / 86.3 % |
+| right D, reads ending 0–20 nt into their J (1,500 mid / 1,500 hard) | 91.2 / 83.1 % | 49.7 / 41.5 % | 91.7 / 83.8 % |
+| right D, reads starting after their V (1,913 mid) | 93.1 % | 0.0 % | 93.1 % |
+| D called, a V then 100 random bases / 100 random bases then a J | 93.5 / 97.7 % | 0.2 / 0.0 % | 6.0 / 9.5 % |
+| D called, a V then 30 random bases / 30 random bases then a J | 72.0 / 79.8 % | 0.0 / 0.0 % | 72.8 / 79.3 % |
+
+On full-length reads 0.39.5 calls as 0.39.4 does, except where the J of a
+read is missed or fails the guards: on the frozen suite only 3 IGH hard
+reads (3 right D gained) and 267 IGH reads at 30 % SHM change a D call (106
+right D gained, none lost; 14 of 129 D-free reads gain a chance D; the
+D-presence Brier score falls from 0.123 to 0.037). With `--no-pair-guards`
+the calls are those of 0.39.3 with the open-flank cost, except for C and
+FWR3; with `--d-open-flank off` they are 0.39.4's, byte for byte on the
+suite's databases.
+
+One cost remains: a V of 30–60 bases before a J of another locus can still
+pair with a J of its own locus that aligns to the read well enough to be
+significant on its own: of 168 such constructed reads, 10 are called
+productive (0.39.3: 30; SwiftIG: none).
 
 ## Double-D screen
 
@@ -941,9 +966,12 @@ The full description, with the guarantee of each search step, is in
   97.8 % → 96.2 %). A chance D within about 30 bases of the anchor sits
   where a real D sits and stays. Real N/P regions longer than about 24
   bases at a read that ends in its J lose some D calls (1.1 pp at 26–30
-  bases). `--d-open-flank off` turns the cost off (docs/ALGORITHM.md §2.3);
-  on a database whose allele names all name their locus and gene, as every
-  shipped reference does, that gives 0.39.3's calls.
+  bases). The pair guards let such a D be called only because it pays
+  this cost (*Plausibility guards*). `--d-open-flank off` turns the cost
+  off (docs/ALGORITHM.md §2.3) and with it the D at a read's open end; on a
+  database whose allele names all name their locus and gene, as every
+  shipped reference does, that gives 0.39.4's calls (and with
+  `--no-pair-guards` too, 0.39.3's apart from C and FWR3).
 - **Significance.** A V or J hit is kept at E ≤ 1 against its database and
   window. A read is called only when its path contains an *anchor*, a V or J
   hit at E ≤ 10⁻³ whose clip on the path still scores that much, so random
@@ -951,8 +979,8 @@ The full description, with the guarantee of each search step, is in
 - **Plausibility guards.** SwiftIG's checks on hits and V–J pairs (see
   *Plausibility guards*) are constraints outside the objective: the call is
   the best path that keeps them, found by re-adjudicating subsets of the
-  placements only when the best path breaks one. A D needs a V before it
-  and a J after it.
+  placements only when the best path breaks one. A D needs a V or a J
+  beside it, and a V and a J that pair when the open-flank cost is off.
 - **Constant region.** C is spliced to J at a fixed phase, so C's base 0
   lies next to the J's exit; the engine places it within `s = 7` bases, as
   SwiftIG anchored C (its first aligned base up to 8 bases after the J and
@@ -1415,6 +1443,20 @@ window; searching J over the whole read lets 0.05 % fall outside.
   not the fixed-scale path; at 11.2 % the fixed path exactly), and
   `conditioned_dag_equals_exhaustive_enumeration` checks the masked,
   topology-restricted pass behind max-marginal D decoding.
+  `open_flank_dag_equals_exhaustive_enumeration` repeats it with the
+  open-flank cost on and off, and
+  `guarded_calls_with_open_flanks_equal_the_exhaustive_subset_optima` checks
+  the pipeline's call under the pair guards and the cost together, in both
+  call models with posteriors: on whole reads, reads cut at their D, reads
+  starting after their V, D-free reads with random tails and reads whose J
+  lies beyond the junction span, the call keeps the guards, re-scores on all
+  the read's placements to the oracle's value (and its fixed score to the
+  oracle's fixed value), never beats the unguarded optimum and equals it when
+  that keeps the guards, is otherwise the best guard-keeping subset optimum
+  (each the DAG's and the exhaustive search's alike), and reports the
+  posterior of the subset that gave it. `without_the_cost_or_the_guards`
+  checks that without the cost no D stands without a V and a J, and that
+  without the guards the call is the exhaustive optimum.
 - **Kernel exactness:**
   - The scalar kernel equals a textbook Gotoh across three gap regimes.
   - Every traceback rescores to its reported score.
@@ -1441,7 +1483,10 @@ window; searching J over the whole read lets 0.05 % fall outside.
   reads, with and without `--no-pair-guards`: a V fragment 220 bases short
   of its 3′ end does not pair with a J 20 bases later; V and J more than
   225 bases apart do not pair (200 apart, they do); 8 bases of J after 12
-  random ones are no J call; a D needs a V and a J; a V cut before Cys104
+  random ones are no J call; a D needs a V and a J without the open-flank
+  cost (`tests/combine.rs`: with it, a D at the read's open end is called
+  and charged, and a J beyond the junction span gives way to the V and its
+  D); a V cut before Cys104
   pairs with its J but gets no junction; a short V does not pair with a
   chance J; C is called up to 7 bases off the splice and not below 12
   columns at 90 %.
@@ -1542,7 +1587,8 @@ Each is a named field you can change.
    best anchoring V, and from the read's start when no V anchors; only
    anchors choose the locus of the J and D candidates. Without a J (or V)
    the D window reaches 60 bases past the V (before the J), the D and its N;
-   under the pair guards such a read gets no D, since a D needs a V and a J.
+   under the pair guards such a D is called only when it pays the
+   open-flank cost (with `--d-open-flank off`, never).
    When the anchors share no locus (a read holding two chains, as an scFv
    does), each of their loci with D genes bounds a D window by its own V
    and J.
