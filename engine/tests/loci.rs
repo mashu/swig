@@ -561,6 +561,27 @@ fn custom_named_j_alleles_keep_c_in_the_read_locus() {
         .count();
     let reaching = reads.iter().filter(|read| read.c.is_some()).count();
     assert!(heavy_c * 10 >= reaching * 9, "{heavy_c} of {reaching}");
+    // SwiftIG's C rules (0.39.4) hold in the locus the path shares: C is
+    // anchored up to 7 bases off the custom-named J's end, and called only
+    // on 12 columns or more.
+    let (hv, hd, hj) = (
+        &heavy.v.alleles()[0].codes,
+        &heavy.d.alleles()[0].codes,
+        &heavy.j.alleles()[0].codes,
+    );
+    let rearranged = [&hv[..], &encode(b"GGTAC"), hd, &encode(b"CCA"), hj].concat();
+    let c_name = &heavy.c.alleles()[0].name;
+    let off_splice = [&rearranged[..], &encode(b"GATCA"), &constant[..80]].concat();
+    let call = assigner.assign(&off_splice, &mut ws);
+    let text = swig::alphabet::decode(&off_splice);
+    let record = AirrRecord::from_call("read", &text, &call, &assigner, &[None, None, None]);
+    let called = record.c.expect("C five bases off the splice").call;
+    assert!(called.split(',').any(|a| a == c_name), "{called}");
+    let short = [&rearranged[..], &constant[..10]].concat();
+    assert!(
+        assigner.assign(&short, &mut ws).c.is_none(),
+        "10 bases of C"
+    );
 }
 
 /// C alleles of no named locus and no relative in a database of heavy and

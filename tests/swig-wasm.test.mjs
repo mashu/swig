@@ -72,6 +72,11 @@ async function makeRuntime() {
     return setOption("profile", profile);
   }
 
+  /** The `{summary, warnings}` that the last `initialize` left in the result buffer. */
+  function summary() {
+    return JSON.parse(read(exports.swig_result_ptr(), exports.swig_result_len()));
+  }
+
   function setConstantPrefixIdentity(identity) {
     return setOption("c-prefix-identity", identity);
   }
@@ -138,6 +143,7 @@ async function makeRuntime() {
     setCallingProfile,
     setConstantPrefixIdentity,
     setOption,
+    summary,
     error,
   };
 }
@@ -1133,6 +1139,18 @@ test("an option without the germlines it needs is refused; one that only tunes a
     assert.throws(() => runtime.initialize(references), message, `${name} ${value}`);
     // With its database the same option runs.
     assert.ok(runtime.initialize(heavy.references) > 0, runtime.error());
+  }
+  // The C identity floor (0.39.4) only tunes the C stage: without C it runs and is named
+  // among the warnings; the pair guards act on V and J and need no database.
+  for (const [name, value, warning] of [
+    ["c-min-identity", 0.8, "--c-min-identity has no effect without a C database (--c)"],
+    ["no-pair-guards", null, null],
+  ]) {
+    const tuned = await makeRuntime();
+    assert.equal(tuned.setOption(name, value), 0, tuned.error());
+    assert.ok(tuned.initialize({ ...heavy.references, C: "" }) > 0, tuned.error());
+    const warnings = tuned.summary().warnings.filter((w) => /no effect|needs a/.test(w));
+    assert.deepEqual(warnings, warning ? [warning] : [], name);
   }
   // 0 turns the C-prefix gate off: nothing to refuse.
   const runtime = await makeRuntime();

@@ -127,7 +127,7 @@ options (`swig --help` prints them):
 | `--d-mismatch S`, `--j-mismatch S` | D or J mismatch score, negative (default: the profile's) |
 | `--min-j-length N` | fewest aligned J columns of a J hit (default none) |
 | `--c-evalue E` | call C when its anchored E-value is at most E (default 10⁻³; needs `--c`) |
-| `--c-min-identity F` | call C only on at least 12 aligned columns at identity F or more (default 0.9, SwiftIG's floor; 0 removes the identity floor, not the 12 columns) |
+| `--c-min-identity F` | call C only on at least 12 aligned columns at identity F or more (default 0.9, SwiftIG's floor; 0 removes the identity floor, not the 12 columns; without `--c` it is run with a warning) |
 | `--c-prefix-identity F` | report C only where the germline from its first base reaches identity F (default 0, off; above 0 needs `--c`) |
 | `--double-d off\|all\|long-span` | Swig's double-D screen (default off); needs `--double-d-out FILE`, and `all` and `long-span` need `--d` |
 | `--double-d-min-span N`, `--double-d-seed-length N`, `--double-d-pseudo-trim N`, `--double-d-pseudo-mismatches N`, `--double-d-min-gain S` | the screen's evidence rules (defaults 40, 11, 5, 3, 8) |
@@ -167,9 +167,11 @@ a usage error before any database is read: `--c-evalue` and
 `long-span` without `--d`. An option that only tunes a stage the run does
 not have is run and named in a warning, since it changes nothing: the D
 options (`--min-d-match`, `--d-mismatch`, `--d-presence-rate`, `--d-allele`,
-`--no-anchor-window`, `--d-open-flank off`) without `--d`, the screen's rules without
-`--double-d`, and `--d-allele max-marginal` with `--no-posterior`. A
-profile is a bundle and is never reported. With the screen on, D alleles
+`--no-anchor-window`, `--d-open-flank off`) without `--d`, `--c-min-identity`
+without `--c`, the screen's rules without `--double-d`, and `--d-allele
+max-marginal` with `--no-posterior`. `--no-pair-guards` acts on V and J,
+which every run has, and needs no database. A profile is a bundle and is
+never reported. With the screen on, D alleles
 shorter than `--double-d-seed-length` are named too, since the screen
 cannot see them. The WebAssembly module refuses the same options (an empty
 D or C text is no database) and adds the warnings to its summary

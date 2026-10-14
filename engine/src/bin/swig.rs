@@ -113,7 +113,8 @@ options:
                        diagonals x e^(-lambda S), is at most E (default 1e-3;
                        needs --c)
   --c-min-identity F   call C only at identity F or more (default 0.9, SwiftIG's
-                       floor; 0 removes it; the 12-column floor remains)
+                       floor; 0 removes it; the 12-column floor remains;
+                       without --c it is ignored with a warning)
   --c-prefix-identity F  report C only where the germline from its first base
                        reaches identity F (c_prefix_identity; default 0, off;
                        above 0 needs --c)

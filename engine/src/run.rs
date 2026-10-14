@@ -372,9 +372,10 @@ impl RunOptions {
     /// `--c-evalue`, `--c-prefix-identity` (above 0) and `--double-d`
     /// (`all`, `long-span`) gate or add to what a run reports: without
     /// their database they are refused, so a run never looks filtered or
-    /// screened when it was not. The D options and the screen's rules only
-    /// tune a stage: without it they are reported, not refused. A profile
-    /// is a bundle and is never reported.
+    /// screened when it was not. The D options, `--c-min-identity` and the
+    /// screen's rules only tune a stage: without it they are reported, not
+    /// refused. `--no-pair-guards` acts on V and J, which every run has. A
+    /// profile is a bundle and is never reported.
     pub fn check_databases(&self, d: bool, c: bool) -> Result<Vec<String>, OptionError> {
         let refused = [
             (
@@ -415,6 +416,10 @@ impl RunOptions {
                     (no_d && !self.d_open_flank, "--d-open-flank off"),
                 ],
                 "a D database (--d)",
+            ),
+            unused(
+                &[(!c && self.c_min_identity.is_some(), "--c-min-identity")],
+                "a C database (--c)",
             ),
             unused(
                 &[
@@ -1295,8 +1300,31 @@ mod tests {
             bool,
             Result<&'a [&'a str], &'a str>,
         );
-        let cases: [Case; 17] = [
+        let cases: [Case; 21] = [
             (&[], false, false, Ok(&[])),
+            // The C identity floor tunes the C stage: reported without it.
+            (
+                &[("c-min-identity", Some("0.8"))],
+                true,
+                false,
+                Ok(&["--c-min-identity has no effect without a C database (--c)"]),
+            ),
+            (&[("c-min-identity", Some("0"))], false, true, Ok(&[])),
+            // The pair guards act on V and J: no database to need.
+            (&[("no-pair-guards", None)], false, false, Ok(&[])),
+            (
+                &[
+                    ("no-pair-guards", None),
+                    ("d-open-flank", Some("off")),
+                    ("c-min-identity", Some("0.5")),
+                ],
+                false,
+                false,
+                Ok(&[
+                    "--d-open-flank off has no effect without a D database (--d)",
+                    "--c-min-identity has no effect without a C database (--c)",
+                ]),
+            ),
             (&[("c-evalue", Some("0.01"))], true, false, Err(c_evalue)),
             (&[("c-evalue", Some("0.01"))], true, true, Ok(&[])),
             (
