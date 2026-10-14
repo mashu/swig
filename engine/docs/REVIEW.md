@@ -101,10 +101,11 @@ open in part, from that review:
     0.39.5 combines the two: under the guards a D at a read's open end is
     called when it pays the cost, and with `--d-open-flank off` not at all
     (0.39.4's calls). The figures below are without the guards; with them
-    (0.39.5) a V followed by 100 random bases gets a D in 6.0 % of 600
-    D-free reads, 100 random bases followed by a J in 9.5 % (`--calls
-    fixed`: 5.0 and 10.7 %), 60 random bases after the V in 77.3 %, 30
-    after the V in 72.8 % and 30 before the J in 79.3 %; reads cut at the
+    (0.39.5) a V followed by 100 random bases gets a D in 3.2 % of 600
+    D-free reads, 100 random bases followed by a J in 9.5 %, 60 random
+    bases after the V in 77.3 %, 30 after the V in 72.8 % and 30 before the
+    J in 79.3 % (`--calls fixed`: 2.2, 10.7, 86.7, 82.8 and 88.2 %; 0.39.3:
+    98.0, 99.5, 94.0, 81.8 and 88.0 %); reads cut at the
     end of their D keep 92.2 % (mid) and 86.3 % (hard) right D calls
     (0.39.3: 90.2 and 84.2 %, 0.39.4: none), reads ending 0–20 bases into
     their J 91.7 and 83.8 % (0.39.4: 49.7 and 41.5 %). This
@@ -142,6 +143,8 @@ open in part, from that review:
     N1/N2 gap hinge first proposed here was measured and rejected (−8 to
     −12 pp D allele at 30 % SHM); a geometric N-length allowance traced the
     same trade-off as the fixed one.
+11. ~~**Gene identity from allele names.**~~ Fixed in 0.39.5: see the
+    table above (§0 11).
 12. ~~**Junk V by circular divergence.**~~ Addressed in effect in 0.39.4.
     With the V presence cost, 7 of 1,200 V-less test reads still got a V:
     the read's divergence is estimated partly from the junk V's own
@@ -203,15 +206,20 @@ items 10 and 12, it leaves open:
     not derived, and the guarded call is the best of the subset optima
     that keep them (V alone, J alone, each J with the V placements that
     pair with it and every D, and, under the open-flank cost since 0.39.5,
-    V with every D and every D with J), not an exact maximum over every
-    admissible path: a subset whose optimum breaks a guard contributes
-    nothing. The posteriors are those of the chosen subset, so a read that
-    falls back to its V–D subset has no chance-J paths in its D-presence
-    posterior. An oracle test now checks each subset optimum against
-    exhaustive enumeration and the call's value against the oracle's value
-    of its path (`guarded_calls_with_open_flanks_equal_the_exhaustive_
-    subset_optima`), but none measures how often a better admissible path
-    is missed.
+    V with the Ds within its reach and Ds with the J they lie within the
+    reach of), not an exact maximum over every admissible path: a subset
+    whose optimum breaks a guard contributes nothing. The posteriors are
+    those of the chosen subset, so a read that falls back to its V–D
+    subset has no chance-J paths in its D-presence posterior. An oracle
+    test checks each subset optimum against exhaustive enumeration and the
+    call's value against the oracle's value of its path
+    (`guarded_calls_with_open_flanks_equal_the_exhaustive_subset_optima`).
+    Since 0.39.5 it also states the rule on its own (`CombineRule`) and
+    measures the misses over every choice of at most one V, D and J among
+    a read's best placements: of 435 calls, none under the per-read model
+    and one under the fixed scale is beaten by a path the rule admits
+    (its VDJ optimum's V clip stretches the span past 225 bases, so the
+    whole subset is passed over; 0.39.4's subsets).
 20. **Junctions withheld on mutated anchors.** The anchor rule withholds
     the junction of a read whose Cys104 or Trp/Phe118 codon is mutated so
     that its alignment stops before the codon: 0.84 points of templated

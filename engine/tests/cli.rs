@@ -373,8 +373,11 @@ const FNV_0394_SIMULATED: u64 = 0x78d7_5831_88a5_a108;
 /// D at a read's open end: a D is then called only between a V and a J that
 /// pair, and the rows are Swig 0.39.4's, byte for byte, on fixture (a) and
 /// on simulated full-length reads. On fixture (a) Swig 0.39.3 called a
-/// chance D on all 20 reads, 0.39.4 on none; the cost leaves 1. The
-/// full-length reads show a V and a J, and the cost changes none of them.
+/// chance D on all 20 reads, 0.39.4 on none, and so does the cost: the one
+/// chance D it left lay more than 60 bases after the V, found only in the
+/// window up to a chance J that the guards drop. The cost still moves the
+/// rows (their D posteriors). The full-length reads show a V and a J, and
+/// the cost changes none of them.
 #[test]
 fn the_open_flank_cost_can_be_turned_off() {
     let dir = workspace("open-flank");
@@ -398,7 +401,8 @@ fn the_open_flank_cost_can_be_turned_off() {
     );
     assert_eq!(fnv(&off), FNV_0394);
     let count = |tsv: &[u8]| d_column(tsv).iter().filter(|d| !d.is_empty()).count();
-    assert_eq!((count(&on), count(&off)), (1, 0));
+    assert_eq!((count(&on), count(&off)), (0, 0));
+    assert_ne!(on, off);
     assert_eq!(call(&["--d-open-flank", "on"], "reads.fa"), on);
     let off = call(&["--d-open-flank", "off"], "sim.fasta");
     assert_eq!(fnv(&off), FNV_0394_SIMULATED);

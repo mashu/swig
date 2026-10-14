@@ -186,6 +186,88 @@ fn a_j_that_does_not_pair_gives_way_to_the_v_and_its_d() {
     assert!(kept >= 6, "{kept} of 8 reads kept their D");
 }
 
+/// A D at the open end lies where a read without the dropped partner
+/// would have searched it: within the D window's reach (60 bases) of the
+/// V's end, or of the J's start. Reads of a full V, random bases, a D and
+/// a J 240 bases after the V (beyond the 225-base junction span, so the
+/// guards drop the pair): with the D 100 to 160 bases after the V and more
+/// than 60 bases before the J, the call is the V (or the J) alone, as on
+/// the same read without the J and in Swig 0.39.4, not the V with a D that
+/// only the dropped J's window found (a chance D in the first 60 random
+/// bases, at most 4 of 24, may be); with the D five bases before the J,
+/// the call is never the V with that D (D–J, or the V alone). Before the
+/// reach was checked, every read of the first kind was called V–D with a
+/// D presence of 1.
+#[test]
+fn an_open_end_d_lies_within_reach_of_its_partner() {
+    let db = database();
+    let mut rng = Rng::new(31);
+    let v = bases(&db.v.allele(0).codes);
+    let j = bases(&db.j.allele(0).codes);
+    let config = EngineConfig::default();
+    let (mut far, mut chance, mut near_j, mut d_j) = (0, 0, 0, 0);
+    for allele in
+        db.d.alleles()
+            .iter()
+            .filter(|a| a.codes.len() >= 20)
+            .take(8)
+    {
+        let d = bases(&allele.codes);
+        for n1 in [100, 130, 160] {
+            let tail = 240 - n1 - d.len();
+            let read = [
+                v.clone(),
+                rng.bases(n1),
+                d.clone(),
+                rng.bases(tail),
+                j.clone(),
+            ]
+            .concat();
+            let r = record(&db, &config, &read);
+            assert!(r.v.is_some() || r.j.is_some(), "{} n1 {n1}", allele.name);
+            // A chance D in the first 60 random bases may be called, as on
+            // the read without the J; the planted D, 100 or more bases on,
+            // may not.
+            if let Some(called) = &r.d {
+                assert!(
+                    called.sequence_end as usize <= v.len() + 60 + 2,
+                    "{} n1 {n1}: D {} at {}..{} beyond the reach",
+                    allele.name,
+                    called.call,
+                    called.sequence_start,
+                    called.sequence_end
+                );
+                chance += 1;
+            } else {
+                assert!(
+                    r.d_presence_posterior.is_none_or(|p| p < 0.5),
+                    "{} n1 {n1}: D presence {:?}",
+                    allele.name,
+                    r.d_presence_posterior
+                );
+            }
+            far += 1;
+        }
+        let n1 = 240 - 5 - d.len();
+        let read = [v.clone(), rng.bases(n1), d.clone(), rng.bases(5), j.clone()].concat();
+        let r = record(&db, &config, &read);
+        if r.d.is_some() {
+            assert!(
+                r.j.is_some() && r.v.is_none(),
+                "{}: V with a far D",
+                allele.name
+            );
+            d_j += 1;
+        }
+        near_j += 1;
+    }
+    assert!(
+        far == 24 && near_j == 8 && chance <= 4,
+        "{far} far ({chance} with a chance D near the V), {near_j} near the J"
+    );
+    eprintln!("{d_j} of {near_j} reads with the D beside a dropped J called D-J");
+}
+
 fn bases(codes: &[u8]) -> Vec<u8> {
     swig::alphabet::decode(codes).into_bytes()
 }

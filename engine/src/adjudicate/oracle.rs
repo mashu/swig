@@ -684,6 +684,62 @@ fn open_flank_dag_equals_exhaustive_enumeration() {
     );
 }
 
+/// The Combine rule (Swig 0.39.5), stated here on its own rather than
+/// taken from [`crate::pipeline`]: a path keeps the guards when
+/// * each of its V and J keeps SwiftIG's score and identity floor where the
+///   path clips it (`floor`), and
+/// * it holds a V and a J that pair (`pairs`, SwiftIG's test) with at most
+///   `span` read bases between the V's exit and the J's entry; or
+/// * it holds no D; or
+/// * it holds a V and no J, and every D placement ends at most `reach`
+///   bases after the V placement's end (the D window of a read without a
+///   J); or a J and no V, and every D placement starts at most `reach`
+///   bases before the J placement's start.
+///
+/// A D with neither a V nor a J breaks it.
+struct CombineRule<'a, F, P> {
+    floor: F,
+    pairs: P,
+    span: u32,
+    reach: u32,
+    query: &'a [u8],
+}
+
+impl<F, P> CombineRule<'_, F, P>
+where
+    F: Fn(&[u8], &[Placement], &CalledSegment) -> bool,
+    P: Fn(&Placement, &Placement) -> bool,
+{
+    fn keeps(&self, placed: &[Placement], segments: &[CalledSegment]) -> bool {
+        let of = |kind| segments.iter().find(|s| placed[s.placement].kind == kind);
+        let flanks = segments
+            .iter()
+            .filter(|s| matches!(placed[s.placement].kind, SegmentKind::V | SegmentKind::J));
+        if !flanks.clone().all(|s| (self.floor)(self.query, placed, s)) {
+            return false;
+        }
+        let mut ds = segments
+            .iter()
+            .map(|s| &placed[s.placement])
+            .filter(|p| p.kind == SegmentKind::D);
+        match (of(SegmentKind::V), of(SegmentKind::J)) {
+            (Some(v), Some(j)) => {
+                j.span.q_lo.saturating_sub(v.span.q_hi) <= self.span
+                    && (self.pairs)(&placed[v.placement], &placed[j.placement])
+            }
+            (Some(v), None) => {
+                let end = placed[v.placement].q_end().saturating_add(self.reach);
+                ds.all(|d| d.q_end() <= end)
+            }
+            (None, Some(j)) => {
+                let start = placed[j.placement].q_start().saturating_sub(self.reach);
+                ds.all(|d| d.q_start() >= start)
+            }
+            (None, None) => ds.next().is_none(),
+        }
+    }
+}
+
 /// Reads of the shapes the pair guards and the open-flank cost act on:
 /// whole, cut two bases after their D (V–D), from ten bases before their D
 /// (D–J), a V followed by 100 random bases, 100 random bases followed by a
@@ -729,7 +785,17 @@ fn guarded_fixtures(db: &SyntheticDatabase) -> Vec<Vec<u8>> {
 ///   anchor and keep the guards, the earlier subset on an exact tie;
 /// * its posterior is the forward–backward pass over the subset that gave
 ///   the call, in the same context, so that under the per-read model the
-///   call is a mode of the reported distribution.
+///   call is a mode of the reported distribution;
+/// * the engine's guard verdict on the call, the unguarded optimum and
+///   every subset optimum is the verdict of [`CombineRule`], the rule
+///   written out independently;
+/// * a path the rule allows rarely beats the call: for every choice of at
+///   most one V, one D and one J among the read's best placements (4 V,
+///   8 D, 4 J), the optimum over that choice, when it holds an anchor and
+///   keeps [`CombineRule`], is compared with the call. The subsets are a
+///   search heuristic (a subset whose optimum breaks the guards is passed
+///   over whole), so this measures what they miss: at most 2 calls of the
+///   fixtures' per model (measured: 0 per-read, 1 fixed-scale).
 #[test]
 fn guarded_calls_with_open_flanks_equal_the_exhaustive_subset_optima() {
     let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 11);
@@ -750,15 +816,30 @@ fn guarded_calls_with_open_flanks_equal_the_exhaustive_subset_optima() {
         assert!(flank.is_some() && dag.charges_open_flank());
         let mut ws = assigner.workspace();
         let (mut fallbacks, mut open_ends, mut open_subsets) = (0, 0, 0);
+        let (mut skeletons, mut allowed, mut missed, mut calls_checked) = (0, 0, 0, 0);
+        let floor =
+            |q: &[u8], p: &[Placement], s: &CalledSegment| assigner.segment_keeps_floor(q, p, s);
+        let pairs = |v: &Placement, j: &Placement| assigner.pair_check(v, j);
         for read in &reads {
             let call = assigner.assign(&encode(read), &mut ws);
             let placed = &call.placements;
             let (query, path) = (&call.query, call.path.as_ref());
+            let rule = CombineRule {
+                floor: &floor,
+                pairs: &pairs,
+                span: config.options.guards.unwrap().max_junction_span,
+                reach: config.d_window.reach,
+                query,
+            };
             let (subsets, keeps) = assigner.guard_check(query, placed, path);
             assert!(keeps, "the call breaks the guards");
             let Some(path) = path else {
                 continue;
             };
+            assert!(
+                rule.keeps(placed, &path.segments),
+                "the call breaks the rule"
+            );
             let context = ReadContext::of(placed, query.len() as u32);
             assert_eq!(path.context, context);
             let read_model = dag.read_model(context.divergence);
@@ -800,6 +881,13 @@ fn guarded_calls_with_open_flanks_equal_the_exhaustive_subset_optima() {
                         model: calls,
                     });
             let (_, all_keep) = assigner.guard_check(query, placed, traced.as_ref());
+            if let Some(t) = &traced {
+                assert_eq!(
+                    all_keep,
+                    rule.keeps(placed, &t.segments),
+                    "unguarded optimum"
+                );
+            }
             let anchored = |placements: &[Placement], segments: &[CalledSegment]| {
                 segments
                     .iter()
@@ -833,9 +921,13 @@ fn guarded_calls_with_open_flanks_equal_the_exhaustive_subset_optima() {
                         context,
                         model: calls,
                     };
-                    if !anchored(&subset, &candidate.segments)
-                        || !assigner.guard_check(query, &subset, Some(&candidate)).1
-                    {
+                    let verdict = assigner.guard_check(query, &subset, Some(&candidate)).1;
+                    assert_eq!(
+                        verdict,
+                        rule.keeps(&subset, &candidate.segments),
+                        "subset {ids:?}"
+                    );
+                    if !anchored(&subset, &candidate.segments) || !verdict {
                         continue;
                     }
                     if best.is_none_or(|(_, b)| value > b) {
@@ -851,6 +943,50 @@ fn guarded_calls_with_open_flanks_equal_the_exhaustive_subset_optima() {
                 );
                 subsets[k].clone()
             };
+            // No path the rule allows beats the call, over every choice of
+            // at most one V, D and J among the best placements.
+            let best_ids = |kind: SegmentKind, n: usize| {
+                let mut ids: Vec<usize> = (0..placed.len())
+                    .filter(|&i| placed[i].kind == kind)
+                    .collect();
+                ids.sort_by_key(|&i| std::cmp::Reverse(placed[i].score()));
+                ids.truncate(n);
+                let mut options: Vec<Option<usize>> = ids.into_iter().map(Some).collect();
+                options.push(None);
+                options
+            };
+            let (vs, ds, js) = (
+                best_ids(SegmentKind::V, 4),
+                best_ids(SegmentKind::D, 8),
+                best_ids(SegmentKind::J, 4),
+            );
+            let mut beaten = false;
+            for &v in &vs {
+                for &d in &ds {
+                    for &j in &js {
+                        if v.is_none() && j.is_none() {
+                            continue;
+                        }
+                        let ids: Vec<usize> = [v, d, j].into_iter().flatten().collect();
+                        let choice: Vec<Placement> =
+                            ids.iter().map(|&i| placed[i].clone()).collect();
+                        fill(&mut table, &read_model, calls, &choice);
+                        let Some((value, segments)) =
+                            dag.viterbi(&choice, &read_model, &table, &mut scratch)
+                        else {
+                            continue;
+                        };
+                        skeletons += 1;
+                        if !anchored(&choice, &segments) || !rule.keeps(&choice, &segments) {
+                            continue;
+                        }
+                        allowed += 1;
+                        beaten |= value > path.value;
+                    }
+                }
+            }
+            missed += usize::from(beaten);
+            calls_checked += 1;
             // The reported posterior is the chosen subset's.
             let subset: Vec<Placement> = chosen.iter().map(|&i| placed[i].clone()).collect();
             fill(&mut table, &read_model, calls, &subset);
@@ -875,6 +1011,19 @@ fn guarded_calls_with_open_flanks_equal_the_exhaustive_subset_optima() {
             fallbacks >= 40 && open_ends >= 100 && open_subsets >= 5,
             "{calls:?}: {fallbacks} fallbacks, {open_ends} open-ended calls, \
              {open_subsets} from an open-end subset"
+        );
+        eprintln!(
+            "{calls:?}: {skeletons} choices, {allowed} allowed by the rule; \
+             on {missed} of {calls_checked} calls one beats the call"
+        );
+        // Measured: none under the per-read model, one call under the fixed
+        // scale, where the optimum of the V–J pair with every D clips the V
+        // so that the pair's span exceeds 225 bases, and the subset is
+        // passed over although a V–D–J path with another D and the V's
+        // full exit keeps it (Swig 0.39.4's subsets, the D-free pair wins).
+        assert!(
+            allowed >= 1000 && missed <= 2,
+            "{calls:?}: on {missed} of {calls_checked} calls an allowed path beats the call"
         );
     }
 }

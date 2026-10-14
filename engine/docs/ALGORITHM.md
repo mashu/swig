@@ -206,7 +206,7 @@ The non-alignment terms are log prior odds in score units:
   the D-call rate falls from 93.5 % to 6.8 %, on 100 random bases followed
   by a J (jcut100) from 97.7 % to 10.2 %, and every full-length suite set
   keeps its calls (§8, item 2); these rates are without the pair guards,
-  and with them, since 0.39.5, 6.0 and 9.5 %. The cost is also what lets
+  and with them, since 0.39.5, 3.2 and 9.5 %. The cost is also what lets
   the guards (§4c) call a D at a read's open end at all: without it they
   call a D only between a V and a J. That needs a derived `P*_D`: the profiles
   `truth` and `igblast` fix it at 0, a chance D of a dozen points then
@@ -888,7 +888,13 @@ rule is then skipped.)
    the default), both a V and a J (SwiftIG paired V and J before it looked
    for a D, and so did 0.39.4): a D that ends its path (no J after it) or
    starts it (no V before it) is admissible only because it pays for the J
-   or V the read would show beyond it;
+   or V the read would show beyond it, and only where a read without that
+   J (V) would have searched it (§5, D windows): with a V and no J every D
+   placement ends at most `r = 60` bases (`ExpandedResidual::reach`) after
+   the V placement's end, with a J and no V every D placement starts at
+   most `r` bases before the J placement's start. A J (V) the guards drop
+   thus no longer decides where the D may lie: the D window of a read
+   with a J runs up to that J;
 3. if `π` holds a V and a J, at most 225 read bases separate the V's exit
    from the J's entry and `pairs(v, j)` holds.
 
@@ -900,17 +906,24 @@ cost its length and anchored columns. The guarded call is
 ```text
 π*(all)                                         if it keeps the guards
 argmax_{Σ ∈ S, π*(Σ) keeps the guards} value(π*(Σ))     otherwise
-S = { V } ∪ { J } ∪ { V_j ∪ D ∪ {j},  V_j ∪ {j} : j ∈ J, V_j ≠ ∅ }  [ ∪ { V ∪ D,  D ∪ J } ]
+S = { V } ∪ { J } ∪ { V_j ∪ D ∪ {j},  V_j ∪ {j} : j ∈ J, V_j ≠ ∅ }
+    [ ∪ { V_≥e ∪ D_≤e : e ∈ ends(V) } ∪ { D_≥s ∪ J_≤s : s ∈ starts(J) } ]
 V_j = { v ∈ V : pairs(v, j) }
+V_≥e = { v ∈ V : end(v) ≥ e },    D_≤e = { d ∈ D : end(d) ≤ e + r }
+J_≤s = { j ∈ J : start(j) ≤ s },  D_≥s = { d ∈ D : start(d) ≥ s − r }
 ```
 
 with `V`, `D` and `J` the read's placements of each kind; the bracketed
 subsets are offered only under the open-flank cost (with D placements),
-last. Each J is offered with and without the D placements because without
-the cost the optimum over `V_j ∪ D ∪ {j}` can be a VD path, which breaks
-rule 2 while its VJ path keeps it. Under the cost `V ∪ D` holds the VD
-paths of a read whose J does not pair (a chance J, a J beyond the span):
-its D pays the cost over every read base after it, chance J included. An
+last, without an empty `D_≤e` (`D_≥s`) or a subset that an earlier one
+of its side holds. Each J is offered with and without the D placements
+because without the cost the optimum over `V_j ∪ D ∪ {j}` can be a VD
+path, which breaks rule 2 while its VJ path keeps it. Under the cost
+`V_≥e ∪ D_≤e` holds the VD paths of a read whose J does not pair (a chance
+J, a J beyond the span) in which a V ending at `e` or later meets a D
+within its reach: every pair of the subset keeps rule 2, and every V and D
+within reach of each other share the subset of the V's end. Its D pays the
+cost over every read base after it, chance J included. An
 exact tie keeps the earlier subset, and a read with no admissible subset
 optimum is not called. Values compare across subsets because every subset
 is read in the same context. The marginals of §4a are those of the subset
@@ -925,8 +938,20 @@ when another of its paths keeps them. Within each subset the DAG's key is
 the exhaustive optimum, and the call's key re-scores on all the read's
 placements to the oracle's value of its path
 (`guarded_calls_with_open_flanks_equal_the_exhaustive_subset_optima`).
+The same test states the rule above on its own (`CombineRule` in the
+oracle, with only SwiftIG's per-segment floor and `pairs` taken from the
+engine) and checks that the engine's verdict agrees with it on every call,
+unguarded optimum and subset optimum; and, over every choice of at most one
+V, D and J among a read's best placements (4, 8 and 4), how often a path
+the rule admits beats the call: on the test's 435 calls, never under the
+per-read model and once under the fixed scale. That read's VDJ optimum
+clips its V so that the span exceeds 225 bases, so the subset `V_j ∪ D ∪
+{j}` is passed over though another VDJ path in it keeps the guards (0.39.4's
+subsets; the VJ path wins).
 Cost: one admissibility check when `π*(all)` keeps the guards; otherwise
-at most `2|J| + 4` more adjudications over fewer placements. On 20,000 simulated human BCR reads per preset the guards
+at most `2|J| + 2` more adjudications over fewer placements, and under
+the cost one more per distinct V placement end and J placement start
+(fewer after empty and repeated subsets are left out). On 20,000 simulated human BCR reads per preset the guards
 changed the V, D or J call or its coordinates on 0 mid and 9 hard reads,
 and CPU time is unchanged within ±2 % (10,000 simulated reads, one
 thread).
@@ -964,12 +989,12 @@ step can lose.
 | J scoring | `segment.rs`, `family_bound.rs` | lossless | The same bounds with each gene one frame, its alleles at offset 0 (sound because J is unbanded); ties in allele order. |
 | V/J keep | `segment.rs` | defined | Keep the top 3 alignments with E ≤ 1 by extended score and the top 3 by local score, each plus ties; trace back until the next local score is below the 3rd extended one, which bounds the 3rd local one from below. The stages have no length or identity floor: a positive `(2, −3)` local alignment has identity > 3/5 and the E-value implies a length. The pair guards (§4c) then drop kept V hits under 24 local columns and J hits under 10, which the E-value does not imply on a short window or a truncated read. |
 | J | `retrieve/exhaustive.rs`, `window.rs` | bounded | Every J allele, unbanded, in `[min V end − 12, read end)` when some V placement is an anchor (E ≤ 10⁻³), or the whole read when none is: a chance V hit on a read without V (one starting in CDR3) no longer pushes the window past the J, and only anchors choose the locus of the J and D candidates. Under the pair guards (§4c) the window ends at the last anchoring V's end + 225 + the longest J, since a J that starts further away pairs with none of them: J copies further downstream then take no slot from the read's own J (the cap shortened the window on 0 of 20,000 mid and 2 of 20,000 hard simulated reads), and a J's outer flank is stitched only inside the window. Each locus the anchors choose is searched and kept on its own (top 3 per locus), so on a read holding two chains (an scFv) one chain's J alleles cannot crowd out the other's: on 800 scFv reads, light-chain calls without a J went from 20 to 0, and the BCR and TCR suite sets are unchanged. A J can reach back into V only through chance edge matches. Whole-read J search is 18 % slower and changes a few hard-preset calls (D −0.04 pp, J −0.02 pp), none on mid. The J is searched without regard to the D (its placement, like every segment's, is chosen jointly in the DAG), and it does not "eat" the D: the D windows reach 12 bases into J and include the conserved-anchor window, and the DAG orders segments by kind, so a D can precede a J whose alignment reaches back over it and the cuts give any J/D overlap to whichever explains it better. With a D remnant ≥ 8 nt (`examples/d_errors.rs`, human IGH), a missing D whose bases the called J covers is 0.00 % of reads on mid and hard, and a true D outside the windows 0 %; whole-read J lets 0.05 % fall outside. |
-| D windows | `window.rs` | bounded | `[V end − 12, best J start + 12)` plus the conserved-anchor window `[V Cys104 + 3, J Trp/Phe118)`, where V is the best V placement that is an anchor (E ≤ 10⁻³). As for J, a V hit that is not an anchor may be a chance hit downstream of the real D (a read that starts in CDR3), so without an anchor the residual starts at the read's start and there is no anchor window; a V stage without E-value gates bounds D by its best hit. On 1,913 simulated IGH reads that start after V, this called 209 more D alleles correctly (+10.9 pp, none lost) and lowered the D-presence Brier score from 0.109 to 0.005; the frozen suite changed one read. Under the pair guards (§4c) 0.39.4 called a D only with a V and a J, so such reads got no D (on 952 mid IGH reads with a D cut where their V ends, 878 right D calls without the guards, none with them); since 0.39.5 the DJ path is a call when the D pays the open-flank cost (§2.3), and these 1,913 reads keep 93.1 % right D calls, as without the guards. Without a J the residual ends 60 bases after V's end, and without a V it starts 60 bases before J's start: a D lies within its N and its own length of the segment the read has (N1 + D and D + N2 are at most 55 in 99.9 % of simulated IGH junctions). This bounds where a chance D can lie on a read that stops before its J or starts after its V, not how often one is called: `P_D` is priced for 25 junction positions, so without the pair guards 30 random bases after V still give a D in 72 % of such reads, and 100 bases in 93.5 % (97.2 % unbounded); the D lies at most 73 bases from the called V instead of 94. With `--d-open-flank off` the pair guards (§4c) call a D only with a V and a J, so such a read gets none unless a chance J completes the path: on 1,000 mid IGH reads cut 30 or 100 random bases after their V, 0.3 and 0.5 % got a D in 0.39.4 (70.0 and 92.5 % without the guards), and behind 30 or 100 random bases before their J, none (81.0 and 95.9 %). With the cost (the default) the far chance Ds go and the near ones stay: on 600 such reads per set, 6.0 % of reads with 100 random bases after the V and 9.5 % of those with 100 before the J get a D, 72.8 % with 30 after the V and 79.3 % with 30 before the J. The chance-D rate near the anchor and on full junctions is open problem 2 (§8): an N/P length prior. When the anchors share no locus (a read holding two chains, as an scFv does), the best V and the first J may belong to different chains, and the window between them holds neither chain's D; each anchored locus with D genes then bounds a window by its own best anchoring V and first J. On 750 simulated heavy-first scFv reads (BCR suite reads joined by a linker), heavy calls with a D went from 412 to 498 and right D calls from 355 to 429; the frozen suite keeps every call. |
+| D windows | `window.rs` | bounded | `[V end − 12, best J start + 12)` plus the conserved-anchor window `[V Cys104 + 3, J Trp/Phe118)`, where V is the best V placement that is an anchor (E ≤ 10⁻³). As for J, a V hit that is not an anchor may be a chance hit downstream of the real D (a read that starts in CDR3), so without an anchor the residual starts at the read's start and there is no anchor window; a V stage without E-value gates bounds D by its best hit. On 1,913 simulated IGH reads that start after V, this called 209 more D alleles correctly (+10.9 pp, none lost) and lowered the D-presence Brier score from 0.109 to 0.005; the frozen suite changed one read. The same reach bounds a D at the open end of a guarded call whose J (V) the guards drop (§4c rule 2), so that J does not stretch the window. Under the pair guards (§4c) 0.39.4 called a D only with a V and a J, so such reads got no D (on 952 mid IGH reads with a D cut where their V ends, 878 right D calls without the guards, none with them); since 0.39.5 the DJ path is a call when the D pays the open-flank cost (§2.3), and these 1,913 reads keep 93.1 % right D calls, as without the guards. Without a J the residual ends 60 bases after V's end, and without a V it starts 60 bases before J's start: a D lies within its N and its own length of the segment the read has (N1 + D and D + N2 are at most 55 in 99.9 % of simulated IGH junctions). This bounds where a chance D can lie on a read that stops before its J or starts after its V, not how often one is called: `P_D` is priced for 25 junction positions, so without the pair guards 30 random bases after V still give a D in 72 % of such reads, and 100 bases in 93.5 % (97.2 % unbounded); the D lies at most 73 bases from the called V instead of 94. With `--d-open-flank off` the pair guards (§4c) call a D only with a V and a J, so such a read gets none unless a chance J completes the path: on 1,000 mid IGH reads cut 30 or 100 random bases after their V, 0.3 and 0.5 % got a D in 0.39.4 (70.0 and 92.5 % without the guards), and behind 30 or 100 random bases before their J, none (81.0 and 95.9 %). With the cost (the default) the far chance Ds go and the near ones stay: on 600 such reads per set, 3.2 % of reads with 100 random bases after the V and 9.5 % of those with 100 before the J get a D, 72.8 % with 30 after the V and 79.3 % with 30 before the J. The chance-D rate near the anchor and on full junctions is open problem 2 (§8): an N/P length prior. When the anchors share no locus (a read holding two chains, as an scFv does), the best V and the first J may belong to different chains, and the window between them holds neither chain's D; each anchored locus with D genes then bounds a window by its own best anchoring V and first J. On 750 simulated heavy-first scFv reads (BCR suite reads joined by a linker), heavy calls with a D went from 412 to 498 and right D calls from 355 to 429; the frozen suite keeps every call. |
 | D prefilter | `retrieve/lmer_mask.rs` | lossless w.r.t. gates | Shares ≥ 1 L-mer, with `L` derived from the gates (`min_d_match`; 4 with the optional distributed-D gate, by pigeonhole). |
 | D floor | `config.rs`, `adjudicate/model.rs` | lossless for the call | Only for a fixed-scale call without posteriors (`--no-posterior --calls fixed`): score ≥ max(gate floor, `P_D + 1`). By Lemma 1 a D at or below `P_D` adds ≤ 0, and dropping it leaves its neighbours' cuts valid (exit ≤ entry), so the no-D path is at least as good (requires `ι = 0`, the default). With posteriors every admissible D is kept: a D below the floor cannot be called but carries mass `e^{s − P_D}`, and dropping it would bias `d_presence_posterior` down; a per-read call can call it. With several loci the floor is the lowest `P_D` of a locus that has D genes. |
 | C | `constant.rs`, `retrieve/reach.rs` | exact for `\|δ\| ≤ s` | One anchored job per reach class, window `[x − s − 1, n)`, band `[0, 2s]`, `s = 7`; the anchor column makes the local optimum the anchored one. Net indel drift inside C beyond `s ∓ δ` truncates the alignment. The top 3 classes (and ties) are kept before the 12-column, 90 % floors, so a read whose three best are all below the floors gets no C. |
 | D admission | `admission.rs` | defined | Exact run ≥ `min_d_match` = 4 (3, 5 and 6 are all worse). The note's distributed-evidence alternative is optional and off: it admitted no D that changed a call. |
-| Pair guards | `pipeline.rs` | defined | Hit floors (V ≥ 24, J ≥ 10 local columns), V–J pairing, the 225-base span and the D rule (§4c). The best path is checked once; only when it breaks a guard are the V, J and per-J paired subsets (and, under the open-flank cost, V ∪ D and D ∪ J) re-adjudicated, and the call is the best admissible subset optimum. Every admissible path lies in some subset, but a subset whose optimum is inadmissible contributes nothing. |
+| Pair guards | `pipeline.rs` | defined | Hit floors (V ≥ 24, J ≥ 10 local columns), V–J pairing, the 225-base span and the D rule (§4c). The best path is checked once; only when it breaks a guard are the V, J and per-J paired subsets (and, under the open-flank cost, the V and D placements within reach of each other, and the D and J placements) re-adjudicated, and the call is the best admissible subset optimum. Every admissible path lies in some subset, but a subset whose optimum is inadmissible contributes nothing. |
 
 *Gene frames.* The alleles of a gene are placed in one coordinate system,
 `frame position = allele position + offset`. An allele joins its gene's frame
@@ -1119,7 +1144,7 @@ this objective can do better.
    open-flank cost (§2.3): a chance D more than about 30 bases from the read
    end it would have to explain (vcut100 93.5 → 6.8 %, jcut100 97.7 →
    10.2 %, vcut60 89.5 → 73.5 % without the pair guards; with them, in
-   0.39.5, 6.0, 9.5 and 77.3 %), with no call changed on the full-length
+   0.39.5, 3.2, 9.5 and 77.3 %), with no call changed on the full-length
    suite sets. The pair guards of 0.39.4 alone removed every such D, near
    or far, and with it every real D of a read that stops before its J or
    starts after its V; 0.39.5 calls a D at the open end again, under the

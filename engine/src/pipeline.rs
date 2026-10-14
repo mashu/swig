@@ -400,51 +400,62 @@ impl<A, RV, RJ, RD, W, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj> {
         v_columns + j_columns >= guards.min_pair_columns && (faces || split)
     }
 
-    /// Whether `path` over `placed` (on `query`) keeps the pair guards:
-    /// each of its V and J keeps a positive score and the identity floor
-    /// where the path clips it, as SwiftIG required of a split V and J; a D
-    /// has a V and a J, or, when `open_d` (the adjudicator charges the
-    /// open-flank cost, [`Adjudicator::charges_open_flank`]), at least one
-    /// of them: a D may then end the path (no J after it) or start it (no
-    /// V before it) and pays for the J or V the read would show beyond it;
-    /// and its V and J (when it has both) pair, with at most
-    /// `max_junction_span` read bases between the V's exit and the J's
-    /// entry.
-    fn keeps_guards(
-        &self,
-        guards: &PairGuards,
-        open_d: bool,
-        query: &[u8],
-        placed: &[Placement],
-        path: &CallPath,
-    ) -> bool {
+    /// Whether the V or J segment `s` of a path over `placed` (on `query`)
+    /// keeps a positive score and the identity floor where the path clips
+    /// it ([`Self::keeps_guards`]).
+    fn keeps_floor(&self, query: &[u8], placed: &[Placement], s: &CalledSegment) -> bool {
         let floor = self.options.min_identity;
         // The outer flank a stage stitched on is not judged, as SwiftIG
         // judged a split V or J before its terminal extension: only the
         // part of the local alignment the path keeps.
-        let viable = |s: &CalledSegment| {
-            let p = &placed[s.placement];
-            let flank = p.evidence.columns.saturating_sub(p.local_evidence.columns);
-            let (lo, hi) = match p.kind {
-                SegmentKind::V => (s.span.q_lo.max(p.q_start() + flank), s.span.q_hi),
-                _ => (
-                    s.span.q_lo,
-                    s.span.q_hi.min(p.q_end().saturating_sub(flank)),
-                ),
-            };
-            let Some(kept) = p.clip.span(lo, hi).filter(|k| k.score > 0) else {
-                return false;
-            };
-            if floor <= 0.0 {
-                return true;
-            }
-            let Some(segment) = self.segment(p.kind) else {
-                return true;
-            };
-            let reference = &segment.set().allele(p.primary_allele()).codes;
-            let e = Evidence::from_columns(p.clip.columns(&kept), query, reference);
-            e.identity() + 1e-9 >= floor
+        let p = &placed[s.placement];
+        let flank = p.evidence.columns.saturating_sub(p.local_evidence.columns);
+        let (lo, hi) = match p.kind {
+            SegmentKind::V => (s.span.q_lo.max(p.q_start() + flank), s.span.q_hi),
+            _ => (
+                s.span.q_lo,
+                s.span.q_hi.min(p.q_end().saturating_sub(flank)),
+            ),
         };
+        let Some(kept) = p.clip.span(lo, hi).filter(|k| k.score > 0) else {
+            return false;
+        };
+        if floor <= 0.0 {
+            return true;
+        }
+        let Some(segment) = self.segment(p.kind) else {
+            return true;
+        };
+        let reference = &segment.set().allele(p.primary_allele()).codes;
+        let e = Evidence::from_columns(p.clip.columns(&kept), query, reference);
+        e.identity() + 1e-9 >= floor
+    }
+
+    /// Whether `path` over `placed` (on `query`) keeps the pair guards:
+    /// each of its V and J keeps a positive score and the identity floor
+    /// where the path clips it, as SwiftIG required of a split V and J; a D
+    /// has a V and a J, or, when `open_d` is the reach of an open-end D
+    /// (the adjudicator charges the open-flank cost,
+    /// [`Adjudicator::charges_open_flank`]), at least one of them: a D may
+    /// then end the path (no J after it) or start it (no V before it) and
+    /// pays for the J or V the read would show beyond it, but only where a
+    /// read without that J (V) would have searched it, within the reach of
+    /// the D window ([`DWindowPolicy::open_reach`]): every D placement of a
+    /// path with a V and no J ends at most `reach` bases after the V
+    /// placement's end, and every D of a path with a J and no V starts at
+    /// most `reach` bases before the J placement's start, so that a J (V)
+    /// the guards drop no longer decides where the D lies; and its V and J
+    /// (when it has both) pair, with at most `max_junction_span` read bases
+    /// between the V's exit and the J's entry.
+    fn keeps_guards(
+        &self,
+        guards: &PairGuards,
+        open_d: Option<u32>,
+        query: &[u8],
+        placed: &[Placement],
+        path: &CallPath,
+    ) -> bool {
+        let viable = |s: &CalledSegment| self.keeps_floor(query, placed, s);
         let flanks = path
             .segments
             .iter()
@@ -452,15 +463,34 @@ impl<A, RV, RJ, RD, W, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj> {
         if !flanks.clone().all(viable) {
             return false;
         }
-        let has_d = path
+        let mut ds = path
             .segments
             .iter()
-            .any(|s| placed[s.placement].kind == SegmentKind::D);
+            .map(|s| &placed[s.placement])
+            .filter(|p| p.kind == SegmentKind::D)
+            .peekable();
         let of = |kind: SegmentKind| flanks.clone().find(|s| placed[s.placement].kind == kind);
         let (Some(v), Some(j)) = (of(SegmentKind::V), of(SegmentKind::J)) else {
             // A D at the open end of its path: allowed only where it pays
-            // the open-flank cost, and only beside a V or a J.
-            return !has_d || (open_d && flanks.clone().next().is_some());
+            // the open-flank cost, beside a V or a J, and within the reach
+            // of the D window of a read without the other.
+            if ds.peek().is_none() {
+                return true;
+            }
+            let Some(reach) = open_d else {
+                return false;
+            };
+            return match (of(SegmentKind::V), of(SegmentKind::J)) {
+                (Some(v), None) => {
+                    let end = placed[v.placement].q_end().saturating_add(reach);
+                    ds.all(|d| d.q_end() <= end)
+                }
+                (None, Some(j)) => {
+                    let start = placed[j.placement].q_start().saturating_sub(reach);
+                    ds.all(|d| d.q_start() >= start)
+                }
+                _ => false,
+            };
         };
         j.span.q_lo.saturating_sub(v.span.q_hi) <= guards.max_junction_span
             && self.pairs(guards, &placed[v.placement], &placed[j.placement])
@@ -919,12 +949,21 @@ where
     /// breaks the pair guards ([`Self::adjudicate_read`]), as ids into
     /// `placed`, in order of preference on an exact tie: the V placements,
     /// the J placements, for each J the V placements that pair with it with
-    /// every D and without, and, when `open_d`, the V placements with every
-    /// D and every D with the J placements.
+    /// every D and without, and, when `open_d` is the reach of an open-end D
+    /// ([`Self::keeps_guards`]), V placements with the Ds within their
+    /// reach and Ds with the J placements they lie within the reach of.
+    ///
+    /// An open-end subset holds only pairs that keep the reach: for each
+    /// end `e` of a V placement, the V placements that end at `e` or later
+    /// with the Ds that end at most `reach` bases after `e` (for each start
+    /// `s` of a J placement, the J placements that start at `s` or earlier
+    /// with the Ds that start at most `reach` bases before `s`). Every V
+    /// and D within reach of each other share one of them, and a subset
+    /// that another holds is left out.
     fn guard_subsets(
         &self,
         guards: &PairGuards,
-        open_d: bool,
+        open_d: Option<u32>,
         placed: &[Placement],
     ) -> Vec<Vec<usize>> {
         let of = |kind: SegmentKind| -> Vec<usize> {
@@ -955,18 +994,70 @@ where
         }
         // A D at the open end, after the V or before the J: last, so that
         // an exact tie keeps SwiftIG's subsets.
-        if open_d && !ds.is_empty() {
-            for flank in [&vs, &js] {
-                if !flank.is_empty() {
-                    let mut open = flank.clone();
-                    open.extend(&ds);
-                    open.sort_unstable();
-                    subsets.push(open);
+        if let Some(reach) = open_d.filter(|_| !ds.is_empty()) {
+            // The V side, by end ascending: fewer Vs, more Ds.
+            let mut ends: Vec<u32> = vs.iter().map(|&v| placed[v].q_end()).collect();
+            ends.sort_unstable();
+            ends.dedup();
+            let mut last: Vec<usize> = Vec::new();
+            for &end in &ends {
+                let limit = end.saturating_add(reach);
+                let near: Vec<usize> = ds
+                    .iter()
+                    .copied()
+                    .filter(|&d| placed[d].q_end() <= limit)
+                    .collect();
+                if near.is_empty() || near == last {
+                    continue;
                 }
+                let mut open: Vec<usize> = vs
+                    .iter()
+                    .copied()
+                    .filter(|&v| placed[v].q_end() >= end)
+                    .collect();
+                open.extend(&near);
+                open.sort_unstable();
+                subsets.push(open);
+                last = near;
+            }
+            // The J side, by start descending: fewer Js, more Ds.
+            let mut starts: Vec<u32> = js.iter().map(|&j| placed[j].q_start()).collect();
+            starts.sort_unstable_by(|a, b| b.cmp(a));
+            starts.dedup();
+            last.clear();
+            for &start in &starts {
+                let limit = start.saturating_sub(reach);
+                let near: Vec<usize> = ds
+                    .iter()
+                    .copied()
+                    .filter(|&d| placed[d].q_start() >= limit)
+                    .collect();
+                if near.is_empty() || near == last {
+                    continue;
+                }
+                let mut open: Vec<usize> = js
+                    .iter()
+                    .copied()
+                    .filter(|&j| placed[j].q_start() <= start)
+                    .collect();
+                open.extend(&near);
+                open.sort_unstable();
+                subsets.push(open);
+                last = near;
             }
         }
         subsets.retain(|ids| !ids.is_empty());
         subsets
+    }
+
+    /// The reach of a D at the open end of a guarded path
+    /// ([`Self::keeps_guards`]): the D window's reach on a read without a J
+    /// or a V ([`DWindowPolicy::open_reach`]) when `adjudicator` charges
+    /// the open-flank cost, else none (a D needs both a V and a J).
+    fn open_reach(&self, adjudicator: &Adj) -> Option<u32> {
+        adjudicator
+            .charges_open_flank()
+            .then(|| self.d_window.open_reach())
     }
 
     /// [`Self::guard_subsets`] and [`Self::keeps_guards`] for the oracle
@@ -980,11 +1071,31 @@ where
         path: Option<&CallPath>,
     ) -> (Vec<Vec<usize>>, bool) {
         let guards = self.options.guards.expect("guarded assigner");
-        let open_d = self.adjudicator.charges_open_flank();
+        let open_d = self.open_reach(&self.adjudicator);
         (
             self.guard_subsets(&guards, open_d, placed),
             path.is_none_or(|path| self.keeps_guards(&guards, open_d, query, placed, path)),
         )
+    }
+
+    /// SwiftIG's per-segment check under the guards, for the oracle's own
+    /// statement of the rule: whether segment `s` of a path over `placed`
+    /// keeps the score and identity floor ([`Self::keeps_floor`]).
+    #[cfg(test)]
+    pub(crate) fn segment_keeps_floor(
+        &self,
+        query: &[u8],
+        placed: &[Placement],
+        s: &CalledSegment,
+    ) -> bool {
+        self.keeps_floor(query, placed, s)
+    }
+
+    /// SwiftIG's pair check under the assigner's guards ([`Self::pairs`]),
+    /// for the oracle's own statement of the rule.
+    #[cfg(test)]
+    pub(crate) fn pair_check(&self, v: &Placement, j: &Placement) -> bool {
+        self.pairs(&self.options.guards.expect("guarded assigner"), v, j)
     }
 
     /// The call of `placed` ([`Self::adjudicate_unguarded`]) under the pair
@@ -993,10 +1104,12 @@ where
     /// placements alone, or, for each J placement, the V placements that
     /// pair with it, with every D placement and without: SwiftIG's pairs and
     /// its V-only or J-only fallback. When the adjudicator charges the
-    /// open-flank cost ([`Adjudicator::charges_open_flank`]), the V
-    /// placements with every D, and every D with the J placements, are
-    /// candidates too: a D at the open end of a read that holds no J (no V)
-    /// the V (J) pairs with is called and pays for the J (V) it lacks. All
+    /// open-flank cost ([`Adjudicator::charges_open_flank`]), V placements
+    /// with the D placements within their reach, and D placements with the
+    /// J placements they lie within the reach of, are candidates too
+    /// ([`Self::guard_subsets`]): a D at the open end of a read that holds
+    /// no J (no V) the V (J) pairs with is called, where a read without
+    /// that J (V) would have searched it, and pays for the J (V) it lacks. All
     /// are read in the same context ([`ReadContext`]: the read's divergence,
     /// length and anchored columns), so they compare by
     /// [`CallPath::value`]; an exact tie keeps the earlier subset. The
@@ -1014,7 +1127,7 @@ where
         let Some(guards) = &self.options.guards else {
             return found;
         };
-        let open_d = adjudicator.charges_open_flank();
+        let open_d = self.open_reach(adjudicator);
         match &found.0 {
             Some(path) if !self.keeps_guards(guards, open_d, query, placed, path) => {}
             _ => return found,

@@ -136,7 +136,8 @@ fn heavy_texts(db: &SyntheticDatabase) -> (String, String, String) {
 /// (a) A full V followed by 100 random bases: a chance D in the random
 /// bases would assert a junction whose J the read does not show. Swig
 /// 0.39.3 calls a D on 56 of these 100 reads at mean presence 0.60 (this
-/// database has 35 D alleles; 93 % on human IGH); the cost on 5, at 0.14.
+/// database has 35 D alleles; 93 % on human IGH); the cost on 5, at 0.14,
+/// without the pair guards, and on 3, at 0.18, with them (Swig 0.39.5).
 /// The bound is the acceptance gate's 10 %.
 #[test]
 fn a_full_v_followed_by_random_bases_gets_no_d() {
@@ -173,7 +174,8 @@ fn random_bases_followed_by_a_j_get_few_ds() {
 
 /// (c) Fixture (a) against a BCR database of two loci: the heavy locus is
 /// adjudicated alone and pays the same cost. Swig 0.39.3: 86 D calls at
-/// mean presence 0.86; the cost: 4, at 0.18.
+/// mean presence 0.86; the cost: 4, at 0.18 (3, at 0.18, with the pair
+/// guards).
 #[test]
 fn a_full_v_followed_by_random_bases_gets_no_d_in_a_bcr_database() {
     let (db, v, d, j) = bcr();

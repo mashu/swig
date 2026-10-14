@@ -331,9 +331,14 @@ Web and swig-cli always run with them.
   it (no J after it) or starts it (no V before it) keeps the guards only
   under the open-flank cost (`--d-open-flank on`, the default; *The model in
   brief*), which charges that D for the J or V the read would show in the
-  bases beyond it. With `--d-open-flank off` a D needs a V and a J that
-  pair, as in SwiftIG, which paired V and J before it looked for a D, and
-  as in 0.39.4. A path of a D alone is never a call.
+  bases beyond it. Such a D must also lie where a read without the J (V)
+  would have searched it: it ends at most 60 bases (the D window's reach,
+  `ExpandedResidual::reach`) after the end of the V placement, or starts at
+  most 60 bases before the start of the J placement. A J (V) that the guards
+  drop therefore no longer decides where the D may lie. With
+  `--d-open-flank off` a D needs a V and a J that pair, as in SwiftIG,
+  which paired V and J before it looked for a D, and as in 0.39.4. A path
+  of a D alone is never a call.
 
 **When the best path breaks a guard.** The guards are not part of the
 DAG's objective. Each read is adjudicated as before; when its best path
@@ -341,15 +346,20 @@ keeps the guards, checking it is their whole cost. Otherwise
 the read's placements are adjudicated again in subsets: the V placements
 alone, the J placements alone, and, for each J placement, the V placements
 that pair with it and that J, once with every D placement and once
-without; under the open-flank cost also the V placements with every D
-placement, and every D placement with the J placements (listed last). The
+without; under the open-flank cost also V placements with the D
+placements within their reach, and D placements with the J placements
+they lie within the reach of (listed last: for each end of a V placement,
+the V placements that end there or later with the Ds that end at most 60
+bases after it, and the same from the J side). The
 call is the best of the subsets' optima that keep the guards, compared by
 value in the read's context (every subset is read at the same divergence
 `p̂`, and its open ends are charged over the whole read's length); an exact
 tie keeps the earlier subset, and a read none of whose subset optima keeps
 the guards is not called. A read whose J does not pair with its V (a
 chance J, or one beyond the junction span) thus keeps its V–D path when
-the D pays for the bases after it. The posteriors are those of the subset that gives the call. As
+the D lies within 60 bases of the V's end and pays for the bases after
+it; a D further on is not called beside the V, as on the same read
+without the J. The posteriors are those of the subset that gives the call. As
 in SwiftIG, a chimeric read, a V fragment that stops short of its 3′ end, a
 J aligned only deep inside, or a V and a J hundreds of bases apart then
 keeps its better segment instead of becoming a rearrangement. On 20,000
@@ -394,14 +404,18 @@ on D-free reads (600 mid reads each):
 | right D, reads cut at their D's end (4,309 mid / 4,251 hard) | 90.2 / 84.2 % | 0.0 / 0.0 % | 92.2 / 86.3 % |
 | right D, reads ending 0–20 nt into their J (1,500 mid / 1,500 hard) | 91.2 / 83.1 % | 49.7 / 41.5 % | 91.7 / 83.8 % |
 | right D, reads starting after their V (1,913 mid) | 93.1 % | 0.0 % | 93.1 % |
-| D called, a V then 100 random bases / 100 random bases then a J | 93.5 / 97.7 % | 0.2 / 0.0 % | 6.0 / 9.5 % |
+| D called, a V then 100 random bases / 100 random bases then a J | 93.5 / 97.7 % | 0.2 / 0.0 % | 3.2 / 9.5 % |
 | D called, a V then 30 random bases / 30 random bases then a J | 72.0 / 79.8 % | 0.0 / 0.0 % | 72.8 / 79.3 % |
 
 On full-length reads 0.39.5 calls as 0.39.4 does, except where the J of a
 read is missed or fails the guards: on the frozen suite only 3 IGH hard
-reads (3 right D gained) and 267 IGH reads at 30 % SHM change a D call (106
-right D gained, none lost; 14 of 129 D-free reads gain a chance D; the
-D-presence Brier score falls from 0.123 to 0.037). With `--no-pair-guards`
+reads (3 right D gained) and 250 IGH reads at 30 % SHM change a D call
+(82 right D gained, none lost; the D-presence Brier score falls from 0.123
+to 0.042). Most of these new D calls are wrong: of the 250, 155 name a
+wrong allele (96 of them away from the true D) and 13 fall on D-free reads,
+because a heavily mutated V aligns short of its end and the D found within
+60 bases of it is often a chance hit. Against 0.39.3, which kept the J,
+those reads lose 28 right D calls and gain 2. With `--no-pair-guards`
 the calls are those of 0.39.3 with the open-flank cost, except for C and
 FWR3; with `--d-open-flank off` they are 0.39.4's, byte for byte on the
 suite's databases.
@@ -959,7 +973,8 @@ The full description, with the guarantee of each search step, is in
   a derived D prior (the default profile `r`, and `sensitive-d`), a chance
   D far from the anchor of a D-free read goes (a V followed by 100 random
   bases: 93.5 % → 6.8 % D calls, `sensitive-d` 99.3 % → 9.5 %; 100 random
-  bases then a J: 97.7 % → 10.2 %, `sensitive-d` 99.7 % → 18.2 %);
+  bases then a J: 97.7 % → 10.2 %, `sensitive-d` 99.7 % → 18.2 %, all
+  without the pair guards; with them 3.2 and 9.5 % on the default profile);
   full-length reads keep their calls. The profiles `truth` and `igblast`
   charge no D prior (`P*_D = 0`), so a chance D scoring a dozen points
   outweighs the 6.2-nat ceiling and most stay (`truth`: 93.7 % → 92.8 % and
@@ -1454,7 +1469,14 @@ window; searching J over the whole read lets 0.05 % fall outside.
   oracle's fixed value), never beats the unguarded optimum and equals it when
   that keeps the guards, is otherwise the best guard-keeping subset optimum
   (each the DAG's and the exhaustive search's alike), and reports the
-  posterior of the subset that gave it. `without_the_cost_or_the_guards`
+  posterior of the subset that gave it. It also states the rule on its own
+  (`CombineRule`: SwiftIG's per-segment floor and pairing from the engine,
+  the 225-base span and the 60-base reach of an open-end D written out),
+  checks that the engine's verdict agrees with it on every call, unguarded
+  optimum and subset optimum, and counts the calls that a path the rule
+  admits beats, over every choice of at most one V, D and J among the
+  read's best placements: none of 435 per-read calls and 1 fixed-scale
+  call (at most 2 allowed). `without_the_cost_or_the_guards`
   checks that without the cost no D stands without a V and a J, and that
   without the guards the call is the exhaustive optimum.
 - **Kernel exactness:**
@@ -1485,8 +1507,9 @@ window; searching J over the whole read lets 0.05 % fall outside.
   225 bases apart do not pair (200 apart, they do); 8 bases of J after 12
   random ones are no J call; a D needs a V and a J without the open-flank
   cost (`tests/combine.rs`: with it, a D at the read's open end is called
-  and charged, and a J beyond the junction span gives way to the V and its
-  D); a V cut before Cys104
+  and charged, a J beyond the junction span gives way to the V and its
+  D, and a D more than 60 bases from the V whose J the guards drop is not
+  called beside it); a V cut before Cys104
   pairs with its J but gets no junction; a short V does not pair with a
   chance J; C is called up to 7 bases off the splice and not below 12
   columns at 90 %.
