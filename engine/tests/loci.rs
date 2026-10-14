@@ -134,6 +134,9 @@ fn simulated_reads_stay_within_one_locus() {
 /// A read that starts inside CDR3 holds no V, but a few bases of another
 /// locus' V can still give a chance V hit. Such a hit neither bounds the J
 /// window nor chooses the J's locus: the read's own J is found and called.
+/// The pair guards' 24-column V floor drops a 15-base chance V before it
+/// is placed, so the chance hit itself is made with the guards off; with
+/// them on, the read gets its own J alone.
 #[test]
 fn a_chance_v_hit_does_not_choose_the_j_locus() {
     let (heavy, _, light_v, light_j) = databases();
@@ -146,33 +149,42 @@ fn a_chance_v_hit_does_not_choose_the_j_locus() {
         j: &j,
         c: None,
     };
-    let database = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
-    let config = CallingProfile::ROptimized.config();
-    let assigner =
-        DefaultAssigner::from_config(&config, database.v, database.d, database.j).unwrap();
-    let mut ws = assigner.workspace();
-    let mut chance_v = 0;
-    for (k, light) in light_v.alleles().iter().enumerate().take(20) {
-        let heavy_j = heavy.j.alleles().get(k % heavy.j.len()).unwrap();
-        let tail = &light.codes[light.codes.len() - 15..];
-        let read: Vec<u8> = tail.iter().chain(&heavy_j.codes).copied().collect();
-        let call = assigner.assign(&read, &mut ws);
-        chance_v += usize::from(call.placements.iter().any(|p| p.kind == SegmentKind::V));
-        let path = call.path.as_ref().expect("the whole J anchors a call");
-        let j_set = assigner.segment(SegmentKind::J).unwrap().set();
-        let called = path
-            .segments
-            .iter()
-            .map(|s| &call.placements[s.placement])
-            .find(|p| p.kind == SegmentKind::J)
-            .expect("a J call");
-        assert_eq!(
-            j_set.allele(called.primary_allele()).loci,
-            Loci::of(Locus::Igh),
-            "read {k}"
-        );
+    for guarded in [false, true] {
+        let database = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+        let mut config = CallingProfile::ROptimized.config();
+        if !guarded {
+            config.options.guards = None;
+        }
+        let assigner =
+            DefaultAssigner::from_config(&config, database.v, database.d, database.j).unwrap();
+        let mut ws = assigner.workspace();
+        let mut chance_v = 0;
+        for (k, light) in light_v.alleles().iter().enumerate().take(20) {
+            let heavy_j = heavy.j.alleles().get(k % heavy.j.len()).unwrap();
+            let tail = &light.codes[light.codes.len() - 15..];
+            let read: Vec<u8> = tail.iter().chain(&heavy_j.codes).copied().collect();
+            let call = assigner.assign(&read, &mut ws);
+            chance_v += usize::from(call.placements.iter().any(|p| p.kind == SegmentKind::V));
+            let path = call.path.as_ref().expect("the whole J anchors a call");
+            let j_set = assigner.segment(SegmentKind::J).unwrap().set();
+            let called = path
+                .segments
+                .iter()
+                .map(|s| &call.placements[s.placement])
+                .find(|p| p.kind == SegmentKind::J)
+                .expect("a J call");
+            assert_eq!(
+                j_set.allele(called.primary_allele()).loci,
+                Loci::of(Locus::Igh),
+                "read {k}, guarded {guarded}"
+            );
+        }
+        if guarded {
+            assert_eq!(chance_v, 0, "the V floor drops 15-base V hits");
+        } else {
+            assert!(chance_v > 0, "no read got a chance V hit to test against");
+        }
     }
-    assert!(chance_v > 0, "no read got a chance V hit to test against");
 }
 
 /// A read holding two loci, as an scFv does (VH–JH, a linker, then VL–JL),

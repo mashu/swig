@@ -17,8 +17,12 @@
 //! read's V alignment, FR4 never ends after the J alignment, FR3 ends where
 //! Cys104's codon does and FR4 starts at Trp/Phe118, so the two never
 //! overlap. The junction (Cys104 … Trp/Phe118, inclusive) is reported only
-//! when both anchors count and it lies inside the read. Coordinates are
-//! 0-based half-open on the oriented query.
+//! when both anchors count and it lies inside the read; under the pair
+//! guards ([`crate::pipeline::PairGuards`]), as in SwiftIG, only when the
+//! called V aligns Cys104's first base and the called J Trp/Phe118's, and
+//! at most `max_junction_span + 6` bases separate them (`complete_vdj` too
+//! then needs the junction). Coordinates are 0-based half-open on the
+//! oriented query.
 //!
 //! The reading frame is the junction's (Cys104's codon); without a junction
 //! it is the called V's, from its anchor or given coding frame
@@ -70,6 +74,19 @@ struct Projected<'a> {
 impl Projected<'_> {
     fn at(&self, germline: Option<u32>) -> Option<i64> {
         germline.map(|r| self.placement.clip.project_reference(r))
+    }
+
+    /// The read base of conserved anchor `germline`: with `aligned`, only
+    /// one the called alignment aligns to it (SwiftIG's rule), else
+    /// projected however far ([`Self::at`]).
+    fn anchor(&self, germline: Option<u32>, aligned: bool) -> Option<i64> {
+        if aligned {
+            let r = germline?;
+            let q = self.placement.clip.aligned_query_in(&self.called.span, r)?;
+            Some(i64::from(q))
+        } else {
+            self.at(germline)
+        }
     }
 
     /// Whether the called alignment's net indel length is not a multiple of 3.
@@ -150,6 +167,20 @@ impl ReadRegions {
             (Some(c), Some(w)) if c + 3 > w => (None, None),
             anchors => anchors,
         };
+        // Under the pair guards the junction needs both anchors aligned in
+        // their called segments, and it spans at most the junction span and
+        // the codons between them, as SwiftIG's did: an anchor projected
+        // past its alignment's end (a V cut before Cys104, a J aligned only
+        // after Trp/Phe118) bounds regions but reports no junction.
+        let junction_holds = |c: i64, w: i64| match catalog.pair_guards() {
+            None => true,
+            Some(guards) => {
+                let aligned = |s: &Option<Projected<'_>>, at: i64| {
+                    s.as_ref().and_then(|s| s.anchor(s.allele.anchor, true)) == Some(at)
+                };
+                aligned(&v, c) && aligned(&j, w) && w - c <= i64::from(guards.max_junction_span) + 6
+            }
+        };
         if let Some(v) = &v {
             let r = &v.allele.regions;
             let floor = i64::from(v.called.span.q_lo);
@@ -159,7 +190,10 @@ impl ReadRegions {
             out.cdr1 = interval(cdr1, fr2, floor, n);
             out.fwr2 = interval(fr2, cdr2, floor, n);
             out.cdr2 = interval(cdr2, fr3, floor, n);
-            out.fwr3 = interval(fr3, cys104.map(|c| c + 3), floor, n);
+            // Without a placed Cys104, FR3 ends with the V alignment, as in
+            // SwiftIG: a V trimmed past its anchor still has its FR3 bases.
+            let fr3_end = cys104.map_or(i64::from(v.called.span.q_hi), |c| c + 3);
+            out.fwr3 = interval(fr3, Some(fr3_end), floor, n);
         }
         if let Some(j) = &j {
             out.fwr4 = interval(trp118, Some(i64::from(j.called.span.q_hi)), 0, n);
@@ -167,6 +201,7 @@ impl ReadRegions {
         if let (Some(c), Some(w)) = (cys104, trp118)
             && c >= 0
             && w + 3 <= n
+            && junction_holds(c, w)
         {
             out.junction = Some(c as u32..(w + 3) as u32);
             out.cdr3 = interval(Some(c + 3), Some(w), 0, n);
@@ -214,7 +249,10 @@ impl ReadRegions {
         {
             out.d_frame = Some((frame + 3 - d.query_frame(u32::from(own))) % 3);
         }
-        if let (Some(v), Some(j)) = (&v, &j) {
+        // Under the pair guards, as in SwiftIG, only with a junction.
+        if let (Some(v), Some(j)) = (&v, &j)
+            && (catalog.pair_guards().is_none() || out.junction.is_some())
+        {
             let j_len = j.allele.codes.len() as u32;
             out.complete_vdj = Some(v.called.span.r_lo <= 2 && j.called.span.r_hi + 3 >= j_len);
         }

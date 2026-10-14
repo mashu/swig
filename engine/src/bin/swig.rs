@@ -64,9 +64,10 @@ Identical sequences are merged and reported under all their names.
 `prepare` writes the result as annotated FASTA plus annotation.tsv for
 review; header values always win.
 
---c adds constant-region (isotype) calls: C base 0 is anchored within 3 bases
-of the called J's end, in the J's locus, and aligned to the read's end. The
-gate counts the C genes of that locus. prepare warns about C records that
+--c adds constant-region (isotype) calls: C base 0 is anchored within 7 bases
+of the called J's end (as SwiftIG anchored it), in the J's locus, and aligned
+to the read's end. The gate counts the C genes of that locus, and a call needs
+at least 12 aligned columns at 90 % identity. prepare warns about C records that
 cannot be anchored (5'-truncated, genomic) and J records whose 3' end strays.
 simulate --c reads 80 % of reads through the J-C splice into a C allele and
 adds c_call, c_equivalent, c_start and c_end to the truth; evaluate then
@@ -82,7 +83,14 @@ options:
                        stitched outer flank) is below identity F (0-1; default none)
   --no-anchor-window   do not add the conserved-anchor D window
   --no-posterior       skip posterior probabilities (*_posterior columns; ~30 % faster)
-  --calls MODEL        the model the call maximises: per-read (each read's own, the
+  --no-pair-guards     turn off SwiftIG's plausibility guards (on by default): V hits
+                       of >= 24 and J hits of >= 10 aligned columns; a V-J pair only
+                       when it faces its junction (V within 45 nt of its 3' end, J
+                       within 30 of its 5' start, >= 80 columns together), holds a
+                       long split (V >= 80, J >= 30) or aligns both anchors in order,
+                       with <= 225 nt between V and J; D only between a V and a J;
+                       a junction only from aligned anchors, Cys-W/F <= 231 nt
+  --calls MODEL       the model the call maximises: per-read (each read's own, the
                        model its posteriors come from) | fixed (the (2, -3) scores)
   --d-allele RULE      the reported D allele: map (the call's) | max-marginal (largest
                        posterior marginal given a D, aligned in the call's topology;
@@ -94,8 +102,10 @@ options:
   --d-mismatch S       D mismatch score, -1000 to -1 (default: the profile's)
   --j-mismatch S       J mismatch score, -1000 to -1 (default: the profile's)
   --min-j-length N     fewest aligned J columns of a J hit (default none)
-  --c-evalue E         call C when its anchored E-value, C genes x 7 start
+  --c-evalue E         call C when its anchored E-value, C genes x 15 start
                        diagonals x e^(-lambda S), is at most E (default 1e-3)
+  --c-min-identity F   call C only on at least 12 aligned columns at identity F
+                       or more (default 0.9, SwiftIG's floor; 0 turns it off)
   --c-prefix-identity F  report C only where the germline from its first base
                        reaches identity F (c_prefix_identity; default 0, off)
   --double-d MODE      off (default) | all | long-span: Swig's double-D screen, a

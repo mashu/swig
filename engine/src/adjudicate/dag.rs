@@ -580,6 +580,10 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
 impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
     type Scratch = DagScratch;
 
+    fn presence_score(&self, kind: SegmentKind) -> Score {
+        self.model.presence_score(kind)
+    }
+
     fn adjudicate(&self, placements: &[Placement], scratch: &mut DagScratch) -> Option<CallPath> {
         self.adjudicate_at(placements, divergence(placements), scratch)
     }
