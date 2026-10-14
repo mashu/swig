@@ -1127,7 +1127,9 @@ impl<R: Retriever, Acc: Admission> SegmentStage<R, Acc> {
             .filter(|&floor| local >= floor);
         let reference = self.segment.reference(placement.primary_allele());
         if self.accept.admit(&placement, request.query, reference) {
-            self.extend_outer(&mut placement, request.query);
+            // The flank stays in the searched window: a J window ends at
+            // the read's end unless the pair guards cap it.
+            self.extend_outer(&mut placement, &request.query[..request.window.end]);
             let key = placement.score();
             debug_assert!(key <= local, "the outer flank lies in the searched window");
             let at = accepted.partition_point(|&s| s >= key);

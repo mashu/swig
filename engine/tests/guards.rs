@@ -221,20 +221,31 @@ fn c_needs_twelve_columns_at_ninety_percent() {
 }
 
 /// A V fragment too short for a long split (under 80 columns) does not
-/// pair with a J that is not significant on its own: a chimera's 40 V
-/// bases do not vouch for a heavily mutated J.
+/// pair with a J that is not significant on its own, unless both conserved
+/// anchors are aligned (SwiftIG's motif rescue): a chimera's 40 V bases do
+/// not vouch for a heavily mutated J fragment that starts after its
+/// Trp/Phe118 codon. The 8 bases between them differ from the J germline
+/// before the fragment, so no chance match aligns the J's anchor.
 #[test]
 fn a_short_v_does_not_vouch_for_a_chance_j() {
     let db = database();
-    let mut rng = Rng::new(15);
+    let other = |b: &u8| match b {
+        b'A' => b'C',
+        b'C' => b'G',
+        b'G' => b'T',
+        _ => b'A',
+    };
     let v = bases(&db.v.allele(0).codes);
     let mut checked = 0;
     for allele in db.j.alleles() {
-        let mut j = bases(&allele.codes);
-        for base in j.iter_mut().skip(2).step_by(3) {
-            *base = if *base == b'G' { b'T' } else { b'G' };
+        let trp = allele.anchor.expect("synthetic J alleles carry anchors") as usize;
+        let germline = bases(&allele.codes);
+        let spacer: Vec<u8> = germline[trp - 5..trp + 3].iter().map(other).collect();
+        let mut j = germline[trp + 3..].to_vec();
+        for base in j.iter_mut().skip(2).step_by(4) {
+            *base = other(base);
         }
-        let read = [v[v.len() - 40..].to_vec(), random(&mut rng, 8), j].concat();
+        let read = [v[v.len() - 40..].to_vec(), spacer, j].concat();
         let unguarded = record(&db, &unguarded(), &read);
         if !paired(&unguarded) {
             continue;

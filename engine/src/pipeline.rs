@@ -153,16 +153,17 @@ impl Default for AssignerOptions {
 ///   and the J starts within `j_start_slack` of its germline 5′ end, or the
 ///   V holds `split_v_columns` and the J `split_j_columns` (a long deletion
 ///   between them). A pair failing that still forms one when V's Cys104
-///   codon and J's Trp/Phe118 codon are both aligned, in that order. A V
-///   shorter than `split_v_columns` pairs only with a J significant on its
-///   own: the engine searches J only in the V's locus, where a chimera's
-///   short V finds a chance J that SwiftIG's search over every locus never
-///   paired.
+///   codon and J's Trp/Phe118 codon are both aligned, in that order.
+///   Without that motif, a V shorter than `split_v_columns` pairs only with
+///   a J significant on its own: the engine searches J only in the V's
+///   locus, where a chimera's short V finds a chance J that SwiftIG's search
+///   over every locus never paired.
 /// * **Junction span.** At most `max_junction_span` read bases lie between
 ///   the V's end and the J's start (`max_junction_span`).
-/// * **D only in a rearrangement.** A D is called only between a V and a J
-///   ([`crate::adjudicate::VdjGrammar::d_needs_v_and_j`]), and with a D each
-///   of them pays its own presence cost, so a D cannot carry a chance J.
+/// * **D only in a rearrangement.** A call holds a D only with a V before it
+///   and a J after it. The best path is found without that rule, so a D
+///   never draws in a chance J (or V) to keep its place; a read whose best
+///   path holds a D without its V or J gets its V or J alone.
 /// * **Split segments stay viable.** Where the path clips a V or J, the
 ///   part of its local alignment it keeps scores above 0 and meets the
 ///   identity floor (`--min-identity`).
@@ -363,6 +364,16 @@ impl<A, RV, RJ, RD, W, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj> {
         }
         let v_allele = self.v.segment.set().allele(v.primary_allele());
         let j_allele = self.j.segment.set().allele(j.primary_allele());
+        // SwiftIG's motif rescue: Cys104's codon ends in the V alignment
+        // before Trp/Phe118's starts in the J alignment.
+        let cys_end = v_allele
+            .anchor
+            .and_then(|a| v.clip.aligned_query(a + 2))
+            .map(|q| q + 1);
+        let trp = j_allele.anchor.and_then(|a| j.clip.aligned_query(a));
+        if matches!((cys_end, trp), (Some(c), Some(w)) if c < w) {
+            return true;
+        }
         let (v_columns, j_columns) = (
             v.local_evidence.match_columns,
             j.local_evidence.match_columns,
@@ -379,40 +390,22 @@ impl<A, RV, RJ, RD, W, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj> {
         let faces = v.alignment.r_end + guards.v_end_slack >= v_allele.codes.len() as u32
             && j.alignment.r_start <= guards.j_start_slack;
         let split = v_columns >= guards.split_v_columns && j_columns >= guards.split_j_columns;
-        if v_columns + j_columns >= guards.min_pair_columns && (faces || split) {
-            return true;
-        }
-        // SwiftIG's motif rescue: Cys104's codon ends in the V alignment
-        // before Trp/Phe118's starts in the J alignment.
-        let cys_end = v_allele
-            .anchor
-            .and_then(|a| v.clip.aligned_query(a + 2))
-            .map(|q| q + 1);
-        let trp = j_allele.anchor.and_then(|a| j.clip.aligned_query(a));
-        matches!((cys_end, trp), (Some(c), Some(w)) if c < w)
+        v_columns + j_columns >= guards.min_pair_columns && (faces || split)
     }
 
-    /// Whether `path` over `placed` (on `query`), adjudicated by
-    /// `adjudicator`, keeps the pair guards: each of its V and J keeps a
-    /// positive score and the identity floor where the path clips it, as
-    /// SwiftIG required of a split V and J; its V and J (when it has both)
-    /// pair, and at most `max_junction_span` read bases lie between the V's
-    /// exit and the J's entry. A D is never without its V and J
-    /// ([`crate::adjudicate::VdjGrammar::d_needs_v_and_j`]), and with a D
-    /// each of them pays its own presence cost: SwiftIG paired V and J hits
-    /// before it looked for a D, so a D cannot carry a chance J (or V) into
-    /// the call that the read would not get without it.
+    /// Whether `path` over `placed` (on `query`) keeps the pair guards:
+    /// each of its V and J keeps a positive score and the identity floor
+    /// where the path clips it, as SwiftIG required of a split V and J; a D
+    /// has a V and a J; and its V and J (when it has both) pair, with at
+    /// most `max_junction_span` read bases between the V's exit and the J's
+    /// entry.
     fn keeps_guards(
         &self,
-        adjudicator: &Adj,
         guards: &PairGuards,
         query: &[u8],
         placed: &[Placement],
         path: &CallPath,
-    ) -> bool
-    where
-        Adj: Adjudicator,
-    {
+    ) -> bool {
         let floor = self.options.min_identity;
         // The outer flank a stage stitched on is not judged, as SwiftIG
         // judged a split V or J before its terminal extension: only the
@@ -451,14 +444,9 @@ impl<A, RV, RJ, RD, W, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj> {
             .segments
             .iter()
             .any(|s| placed[s.placement].kind == SegmentKind::D);
-        let pays =
-            |s: &CalledSegment| s.span.score > adjudicator.presence_score(placed[s.placement].kind);
-        if has_d && !flanks.clone().all(pays) {
-            return false;
-        }
         let of = |kind: SegmentKind| flanks.clone().find(|s| placed[s.placement].kind == kind);
         let (Some(v), Some(j)) = (of(SegmentKind::V), of(SegmentKind::J)) else {
-            return true;
+            return !has_d;
         };
         j.span.q_lo.saturating_sub(v.span.q_hi) <= guards.max_junction_span
             && self.pairs(guards, &placed[v.placement], &placed[j.placement])
@@ -665,8 +653,29 @@ where
         batch: &mut BatchScratch,
     ) {
         let set = self.j.segment.set();
+        // Under the pair guards, a J that starts more than the junction span
+        // after every anchoring V's end pairs with none of them: the window
+        // ends there (and the longest J later), so J copies further
+        // downstream take no slot from the read's own J.
+        let longest_j = set
+            .alleles()
+            .iter()
+            .map(|a| a.codes.len())
+            .max()
+            .unwrap_or(0);
         for (state, placed) in reads.iter_mut().zip(placements.iter()) {
             state.j_window = self.j_window.window(state.query.len(), placed);
+            if let Some(guards) = &self.options.guards
+                && let Some(v_end) = placed
+                    .iter()
+                    .filter(|p| p.anchor.is_some())
+                    .map(|p| p.q_end() as usize)
+                    .max()
+            {
+                let end = v_end + guards.max_junction_span as usize + longest_j;
+                let window = &mut state.j_window;
+                window.end = window.end.min(end).max(window.start);
+            }
             self.j.retrieve(
                 &state.query,
                 state.j_window.clone(),
@@ -895,8 +904,8 @@ where
     /// guards ([`PairGuards`]). When the best path breaks them, the call is
     /// the best path that keeps them, of the V placements alone, the J
     /// placements alone, or, for each J placement, the V placements that
-    /// pair with it, with every D placement: SwiftIG's pairs and its V-only
-    /// or J-only fallback. All are read at the same divergence, so they
+    /// pair with it, with every D placement and without: SwiftIG's pairs and
+    /// its V-only or J-only fallback. All are read at the same divergence, so they
     /// compare by [`CallPath::value`]; an exact tie keeps the earlier
     /// subset. The marginals are those of the subset that gives the call.
     /// A read whose best path keeps the guards pays one check.
@@ -913,7 +922,7 @@ where
             return found;
         };
         match &found.0 {
-            Some(path) if !self.keeps_guards(adjudicator, guards, query, placed, path) => {}
+            Some(path) if !self.keeps_guards(guards, query, placed, path) => {}
             _ => return found,
         }
         let of = |kind: SegmentKind| -> Vec<usize> {
@@ -930,11 +939,16 @@ where
                 .filter(|&v| self.pairs(guards, &placed[v], &placed[j]))
                 .collect();
             if !paired.is_empty() {
-                let mut ids = paired;
-                ids.extend(&ds);
-                ids.push(j);
-                ids.sort_unstable();
-                subsets.push(ids);
+                let mut pair = paired;
+                pair.push(j);
+                pair.sort_unstable();
+                if !ds.is_empty() {
+                    let mut with_d = pair.clone();
+                    with_d.extend(&ds);
+                    with_d.sort_unstable();
+                    subsets.push(with_d);
+                }
+                subsets.push(pair);
             }
         }
         let mut best: Option<(Vec<usize>, CallPath, Option<Marginals>)> = None;
@@ -945,7 +959,7 @@ where
             else {
                 continue;
             };
-            if !self.keeps_guards(adjudicator, guards, query, &subset, &path) {
+            if !self.keeps_guards(guards, query, &subset, &path) {
                 continue;
             }
             if best.as_ref().is_none_or(|(_, b, _)| path.value > b.value) {

@@ -41,7 +41,8 @@ simulate writes PREFIX.fasta and PREFIX.truth.tsv: reads from the IgSim model
 --shm fixes the SHM rate of every read; --dd sets the tandem-DD fraction) with
 their true alleles, the germline-equivalent alleles, segment intervals and
 junctions; each read's V, D and C come from its J's locus, and V and J records
-without a trusted anchor and the C records prepare warns about are not drawn.
+without a trusted anchor, genomic C records and C records lacking more than 3
+bases of their gene's start are not drawn.
 evaluate scores an AIRR Rearrangement TSV from any tool against that truth
 (germline-equivalence-aware allele, gene, boundary, D-presence and junction
 accuracy). Given a second calls file, evaluate also compares the two read by
@@ -90,7 +91,7 @@ options:
                        long split (V >= 80, J >= 30) or aligns both anchors in order,
                        with <= 225 nt between V and J; D only between a V and a J;
                        a junction only from aligned anchors, Cys-W/F <= 231 nt
-  --calls MODEL       the model the call maximises: per-read (each read's own, the
+  --calls MODEL        the model the call maximises: per-read (each read's own, the
                        model its posteriors come from) | fixed (the (2, -3) scores)
   --d-allele RULE      the reported D allele: map (the call's) | max-marginal (largest
                        posterior marginal given a D, aligned in the call's topology;
@@ -104,8 +105,8 @@ options:
   --min-j-length N     fewest aligned J columns of a J hit (default none)
   --c-evalue E         call C when its anchored E-value, C genes x 15 start
                        diagonals x e^(-lambda S), is at most E (default 1e-3)
-  --c-min-identity F   call C only on at least 12 aligned columns at identity F
-                       or more (default 0.9, SwiftIG's floor; 0 turns it off)
+  --c-min-identity F   call C only at identity F or more (default 0.9, SwiftIG's
+                       floor; 0 removes it; the 12-column floor remains)
   --c-prefix-identity F  report C only where the germline from its first base
                        reaches identity F (c_prefix_identity; default 0, off)
   --double-d MODE      off (default) | all | long-span: Swig's double-D screen, a

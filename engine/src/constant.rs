@@ -43,7 +43,7 @@
 //! by default `10⁻³`, the gate of a hit that must stand on its own
 //! ([`crate::segment::EvalueGates::anchor`]): C is not implied by V(D)J, it
 //! depends on the library. For `(2, −3)` scoring
-//! (`λ = 0.634`) that is `S ≥ 18` for the 10 human IGHC genes. `N_C`
+//! (`λ = 0.634`) that is `S ≥ 19` for the 10 human IGHC genes at `s = 7`. `N_C`
 //! counts the C genes of the read's (J's) locus: a database of several loci
 //! gets one gate per locus. This is not the K·m·n E-value of V, D and J.
 //!

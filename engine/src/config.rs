@@ -625,13 +625,10 @@ impl Assigner {
             WithAnchorWindow::disabled(config.d_window)
         };
         // An AIRR row holds one D: tandem D is the double-D screen's.
-        let grammar = VdjGrammar {
-            d_needs_v_and_j: config.options.guards.is_some(),
-            ..if d.is_some() {
-                VdjGrammar::VDJ
-            } else {
-                VdjGrammar::VJ
-            }
+        let grammar = if d.is_some() {
+            VdjGrammar::VDJ
+        } else {
+            VdjGrammar::VJ
         };
         // The pair guards' hit floors hold for clipped V and J too.
         let mut min_retained = config.min_retained;
@@ -1057,7 +1054,6 @@ mod tests {
             retained[SegmentKind::V.index()] = guards.min_v_columns;
             retained[SegmentKind::J.index()] = guards.min_j_columns;
             assert_eq!(dag.min_retained, retained);
-            assert!(dag.grammar.d_needs_v_and_j);
             assert_eq!(dag.d_score_floor(), floor);
             let d = assigner.d.as_ref().unwrap();
             assert_eq!(d.keep.min_score, lossless.max(floor));

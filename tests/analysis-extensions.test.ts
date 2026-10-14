@@ -40,6 +40,14 @@ test("SHM codons follow the read's frame when the V alignment starts inside a co
   assert.ok(metric);assert.equal(metric.vNtMutations,2);assert.equal(metric.comparedCodons,3);assert.equal(metric.synonymous,1);assert.equal(metric.vAaReplacements,1);
 });
 
+test("SHM codons follow the V germline's frame on rows without sequence_frame", () => {
+  // IgBLAST rows carry no sequence_frame; the alignment starts at V germline
+  // base 2, so its first two bases end germline codon 1.
+  const row={sequence_id:"r1",v_call:"IGHV1-2*01",j_call:"IGHJ4*02",v_sequence_alignment:"AAGCCGATGCT",v_germline_alignment:"AAGCTGCTGCT",v_sequence_start:"5",v_germline_start:"2"};
+  const metric=computeShmMetric(row);
+  assert.ok(metric);assert.equal(metric.comparedCodons,3);assert.equal(metric.synonymous,1);assert.equal(metric.vAaReplacements,1);
+});
+
 type GermlineTestRow={row:Record<string,string>;ordinal:number;lineageId:number};
 function cdr3For(index:number,length=30+index%4){const encoded=index.toString(4).split("").map(value=>"ACGT"[Number(value)]).join("");return `TGT${encoded}${"A".repeat(length-encoded.length-6)}TGG`;}
 function germlineRow(reference:string,index:number,mutations:number[]=[]):Record<string,string>{

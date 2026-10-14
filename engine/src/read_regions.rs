@@ -192,7 +192,15 @@ impl ReadRegions {
             out.cdr2 = interval(cdr2, fr3, floor, n);
             // Without a placed Cys104, FR3 ends with the V alignment, as in
             // SwiftIG: a V trimmed past its anchor still has its FR3 bases.
-            let fr3_end = cys104.map_or(i64::from(v.called.span.q_hi), |c| c + 3);
+            // It stops where FR4 starts, at Trp/Phe118, which may lie up to
+            // two bases inside the V's end.
+            let fr3_end = cys104.map_or_else(
+                || {
+                    let v_end = i64::from(v.called.span.q_hi);
+                    trp118.map_or(v_end, |w| v_end.min(w))
+                },
+                |c| c + 3,
+            );
             out.fwr3 = interval(fr3, Some(fr3_end), floor, n);
         }
         if let Some(j) = &j {

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { _ as DEFAULT_PIPELINE_PLAN, a as createExactDedupPlan, b as datasetScopeValue, c as finishExactDedupPlan, d as prepareReferenceMsa, h as sequenceFingerprint, l as normalizeNt, m as runExactDedupJob, n as assignLineages, o as deduplicate, p as runDenoisePartitionJob, r as chmmJunctionFlank, t as DenoiseAccumulator, u as parseFasta$2, v as annotateAirrBatch, x as stableDatasetSeed, y as annotateDoubleDBatch } from "./chunks/post-analysis-core-B8-vIT7N.mjs";
+import { S as orientedSequence, _ as DEFAULT_PIPELINE_PLAN, a as createExactDedupPlan, b as datasetScopeValue, c as finishExactDedupPlan, d as prepareReferenceMsa, h as sequenceFingerprint, l as normalizeNt, m as runExactDedupJob, n as assignLineages, o as deduplicate, p as runDenoisePartitionJob, r as chmmJunctionFlank, t as DenoiseAccumulator, u as parseFasta$2, v as annotateAirrBatch, x as stableDatasetSeed, y as annotateDoubleDBatch } from "./chunks/post-analysis-core-LY5d8K8i.mjs";
 import { i as isCallingProfile, n as CALLING_PROFILES, r as alignerOptions } from "./chunks/aligner-engine-BHdxJCoP.mjs";
 import { chmodSync, createReadStream, createWriteStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -8050,13 +8050,7 @@ function parseObservation$1(row, ordinal, lineageId, byName, options) {
 	}
 	if (positions.length < options.minimumAlignedBases) return null;
 	const cutoff = parent.sequence.length - 12;
-	let raw = (row.sequence ?? "").toUpperCase();
-	if (/^(T|true|1)$/i.test(row.rev_comp ?? "")) raw = [...raw].reverse().map((b) => ({
-		A: "T",
-		C: "G",
-		G: "C",
-		T: "A"
-	})[b] ?? "N").join("");
+	const raw = orientedSequence(row.sequence, row.rev_comp);
 	const anchor = rawPositions.get(cutoff);
 	const downstreamStart = Number(row.d_sequence_start) > 0 ? Number(row.d_sequence_start) - 1 : Number(row.j_sequence_start) > 0 ? Number(row.j_sequence_start) - 1 : raw.length;
 	const terminal = raw && anchor !== void 0 ? {
@@ -12491,20 +12485,13 @@ function airrRowToPostAnalysisRecord(row, intern = (value) => value) {
 		inputCount: Math.max(1, Math.floor(Number(value("duplicate_count")) || 1))
 	};
 }
-const COMPLEMENT = {
-	A: "T",
-	C: "G",
-	G: "C",
-	T: "A"
-};
 /**
 * Exact V-to-J slice used by every denoising front end. AIRR coordinates are
 * one-based and refer to the read as aligned: its reverse complement when
 * `rev_comp` is true.
 */
 function denoiseVdjSequence(row) {
-	const given = row.values.sequence ?? "";
-	const raw = /^(?:T|TRUE|1)$/i.test(row.values.rev_comp ?? "") ? [...given.toUpperCase()].reverse().map((base) => COMPLEMENT[base] ?? "N").join("") : given;
+	const raw = orientedSequence(row.values.sequence, row.values.rev_comp);
 	const start = Math.floor(Number(row.values.v_sequence_start));
 	const end = Math.floor(Number(row.values.j_sequence_end));
 	if (raw && Number.isFinite(start) && Number.isFinite(end) && start >= 1 && end >= start && end <= raw.length) return raw.slice(start - 1, end);
@@ -12681,7 +12668,6 @@ function computeShmMetric(row, ordinal = 0, lineageId = 0, stratum = "all") {
 	if (!query || !germline) return null;
 	const length = Math.min(query.length, germline.length);
 	const queryStart = Math.max(1, rangeValue(row, "v_sequence_start") || 1);
-	const frame = Math.max(1, rangeValue(row, "sequence_frame") || rangeValue(row, "v_frame") || 1);
 	let queryPosition = queryStart - 1;
 	let comparedNt = 0, vNtMutations = 0, cdrNtCompared = 0, cdrNtMutations = 0, frameworkNtCompared = 0, frameworkNtMutations = 0;
 	const codonQuery = [], codonGermline = [];
@@ -12696,7 +12682,9 @@ function computeShmMetric(row, ordinal = 0, lineageId = 0, stratum = "all") {
 			else vAaReplacements += 1;
 		}
 	};
-	let codingBases = ((queryStart - frame) % 3 + 3) % 3;
+	const frame = rangeValue(row, "sequence_frame") || rangeValue(row, "v_frame");
+	const germlineStart = rangeValue(row, "v_germline_start");
+	let codingBases = frame ? ((queryStart - frame) % 3 + 3) % 3 : germlineStart ? (germlineStart - 1) % 3 : 0;
 	for (let column = 0; column < length; column += 1) {
 		const q = query[column], g = germline[column];
 		if (q !== "-") queryPosition += 1;

@@ -323,9 +323,9 @@ export function inferIsotype(
   identity: number | null,
   support: number | null = null,
 ): string {
-  // The aligner calls C on at least 12 aligned bases at 90 % identity with an
-  // anchored E-value of at most 1e-3 (SwiftIG's floors and its anchor); a
-  // stretch of 30 bases or more stands on its identity alone.
+  // An isotype needs 90 % identity and either 30 aligned C bases, or 12 with
+  // the Rust aligner's anchored gate (c_support, E ≤ 1e-3; SwiftIG used
+  // 1e-4 on its own E-value).
   const alignedBases = alignedSequence.replace(/[-.\s]/g, "").length;
   const longLocalEvidence = alignedBases >= 30;
   const shortAnchoredEvidence = alignedBases >= 12 && support !== null && support <= 1e-3;

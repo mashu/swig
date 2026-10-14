@@ -35,12 +35,6 @@ pub struct VdjGrammar {
     pub require_v: bool,
     /// Paths must end with J.
     pub require_j: bool,
-    /// A path with a D must hold a V before it and a J after it: a D is
-    /// called only between the V and J of a rearrangement, as SwiftIG
-    /// called it (Swig ≤ 0.38). The engine sets it with its pair guards
-    /// ([`crate::pipeline::PairGuards`]); a read that stops in its junction
-    /// then gets no chance D from the few bases after its V.
-    pub d_needs_v_and_j: bool,
 }
 
 impl VdjGrammar {
@@ -49,14 +43,12 @@ impl VdjGrammar {
         max_d: 1,
         require_v: false,
         require_j: false,
-        d_needs_v_and_j: false,
     };
     /// Light chains: no D.
     pub const VJ: Self = Self {
         max_d: 0,
         require_v: false,
         require_j: false,
-        d_needs_v_and_j: false,
     };
 }
 
@@ -70,7 +62,7 @@ impl Grammar for VdjGrammar {
     fn can_start(&self, kind: SegmentKind) -> bool {
         match kind {
             SegmentKind::V => true,
-            SegmentKind::D => !self.require_v && !self.d_needs_v_and_j && self.max_d > 0,
+            SegmentKind::D => !self.require_v && self.max_d > 0,
             SegmentKind::J => !self.require_v,
             SegmentKind::C => false,
         }
@@ -85,12 +77,9 @@ impl Grammar for VdjGrammar {
         }
     }
 
-    fn can_end(&self, first: SegmentKind, last: SegmentKind, d_count: u8) -> bool {
+    fn can_end(&self, first: SegmentKind, last: SegmentKind, _d_count: u8) -> bool {
         let has_flank = first != SegmentKind::D || last != SegmentKind::D;
-        let flanked_d = d_count == 0
-            || !self.d_needs_v_and_j
-            || (first == SegmentKind::V && last == SegmentKind::J);
-        has_flank && flanked_d && (!self.require_j || last == SegmentKind::J)
+        has_flank && (!self.require_j || last == SegmentKind::J)
     }
 }
 

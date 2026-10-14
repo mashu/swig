@@ -1,4 +1,5 @@
 import { datasetScopeKey, datasetScopeValue, type DatasetScope } from "./study-design.ts";
+import { orientedSequence } from "./nucleotide.ts";
 
 export type CallResolution = "gene" | "allele";
 export type AmbiguityPolicy = "overlap" | "top" | "strict";
@@ -2533,8 +2534,6 @@ function chmmReferenceIndex(callName: string, msa: ReferenceMsa): number | undef
   return referenceIndex;
 }
 
-const CHMM_COMPLEMENT: Record<string, string> = { A: "T", C: "G", G: "C", T: "A" };
-
 /**
  * The read bases beside a segment's local alignment on its junction side (after the V
  * alignment, before the J alignment), in the alignment's orientation. `start`/`end` are the
@@ -2549,11 +2548,8 @@ export function chmmJunctionFlank(
   end: string | number | undefined,
   limit = 64,
 ): string {
-  const raw = (sequence ?? "").toUpperCase();
-  if (!raw) return "";
-  const oriented = /^(T|TRUE)$/i.test(String(revComp ?? "").trim())
-    ? [...raw].reverse().map((base) => CHMM_COMPLEMENT[base] ?? "N").join("")
-    : raw;
+  const oriented = orientedSequence(sequence, revComp);
+  if (!oriented) return "";
   if (segment === "V") {
     const last = Number(end);
     return Number.isInteger(last) && last > 0 ? oriented.slice(last, last + limit) : "";
@@ -2562,7 +2558,7 @@ export function chmmJunctionFlank(
   return Number.isInteger(first) && first > 1 ? oriented.slice(Math.max(0, first - 1 - limit), first - 1) : "";
 }
 
-function bestExtension(read: string, germline: string): number {
+function bestExtension(read: string, germline: string, minimumScore: number): number {
   let score = 0;
   let best = 0;
   let length = 0;
@@ -2573,15 +2569,17 @@ function bestExtension(read: string, germline: string): number {
       length = index + 1;
     }
   }
-  return length;
+  return best >= minimumScore ? length : 0;
 }
 
 /**
  * Extend a V alignment toward its germline 3' end (a J alignment toward its 5' start) by the
  * best-scoring gapless prefix of the junction-side read bases, scored +1/-1. The aligner may
  * stop a V (start a J) before trailing (leading) mismatches it attributes to the junction;
- * a PCR chimera's last informative columns can lie there. Unchanged when the reference or
- * the local germline cannot be located (threading then reports why).
+ * a PCR chimera's last informative columns can lie there. A J extension must score at least
+ * 2: on a J of ~50 bases one N base that matches by chance (1 in 4) flagged ordinary reads,
+ * which one more base of a ~290-base V did not. Unchanged when the reference or the local
+ * germline cannot be located (threading then reports why).
  */
 export function extendChmmAlignment(
   segment: "V" | "J",
@@ -2602,13 +2600,13 @@ export function extendChmmAlignment(
   const read = flank.toUpperCase();
   if (segment === "V") {
     const germline = reference.slice(at + local.length);
-    const length = bestExtension(read, germline);
+    const length = bestExtension(read, germline, 1);
     return { sequenceAlignment: sequenceAlignment + read.slice(0, length), germlineAlignment: germlineAlignment + germline.slice(0, length) };
   }
   const reverse = (value: string) => [...value].reverse().join("");
   const germline = reverse(reference.slice(0, at));
   const readReversed = reverse(read);
-  const length = bestExtension(readReversed, germline);
+  const length = bestExtension(readReversed, germline, 2);
   return {
     sequenceAlignment: reverse(readReversed.slice(0, length)) + sequenceAlignment,
     germlineAlignment: reverse(germline.slice(0, length)) + germlineAlignment,

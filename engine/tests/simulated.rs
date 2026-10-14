@@ -118,7 +118,7 @@ fn igm_like_reads_keep_their_accuracy() {
 }
 
 /// The junction is reported only from anchors the called V and J align
-/// (SwiftIG's rule, [`swig::pipeline::PairGuards`]): at 30 % SHM a mutated
+/// (SwiftIG's rule, [`swig::pipeline::PairGuards`]): at IgG-like SHM a mutated
 /// Cys104 or Trp118 ends some alignments before their anchor, so 8 of 197
 /// templated junctions go unreported, while reads whose anchors were
 /// trimmed away get far fewer junctions than projecting the anchors

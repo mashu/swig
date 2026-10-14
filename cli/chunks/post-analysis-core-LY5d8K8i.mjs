@@ -1,3 +1,40 @@
+//#region src/nucleotide.ts
+/** Complement of each IUPAC nucleotide code; U pairs as T. */
+const IUPAC_COMPLEMENT = {
+	A: "T",
+	C: "G",
+	G: "C",
+	T: "A",
+	U: "A",
+	R: "Y",
+	Y: "R",
+	K: "M",
+	M: "K",
+	B: "V",
+	V: "B",
+	D: "H",
+	H: "D",
+	S: "S",
+	W: "W",
+	N: "N"
+};
+/**
+* AIRR `rev_comp`: true when the row's coordinates and alignments refer to
+* the reverse complement of `sequence`. Accepts T/TRUE/1 in any case.
+*/
+function isReverseComplement(value) {
+	return /^(?:T|TRUE|1)$/i.test(String(value ?? "").trim());
+}
+/** Upper-case reverse complement; IUPAC codes are complemented, other symbols become N. */
+function reverseComplement(sequence) {
+	return [...sequence.toUpperCase()].reverse().map((base) => IUPAC_COMPLEMENT[base] ?? "N").join("");
+}
+/** `sequence` as the aligner aligned it: upper-case, reverse-complemented when `rev_comp` is true. */
+function orientedSequence(sequence, revComp) {
+	const raw = sequence ?? "";
+	return isReverseComplement(revComp) ? reverseComplement(raw) : raw.toUpperCase();
+}
+//#endregion
 //#region src/study-design.ts
 const DEFAULT_PIPELINE_PLAN = {
 	enabled: false,
@@ -1776,12 +1813,6 @@ function chmmReferenceIndex(callName, msa) {
 	}
 	return referenceIndex;
 }
-const CHMM_COMPLEMENT = {
-	A: "T",
-	C: "G",
-	G: "C",
-	T: "A"
-};
 /**
 * The read bases beside a segment's local alignment on its junction side (after the V
 * alignment, before the J alignment), in the alignment's orientation. `start`/`end` are the
@@ -1789,9 +1820,8 @@ const CHMM_COMPLEMENT = {
 * `sequence` when `rev_comp` is true.
 */
 function chmmJunctionFlank(segment, sequence, revComp, start, end, limit = 64) {
-	const raw = (sequence ?? "").toUpperCase();
-	if (!raw) return "";
-	const oriented = /^(T|TRUE)$/i.test(String(revComp ?? "").trim()) ? [...raw].reverse().map((base) => CHMM_COMPLEMENT[base] ?? "N").join("") : raw;
+	const oriented = orientedSequence(sequence, revComp);
+	if (!oriented) return "";
 	if (segment === "V") {
 		const last = Number(end);
 		return Number.isInteger(last) && last > 0 ? oriented.slice(last, last + limit) : "";
@@ -1799,7 +1829,7 @@ function chmmJunctionFlank(segment, sequence, revComp, start, end, limit = 64) {
 	const first = Number(start);
 	return Number.isInteger(first) && first > 1 ? oriented.slice(Math.max(0, first - 1 - limit), first - 1) : "";
 }
-function bestExtension(read, germline) {
+function bestExtension(read, germline, minimumScore) {
 	let score = 0;
 	let best = 0;
 	let length = 0;
@@ -1810,14 +1840,16 @@ function bestExtension(read, germline) {
 			length = index + 1;
 		}
 	}
-	return length;
+	return best >= minimumScore ? length : 0;
 }
 /**
 * Extend a V alignment toward its germline 3' end (a J alignment toward its 5' start) by the
 * best-scoring gapless prefix of the junction-side read bases, scored +1/-1. The aligner may
 * stop a V (start a J) before trailing (leading) mismatches it attributes to the junction;
-* a PCR chimera's last informative columns can lie there. Unchanged when the reference or
-* the local germline cannot be located (threading then reports why).
+* a PCR chimera's last informative columns can lie there. A J extension must score at least
+* 2: on a J of ~50 bases one N base that matches by chance (1 in 4) flagged ordinary reads,
+* which one more base of a ~290-base V did not. Unchanged when the reference or the local
+* germline cannot be located (threading then reports why).
 */
 function extendChmmAlignment(segment, sequenceAlignment, germlineAlignment, call, flank, msa) {
 	const unchanged = {
@@ -1834,7 +1866,7 @@ function extendChmmAlignment(segment, sequenceAlignment, germlineAlignment, call
 	const read = flank.toUpperCase();
 	if (segment === "V") {
 		const germline = reference.slice(at + local.length);
-		const length = bestExtension(read, germline);
+		const length = bestExtension(read, germline, 1);
 		return {
 			sequenceAlignment: sequenceAlignment + read.slice(0, length),
 			germlineAlignment: germlineAlignment + germline.slice(0, length)
@@ -1843,7 +1875,7 @@ function extendChmmAlignment(segment, sequenceAlignment, germlineAlignment, call
 	const reverse = (value) => [...value].reverse().join("");
 	const germline = reverse(reference.slice(0, at));
 	const readReversed = reverse(read);
-	const length = bestExtension(readReversed, germline);
+	const length = bestExtension(readReversed, germline, 2);
 	return {
 		sequenceAlignment: reverse(readReversed.slice(0, length)) + sequenceAlignment,
 		germlineAlignment: reverse(germline.slice(0, length)) + germlineAlignment
@@ -2193,4 +2225,4 @@ function runChmm(msa, threadedObservation, localSequenceAlignment, localGermline
 	};
 }
 //#endregion
-export { DEFAULT_PIPELINE_PLAN as _, createExactDedupPlan as a, datasetScopeValue as b, finishExactDedupPlan as c, prepareReferenceMsa as d, runChmm as f, threadSequenceToMsa as g, sequenceFingerprint as h, chmmairraDistanceFromReference as i, normalizeNt as l, runExactDedupJob as m, assignLineages as n, deduplicate as o, runDenoisePartitionJob as p, chmmJunctionFlank as r, extendChmmAlignment as s, DenoiseAccumulator as t, parseFasta as u, annotateAirrBatch as v, stableDatasetSeed as x, annotateDoubleDBatch as y };
+export { orientedSequence as S, DEFAULT_PIPELINE_PLAN as _, createExactDedupPlan as a, datasetScopeValue as b, finishExactDedupPlan as c, prepareReferenceMsa as d, runChmm as f, threadSequenceToMsa as g, sequenceFingerprint as h, chmmairraDistanceFromReference as i, normalizeNt as l, runExactDedupJob as m, assignLineages as n, deduplicate as o, runDenoisePartitionJob as p, chmmJunctionFlank as r, extendChmmAlignment as s, DenoiseAccumulator as t, parseFasta as u, annotateAirrBatch as v, stableDatasetSeed as x, annotateDoubleDBatch as y };

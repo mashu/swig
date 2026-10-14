@@ -40,7 +40,7 @@ pub use units::{
 use std::cmp::Ordering;
 
 use crate::clip::ClipSpan;
-use crate::germline::{AlleleId, SegmentKind};
+use crate::germline::AlleleId;
 use crate::placement::Placement;
 use crate::scoring::Score;
 
@@ -131,14 +131,6 @@ pub trait Adjudicator: Send + Sync {
     ) -> Option<CallPath> {
         let _ = divergence;
         self.adjudicate(placements, scratch)
-    }
-
-    /// The fixed-scale cost of including a segment of `kind` on a path
-    /// (`⌊P*_k⌋`, [`PathModel::presence_score`]): a clip that scores no more
-    /// does not pay for itself. 0 for adjudicators without presence costs.
-    fn presence_score(&self, kind: SegmentKind) -> Score {
-        let _ = kind;
-        0
     }
 
     /// The smallest local score a D placement needs to matter: one that

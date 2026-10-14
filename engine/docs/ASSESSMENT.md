@@ -423,8 +423,11 @@ work.
    cuts; the 12-base reclaim keeps this rare. It is the one remaining
    approximation of the segmentation model.
 5. **Constants inherited from the note** — now measured (§7): five are
-   inert and default to neutral values; the rest are speed knobs or have a
-   measured optimum at the inherited value. `tandem` (12) was not swept:
+   inert on full-length simulated reads and default to neutral values; the
+   rest are speed knobs or have a measured optimum at the inherited value.
+   The V/J column and retention floors are not inert on truncated,
+   chimeric or cross-locus reads, and since 0.39.4 they are back as part
+   of the plausibility guards (§7.1). `tandem` (12) was not swept:
    VDDJ reads are 0.1 % of IgSim reads.
 6. **E-values are approximate.** They use ungapped λ/K (anti-conservative for
    gapped scores) and the total database length (conservative for
@@ -486,10 +489,10 @@ calibration error was unchanged.
 | Constant | Inherited value | Range tested | Effect | Now |
 |---|---|---|---|---|
 | V…J pair bonus | 24 | 0, 12, 36, 48 | flat | 0 |
-| V acceptance | 24 columns, 60 % | 12–48 columns; 50–70 % | flat | none |
-| J acceptance | 10 columns, 60 % | 6–18 columns; 50–70 % | flat | none |
+| V acceptance | 24 columns, 60 % | 12–48 columns; 50–70 % | flat | none in the stage; 24 columns under the pair guards since 0.39.4 (§7.1) |
+| J acceptance | 10 columns, 60 % | 6–18 columns; 50–70 % | flat | none in the stage; 10 columns under the pair guards since 0.39.4 (§7.1) |
 | Distributed-D gate | on (16/14/80 %/19) | off; looser; tighter | flat | off |
-| Retained bases V / J | 24 / 10 | V 1–36, J 1–14 | flat | 1 / 1 |
+| Retained bases V / J | 24 / 10 | V 1–36, J 1–14 | flat | 1 / 1; 24 / 10 under the pair guards since 0.39.4 (§7.1) |
 | Retained bases D | 4 | 3, 5 | D-presence ECE ±0.1 pp | 4 (= `min_d_match`) |
 | Seed lengths | 9 / 7 | 11/7, 11/9, 9/–, 8/6, 7/– | V ≤ ±0.07 pp | 9 / 7 |
 | `max_occurrences` | 256 | 64–1024 | flat | 256 |
@@ -508,12 +511,81 @@ Two results matter for the paper:
   break-even identity of `(2, −3)` (`2m − 3x > 0 ⇔ m/(m + x) > 3/5`), so a
   positive local score already implies it. All five together changed no call
   on real or synthetic databases at any preset, left calibration unchanged
-  (within 0.03 pp), and kept random-read calls at 0.04 % of 20,000.
+  (within 0.03 pp), and kept random-read calls at 0.04 % of 20,000. These
+  were full-length simulated reads only; §7.1 qualifies the conclusion.
 - **The derived `P_D` is the calibration optimum.** D-presence calibration
   error is lowest at `P_D = 11` on both presets (mid 2.25 %, hard 1.66 %; 2.71 %
   and 2.59 % at 9, 3.36 % and 5.37 % at 13), so the posterior independently
   supports the value the derivation gives. Accuracy alone cannot choose it:
   D accuracy and D-free false positives trade monotonically.
+
+### 7.1 Note (0.39.4): the floors on reads the simulator does not make
+
+The sweeps above, and the ablation that called the V/J floors redundant,
+used IgSim reads only: full-length rearrangements between random flanks.
+On those, a positive local score implies 60 % identity and the E-value
+gates imply a length, and the floors changed no call. They did not test reads whose V or J is truncated,
+chimeric reads (two templates joined) or reads that cross loci, and there
+the floors and SwiftIG's pairing rule decide whether a read becomes a
+rearrangement. Swig 0.39.0 dropped them with the rest of SwiftIG; 0.39.4
+restores them as the plausibility guards (ALGORITHM §4c, on by default,
+`--no-pair-guards`): V and J hits of at least 24 and 10 local columns,
+clipped V and J keeping at least 24 and 10 read bases, SwiftIG's
+`supports_rearranged_pair` with its 225-base junction span, a D only
+between a V and a J, and junctions only from aligned anchors at most 231
+bases apart. The 60 % identity floor is Swig Web's and swig-cli's
+(`--min-identity 0.6`), and under the guards it also judges the part of a
+V or J that a call keeps.
+
+Against 0.39.3, on the human IMGT references, 20,000 simulated BCR reads
+(IGH, IGK, IGL) per preset:
+
+| | mid 0.39.3 | mid 0.39.4 | hard 0.39.3 | hard 0.39.4 |
+|---|---|---|---|---|
+| V / D / J allele | 98.70 / 93.46 / 99.11 % | same | 93.77 / 85.88 / 94.92 % | 93.77 / 85.83 / 94.91 % |
+| reads whose V, D or J call or coordinates changed | | 0 | | 9 |
+| templated junctions reported exactly | 99.97 % | 99.13 % | 99.63 % | 95.67 % |
+| reads without a templated junction given one | 90.9 % | 24.1 % | 89.2 % | 14.0 % |
+| `productive = T` without a templated junction | 1,122 | 215 | 673 | 90 |
+
+On constructed reads, 0.39.3 paired the first 70 bases of a V with a J 20
+random bases later, made a V and a J 500 random bases apart into a
+rearrangement with a 543-nt junction, called 8 J bases after 12 random ones
+a J on 18 of 20 reads, and gave a V followed by 100 random bases a D on 19
+of 20 reads (D-presence posterior 0.91–0.99); `tests/guards.rs` checks each
+case. On 1,000 mid IGH reads cut 30 or 100 random bases after their V, a D
+was called on 70.0 and 92.5 % of reads and is on 0.3 and 0.5 %; behind 30
+or 100 random bases before their J, a D on 81.0 and 95.9 % and a V on 7 of
+2,000, and now on none. CPU time is unchanged within ±2 % (10,000 reads,
+one thread). The costs: the templated junctions whose anchor codon is so
+mutated that the alignment stops before it (0.84 points on mid reads,
+3.95 on hard ones), and the D of reads that hold one but start after their
+V, which SwiftIG did not call either (on 952 mid IGH reads with a D, cut
+where their V ends, 878 right D calls in 0.39.3 and none now; with the
+last 30, 40 or 60 V bases kept, 805, 866 and 880 against 881, 881 and
+880).
+
+So the conclusion above holds for full-length reads, and it does not
+license dropping a check whose purpose is reads the simulator does not
+make. Two gaps remain:
+
+- **Short-V cross-locus chimeras.** J is searched only in the locus of the
+  read's anchoring V, so the 30–60 bases of an IGHV that a chimera carries
+  before an IGK J find a chance IGHJ, which SwiftIG, searching every locus,
+  never paired. The guards add a rule SwiftIG did not need (a V under 80
+  columns pairs only with a J significant on its own), but an IGHJ that
+  aligns to the IGK J well enough to be significant passes it: of 168
+  such constructed reads, 10 are called productive (0.39.3: 30; SwiftIG:
+  none).
+- **J-mode CHMMAIRRa.** Swig's PCR-chimera filter now extends the V
+  alignment gaplessly toward its germline 3′ end, and the J toward its 5′
+  start (a J by a run scoring at least 2), before it threads a read
+  ([07_CHIMERA_INFERENCE.md](../../public/methods/07_CHIMERA_INFERENCE.md)). That
+  restores V mode (420 of 500 and 1,698 of 2,000 simulated IGH V chimeras
+  flagged; SwiftIG 420 and 1,696; 0.39.3 416 and 1,676), but J mode flags
+  35 of 60 and 130 of 200 J chimeras against SwiftIG's 38 and 138 (0.39.3:
+  35 and 125): the engine prefers the 3′ parent's J with a hard 5′ clip,
+  so the 5′ parent's bases are not in the J alignment the filter reads.
 
 ## 8. Seed sampling, the J/D interplay, and IgBLAST
 
@@ -1171,8 +1243,9 @@ TRGV starts copied from an unflagged chain-default donor were silent.
   (its Δ sums over CH2/CH3, beyond any read's reach; reach classes already
   remove the redundancy). The 16-bit lane limit depends on the longest C
   record, not on read length, so `prepare --c` warns about records over
-  2 kb or without a stop-free frame (genomic C-GENE records). `s = 3` rests
-  on the measured histogram below. The truth gains `c_` columns only with
+  2 kb or without a stop-free frame (genomic C-GENE records). `s = 3` rested
+  on the measured histogram below; since 0.39.4 `s = 7`, with SwiftIG's
+  floors (§11.4). The truth gains `c_` columns only with
   `--c`, so existing datasets stay byte-identical.
 
 ### 11.2 Measurements
@@ -1222,7 +1295,8 @@ over-call = a reported name outside the equivalent set, per call):
   correct orientation or a J exit next to C (16–23 per hard set).
 - **8–15 nt** is limited by the gate: `S ≥ 18` needs 9 exact bases on IGH
   (10 genes), `S ≥ 19` needs 10 on the synthetic database (14 genes); every
-  call there is equivalent.
+  call there is equivalent. (0.39.4: the 12-column floor leaves 8–11 nt
+  uncalled, §11.4.)
 - **Exact gene sets trail the anchored oracle** at 16–63 nt (IGH 97.9–99.0 %,
   synthetic 91.7–99.0 %). Of the misses from 16 nt, 679 are on reads whose
   C part is followed by other bases (2.2 % of 30,220 such reads), 34 on reads
@@ -1319,9 +1393,61 @@ would call them).
   be fewer than the read's true ambiguity (2.2 % of C parts followed by
   other bases, from 16 nt). `c_posterior` does not see it: the extension is
   real evidence to the model.
-- **Short C parts** need 9–10 exact bases to pass the gate.
+- **Short C parts** need 9–10 exact bases to pass the gate (0.39.4: 12
+  aligned columns at 90 % identity, §11.4).
 - **Net indel drift** inside C beyond `s ∓ δ` truncates the C alignment.
 - **3′-partial J records** (IGHJ6\*02/\*03) lose J calls on reads that
   continue into C, with or without `--c` (−0.52 pp J on hard IGH reads).
 - **`c_posterior` below 0.95** is too rare in simulation (≤ 14 reads per
   20,000) to check its calibration there.
+
+### 11.4 Note (0.39.4): SwiftIG's C anchoring and floors
+
+`s = 3` above rests on simulated reads, whose J ends at its germline end
+and whose C starts at its gene's base 0 (the simulator draws only C
+alleles that lack at most 3 of their gene's first bases). SwiftIG, the
+aligner of Swig ≤ 0.38, anchored C more loosely, taking C's first aligned
+base up to 8 bases after the J's end and up to 3 bases into C, and called C
+on at least 12 aligned columns at 90 % identity. On 2,552 constructed reads
+(every human IG and TR C gene, 15–300 nt of C, J 3′ ends cut by 1–6 bases,
+1–5 bases between J and C, C's first bases deleted, 2–20 % C divergence,
+both strands):
+
+| | SwiftIG | 0.39.3 (`s = 3`) | 0.39.4 (`s = 7`, floors) |
+|---|---|---|---|
+| C right | 2,035 | 2,083 | 2,074 |
+| wrong C gene | 4 | 41 | 1 |
+| right in SwiftIG, not here | — | 163 | 33 |
+
+0.39.3 lost the C of reads whose J end lay more than 3 bases from C's
+start, called IGLC3 for IGLC2 and TRBC2 for TRBC1 there, could not name
+IGLC1\*01 or IGLC3\*01 (6 bases shorter than their genes), and called
+IGHG2\*16 at 79 % identity on a read whose C part was IGKC. 0.39.4 sets
+`s = 7` (15 start diagonals, so the gate needs `S ≥ 19` on human IGHC
+instead of 18) and adds SwiftIG's floors, applied to each C placement
+before ranking (`--c-min-identity` sets the identity floor). Of the 33
+reads still behind SwiftIG, 29 have no J, and SwiftIG called their C only
+after a chance J; 4 have C at 12–20 % divergence, where the anchored
+alignment counts leading mismatches that SwiftIG's local one trimmed.
+`prepare` now warns about C records missing more than 7 leading bases and
+J records whose tail strays by more than 7.
+
+The price is short C parts. On 20,000 simulated human BCR reads per preset
+(primary C allele anchored-equivalent, by C length; false calls on reads
+without C):
+
+| C part | mid 0.39.3 | mid 0.39.4 | hard 0.39.3 | hard 0.39.4 |
+|---|---|---|---|---|
+| none: calls | 1 of 4,097 | 0 | 1 of 4,006 | 0 |
+| 1–7 nt: called | 5.2 % | 0 | 8.1 % | 0 |
+| 8–15 nt | 94.1 % | 55.6 % | 93.2 % | 55.5 % |
+| 16–31 nt | 99.83 % | 99.30 % | 99.69 % | 99.30 % |
+| 32 nt and more | 99.84–100 % | within 0.02 pp | 99.53–99.71 % | within 0.02 pp |
+| C allele, all C reads | 96.71 % | 94.94 % | 96.04 % | 94.15 % |
+
+Of the 584 reads that lost a right C call (281 mid, 303 hard), 580 have a
+C part shorter than 32 nt (the other four: 33–102 nt; two hard reads gained
+one); 8–11 nt fall under the 12-column floor, as they did in SwiftIG, and
+Swig Web's isotype column never labelled them. `c_posterior` ECE is 0.13–0.14 %. `tests/simulated.rs`
+pins the synthetic database's 8–15 nt floors at 47.83 % (mid) and
+63.89 % (hard) accordingly.
