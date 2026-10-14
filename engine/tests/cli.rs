@@ -247,3 +247,88 @@ fn missing_inputs_are_usage_errors() {
     }
     fs::remove_dir_all(dir).unwrap();
 }
+
+/// An option that filters or adds to the output without the database it
+/// needs is a usage error (exit 2 with the usage), refused before any
+/// database is read or the sidecar is created; one that only tunes a stage
+/// the run does not have is run, with a warning, and changes nothing.
+#[test]
+fn options_without_their_database() {
+    let dir = workspace("databases");
+    let simulate = [
+        "--out", "sim", "--reads", "40", "--seed", "3", "--preset", "easy",
+    ];
+    let output = run(&dir, &[&["simulate"], &GERMLINES[..], &simulate].concat());
+    assert!(output.status.success(), "{}", stderr(&output));
+    let vj = ["sim.fasta", "--v", "V.fasta", "--j", "J.fasta"];
+    let vdj = [&vj[..], &["--d", "D.fasta"]].concat();
+    let vjc = [&vj[..], &["--c", "C.fasta"]].concat();
+    for (germlines, options, message) in [
+        (
+            &vdj,
+            &["--c-evalue", "0.01"][..],
+            "--c-evalue needs a C database (--c)",
+        ),
+        (
+            &vdj,
+            &["--c-prefix-identity", "0.97"],
+            "--c-prefix-identity needs a C database (--c)",
+        ),
+        (
+            &vjc,
+            &["--double-d", "all", "--double-d-out", "dd.tsv"],
+            "--double-d needs a D database (--d)",
+        ),
+        (
+            &vjc,
+            &["--double-d", "long-span", "--double-d-out", "dd.tsv"],
+            "--double-d needs a D database (--d)",
+        ),
+    ] {
+        let output = run(&dir, &[&germlines[..], options].concat());
+        let text = stderr(&output);
+        assert_eq!(output.status.code(), Some(2), "{options:?}: {text}");
+        assert!(text.contains(message), "{options:?}: {text}");
+        assert!(text.contains("usage:"), "{options:?}: {text}");
+        assert!(!text.contains("database prepared"), "{options:?}: {text}");
+        assert!(!dir.join("dd.tsv").exists(), "{options:?}");
+    }
+
+    // 0 turns the C-prefix gate off: nothing to refuse or report.
+    let output = run(&dir, &[&vdj[..], &["--c-prefix-identity", "0"]].concat());
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!stderr(&output).contains("c-prefix"), "{}", stderr(&output));
+
+    // D tuning and the screen's rules without a D database or the screen.
+    let plain = run(&dir, &vj);
+    assert!(plain.status.success(), "{}", stderr(&plain));
+    let tuning = [
+        "--min-d-match",
+        "6",
+        "--d-mismatch",
+        "-4",
+        "--no-anchor-window",
+        "--double-d-seed-length",
+        "9",
+    ];
+    let tuned = run(&dir, &[&vj[..], &tuning].concat());
+    let text = stderr(&tuned);
+    assert!(tuned.status.success(), "{text}");
+    assert_eq!(tuned.stdout, plain.stdout);
+    assert!(
+        text.contains(
+            "swig: warning: --min-d-match, --d-mismatch, --no-anchor-window have no \
+             effect without a D database (--d)\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "swig: warning: --double-d-seed-length has no effect without --double-d all \
+             or long-span\n"
+        ),
+        "{text}"
+    );
+    assert!(!stderr(&plain).contains("no effect"), "{}", stderr(&plain));
+    fs::remove_dir_all(dir).unwrap();
+}
