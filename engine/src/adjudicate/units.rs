@@ -544,6 +544,40 @@ pub(crate) struct FlankTable {
     /// `N_open` and `ℓ_max` of the model ([`index`]).
     n_open: u32,
     max_visible: u32,
+    /// What the last [`FlankTable::fill`] read ([`FlankTable::refill`]).
+    filled: Option<Filled>,
+}
+
+/// The arguments of a [`FlankTable::fill`], the placements by address and
+/// length.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Filled {
+    flank: Option<ResolvedOpenFlank>,
+    presence: [u64; 3],
+    read: ReadModel,
+    calls: CallModel,
+    context: ReadContext,
+    placements: (usize, usize),
+}
+
+impl Filled {
+    fn of(
+        flank: Option<&ResolvedOpenFlank>,
+        presence: [f64; 3],
+        read: &ReadModel,
+        calls: CallModel,
+        context: &ReadContext,
+        placements: &[Placement],
+    ) -> Self {
+        Self {
+            flank: flank.copied(),
+            presence: presence.map(f64::to_bits),
+            read: *read,
+            calls,
+            context: *context,
+            placements: (placements.as_ptr() as usize, placements.len()),
+        }
+    }
 }
 
 impl FlankTable {
@@ -553,6 +587,70 @@ impl FlankTable {
     /// costs of every D in `placements` at either end of a path. They are
     /// kept while the read and model stay the same.
     pub fn fill(
+        &mut self,
+        flank: Option<&ResolvedOpenFlank>,
+        presence: [f64; 3],
+        read: &ReadModel,
+        calls: CallModel,
+        context: &ReadContext,
+        placements: &[Placement],
+    ) {
+        self.fill_anew(flank, presence, read, calls, context, placements);
+        self.filled = Some(Filled::of(
+            flank, presence, read, calls, context, placements,
+        ));
+    }
+
+    /// [`FlankTable::fill`], unless the last fill had the same arguments
+    /// and the same placement slice: the posterior and the decoder of a
+    /// call reuse the table its Viterbi pass filled, with the read's
+    /// placements unchanged in between. A fill for another read or slice
+    /// (by address and length, or context) fills anew; so does every
+    /// [`FlankTable::fill`], which a call's adjudication starts with, so a
+    /// buffer reused by the next read never finds the last read's table.
+    pub fn refill(
+        &mut self,
+        flank: Option<&ResolvedOpenFlank>,
+        presence: [f64; 3],
+        read: &ReadModel,
+        calls: CallModel,
+        context: &ReadContext,
+        placements: &[Placement],
+    ) {
+        if self.filled
+            != Some(Filled::of(
+                flank, presence, read, calls, context, placements,
+            ))
+        {
+            return self.fill(flank, presence, read, calls, context, placements);
+        }
+        #[cfg(debug_assertions)]
+        {
+            let mut fresh = FlankTable::default();
+            fresh.fill(flank, presence, read, calls, context, placements);
+            debug_assert!(
+                fresh.closes == self.closes && fresh.same_costs(self, placements),
+                "a flank table reused for other placements"
+            );
+        }
+    }
+
+    /// Whether `self` and `other` charge every D of `placements` alike.
+    #[cfg(debug_assertions)]
+    fn same_costs(&self, other: &Self, placements: &[Placement]) -> bool {
+        placements.iter().all(|p| {
+            [Flank::Start, Flank::End].into_iter().all(|side| {
+                let (lo, hi) = (p.q_start(), p.q_end());
+                self.units(side, p.kind, lo, hi) == other.units(side, p.kind, lo, hi)
+                    && self.nats(side, p.kind, lo, hi).to_bits()
+                        == other.nats(side, p.kind, lo, hi).to_bits()
+                    && self.score(side, p.kind, lo, hi) == other.score(side, p.kind, lo, hi)
+            })
+        })
+    }
+
+    /// [`FlankTable::fill`] without recording its arguments.
+    fn fill_anew(
         &mut self,
         flank: Option<&ResolvedOpenFlank>,
         presence: [f64; 3],
@@ -603,6 +701,7 @@ impl FlankTable {
         context: &ReadContext,
         needed: [Option<u32>; 2],
     ) {
+        self.filled = None;
         self.prepare(flank, d_presence, calls, context, needed);
         for (side, needed) in needed.into_iter().enumerate() {
             for i in needed.map_or(0..0, |x| 0..index(flank, x) + 1) {
@@ -696,6 +795,7 @@ impl FlankTable {
 
     /// Every cost 0.
     pub fn clear(&mut self) {
+        self.filled = None;
         self.key = None;
         self.scale = None;
         self.entries.iter_mut().for_each(Vec::clear);
@@ -776,11 +876,22 @@ impl FlankTable {
 /// `ℓ' ≤ ℓ` (non-increasing, still an upper bound of the true miss
 /// probability), and at least `floor`.
 ///
-/// The pmf at `(ℓ, k(ℓ))` is carried along `ℓ` by one ratio each, and
-/// each tail summed from it until its terms fall below `10⁻⁷` of the
-/// sum or the sum reaches the running minimum; with `k(ℓ)` unchanged
-/// the tail only grows, so `ε` changes only where `k` steps. Once `ε`
-/// reaches `floor` it stays there, and the list ends.
+/// The tail is carried along `ℓ` in O(1) per step, by the Pólya-urn
+/// identities of the beta-binomial (`s = a + b + ℓ − 1`):
+///
+/// ```text
+/// P(X_ℓ ≥ k)     = P(X_{ℓ−1} ≥ k) + P(X_{ℓ−1} = k−1)·(a + k − 1)/s
+/// P(X_ℓ = k)     = (P(X_{ℓ−1} = k)·(b + ℓ − 1 − k) + P(X_{ℓ−1} = k−1)·(a + k − 1))/s
+/// P(X_ℓ ≥ k + 1) = P(X_ℓ ≥ k) − P(X_ℓ = k)
+/// ```
+///
+/// starting from `P(X_ℓ ≥ k) = 1 − Σ_{j<k} P(X_ℓ = j)` where `m·ℓ` first
+/// reaches `S_acc`. The subtraction keeps an absolute error of a few ulps
+/// of 1, so a tail below [`SUMMED_BELOW`] is summed instead, from
+/// `P(X_ℓ = k)` up until its terms fall below `10⁻⁷` of the sum or the sum
+/// reaches the running minimum (with `k(ℓ)` unchanged the tail only grows,
+/// so `ε` then changes only where `k` steps). Once `ε` reaches `floor` it
+/// stays there, and the list ends.
 fn miss_probabilities(
     eps: &mut Vec<f64>,
     accept: Score,
@@ -792,59 +903,92 @@ fn miss_probabilities(
     let a = counts.mismatches as f64 + 0.5;
     let b = counts.columns.saturating_sub(counts.mismatches) as f64 + 0.5;
     // Both below 1 (no anchored columns): the pmf is U-shaped, so a
-    // tail is summed whole.
+    // summed tail is summed whole.
     let unimodal = a >= 1.0 || b >= 1.0;
     eps.clear();
-    // P(X_ℓ = 0), and P(X_ℓ = k) at the last k reached.
+    // P(X_ℓ = 0).
     let mut zero = 1.0;
-    let mut walk: Option<(u32, f64)> = None;
+    // From the first ℓ with m·ℓ ≥ S_acc on: k(ℓ), P(X_ℓ = k − 1),
+    // P(X_ℓ = k), and P(X_ℓ ≥ k) while it is carried (`None`: summed).
+    let mut walk: Option<(u32, f64, f64, Option<f64>)> = None;
     let mut best = 1.0f64;
-    // The k of the last tail: with k fixed, P(X_ℓ ≥ k) only grows
-    // with ℓ, so ε changes only where k does.
-    let mut last_k = None;
     for l in 0..=upto {
         let lf = f64::from(l);
         if l > 0 {
             let n = lf - 1.0;
             let step = 1.0 / (a + b + n);
             zero *= (b + n) * step;
-            // P(X_ℓ = k) = P(X_{ℓ−1} = k) · ℓ/(ℓ − k) · (ℓ − 1 − k + b)/(a + b + ℓ − 1).
-            walk = walk.map(|(k, p)| {
+            walk = walk.map(|(k, below, at, tail)| {
                 let k_f = f64::from(k);
-                (k, p * lf / (lf - k_f) * (n - k_f + b) * step)
+                let up = below * (k_f - 1.0 + a) * step;
+                (
+                    k,
+                    // P(X_ℓ = k − 1) = P(X_{ℓ−1} = k − 1)·ℓ/(ℓ − k + 1)·(ℓ − k + b)/s.
+                    below * lf / (lf - k_f + 1.0) * (lf - k_f + b) * step,
+                    at * (n - k_f + b) * step + up,
+                    tail.map(|t| t + up),
+                )
             });
         }
         let score = m * l as Score;
-        if score >= accept {
-            let k = ((score - accept) / (m - mu)) as u32 + 1;
-            let tail = if last_k == Some(k) {
-                best
-            } else if k > l {
-                0.0
-            } else {
-                let (mut at, mut p) = walk.unwrap_or((0, zero));
-                while at < k {
-                    let x = f64::from(at);
-                    p *= (lf - x) / (x + 1.0) * (x + a) / (lf - x - 1.0 + b);
-                    at += 1;
-                }
-                walk = Some((at, p));
-                last_k = Some(k);
-                // Only a tail below the running minimum changes ε.
-                let (mut tail, mut term) = (0.0, p);
-                for x in k..=l {
-                    tail += term;
-                    if x == l || tail >= best {
-                        break;
+        if score < accept {
+            eps.push(best.max(floor));
+            continue;
+        }
+        let k = ((score - accept) / (m - mu)) as u32 + 1;
+        if k > l {
+            // Not even every base mismatching hides the span.
+            best = 0.0;
+        } else {
+            let (mut at_k, mut below, mut at, mut tail) = match walk {
+                Some(w) => w,
+                None => {
+                    // The first span long enough to show: P(X_ℓ = j) for
+                    // j < k by the pmf's ratio steps, and 1 minus their sum.
+                    let (mut p, mut sum) = (zero, 0.0);
+                    let mut below = 0.0;
+                    for j in 0..k {
+                        let x = f64::from(j);
+                        sum += p;
+                        below = p;
+                        p *= (lf - x) / (x + 1.0) * (x + a) / (lf - x - 1.0 + b);
                     }
-                    let xf = f64::from(x);
-                    let next = term * ((lf - xf) * (xf + a)) / ((xf + 1.0) * (lf - xf - 1.0 + b));
-                    if unimodal && next < term && next < 1e-7 * tail {
-                        break;
-                    }
-                    term = next;
+                    (k, below, p, Some(1.0 - sum))
                 }
-                tail
+            };
+            let stepped = at_k != k;
+            while at_k < k {
+                // P(X_ℓ ≥ k + 1) = P(X_ℓ ≥ k) − P(X_ℓ = k), and the pmf one up.
+                tail = tail.map(|t| t - at);
+                let x = f64::from(at_k);
+                below = at;
+                at *= (lf - x) / (x + 1.0) * (x + a) / (lf - x - 1.0 + b);
+                at_k += 1;
+            }
+            tail = tail.filter(|&t| t >= SUMMED_BELOW);
+            walk = Some((k, below, at, tail));
+            let tail = match tail {
+                Some(t) => t,
+                // With k unchanged a summed tail only grows.
+                None if !stepped && best < 1.0 => best,
+                None => {
+                    // Only a tail below the running minimum changes ε.
+                    let (mut tail, mut term) = (0.0, at);
+                    for x in k..=l {
+                        tail += term;
+                        if x == l || tail >= best {
+                            break;
+                        }
+                        let xf = f64::from(x);
+                        let next =
+                            term * ((lf - xf) * (xf + a)) / ((xf + 1.0) * (lf - xf - 1.0 + b));
+                        if unimodal && next < term && next < 1e-7 * tail {
+                            break;
+                        }
+                        term = next;
+                    }
+                    tail
+                }
             };
             best = best.min(tail);
         }
@@ -855,6 +999,10 @@ fn miss_probabilities(
         }
     }
 }
+
+/// The smallest tail [`miss_probabilities`] carries by differences (whose
+/// absolute error is a few ulps of 1); a smaller one is summed.
+const SUMMED_BELOW: f64 = 1e-6;
 
 /// The entry of cost `c` nats in each scale ([`FlankTable`]).
 #[inline]
@@ -1397,6 +1545,65 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The posterior and the decoder of a call reuse the table its Viterbi
+    /// pass filled ([`FlankTable::refill`]), but only for the same
+    /// arguments and placement slice: other placements (the next read in
+    /// the same buffer is filled by its own adjudication first) or another
+    /// context are filled anew, with their own costs.
+    #[test]
+    fn refill_reuses_only_the_same_reads_table() {
+        let flank = open_flank();
+        let query = crate::sim::Rng::new(5).codes(400);
+        let mut v = placement(SegmentKind::V, &query, 0, 250, &[10]);
+        v.anchor = Some(40);
+        let near = placement(SegmentKind::D, &query, 260, 15, &[]);
+        let far = placement(SegmentKind::D, &query, 300, 15, &[3]);
+        let (presence, read) = ([0.0, 10.0, 7.0], ReadModel::fixed(1.0, [0.0, 10.0, 7.0]));
+        let fill = |table: &mut FlankTable, placements: &[Placement], context: &ReadContext| {
+            table.refill(
+                Some(&flank),
+                presence,
+                &read,
+                CallModel::PerRead,
+                context,
+                placements,
+            )
+        };
+        let a = [v.clone(), near.clone()];
+        let context = ReadContext::of(&a, 400);
+        let mut table = FlankTable::default();
+        fill(&mut table, &a, &context);
+        let filled = table.filled;
+        assert!(filled.is_some());
+        fill(&mut table, &a, &context);
+        assert_eq!(table.filled, filled);
+        let end =
+            |t: &FlankTable, p: &Placement| t.units(Flank::End, p.kind, p.q_start(), p.q_end());
+        assert!(end(&table, &near) > 0);
+        for (b, context) in [
+            (vec![v.clone(), far.clone()], context),
+            (a.to_vec(), ReadContext::of(&a, 380)),
+        ] {
+            fill(&mut table, &b, &context);
+            assert_ne!(table.filled, filled);
+            let mut fresh = FlankTable::default();
+            fill(&mut fresh, &b, &context);
+            for p in &b {
+                assert_eq!(end(&table, p), end(&fresh, p));
+            }
+        }
+        // A fill records its own arguments.
+        table.fill(
+            Some(&flank),
+            presence,
+            &read,
+            CallModel::PerRead,
+            &context,
+            &a,
+        );
+        assert_eq!(table.filled, filled);
     }
 
     /// The anchored count reads only the V and J that reached the anchor

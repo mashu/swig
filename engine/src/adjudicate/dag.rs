@@ -591,6 +591,26 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         );
     }
 
+    /// [`Self::flank_table`] for the posterior or the decoder of a call:
+    /// the table its adjudication filled, when `table` still holds it
+    /// ([`FlankTable::refill`]).
+    fn call_flank_table(
+        &self,
+        context: &ReadContext,
+        placements: &[Placement],
+        read: &ReadModel,
+        table: &mut FlankTable,
+    ) {
+        table.refill(
+            self.model.open_flank(),
+            self.presence(),
+            read,
+            self.calls(),
+            context,
+            placements,
+        );
+    }
+
     /// The model a call at divergence `p` maximises.
     fn read_model(&self, p: f64) -> ReadModel {
         match self.mode {
@@ -661,7 +681,7 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
     ) -> Option<Marginals> {
         let nats = self.nats(path.context.divergence)?;
         let read = self.read_model(path.context.divergence);
-        self.flank_table(&path.context, placements, &read, &mut scratch.flank);
+        self.call_flank_table(&path.context, placements, &read, &mut scratch.flank);
         self.posterior(placements, &nats, &scratch.flank, &mut scratch.posterior)
     }
 
@@ -715,7 +735,7 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
         };
         let read = self.read_model(path.context.divergence);
         let mut flank = std::mem::take(&mut scratch.flank);
-        self.flank_table(&path.context, placements, &read, &mut flank);
+        self.call_flank_table(&path.context, placements, &read, &mut flank);
         let decoded = self
             .conditioned(placements, keep, topology, &read, &flank, scratch)
             .map(|(_, mut segments)| {

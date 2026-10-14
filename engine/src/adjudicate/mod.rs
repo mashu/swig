@@ -118,7 +118,11 @@ pub trait Adjudicator: Send + Sync {
     type Scratch: Default + Send;
 
     /// The call of `placements` in the context of their own
-    /// ([`ReadContext::of_placements`]: the read ends where they end).
+    /// ([`ReadContext::of_placements`]: the read ends where they end). A D
+    /// that ends its path is then charged for the bases after it up to the
+    /// last placement's end only, not to the read's end: a caller that
+    /// knows the read's length passes it with
+    /// [`Adjudicator::adjudicate_at`].
     fn adjudicate(&self, placements: &[Placement], scratch: &mut Self::Scratch)
     -> Option<CallPath>;
 
@@ -146,7 +150,9 @@ pub trait Adjudicator: Send + Sync {
 
     /// Posterior marginals of `placements` given the adjudicated `path`, for
     /// adjudicators with a probabilistic reading that are configured to
-    /// compute them.
+    /// compute them. With the scratch of the adjudication that returned
+    /// `path` (and of no other read's since), what that adjudication
+    /// computed for the read is reused.
     fn marginals(
         &self,
         _placements: &[Placement],
