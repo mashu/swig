@@ -399,6 +399,7 @@ impl RunOptions {
                     (no_d && self.d_presence_rate.is_some(), "--d-presence-rate"),
                     (no_d && self.d_allele.is_some(), "--d-allele"),
                     (no_d && !self.anchor_window, "--no-anchor-window"),
+                    (no_d && !self.d_open_flank, "--d-open-flank off"),
                 ],
                 "a D database (--d)",
             ),
@@ -1252,7 +1253,8 @@ mod tests {
         let c_gate = "--c-prefix-identity needs a C database (--c)";
         let double_d = "--double-d needs a D database (--d)";
         let w1 = "--min-d-match, --d-mismatch, --d-presence-rate, --d-allele, \
-                  --no-anchor-window have no effect without a D database (--d)";
+                  --no-anchor-window, --d-open-flank off have no effect without a D \
+                  database (--d)";
         let w2 = "--double-d-min-span, --double-d-seed-length, --double-d-pseudo-trim, \
                   --double-d-pseudo-mismatches, --double-d-min-gain have no effect without \
                   --double-d all or long-span";
@@ -1301,6 +1303,7 @@ mod tests {
                     ("d-presence-rate", Some("0.9")),
                     ("d-allele", Some("map")),
                     ("no-anchor-window", None),
+                    ("d-open-flank", Some("off")),
                     ("double-d-min-span", Some("30")),
                     ("double-d-seed-length", Some("9")),
                     ("double-d-pseudo-trim", Some("4")),
