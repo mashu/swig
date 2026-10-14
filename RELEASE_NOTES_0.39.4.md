@@ -1,308 +1,195 @@
 # Swig 0.39.4
 
-Swig 0.39.4 fixes four problems that `engine/docs/REVIEW.md` listed as open
-after 0.39.3, one of them only in part:
-- chance D calls on D-free reads that stop before their J or start after
-  their V (in part: a chance D within about 30 bases of the V or J stays);
-- IgT, IgZ and IgO constant alleles that got no locus;
-- V names without `*`, which cost V accuracy on mutated reads;
-- options that were silently ignored without the database they need.
+Swig 0.39.4 restores the plausibility guards and the constant-region (C)
+rules of SwiftIG, the aligner of Swig ≤ 0.38, which the switch to the Rust
+aligner in 0.39.0 dropped. Each guard is a comparison per hit or per V–J
+pair: CPU time is unchanged (within ±2 % on 10,000 simulated reads, one
+thread). It also restores the sensitivity of the CHMMAIRRa PCR-chimera
+filter, and fixes defects in Swig Web and `swig-cli` that predate the
+switch. The aligner runs in Swig Web, in `swig-cli` (native and
+WebAssembly) and in the `swig` binary; every change to calls below applies
+to all three.
 
-It also gives a locus to alleles with custom names, which used to pair with
-every locus.
+On ordinary reads, calls do not change. On 20,000 simulated human BCR reads
+(IGH, IGK, IGL) of the IgM-like preset (mid, mean SHM 1.5 %) and 20,000 of
+the IgG-like preset with SHM indels (hard, mean SHM 7.7 %), against 0.39.3:
 
-Checking these fixes end to end also turned up five gaps in how Swig Web and
-`swig-cli` prepare references and report the aligner's warnings. Those are
-fixed too. Every fix has a regression test that fails on 0.39.3.
+| | mid 0.39.3 | mid 0.39.4 | hard 0.39.3 | hard 0.39.4 |
+|---|---|---|---|---|
+| V, D, J allele right | 98.70 / 93.46 / 99.11 % | same | 93.77 / 85.88 / 94.92 % | 93.77 / 85.83 / 94.91 % |
+| reads whose V, D or J call or coordinates changed | | 0 | | 9 |
+| templated junctions reported exactly | 99.97 % | 99.13 % | 99.63 % | 95.67 % |
+| reads without a templated junction that get one | 90.9 % | 24.1 % | 89.2 % | 14.0 % |
+| `productive=T` without a templated junction | 1,122 | 215 | 673 | 90 |
+| C allele right | 96.71 % | 94.94 % | 96.04 % | 94.15 % |
 
-The aligner runs in Swig Web, in `swig-cli` (native and WebAssembly) and in
-the `swig` binary. Every change the aligner itself makes to calls and AIRR
-columns below applies to all three, given the same reference. Changes to
-reading files, preparing references, options and messages name the route
-they apply to; the fixes to how Swig Web and `swig-cli` prepare custom
-references also change calls, but only on the routes they name.
-
-With the shipped references, calls change only on reads where 0.39.3
-called a D with no J after it or no V before it. On full-length reads that
-happens only when the aligner misses the J or V. On the 29,500 simulated
-reads of the frozen suite:
-- the IGH easy, mid and hard, BCR and TCR sets, and 1,000 IGK reads run
-  against the IGH database, keep every call. On IGH hard only posteriors
-  move;
-- on the IGH set at 30 % SHM, 14 rows change a call (13 D, 1 J), all reads
-  in which 0.39.3 found no J. No right D call is lost, and right "no D"
-  calls rise from 33.33 % to 34.11 %.
-
-With databases whose alleles name their locus, as every shipped reference
-does, speed is unchanged.
+Of the 584 C calls lost, 580 are on C tracts shorter than 32 nt, where
+SwiftIG's floors (12 aligned columns at 90 % identity) now apply: 8–11 nt
+of C are no longer called, nor short tracts below 90 % identity. Swig Web's
+isotype column never labelled those either.
 
 ## What changes for users
 
-- **Chance D on reads without a D.** A read that stops before its J, or
-  starts after its V, used to get a D from a chance match in its random
-  bases on most reads. The D was priced for a junction-sized window, and the
-  bases beyond such a read's last segment are not one.
+- **V–J pairs must be plausible (SwiftIG's `supports_rearranged_pair`).**
+  A V and a J form a rearrangement only when the V starts before the J,
+  at most 225 read bases lie between them, and their local alignments
+  hold at least 80 aligned columns together and either face the junction
+  (the V reaches within 45 bases of its germline 3′ end, the J starts
+  within 30 of its 5′ end) or hold a long split (V ≥ 80, J ≥ 30 columns).
+  A pair failing that still forms one when V's Cys104 and J's Trp/Phe118
+  codons are both aligned, in that order. When the best call breaks a
+  guard, the read gets the best call that keeps them: its V alone, its J
+  alone, or a V–J pair that passes, as in SwiftIG. In 0.39.3 the first 70
+  bases of a V paired with a J 20 random bases later, and V and J 500
+  random bases apart formed a rearrangement with a 543-nt junction.
+- **A short V does not vouch for a chance J.** Unless both conserved
+  codons are aligned, a V of fewer than 80 aligned columns pairs only with
+  a J that is significant on its own (E ≤ 10⁻³). The aligner searches J
+  only in the locus of the read's V, so the 30–60 bases of an IGHV that a
+  chimera carries before an IGK J found a chance IGHJ there; SwiftIG,
+  which searched every locus, did not pair them. On 168 such reads, 30
+  were called productive in 0.39.3 and 10 now; SwiftIG called none. The
+  other 10 pair with an IGHJ that aligns to the IGK J well enough to be
+  significant on its own (see below).
+- **Hit floors.** A V hit needs 24 aligned columns and a J hit 10 (local
+  alignment, before the stitched outer flank), and a V or J clipped by the
+  call keeps a positive score and the identity floor (`--min-identity`,
+  0.6 in Swig Web and `swig-cli`). In 0.39.3 eight bases of J after 12
+  random ones were called J on 18 of 20 reads.
+- **A D only between a V and a J.** As in SwiftIG, which paired V and J
+  before it looked for a D, a call with a D also holds a V and a J that
+  pair. On 1,000 mid IGH reads cut 30 or 100 random bases after their V,
+  0.39.3 called a D on 70.0 and 92.5 % of reads, and 0.39.4 on 0.3 and
+  0.5 % (each with a chance J). On reads that start at their J behind 30
+  or 100 random bases, and so hold no D, 0.39.3 called one on 81.0 and
+  95.9 %, and 0.39.4 on none.
+- **Reads that start after their V lose their D again.** 0.39.3 had
+  restored the D of such reads (right D on 878 of 952 mid IGH reads cut
+  where their V ends). Since a D on a read without a V could not be told
+  from chance (81–96 % of the D-free reads above got one), 0.39.4 returns
+  to SwiftIG's rule: those reads get no D (0 of 952). A read that keeps
+  the last 30, 40 or 60 bases of its V keeps its D (805, 866 and 880 right
+  calls; 0.39.3: 881, 881, 880).
+- **Junctions only from aligned anchors (SwiftIG's `annotate_junction`).**
+  The junction, CDR3, `vj_in_frame`, `productive` and `complete_vdj` are
+  reported only when the called V aligns the first base of Cys104 and the
+  called J that of Trp/Phe118, at most 231 bases apart. 0.39.3 projected an
+  anchor along the alignment's end diagonal however far, so a V trimmed
+  past Cys104, or a J aligned only after Trp/Phe118, got a junction made of
+  bases neither segment explains (see the table above). The cost is the
+  templated junctions whose anchor codon is mutated, so that the alignment
+  stops before it: 0.84 points on the mid preset, 3.95 points on the hard
+  preset.
+- **FWR3 without Cys104.** When Cys104 is not placed, FWR3 ends where the
+  V alignment does, as in SwiftIG. 0.39.3 dropped FWR3, and Swig Web's
+  alignment viewer then reported no region map, on 40 of 400 simulated TRA
+  and TRD reads.
+- **Constant region as SwiftIG anchored it.** C's base 0 may lie within 7
+  bases of the J's end (SwiftIG took C's first aligned base up to 8 bases
+  after J and 3 into C; 0.39.3 allowed 3), and C is called on at least 12
+  aligned columns at 90 % identity, SwiftIG's floors, besides the anchored
+  E-value gate (now `N_C · 15 · e^(−λS) ≤ 10⁻³`, 15 start diagonals). On
+  2,552 constructed reads (every human IG and TR C gene, 15–300 nt of C,
+  J 3′ ends cut by 1–6 bases, 1–5 bases between J and C, C's first bases
+  deleted, 2–20 % C divergence, both strands):
 
-  A D that ends its path (no J after it), or starts it (no V before it), now
-  pays for the J (or V) the read would show in the bases beyond it if one
-  were there. Two things set the cost:
-  - how many such bases the read has, beyond a free stretch of 24 bases
-    that N and P regions can fill;
-  - the read's own measured divergence, so a mutated J that the read does
-    show is not mistaken for a missing one.
+  | | SwiftIG | 0.39.3 | 0.39.4 |
+  |---|---|---|---|
+  | C right | 2,035 | 2,083 | 2,074 |
+  | wrong C gene | 4 | 41 | 1 |
+  | right in SwiftIG, not here | — | 163 | 33 |
 
-  The cost has a ceiling, so a database that lacks the read's J or V cannot
-  erase every D. On 600 D-free IGH reads per row:
+  0.39.3 lost the C of reads whose J end lay more than 3 bases from C's
+  start, called IGLC3 for IGLC2 and TRBC2 for TRBC1 there, could not name
+  IGLC1\*01 or IGLC3\*01 (6 bases shorter than their genes), and called
+  IGHG2\*16 at 79 % identity on an IGKC sequence. Of the 33 reads left, 29
+  have no J, and SwiftIG called their C only after a chance J; 4 have C at
+  12–20 % divergence, where the anchored alignment counts leading
+  mismatches that SwiftIG's local one trimmed. `--c-min-identity F`
+  (default 0.9; 0 turns the floor off, the 12-column floor remains) sets
+  the identity floor.
+- **`--no-pair-guards`.** Turns the pair guards off (`swig`, and the
+  WebAssembly module's `no-pair-guards` option); calls then are those of
+  0.39.3 except for C and FWR3.
 
-  | D-free reads | 0.39.3 | 0.39.4 |
-  |---|---|---|
-  | a V followed by 100 random bases | 93.5 % get a D | 6.8 % |
-  | 100 random bases followed by a J | 97.7 % | 10.2 % |
-  | a V followed by 60 random bases | 89.5 % | 73.5 % |
-  | a V followed by 10, 25 or 30 random bases | 27.2, 63.7, 72.0 % | unchanged |
-  | 30 random bases followed by a J | 79.8 % | unchanged |
+## PCR-chimera filter (CHMMAIRRa)
 
-  Under `--calls fixed` the first two rows read 98.0 → 6.5 % and
-  99.5 → 10.8 %.
+The Rust aligner ends a V alignment before trailing mismatches it gives to
+the junction, and starts a J after leading ones; a late chimera breakpoint
+puts the second parent's informative bases exactly there. CHMMAIRRa now
+extends the V alignment gaplessly toward its germline 3′ end, and the J
+toward its 5′ start, by the best-scoring run of the read bases beside it
+(+1 match, −1 mismatch), before it measures the distance from reference and
+threads the read onto the MSA. A J extension must score at least 2: on a J
+of about 50 bases, one junction base that matched by chance flagged
+ordinary reads; one more base of a V did not. On 2,500 simulated IGH V
+chimeras (two V alleles of different genes joined at a homologous
+position), 260 J chimeras and 1,400 ordinary reads:
 
-  What this does not fix:
-  - A chance D within about 30 bases of the V or J stays. It sits exactly
-    where the real D of a truncated read sits, so no length term can
-    separate them; only a higher D price for every read could, at the cost
-    of real D calls.
-  - Under `--profile truth` and `--profile igblast`, which charge no D
-    price, most chance Ds stay. Behind a V: `truth` 93.7 → 92.8 %,
-    `igblast` 100 → 99.5 %.
-
-  What it costs:
-  - **Real D behind a long N region.** The cost assumes non-templated
-    regions of at most about 24 bases. On 1,500 simulated reads per bin
-    that end 0–20 bases into their J, right D calls fall by 1.07 points
-    with an N2 of 26–30 bases (17 lost, 1 gained) and by 3.80 points with
-    31–40 bases. With 20–25 bases the share of right D calls does not
-    change (2 lost, 2 gained), but 5 of the 1,500 reads lose their D call
-    and the D-presence Brier score rises from 0.0056 to 0.0126. Reads that
-    start inside a long N1 lose 0.07 points at 26–30 bases and 1.13 points
-    at 31–40.
-  - **D-presence calibration on truncated reads.** On 1,500 simulated
-    reads per set that end inside their J, 3 D calls change per set and
-    right D calls stay at 91.20 % (mid) and 83.13 % (hard, 1 lost and 1
-    gained), but the D-presence Brier score rises by 0.0045 (mid) and
-    0.0014 (hard).
-  - **J posteriors at high SHM.** Paths without a J lose posterior mass, so
-    a called J gains some, right or not. At 30 % SHM the J posterior rises on
-    908 of 2,742 reads with the same J call, and on those reads its Brier
-    score goes from 0.1870 to 0.1887 (paired t = 3.8). No right J call
-    changes; one read that had no J now gets a wrong one.
-  - **A database with no J of the read's locus.** On IGH reads run against a
-    database whose J alleles are all from another locus under custom names,
-    7.3 % of right D calls are lost.
-    - Dropping all J genes but IGHJ6 loses none.
-    - So does replacing the IGH J alleles with TRB J alleles under their
-      own names, or removing the TRB J alleles from the TCR database.
-
-  `--d-open-flank off` turns the cost off. On the suite's databases and the
-  shipped references, that gives 0.39.3's calls. Names that 0.39.4 reads
-  differently can still change calls: IGH constant genes of isotype F, O,
-  T, W, X, Y or Z, which 0.39.3 left without a locus; alleles whose name,
-  `locus=` key and header give no locus; and V names without `*`, which can
-  now join a relative's gene.
-- **IgT, IgZ and IgO constant genes.** An IGH constant gene is now
-  recognised by any isotype letter: A, D, E, F, G, M, O, T, W, X, Y, Z
-  (`IGHT2D`, `IGHZ`, `IGHO`).
-  - After any of these letters except D, which also starts D gene names
-    (`IGHD1-1`), at most one more letter may come before the next digit,
-    `*` or other non-letter (`IGHMD`, `IGHGP`). A word such as `IGHTEST1`
-    therefore names no locus.
-  - That limit is new for A, E, G and M, which 0.39.3 accepted with any
-    number of letters after them, so `IGHGPX1` no longer names IGH. No name
-    in Swig's IMGT reference pack loses its locus.
-  - In that pack, 8 constant alleles in 6 of its 64 species and strain sets
-    (5 species) had no locus: IGHT (6), IGHZ (1) and IGHO (1). They are now
-    IGH.
-  - Calls on the shipped references do not change.
-  - In a database of several loci, an allele of no locus could join any
-    locus' segments and counted in every locus' C gate.
-- **Alleles with custom names.** An allele whose name, `locus=` key and
-  header name no locus (`novel_1`, `sample7_V3`) used to pair with every
-  locus. In a database of several loci, that let light-chain and TRA reads
-  get a D, and light-chain reads get a heavy C.
-
-  The locus is now taken from, in order:
-  1. the `locus=` key;
-  2. the name;
-  3. the header's gene names;
-  4. the allele's closest named relative in the database, or in a small
-     built-in panel of human and mouse V, J and C genes;
-  5. failing all of these, the loci the database names; a D takes only
-     those of them with D genes (IGH, TRB, TRD). In a database of several
-     loci, a warning names these alleles and asks for a `locus=` key. When
-     steps 1–4 place no allele of the database in a locus, the alleles
-     still pair with every locus, now with a warning.
-
-  `swig prepare` writes the result as `locus=`. On the suite's databases
-  with custom names:
-
-  | Custom-named alleles | 0.39.3 | 0.39.4 |
-  |---|---|---|
-  | every D of the BCR database: light-chain reads with a D | 1,077 of 5,000 | 0, as with IMGT names |
-  | every D of the TCR database: TRA reads with a D | 839 | 0 |
-  | every J of the BCR database: C allele against IMGT names | −0.74 points | equal |
-  | every V of the BCR database: calls against IMGT names | same accuracy; 4 of 7,500 reads list 1 or 2 extra tied alleles | equal on all 7,500 reads |
-  | every allele of an IGH database: reads with no `locus` | all 5,000 | none |
-
-  Limits:
-  - D genes are too short to place by relatives. Custom-named TRB and TRD D
-    alleles both fall back to TRB and TRD, so they need a `locus=` key.
-  - Loading 20 custom-named alleles takes about 12 ms more. Loading 705
-    custom-named human BCR V alleles takes about 60 ms more, but a run on
-    such a database is now faster: 7,500 BCR reads take 3.2 s instead of
-    5.8 s on one thread.
-- **V names without `*`.** A gene is the allele name's part before `*`.
-  With no `*`, each allele counted as a gene of its own, which costs V
-  accuracy on mutated reads.
-  - A V name without `*` now joins the gene of its closest `*`-named
-    relative within about 2 % sequence divergence. Otherwise it forms a
-    gene with the other V alleles without `*` that it reaches through steps
-    of about 2 % or less.
-  - On the suite's IGH reads at 30 % SHM, with every `*` removed, V allele
-    accuracy is now 0.10 points above IMGT names; it was 8.20 points below.
-  - With 20 % of names hidden, it is 0.03 points above; it was 1.77 points
-    below.
-  - Names with `*`, as in every shipped reference, keep their genes.
-- **Custom references in Swig Web and `swig-cli`.**
-  - A Swig Web reference cell is one locus, so a custom record in it
-    (a bare `novel_1`, say) now gets that locus. Before, it was refused
-    with "does not identify one of the supported IG/TR loci".
-  - `swig-cli prepare-reference` and the config route place a custom
-    record by its closest template and the locus words of its header. A
-    record nothing places is refused with a message that asks for a
-    `locus=` key.
-  - The `swig-cli --vdj` route rewrote every germline header to the bare
-    name, which dropped a `locus=` key. Custom TRB D alleles then gave TRD
-    reads a TRB D. It now keeps the key.
-  - The later template tiers of reference preparation read each record's
-    original header, so a record placed in the first tier is not refused in
-    a later one.
-  - Reference preparation in Swig Web and `swig-cli` accepts IMGT's IgD
-    constant gene (`IGHD*01`) and J–C orphon records (`IGLJ-C/OR18*01`) in
-    a C database. Before, they were refused as a D or J gene.
-- **Options without their database.** Two options were ignored when the
-  run had no database for them; they are now refused, as `--c-evalue`
-  already was:
-  - `--c-prefix-identity` above 0 needs a C database;
-  - `--double-d all` or `long-span` needs a D database.
-
-  Where the refusal happens on each route:
-  - `swig` binary: exit 2 with the usage, before any database is read.
-  - WebAssembly module: refuses to start.
-  - Swig Web: refuses the C gate before a run without a C reference.
-  - `swig-cli`: on the config route, `annotation.minimumConstantPrefixIdentity`
-    above 0 needs C germlines and `annotation.doubleD` (`all` or
-    `long-span`) needs D germlines. On the `--vdj` route,
-    `--minimum-c-prefix-identity` above 0 needs a C database
-    (`-c_region_db`); that route has no double-D screen. `swig-cli` checks
-    these before it starts the aligner, so its message is the same with
-    `--aligner native` and `--aligner wasm`.
-
-  Options that only tune a stage the run lacks are run with a warning. These
-  are the D options without a D database (`--min-d-match`, `--d-mismatch`,
-  `--d-presence-rate`, `--d-allele`, `--no-anchor-window`,
-  `--d-open-flank off`) and the double-D rules without `--double-d`. So is
-  `--d-allele max-marginal` with `--no-posterior`, and a D allele too short
-  for the double-D screen's seeds (TRDD1 and TRDD2 at the default seed
-  length). These warnings change no calls: a warned option is ignored, so
-  the run writes the same AIRR as without it.
-- **Aligner warnings are shown.** Swig Web and `swig-cli` never showed the
-  aligner's database and run warnings: unknown or fallback loci, names
-  without `*`, J and C convention problems, and the warnings above.
-  - `swig-cli` now prints each once, as `Aligner warning: …`, on both
-    routes. The pipeline also lists them in `<prefix>.summary.json` under
-    `references.alignerWarnings`.
-  - Swig Web shows them in the run summary.
-
-## Output
-
-The native and WebAssembly routes still write byte-identical AIRR (release
-smoke tests). Against 0.39.3, on the frozen suite with default settings,
-paired on the same reads and scored by the 0.39.1 evaluator:
-
-| Set | Reads | Rows that change a call | V, D, J, C allele and junction |
+| | SwiftIG | 0.39.3 | 0.39.4 |
 |---|---|---|---|
-| IGH easy | 3,000 | 0 | unchanged |
-| IGH mid | 5,000 | 0 | unchanged |
-| IGH hard | 5,000 | 0 (posteriors only) | unchanged |
-| IGH 30 % SHM | 3,000 | 14 (13 D, 1 J) | unchanged; right "no D" 33.33 → 34.11 % |
-| BCR (IGH+IGK+IGL) | 7,500 | 0 | unchanged |
-| TCR (TRA+TRB+TRD+TRG database) | 5,000 | 0 | unchanged |
-| IGK reads against the IGH database | 1,000 | 0 | — |
+| V chimeras flagged, set 1 | 420 / 500 | 416 / 500 | 420 / 500 |
+| V chimeras flagged, set 2 | 1,696 / 2,000 | 1,676 / 2,000 | 1,698 / 2,000 |
+| J chimeras flagged (J mode) | 38 / 60, 138 / 200 | 35 / 60, 125 / 200 | 35 / 60, 130 / 200 |
+| ordinary reads flagged | 0 | 0 | 0 |
 
-Other real and simulated data:
-- **Macaque.** On two macaque repertoires of 12,229 and 13,698 D calls, no D
-  call changes.
-- **Reads that start after their V.** On 1,913 simulated IGH reads that hold
-  a D and a J but no V, no call changes; only some D and J posteriors
-  move.
-- **Shipped references of other species.** Calls on the IMGT pack's sets do
-  not change. Some posteriors change in their last digits, from the
-  chance-D cost.
+On 11,000 further ordinary simulated reads (4,000 BCR at IgM-like and
+4,000 at IgG-like SHM, 3,000 TCR), the extension flags no read that the
+filter did not flag without it (V mode 4, J mode 6; SwiftIG's alignments:
+9 and 11).
 
-## Timing
+`swig-cli` also threaded every read whose allele the pipeline's allele
+refinement had reassigned against the new allele's MSA row, with the old
+allele's alignment: threading failed on all of them, and with
+`retainUnevaluated` false they were dropped. It now threads against the
+allele the aligner aligned (`swig_original_v_call`).
 
-With databases whose alleles name their locus, as every shipped reference
-does, speed is unchanged. Instruction counts (callgrind, one thread)
-against 0.39.3:
-- 1,000 IGH hard reads: +0.39 %;
-- the 600 reads of a V followed by 100 random bases: −0.46 %.
+## Fixes in Swig Web and `swig-cli` that predate 0.39
 
-Wall time of the `swig` native binary on the IGH mid and hard sets (5,000
-reads each, human IGH V, D, J and C): each figure is the median of 5
-interleaved runs on a 4-core cloud VM, database preparation included.
+- **SHM replacement and silent counts** phased codons from the read's
+  first base instead of the V alignment's, so about two reads in three
+  counted them in the wrong frame. Rows without `sequence_frame` (IgBLAST
+  output) now take the V germline's frame from `v_germline_start`.
+- **Denoising** cut the V–J slice of a reverse-complemented read with
+  reverse-strand coordinates from the read as given. The reverse
+  complement now keeps IUPAC codes (R↔Y, K↔M, B↔V, D↔H), both strands are
+  upper-cased alike, and `rev_comp` is read as T, TRUE or 1 everywhere
+  (denoising, CHMMAIRRa, personalized germline inference).
+- **Isotype.** The isotype column required `c_support ≤ 10⁻⁴` for C
+  stretches under 30 bases, SwiftIG's E-value; the aligner's gate is
+  10⁻³ on its own E-value, so some C calls had no isotype.
+- **Alignment viewer.** A long `=`/`X` CIGAR now wraps inside its segment
+  card instead of running under the Query/Germline/Score block.
 
-| Set | Threads | 0.39.3 | 0.39.4 |
-|---|---|---|---|
-| IGH mid | 1 | 3.25 s | 3.19 s |
-| IGH hard | 1 | 3.13 s | 3.05 s |
-| IGH mid | 4 | 0.97 s | 1.00 s |
-| IGH hard | 4 | 0.91 s | 0.91 s |
+## Behaviour that stays different from SwiftIG
 
-Single runs varied by up to 20 % from the median (one 0.39.3 run by 49 %),
-so the differences are noise. Loading a database does a little more work
-even when every allele names its locus: each header is checked for a
-`gene=` key, and the open-flank cost is set up for each locus. On the
-suite's human references that adds about 0.2 % to the load's instructions
-for IGH, 0.4 % for BCR and 0.9 % for TCR, under 1 ms. Alleles that name no
-locus add more (see "Alleles with custom names").
+- `stop_codon` and `productive` look for stop codons through the end of
+  the J alignment (as IgBLAST does), not only to Trp/Phe118; TRAJ8\*02 and
+  TRAJ51\*01, which carry an in-frame stop in FR4, give non-productive
+  rearrangements.
+- Random sequence gets no call (SwiftIG called a J on 65 of 100 random
+  reads), and the J of a full V is not paired with a junk J of the V's
+  locus when the read's J belongs to another locus.
+- A V of 30–60 bases before a J of another locus can still pair with a J
+  of its own locus that is significant on its own (10 of 168 such reads
+  productive; SwiftIG 0): the aligner searches J only in the V's locus.
+- J-mode CHMMAIRRa still misses a few J chimeras that SwiftIG flagged: the
+  aligner prefers the 3′ parent J with a hard 5′ clip.
 
-## For developers
+## Tests
 
-- New `swig` option: `--d-open-flank on|off` (default `on`). The WebAssembly
-  module takes it through the generic option call.
-- The posterior's forward–backward, the exhaustive oracle and the DAG all
-  include the new cost. Property tests check that they agree in both call
-  models, with the cost on and off. `PlacementDag::path_score` and
-  `PlacementDag::posterior` are now crate-internal. `Adjudicator::adjudicate`
-  charges the open end only up to the last placement; callers that know the
-  read's length use `adjudicate_at`.
-- New module `locus_infer` and the embedded panel `engine/data/locus_panel.fa`
-  (269 human and mouse V, J and C records, built from the shipped IMGT pack
-  by `scripts/build-locus-data.mjs`). `public/swig.wasm` grows from 1.0 to
-  1.16 MB.
-- `RunOptions::check_databases` returns an option's refusal as an error,
-  or else its warnings, and `Run::warnings` returns the run's warnings. The
-  WebAssembly summary adds the run's warnings to the database's in
-  `warnings`. A refusal fails `swig_init_database` (or, after an option
-  change, the next `swig_annotate`) with its message in the error buffer.
-
-## Still open
-
-`engine/docs/REVIEW.md` §0 lists what this release does not fix. Among them:
-- chance Ds within about 30 bases of the V or J of a truncated read;
-- real Ds behind N regions longer than about 24 bases at a read's open end,
-  and the J-posterior calibration at high SHM described above;
-- custom-named D alleles in a database holding TRB and TRD, which need a
-  `locus=` key;
-- the double-D screen's seed length, which cannot see TRDD1 and TRDD2 (it is
-  now reported, not changed);
-- the strand test's null model, posterior overconfidence at high SHM, and
-  the other items carried over from 0.39.3.
+- `engine/tests/guards.rs`: each guard on constructed reads, with and
+  without the guards: a V that does not reach its junction, V and J beyond
+  the junction span, a J under 10 columns, a D without a V or a J, a
+  junction without aligned anchors, a short V before a chance J; C 7 bases
+  off the splice; C floors.
+- `tests/simulated.rs`: the junction floors reflect the anchor rule, and a
+  new check requires the guards to report less than half the spurious
+  junctions of the unguarded engine on the hard preset.
+- `swig simulate` keeps drawing only C alleles that start within 3 bases of
+  their gene, so simulations are byte-identical to 0.39.3's;
+  `swig evaluate` also prints the spurious-junction rate.
+- Web: SHM codon phase with and without `sequence_frame`, denoising of
+  reverse-complemented and IUPAC reads, `rev_comp` spellings, isotype gate,
+  CHMMAIRRa extension and its J threshold, the `c-min-identity` option of
+  the WebAssembly module.

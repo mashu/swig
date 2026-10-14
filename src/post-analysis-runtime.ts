@@ -195,7 +195,7 @@ export class PostAnalysisRuntime {
   async denoise(options: DenoiseOptions, onProgress?: (processed: number, total: number, phase?: "ingest" | "variants" | "finalize") => void, signal?: AbortSignal): Promise<DedupDashboard> {
     await this.ensureIndexed(onProgress, signal);
     await this.request({ type: "denoiseInit", options });
-    await this.store.scanAirrRows(["sequence_alignment", "sequence", "v_sequence_start", "j_sequence_end"], async (rows) => {
+    await this.store.scanAirrRows(["sequence_alignment", "sequence", "rev_comp", "v_sequence_start", "j_sequence_end"], async (rows) => {
       if (signal?.aborted) throw new DOMException("Denoising was cancelled.", "AbortError");
       await this.request({
         type: "denoiseIngest",

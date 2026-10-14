@@ -105,6 +105,9 @@ pub struct RunOptions {
     pub anchor_window: bool,
     /// Report posterior probabilities.
     pub posterior: bool,
+    /// SwiftIG's plausibility guards on hits and V–J pairs
+    /// ([`crate::pipeline::PairGuards`]).
+    pub pair_guards: bool,
     /// The model the call maximises; `None` keeps the profile's.
     pub calls: Option<CallModel>,
     /// How the reported D allele is chosen; `None` keeps the profile's.
@@ -120,6 +123,8 @@ pub struct RunOptions {
     /// Report C only where the germline from its first base reaches this
     /// identity (`c_prefix_identity`).
     pub c_prefix_identity: Option<f64>,
+    /// Lowest identity of a called C; `None` keeps the default (0.90).
+    pub c_min_identity: Option<f64>,
     /// Drop V, D and J hits below this identity.
     pub min_identity: Option<f64>,
     /// Shortest exact run of an admissible D; `None` keeps the profile's.
@@ -145,12 +150,14 @@ impl Default for RunOptions {
             strand: Strand::Both,
             anchor_window: true,
             posterior: true,
+            pair_guards: true,
             calls: None,
             d_allele: None,
             d_presence_rate: None,
             d_open_flank: true,
             c_evalue: None,
             c_prefix_identity: None,
+            c_min_identity: None,
             min_identity: None,
             min_d_match: None,
             d_mismatch: None,
@@ -199,7 +206,7 @@ fn with_mismatch(scoring: AffineScoring, mismatch: Score) -> AffineScoring {
 
 impl RunOptions {
     /// Every option [`Self::set`] reads, and whether it takes a value.
-    pub const NAMES: [(&'static str, bool); 24] = [
+    pub const NAMES: [(&'static str, bool); 26] = [
         ("profile", true),
         ("chain", true),
         ("strand", true),
@@ -211,6 +218,7 @@ impl RunOptions {
         ("d-open-flank", true),
         ("c-evalue", true),
         ("c-prefix-identity", true),
+        ("c-min-identity", true),
         ("min-identity", true),
         ("min-d-match", true),
         ("d-mismatch", true),
@@ -224,6 +232,7 @@ impl RunOptions {
         ("double-d-min-gain", true),
         ("no-anchor-window", false),
         ("no-posterior", false),
+        ("no-pair-guards", false),
     ];
 
     /// Whether option `name` takes a value; `None` for an unknown option.
@@ -311,6 +320,9 @@ impl RunOptions {
                 let gate = parsed(name, value, "a fraction in [0, 1]", fraction)?;
                 self.c_prefix_identity = (gate > 0.0).then_some(gate);
             }
+            "c-min-identity" => {
+                self.c_min_identity = Some(parsed(name, value, "a fraction in [0, 1]", fraction)?);
+            }
             "min-identity" => {
                 self.min_identity = Some(parsed(name, value, "a fraction in [0, 1]", fraction)?);
             }
@@ -347,6 +359,7 @@ impl RunOptions {
             }
             "no-anchor-window" => self.anchor_window = false,
             "no-posterior" => self.posterior = false,
+            "no-pair-guards" => self.pair_guards = false,
             _ => unreachable!("every name in NAMES is handled"),
         }
         Ok(())
@@ -452,6 +465,9 @@ impl RunOptions {
         config.anchor_window = self.anchor_window;
         config.simd = self.simd;
         config.posterior = self.posterior;
+        if !self.pair_guards {
+            config.options.guards = None;
+        }
         if let Some(calls) = self.calls {
             config.calls = calls;
         }
@@ -466,6 +482,9 @@ impl RunOptions {
         }
         if let Some(evalue) = self.c_evalue {
             config.c.evalue = evalue;
+        }
+        if let Some(identity) = self.c_min_identity {
+            config.c.accept.min_identity = identity;
         }
         if let Some(run) = self.min_d_match {
             config.d.min_exact_run = run;
@@ -862,6 +881,7 @@ mod tests {
             ("d-open-flank", Some("off")),
             ("c-evalue", Some("0.01")),
             ("c-prefix-identity", Some("0.97")),
+            ("c-min-identity", Some("0.8")),
             ("min-identity", Some("0.7")),
             ("min-d-match", Some("5")),
             ("d-mismatch", Some("-4")),
@@ -875,6 +895,7 @@ mod tests {
             ("double-d-min-gain", Some("6")),
             ("no-anchor-window", None),
             ("no-posterior", None),
+            ("no-pair-guards", None),
         ] {
             options.set(name, value).unwrap();
         }
@@ -884,12 +905,14 @@ mod tests {
             strand: Strand::Reverse,
             anchor_window: false,
             posterior: false,
+            pair_guards: false,
             calls: Some(CallModel::FixedScale),
             d_allele: Some(DAlleleDecoding::MaxMarginal),
             d_presence_rate: Some(0.9),
             d_open_flank: false,
             c_evalue: Some(0.01),
             c_prefix_identity: Some(0.97),
+            c_min_identity: Some(0.8),
             min_identity: Some(0.7),
             min_d_match: Some(5),
             d_mismatch: Some(-4),
@@ -914,6 +937,8 @@ mod tests {
         assert_eq!(config.objective.open_flank, None);
         assert!(!config.posterior && !config.anchor_window);
         assert_eq!(config.c.evalue, 0.01);
+        assert_eq!(config.c.accept.min_identity, 0.8);
+        assert_eq!(config.options.guards, None);
         assert_eq!(config.d.min_exact_run, 5);
         assert_eq!(config.d.scoring, AffineScoring::new(2, -4, -11, -1));
         assert_eq!(config.j.accept.min_subst, 12);
@@ -930,6 +955,8 @@ mod tests {
             ("d-presence-rate", Some("1")),
             ("c-evalue", Some("0")),
             ("c-prefix-identity", Some("1.5")),
+            ("c-min-identity", Some("1.5")),
+            ("no-pair-guards", Some("yes")),
             ("d-mismatch", Some("3")),
             ("d-mismatch", Some("-1001")),
             ("j-mismatch", Some("-2147483648")),

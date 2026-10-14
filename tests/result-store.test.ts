@@ -100,15 +100,17 @@ test("constant-region evidence yields isotype facets and repertoire summaries", 
   const constantBody = [
     "ig_m\tACGT\tIGH\tIGHV1*01\tIGHD1*01\tIGHJ1*01\tIGHM*01\tT\tCARDR\t.98\t1\t.97\t.99\t\tAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\tT\tF\tT\tF",
     "ig_g_short\tACGT\tIGH\tIGHV1*01\tIGHD1*01\tIGHJ1*01\tIGHG1*01\tT\tCARDR\t.98\t1\t.97\t.99\t5e-5\tAAAAAAAAAAAAAAAAAA\tT\tF\tT\tF",
-    "ig_g_short_weak\tACGT\tIGH\tIGHV1*01\tIGHD1*01\tIGHJ1*01\tIGHG2*01\tT\tCARDR\t.98\t1\t.97\t.99\t2e-4\tAAAAAAAAAAAAAAAAAA\tT\tF\tT\tF",
+    "ig_g_short_anchored\tACGT\tIGH\tIGHV1*01\tIGHD1*01\tIGHJ1*01\tIGHG2*01\tT\tCARDR\t.98\t1\t.97\t.99\t2e-4\tAAAAAAAAAAAAAAAAAA\tT\tF\tT\tF",
+    "ig_g_short_weak\tACGT\tIGH\tIGHV1*01\tIGHD1*01\tIGHJ1*01\tIGHG4*01\tT\tCARDR\t.98\t1\t.97\t.99\t2e-3\tAAAAAAAAAAAAAAAAAA\tT\tF\tT\tF",
     "ig_a\tACGT\tIGH\tIGHV2*01\tIGHD1*01\tIGHJ2*01\tIGHA2*01\tF\tCARDRR\t.95\t1\t.96\t.97\t\tAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\tT\tF\tT\tF",
     "ig_g_ambiguous\tACGT\tIGH\tIGHV2*01\tIGHD1*01\tIGHJ2*01\tIGHG1*01,IGHG3*01\tT\tCARDRR\t.95\t1\t.96\t.98\t\tAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\tT\tF\tT\tF",
     "ig_e_weak\tACGT\tIGH\tIGHV2*01\tIGHD1*01\tIGHJ2*01\tIGHE*01\tT\tCARDRR\t.95\t1\t.96\t.89\t\tAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\tT\tF\tT\tF",
   ].join("\n") + "\n";
   await store.appendBatch(constantHeader, encoder.encode(constantBody));
   await store.finalize();
-  assert.deepEqual(store.facets().isotypes.map((item) => item.value).sort(), ["IgA2", "IgG", "IgG1", "IgM"]);
-  assert.equal(store.repertoire().isotypes.reduce((sum, item) => sum + item.count, 0), 4);
+  // A short C stretch needs the aligner's anchored gate (c_support ≤ 1e-3).
+  assert.deepEqual(store.facets().isotypes.map((item) => item.value).sort(), ["IgA2", "IgG", "IgG1", "IgG2", "IgM"]);
+  assert.equal(store.repertoire().isotypes.reduce((sum, item) => sum + item.count, 0), 5);
   const page = await store.page({ ...EMPTY_FILTERS, isotype: "IgM" }, 0, 10);
   assert.equal(page.rows.length, 1);
   assert.equal(page.rows[0].cCall, "IGHM*01");

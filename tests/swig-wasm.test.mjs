@@ -892,7 +892,7 @@ test("constant calling is post-J, anchored, primer-tolerant, and VDJ-invariant",
   assert.equal(runtime.setConstantPrefixIdentity(0), 0);
 
   // The anchored gate counts the locus' C genes and the start diagonals
-  // (E = N_C · 7 · e^(−λS) ≤ 10⁻³), not a fixed length.
+  // (E = N_C · 15 · e^(−λS) ≤ 10⁻³), on at least 12 aligned columns.
   runtime.initialize({ ...heavy.references, C: asFasta(human.loci.IGH.C) });
   const minimumStrong = runtime.annotate(
     `>minimum_strong_constant\n${vdjSequence}${cSequence.slice(0, 15)}${primerTail}\n`,
@@ -926,11 +926,15 @@ test("constant calling is post-J, anchored, primer-tolerant, and VDJ-invariant",
   const weakConstant = cSequence.slice(0, 72).split("").map((base, index) => (
     index % 5 === 2 ? replacement[base] : base
   )).join("");
-  // An 80%-identity tract is still far from chance: it is called, its
-  // identity reported, and the optional prefix gate removes it.
+  // An 80%-identity tract is far from chance, but below SwiftIG's 90 % C
+  // floor, which the aligner keeps: it is not called. Without the floor
+  // (`c-min-identity 0`) it is, and the optional prefix gate removes it.
   const weak = runtime.annotate(`>weak_constant\n${vdjSequence}${weakConstant}\n`, 1).rows[0];
-  assert.ok(weak.c_call);
-  assert.ok(Number(weak.c_identity) < 0.9);
+  assert.equal(weak.c_call, "", "an 80 % identity C tract passed the 90 % floor");
+  assert.equal(runtime.setOption("c-min-identity", 0), 0);
+  const unfloored = runtime.annotate(`>weak_constant\n${vdjSequence}${weakConstant}\n`, 1).rows[0];
+  assert.ok(unfloored.c_call);
+  assert.ok(Number(unfloored.c_identity) < 0.9);
   assert.equal(runtime.setConstantPrefixIdentity(0.9), 0);
   const gated = runtime.annotate(`>weak_constant\n${vdjSequence}${weakConstant}\n`, 1).rows[0];
   assert.equal(gated.c_call, "");

@@ -3,6 +3,7 @@ import { hs5fRate } from "./shm-model/hs5f.ts";
 import { substitutionCompatible } from "./shm-model/alignment.ts";
 import { AlignedRateCalibration, baseAt, discoveryCost, testHaplotype } from "./shm-model/discovery.ts";
 import { parseReferenceFasta, serializeReferenceFasta, type ReferenceFastaRecord } from "./reference-fasta.ts";
+import { orientedSequence } from "./nucleotide.ts";
 
 export interface PersonalizedGermlineOptions {
   minimumAlignedBases: number;
@@ -274,8 +275,7 @@ function parseObservation(
   }
   if (positions.length < options.minimumAlignedBases) return null;
   const cutoff=parent.sequence.length-TERMINAL_WINDOW;
-  let raw=(row.sequence??"").toUpperCase();
-  if (/^(T|true|1)$/i.test(row.rev_comp??"")) raw=[...raw].reverse().map(b=>({A:"T",C:"G",G:"C",T:"A"}[b]??"N")).join("");
+  const raw=orientedSequence(row.sequence,row.rev_comp);
   const anchor=rawPositions.get(cutoff);
   // Downstream D/J templated bases cannot be evidence for a novel V end.
   const downstreamStart=Number(row.d_sequence_start)>0?Number(row.d_sequence_start)-1:Number(row.j_sequence_start)>0?Number(row.j_sequence_start)-1:raw.length;

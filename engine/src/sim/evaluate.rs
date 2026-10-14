@@ -454,6 +454,10 @@ pub struct Evaluation {
     /// Reads whose junction is templated at both anchors.
     pub junction_reads: usize,
     pub junction_exact: usize,
+    /// Reads whose junction is not templated at both anchors (an anchor
+    /// trimmed away, or no V or J), and those of them given a junction.
+    pub junction_absent: usize,
+    pub junction_spurious: usize,
     /// By [`C_LENGTH_BINS`]; empty unless the reads were simulated with C.
     pub c: [ConstantStats; C_LENGTH_BINS.len()],
     pub calibration: PosteriorCalibration,
@@ -508,6 +512,9 @@ impl Evaluation {
         if let Some(junction) = &truth.junction {
             self.junction_reads += 1;
             self.junction_exact += usize::from(call.junction.as_deref() == Some(junction.as_str()));
+        } else {
+            self.junction_absent += 1;
+            self.junction_spurious += usize::from(call.junction.is_some());
         }
 
         if truth.constant {
@@ -544,6 +551,11 @@ impl Evaluation {
     pub fn junction_rate(&self) -> f64 {
         SegmentStats::rate(self.junction_exact, self.junction_reads)
     }
+
+    /// Of the reads without a templated junction, the share given one.
+    pub fn spurious_junction_rate(&self) -> f64 {
+        SegmentStats::rate(self.junction_spurious, self.junction_absent)
+    }
 }
 
 impl fmt::Display for Evaluation {
@@ -551,12 +563,14 @@ impl fmt::Display for Evaluation {
         let pct = SegmentStats::rate;
         writeln!(
             f,
-            "reads {}  oriented {:.2}%  unassigned {}  junction exact {:.2}% (of {})",
+            "reads {}  oriented {:.2}%  unassigned {}  junction exact {:.2}% (of {}), spurious {:.2}% (of {})",
             self.reads,
             pct(self.oriented, self.reads),
             self.unassigned,
             self.junction_rate(),
-            self.junction_reads
+            self.junction_reads,
+            self.spurious_junction_rate(),
+            self.junction_absent
         )?;
         writeln!(
             f,

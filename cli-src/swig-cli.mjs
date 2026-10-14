@@ -33,6 +33,7 @@ import {
   DenoiseAccumulator,
   assignLineages,
   createExactDedupPlan,
+  chmmJunctionFlank,
   deduplicate,
   finishExactDedupPlan,
   prepareReferenceMsa,
@@ -883,8 +884,10 @@ async function runChimera(rows,activeMask,config,scope,headers,references,worker
   const batches=[];let batch=[];
   for(let ordinal=0;ordinal<rows.length;ordinal+=1){
     if(!activeMask[ordinal])continue;
-    const row=rows[ordinal],call=row[`${segment}_call`]??"",sequence=row[`${segment}_sequence_alignment`]??"",germline=row[`${segment}_germline_alignment`]??"";
-    batch.push({ordinal,call,sequenceAlignment:sequence,germlineAlignment:germline});if(batch.length>=250){batches.push(batch);batch=[];}
+    // The alignment columns are the aligner's: thread them against the allele it aligned, not one allele refinement assigned since.
+    const row=rows[ordinal],call=row[`swig_original_${segment}_call`]||row[`${segment}_call`]||"",sequence=row[`${segment}_sequence_alignment`]??"",germline=row[`${segment}_germline_alignment`]??"";
+    const flank=chmmJunctionFlank(selectedSegment,row.sequence,row.rev_comp,row[`${segment}_sequence_start`],row[`${segment}_sequence_end`]);
+    batch.push({ordinal,call,sequenceAlignment:sequence,germlineAlignment:germline,segment:selectedSegment,flank});if(batch.length>=250){batches.push(batch);batch=[];}
   }
   if(batch.length)batches.push(batch);
   if(!batches.length)return {evaluated,flagged,unevaluated,threshold:config.posteriorThreshold};

@@ -62,6 +62,11 @@ retained bases in read order:
 V → D{0..max_d} → J,     partial paths allowed (V…, …J, V…J);  max_d = 1 (VDJ), 0 (VJ)
 ```
 
+The grammatical paths are V, J, VJ, VD, DJ and VDJ (never a lone D: every
+path holds a V or a J). Under the pair guards (§4c, on by default) a call
+with a D must also hold a V and a J; that is checked on the adjudicated
+path, outside the grammar.
+
 Between two consecutive placements there are two *cuts*: the first keeps
 read bases before its *exit* `x`, the second keeps bases from its *entry*
 `y ≥ x` on, and the `y − x` bases between them are N/P. Each placement is
@@ -241,7 +246,9 @@ query window that was searched:
   called. The same test applies to a path decoded from the posterior.
 
 Random sequence therefore receives no call. A J downstream of a significant V
-needs only E ≤ 1, because given the V a J is expected there.
+needs only E ≤ 1, because given the V a J is expected there. Whether a V and
+a J may form one rearrangement at all is decided by the plausibility guards
+(§4c), not by significance.
 
 ## 3. Placements and the clip index
 
@@ -729,13 +736,20 @@ without C does no C work.
 bases, no hypermutation, and C's germline base 0 lies next to the J's
 germline 3′ end. With `x` the called J's exit (taken only when J ends the
 path and bases follow it), hypothesis `H(a, δ)` puts base 0 of C allele `a`
-at read position `x + δ`, `|δ| ≤ s`, `s = 3`. Reference conventions differ by
+at read position `x + δ`, `|δ| ≤ s`, `s = 7`. Reference conventions differ by
 a base (IMGT CH1 records start after the J's last base, codon-aligned
 records such as abstar's repeat it, 3′-partial J records end a base early),
 and indels near the J's 3′ end move `x`; on 20,000 hard reads, `x` minus the
 true position of C's base 0 lies in `[−1, +2]` for all but 7 of 15,882 IGH
-reads (ASSESSMENT §11). C never enters the placement lattice: a C kind there
-would let C evidence move the J exit or the J allele.
+reads (ASSESSMENT §11). That histogram set `s = 3` until 0.39.3. Reads and
+references the simulator does not produce move `x` further: errors at the
+J's 3′ end stop its alignment early, a few bases can lie between J and C,
+and C records can lack up to 6 of their gene's first bases (IGLC1\*01 and
+IGLC3\*01) or carry a few extra. SwiftIG, the aligner of Swig
+≤ 0.38, took C's first aligned base up to 8 bases after the J's end and up
+to 3 bases into C; `s = 7` covers the same offsets (ASSESSMENT §11.4). C
+never enters the placement lattice: a C kind there would let C evidence
+move the J exit or the J allele.
 
 **Exact anchored DP with a local aligner.** An anchored alignment (start
 pinned to `C[0]` on one of `2s + 1` diagonals, free end) is a local alignment
@@ -779,13 +793,23 @@ diagonals gives
 E_C(S) = N_C · (2s + 1) · e^(−λS)
 ```
 
-for the clipped score `S`, reported as `c_support`. C is called iff
-`E_C ≤ 10⁻³` (`--c-evalue`), the gate of a hit that must stand on its own:
-C is not implied by V(D)J. For `(2, −3)` that is `S ≥ 18` (nine exact
-bases) for the 10 human IGHC genes. `N_C` counts the C genes of the read's
-(J's) locus: a database of several loci gets one gate per locus. On about 4,000 C-free reads
-per 20,000-read hard set, the false-call rate is 2–6× below the bound at
-every gate from 1 to 10⁻³ (ASSESSMENT §11).
+for the clipped score `S`, reported as `c_support`; at `s = 7`,
+`E_C = 15·N_C·e^(−λS)`. C is called iff `E_C ≤ 10⁻³` (`--c-evalue`), the
+gate of a hit that must stand on its own: C is not implied by V(D)J. For
+`(2, −3)` that is `S ≥ 19` (ten exact bases) for the 10 human IGHC genes
+(`S ≥ 18` at `s = 3`). `N_C` counts the C genes of the read's (J's) locus:
+a database of several loci gets one gate per locus. On about 4,000 C-free
+reads per 20,000-read hard set, the false-call rate at `s = 3` was 2–6×
+below the bound at every gate from 1 to 10⁻³ (ASSESSMENT §11).
+
+**Floors.** A C placement is called only on at least 12 substitution
+columns (matches and mismatches) at identity `matches/columns ≥ 0.9`
+(`CSegmentConfig::accept`, `--c-min-identity`), SwiftIG's floors. They are
+applied to each placement, clipped to `[x, n)`, before ranking, so a
+placement below them gives way to the next. Twelve columns at one mismatch
+score 19, so on human IGHC the floor, not the gate, sets the shortest
+callable C part. The gate alone admits long, divergent alignments: 0.39.3
+called IGHG2\*16 at 79 % identity on a read whose C part was IGKC.
 
 **Calls and posterior.** Placements are ranked by clipped score, then the
 longest exact run, matches and allele id; `c_call` lists the co-optimal
@@ -807,6 +831,104 @@ c_posterior = Σ_{p tied or carried} w_p / Σ_p w_p
 It is the probability that the reported names include the read's C allele,
 given that the read reaches C; no C-presence probability is reported.
 
+## 4c. Plausibility guards (`pipeline::PairGuards`)
+
+SwiftIG checked a read's V and J hits and their pairing before it called a
+rearrangement. The objective of §2.3 has no term for those checks: on
+full-length simulated reads its optimum almost always keeps them, but on
+truncated, chimeric and cross-locus reads it often does not (ASSESSMENT
+§7.1). The engine therefore
+applies them as constraints outside the objective, on by default
+(`--no-pair-guards` turns them off).
+
+For a V or J placement `p` let `c(p)` be the substitution columns of its
+local alignment (before the stitched outer flank), `[q₀, q₁)` its read
+interval, `[r₀, r₁)` its germline interval on its primary allele `a`,
+`A(p)` whether it is an anchor (E ≤ 10⁻³, §2.4), and `q_p(r)` the read base
+the alignment aligns to germline base `r` (undefined across a deletion or
+outside the alignment).
+
+**Hit floors.** A kept hit with `c(p) < 24` (V) or `c(p) < 10` (J) is
+dropped after its stage, so the stages' acceptance stays permissive and the
+sibling bounds of §5 stay exact. The DAG's retention floor rises to the
+same 24 and 10 read bases for a clipped V or J.
+
+**Pairing** (SwiftIG's `supports_rearranged_pair`, plus one rule):
+
+```text
+pairs(v, j) = q₀(v) < q₀(j)  ∧  q₀(j) − q₁(v) ≤ 225
+            ∧ ( motif  ∨  [ (c(v) ≥ 80 ∨ A(j))  ∧  c(v) + c(j) ≥ 80  ∧  (faces ∨ split) ] )
+faces       = r₁(v) + 45 ≥ |a(v)|  ∧  r₀(j) ≤ 30
+split       = c(v) ≥ 80  ∧  c(j) ≥ 30
+motif       = q_v(Cys104 + 2) + 1 < q_j(Trp/Phe118)        (both defined)
+```
+
+The pair faces its junction (V within 45 bases of its germline 3′ end, J
+within 30 of its 5′ end), holds a long split, or aligns both conserved
+codons in order. The rule `c(v) ≥ 80 ∨ A(j)` is the engine's own: J is
+searched only in the locus of the read's anchoring V (§5), so a chimera's
+30–60 bases of one locus' V before another locus' J find a chance J of the
+V's locus, which SwiftIG, searching every locus, never paired. It yields
+to the motif rescue: a short V and a J that align both conserved codons in
+order still pair. (A J stage without E-value gates has no anchors, and the
+rule is then skipped.)
+
+**Admissible paths.** A path `π` keeps the guards when
+
+1. each V and J clip on `π` keeps, of its local alignment (the stitched
+   flank excluded), a part that scores above 0 and has identity at least
+   `--min-identity`;
+2. if `π` holds a D, it also holds a V and a J (SwiftIG paired V and J
+   before it looked for a D);
+3. if `π` holds a V and a J, at most 225 read bases separate the V's exit
+   from the J's entry and `pairs(v, j)` holds.
+
+**Search.** Let `π*(Σ)` be the call of §4 (with its anchor test, §2.4, and
+the decoded path of §4a) over a set `Σ` of placements, all read at the
+divergence `p̂` of the whole read. The guarded call is
+
+```text
+π*(all)                                         if it keeps the guards
+argmax_{Σ ∈ S, π*(Σ) keeps the guards} value(π*(Σ))     otherwise
+S = { V } ∪ { J } ∪ { V_j ∪ D ∪ {j},  V_j ∪ {j} : j ∈ J, V_j ≠ ∅ },    V_j = { v ∈ V : pairs(v, j) }
+```
+
+with `V`, `D` and `J` the read's placements of each kind. Each J is offered
+with and without the D placements because the optimum over `V_j ∪ D ∪ {j}`
+can be a VD path, which breaks rule 2 while its VJ path keeps it. An exact tie
+keeps the earlier subset, and a read with no admissible subset optimum is
+not called. Values compare across subsets because every subset is read at
+the same `p̂`. The marginals of §4a are those of the subset that gives the
+call. Each locus of a read with several (§5) is guarded on its own.
+
+*Guarantee: defined, not exact.* Every admissible path lies in some subset
+(it is V, J, VJ or VDJ with a pairing V and J), but a
+subset whose optimum breaks a guard contributes nothing, even when another
+of its paths keeps them. Cost: one admissibility check when `π*(all)`
+keeps the guards; otherwise at most `2|J| + 2` more adjudications over fewer
+placements. On 20,000 simulated human BCR reads per preset the guards
+changed the V, D or J call or its coordinates on 0 mid and 9 hard reads,
+and CPU time is unchanged within ±2 % (10,000 simulated reads, one
+thread).
+
+**Junctions from aligned anchors** (SwiftIG's `annotate_junction`). The
+read regions are projected through the called alignments as before
+(README, *Regions*), but under the guards the junction, CDR3,
+`vj_in_frame`, `productive` and `complete_vdj` are reported only when
+
+```text
+q_V(Cys104) and q_J(Trp/Phe118) are defined within the called V and J spans
+∧ q_J(Trp/Phe118) − q_V(Cys104) ≤ 225 + 6
+```
+
+Without the guards an anchor outside the alignment is projected along its
+end diagonal however far, so a V trimmed past Cys104, or a J aligned only
+after Trp/Phe118, got a junction made of bases neither segment explains.
+When Cys104 is not placed at all (the allele has no anchor, its projection
+falls at or after the J's start, or its codon overlaps Trp/Phe118's), FWR3
+ends where the V alignment ends, guards or not; until 0.39.3 FWR3 was then
+empty.
+
 ## 5. Search
 
 Each stage narrows the hypotheses the DAG sees. The table states what each
@@ -820,13 +942,14 @@ step can lose.
 | V band | `retrieve/seed_vote.rs` | bounded | Cluster's diagonal range, shifted by the allele's frame offset, ± 8 diagonals: holds unless an indel longer than 8 escapes the seeds. |
 | V scoring | `segment.rs`, `family_bound.rs` | lossless | Score-only DP on one representative `R` per gene frame (most votes, then the frame's medoid, then lowest id). A sibling `A` in `R`'s frame diagonals satisfies `L ≤ S*(A) ≤ S*(R) + Δ(R, A)`: `Δ` sums the best profile gain per frame position both cover plus the best score where only `A` does; `L` is a traced representative path clipped to `A`'s span and rescored with `A`'s profile. The cutoff `c` is the 3rd largest of one lower bound per candidate, so `c ≤` the exact 3rd score. `A` is skipped when `U < c`, known when `U = L`, aligned outright when `L ≥ c` (its traceback reused), scored otherwise. The ranking from the 3rd score up is that of full scoring; ties follow an explicit key (gene leaders first, then retrieval order), never the schedule. Under a length or identity floor only `U <` floor prunes. |
 | J scoring | `segment.rs`, `family_bound.rs` | lossless | The same bounds with each gene one frame, its alleles at offset 0 (sound because J is unbanded); ties in allele order. |
-| V/J keep | `segment.rs` | defined | Keep the top 3 alignments with E ≤ 1 by extended score and the top 3 by local score, each plus ties; trace back until the next local score is below the 3rd extended one, which bounds the 3rd local one from below. No length or identity floor: a positive `(2, −3)` local alignment has identity > 3/5 and the E-value implies a length. |
-| J | `retrieve/exhaustive.rs`, `window.rs` | bounded | Every J allele, unbanded, in `[min V end − 12, read end)` when some V placement is an anchor (E ≤ 10⁻³), or the whole read when none is: a chance V hit on a read without V (one starting in CDR3) no longer pushes the window past the J, and only anchors choose the locus of the J and D candidates. Each locus the anchors choose is searched and kept on its own (top 3 per locus), so on a read holding two chains (an scFv) one chain's J alleles cannot crowd out the other's: on 800 scFv reads, light-chain calls without a J went from 20 to 0, and the BCR and TCR suite sets are unchanged. A J can reach back into V only through chance edge matches. Whole-read J search is 18 % slower and changes a few hard-preset calls (D −0.04 pp, J −0.02 pp), none on mid. The J is not placed jointly with the D, yet it does not "eat" it: the D windows reach 12 bases into J and include the conserved-anchor window, and the DAG orders segments by kind, so a D can precede a J whose alignment reaches back over it and the cuts give any J/D overlap to whichever explains it better. With a D remnant ≥ 8 nt (`examples/d_errors.rs`, human IGH), a missing D whose bases the called J covers is 0.00 % of reads on mid and hard, and a true D outside the windows 0 %; whole-read J lets 0.05 % fall outside. |
-| D windows | `window.rs` | bounded | `[V end − 12, best J start + 12)` plus the conserved-anchor window `[V Cys104 + 3, J Trp/Phe118)`, where V is the best V placement that is an anchor (E ≤ 10⁻³). As for J, a V hit that is not an anchor may be a chance hit downstream of the real D (a read that starts in CDR3), so without an anchor the residual starts at the read's start and there is no anchor window; a V stage without E-value gates bounds D by its best hit. On 1,913 simulated IGH reads that start after V, this called 209 more D alleles correctly (+10.9 pp, none lost) and lowered the D-presence Brier score from 0.109 to 0.005; the frozen suite changed one read. Without a J the residual ends 60 bases after V's end, and without a V it starts 60 bases before J's start: a D lies within its N and its own length of the segment the read has (N1 + D and D + N2 are at most 55 in 99.9 % of simulated IGH junctions). This bounds where a chance D can lie on a read that stops before its J or starts after its V, not how often one is called: `P_D` is priced for 25 junction positions, so 30 random bases after V still give a D in 72 % of such reads, and 100 bases gave one in 93.5 % (97.2 % unbounded); the D lies at most 73 bases from the called V instead of 94. The open-flank cost (§2.3) removes the far ones (100 bases: 6.8 %); the near ones are open problem 2 (§8). When the anchors share no locus (a read holding two chains, as an scFv does), the best V and the first J may belong to different chains, and the window between them holds neither chain's D; each anchored locus with D genes then bounds a window by its own best anchoring V and first J. On 750 simulated heavy-first scFv reads (BCR suite reads joined by a linker), heavy calls with a D went from 412 to 498 and right D calls from 355 to 429; the frozen suite keeps every call. |
+| V/J keep | `segment.rs` | defined | Keep the top 3 alignments with E ≤ 1 by extended score and the top 3 by local score, each plus ties; trace back until the next local score is below the 3rd extended one, which bounds the 3rd local one from below. The stages have no length or identity floor: a positive `(2, −3)` local alignment has identity > 3/5 and the E-value implies a length. The pair guards (§4c) then drop kept V hits under 24 local columns and J hits under 10, which the E-value does not imply on a short window or a truncated read. |
+| J | `retrieve/exhaustive.rs`, `window.rs` | bounded | Every J allele, unbanded, in `[min V end − 12, read end)` when some V placement is an anchor (E ≤ 10⁻³), or the whole read when none is: a chance V hit on a read without V (one starting in CDR3) no longer pushes the window past the J, and only anchors choose the locus of the J and D candidates. Under the pair guards (§4c) the window ends at the last anchoring V's end + 225 + the longest J, since a J that starts further away pairs with none of them: J copies further downstream then take no slot from the read's own J (the cap shortened the window on 0 of 20,000 mid and 2 of 20,000 hard simulated reads), and a J's outer flank is stitched only inside the window. Each locus the anchors choose is searched and kept on its own (top 3 per locus), so on a read holding two chains (an scFv) one chain's J alleles cannot crowd out the other's: on 800 scFv reads, light-chain calls without a J went from 20 to 0, and the BCR and TCR suite sets are unchanged. A J can reach back into V only through chance edge matches. Whole-read J search is 18 % slower and changes a few hard-preset calls (D −0.04 pp, J −0.02 pp), none on mid. The J is searched without regard to the D (its placement, like every segment's, is chosen jointly in the DAG), and it does not "eat" the D: the D windows reach 12 bases into J and include the conserved-anchor window, and the DAG orders segments by kind, so a D can precede a J whose alignment reaches back over it and the cuts give any J/D overlap to whichever explains it better. With a D remnant ≥ 8 nt (`examples/d_errors.rs`, human IGH), a missing D whose bases the called J covers is 0.00 % of reads on mid and hard, and a true D outside the windows 0 %; whole-read J lets 0.05 % fall outside. |
+| D windows | `window.rs` | bounded | `[V end − 12, best J start + 12)` plus the conserved-anchor window `[V Cys104 + 3, J Trp/Phe118)`, where V is the best V placement that is an anchor (E ≤ 10⁻³). As for J, a V hit that is not an anchor may be a chance hit downstream of the real D (a read that starts in CDR3), so without an anchor the residual starts at the read's start and there is no anchor window; a V stage without E-value gates bounds D by its best hit. On 1,913 simulated IGH reads that start after V, this called 209 more D alleles correctly (+10.9 pp, none lost) and lowered the D-presence Brier score from 0.109 to 0.005; the frozen suite changed one read. Under the pair guards (§4c, default since 0.39.4) a D needs a V, so such reads get no D (on 952 mid IGH reads with a D cut where their V ends, 878 right D calls without the guards, none with them); the window still serves reads whose V is short but kept. Without a J the residual ends 60 bases after V's end, and without a V it starts 60 bases before J's start: a D lies within its N and its own length of the segment the read has (N1 + D and D + N2 are at most 55 in 99.9 % of simulated IGH junctions). This bounds where a chance D can lie on a read that stops before its J or starts after its V, not how often one is called: `P_D` is priced for 25 junction positions, so without the pair guards 30 random bases after V still give a D in 72 % of such reads, and 100 bases in 93.5 % (97.2 % unbounded); the D lies at most 73 bases from the called V instead of 94. Under the pair guards (§4c, default) a D needs a V and a J, so such a read gets none unless a chance J completes the path: on 1,000 mid IGH reads cut 30 or 100 random bases after their V, 0.3 and 0.5 % get a D (70.0 and 92.5 % without the guards), and behind 30 or 100 random bases before their J, none (81.0 and 95.9 %). The chance-D rate on full junctions is open problem 2 (§8): an N/P length prior. When the anchors share no locus (a read holding two chains, as an scFv does), the best V and the first J may belong to different chains, and the window between them holds neither chain's D; each anchored locus with D genes then bounds a window by its own best anchoring V and first J. On 750 simulated heavy-first scFv reads (BCR suite reads joined by a linker), heavy calls with a D went from 412 to 498 and right D calls from 355 to 429; the frozen suite keeps every call. |
 | D prefilter | `retrieve/lmer_mask.rs` | lossless w.r.t. gates | Shares ≥ 1 L-mer, with `L` derived from the gates (`min_d_match`; 4 with the optional distributed-D gate, by pigeonhole). |
 | D floor | `config.rs`, `adjudicate/model.rs` | lossless for the call | Only for a fixed-scale call without posteriors (`--no-posterior --calls fixed`): score ≥ max(gate floor, `P_D + 1`). By Lemma 1 a D at or below `P_D` adds ≤ 0, and dropping it leaves its neighbours' cuts valid (exit ≤ entry), so the no-D path is at least as good (requires `ι = 0`, the default). With posteriors every admissible D is kept: a D below the floor cannot be called but carries mass `e^{s − P_D}`, and dropping it would bias `d_presence_posterior` down; a per-read call can call it. With several loci the floor is the lowest `P_D` of a locus that has D genes. |
-| C | `constant.rs`, `retrieve/reach.rs` | exact for `\|δ\| ≤ s` | One anchored job per reach class, window `[x − s − 1, n)`, band `[0, 2s]`; the anchor column makes the local optimum the anchored one. Net indel drift inside C beyond `s ∓ δ` truncates the alignment. |
+| C | `constant.rs`, `retrieve/reach.rs` | exact for `\|δ\| ≤ s` | One anchored job per reach class, window `[x − s − 1, n)`, band `[0, 2s]`, `s = 7`; the anchor column makes the local optimum the anchored one. Net indel drift inside C beyond `s ∓ δ` truncates the alignment. The top 3 classes (and ties) are kept before the 12-column, 90 % floors, so a read whose three best are all below the floors gets no C. |
 | D admission | `admission.rs` | defined | Exact run ≥ `min_d_match` = 4 (3, 5 and 6 are all worse). The note's distributed-evidence alternative is optional and off: it admitted no D that changed a call. |
+| Pair guards | `pipeline.rs` | defined | Hit floors (V ≥ 24, J ≥ 10 local columns), V–J pairing and the 225-base span (§4c). The best path is checked once; only when it breaks a guard are the V, J and per-J paired subsets re-adjudicated, and the call is the best admissible subset optimum. Every admissible path lies in some subset, but a subset whose optimum is inadmissible contributes nothing. |
 
 *Gene frames.* The alleles of a gene are placed in one coordinate system,
 `frame position = allele position + offset`. An allele joins its gene's frame
@@ -876,7 +999,7 @@ indels, and instrument substitutions. The presets are `easy` (no SHM), `mid`
 (IgM-like) and `hard` (IgG-like); half of the reads are reverse-complemented.
 Every read base carries its germline origin. With a C database, 80 % of the
 reads continue through the J–C splice: the 3′ flank becomes a uniformly drawn
-C allele, from the base that follows the J's last base in the reading frame,
+C allele (among those lacking at most 3 of their gene's first bases), from the base that follows the J's last base in the reading frame,
 for the whole flank (60 %) or a uniform part of it, with instrument errors and
 no SHM. Those draws use a random stream of their own, so the reads and the
 truth without C are byte-identical, and with C their V(D)J part is.
@@ -888,7 +1011,10 @@ Metrics (`sim/evaluate.rs`):
 - gene accuracy;
 - boundary error;
 - D presence by remnant length;
-- junction exactness;
+- junction exactness, and its converse: the share of reads without a
+  templated junction (an anchor trimmed away, or no V or J) that are given
+  one anyway (`Evaluation::spurious_junction_rate`, printed by `evaluate`
+  as `spurious`);
 - for reads simulated with C (`simulate --c`), C by the length of the C part
   against **anchored** equivalence: an allele is equivalent when its germline
   from its own splice offset equals the simulated C bases. Containment
@@ -993,3 +1119,15 @@ this objective can do better.
    single `C` is never questioned, so a mutated Cys23 next to a
    mutation-made decoy would give a silent CDR1 error; none occurs in the
    tests or the 13 loci measured.
+5. **The plausibility guards are inherited thresholds.** SwiftIG's 24/10
+   columns, 80/45/30 pairing rule, 225-base span and anchor rule (§4c) are
+   constraints, not terms of the likelihood, and the guarded call is the
+   best of the subset optima that keep them, not an exact maximum over
+   every admissible path. A model of truncated and chimeric reads (a
+   segment's presence given where the read starts and ends, and a switch
+   between templates) would price what the guards forbid. Three measured
+   gaps remain: a V of 30–60 bases before a J of another locus can pair
+   with a J of its own locus that is significant on its own, because J is
+   searched only in the V's locus; a templated junction whose anchor codon
+   is mutated so that the alignment stops before it is not reported; and a
+   read that starts after its V gets no D.

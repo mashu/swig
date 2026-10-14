@@ -77,6 +77,10 @@ pub struct CSegmentConfig {
     pub spread: u32,
     /// Call C iff its anchored E-value is at most this.
     pub evalue: f64,
+    /// Fewest substitution columns and lowest identity of a C placement
+    /// that may be called (SwiftIG's floors, 12 columns and 90 %); a
+    /// placement below them gives way to the next.
+    pub accept: HitAcceptance,
     /// Anchored alignments kept per read. `min_score` is an anchored score;
     /// the stage adds the anchor bonus.
     pub keep: KeepPolicy,
@@ -472,17 +476,26 @@ impl Default for JSegmentConfig {
 }
 
 impl Default for CSegmentConfig {
-    /// The V scoring, so the gate and the posterior read V's λ. `s = 3`:
-    /// reference conventions put C's base 0 within one base of the J exit
-    /// (IMGT CH1 records after the J's last base, codon-aligned records on
-    /// it, 3′-partial J records one base early), and SHM indels near the J's
-    /// 3′ end misplace the exit by up to two more. The gate is the anchor
-    /// gate of [`EvalueGates`]: C is called on its own evidence.
+    /// The V scoring, so the gate and the posterior read V's λ. `s = 7`, as
+    /// SwiftIG (Swig ≤ 0.38) anchored C: reference conventions put C's base
+    /// 0 within one base of the J exit (IMGT CH1 records after the J's last
+    /// base, codon-aligned records on it, 3′-partial J records one base
+    /// early), and the read moves it further: SHM and errors at the J's 3′
+    /// end stop its alignment early, indels near it shift the exit, and C
+    /// records lack up to 6 leading bases of their gene (IGLC1*01,
+    /// IGLC3*01) or carry a few extra. SwiftIG took C's first aligned base
+    /// up to 8 bases after the J and 3 into C. The gate is the anchor gate
+    /// of [`EvalueGates`]: C is called on its own evidence, and on at least
+    /// 12 columns at 90 % identity, SwiftIG's floors.
     fn default() -> Self {
         Self {
             scoring: AffineScoring::new(2, -3, -9, -1),
-            spread: 3,
+            spread: 7,
             evalue: EvalueGates::default().anchor,
+            accept: HitAcceptance {
+                min_subst: 12,
+                min_identity: 0.90,
+            },
             keep: KeepPolicy {
                 top: 3,
                 min_score: 1,
@@ -709,6 +722,14 @@ impl Assigner {
         } else {
             VdjGrammar::VJ
         };
+        // The pair guards' hit floors hold for clipped V and J too.
+        let mut min_retained = config.min_retained;
+        if let Some(guards) = &config.options.guards {
+            for kind in [SegmentKind::V, SegmentKind::J] {
+                let floor = &mut min_retained[kind.index()];
+                *floor = (*floor).max(guards.min_columns(kind));
+            }
+        }
         let strand = StrandIndex::build([&v, &j], StrandIndex::K);
         let objective =
             config
@@ -728,7 +749,7 @@ impl Assigner {
                 posterior: config.posterior.then_some(config.d_allele),
             }
         };
-        let dag = |model| PlacementDag::new(grammar, model, config.min_retained, mode);
+        let dag = |model| PlacementDag::new(grammar, model, min_retained, mode);
         let adjudicator = dag(objective);
         // A V, D or J database of several loci: a read of one locus prices
         // each segment by that locus' genes, leaving out alleles of
@@ -1138,7 +1159,12 @@ mod tests {
                 (mode, Score::MIN)
             };
             assert_eq!((dag.mode(), dag.model), (mode, objective));
-            assert_eq!(dag.min_retained, default.min_retained);
+            // The pair guards raise the V and J floors to theirs.
+            let guards = crate::pipeline::PairGuards::SWIFTIG;
+            let mut retained = default.min_retained;
+            retained[SegmentKind::V.index()] = guards.min_v_columns;
+            retained[SegmentKind::J.index()] = guards.min_j_columns;
+            assert_eq!(dag.min_retained, retained);
             assert_eq!(dag.d_score_floor(), floor);
             let d = assigner.d.as_ref().unwrap();
             assert_eq!(d.keep.min_score, lossless.max(floor));

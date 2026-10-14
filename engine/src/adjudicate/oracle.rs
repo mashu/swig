@@ -561,7 +561,11 @@ fn dag_equals_brute_force_over_all_paths_and_cuts() {
 #[test]
 fn open_flank_dag_equals_exhaustive_enumeration() {
     let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 11);
-    let config = EngineConfig::default();
+    // The placements of the unguarded engine: the pair guards' hit floors
+    // would drop the short V and J that cannot pay for themselves, which
+    // this test feeds the DAG ([`FlankTable::closes`]).
+    let mut config = EngineConfig::default();
+    config.options.guards = None;
     let assigner =
         DefaultAssigner::from_config(&config, db.v.clone(), Some(db.d.clone()), db.j.clone())
             .unwrap();
