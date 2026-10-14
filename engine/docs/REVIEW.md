@@ -32,7 +32,7 @@ items, these are now fixed:
 | 3.1.12 frame ties, σ series, trace memory, BOM and non-UTF-8 input, `--tail`, timing test, floors | fixed (σ as two binomial tails; scores up to 30,000 in lanes with a bound per traceback group) |
 | 4.1–4.3, 4.7, 4.8 | one acceptance mechanism; the adjudication mode as a validated type; the lattice recursion written once; typed notes; one test kit |
 | 4.5 (part) | the tandem-D grammar and the residual path are gone |
-| §0 13 (part) IGHT, IGHZ and IGHO without a locus | every IGH isotype letter names IGH; a custom-named V, J or C takes its relatives' locus (the database's named alleles, else an embedded panel), a custom D the loci with D genes, with a warning asking for `locus=`; C follows the locus the path shares; Swig Web and swig-cli write `locus=` for custom records |
+| §0 13 (part) IGHT, IGHZ and IGHO without a locus | every IGH isotype letter names IGH; a custom-named V, J or C takes its relatives' locus (the database's named alleles, else an embedded panel, which places a J or C only in loci of the database's V), a custom D the loci with D genes, with a warning asking for `locus=`; C follows the locus the path shares; Swig Web and swig-cli write `locus=` for custom records |
 
 The audit's own fixes are listed in the commit log; the README and
 ALGORITHM describe the behaviour they changed. Still open, by priority:

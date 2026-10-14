@@ -430,8 +430,11 @@ found in this order (`locus.rs`, `locus_infer.rs`, `prepare.rs`):
    named alleles of the kind, else an embedded panel of 269 human and mouse
    V, J and C family representatives. A relative must align clearly (a local
    score of at least 30, and 0.3 of the allele's score against itself for
-   the database's alleles, 0.1 for the panel's); every locus within 15 of
-   the best counts;
+   the database's alleles; for the panel's 0.1 for V and C, 0.5 for the
+   short J); every locus within 15 of the best counts. As the panel is of
+   another species for most databases, a J or C it places keeps only the
+   loci of the database's V alleles, and a V it places weakly in TRA alone
+   or TRD alone takes both (the two loci share V genes);
 4. otherwise the loci the database names: a D allele (too short to place by
    sequence) the loci with D genes (IGH in a BCR database, TRB and TRD in a
    TCR one), a V, J or C allele every locus the database names. In a

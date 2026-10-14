@@ -655,3 +655,175 @@ fn a_one_locus_database_of_custom_names_reports_its_locus() {
     let rows: Vec<&str> = lines.map(|l| l.split('\t').nth(locus).unwrap()).collect();
     assert_eq!(rows, ["IGH"; 5]);
 }
+
+/// The records of `tests/data/tcr-other-species.fa` of `kind` (and of
+/// `species`, if given) as FASTA: TCR alleles of species outside the
+/// locus panel (`scripts/build-locus-data.mjs others`). With `custom`, each
+/// label `TR<locus><rest>` becomes `Q<locus>x<rest>_<k>` (`k` its record
+/// number, as some labels recur across species), a name of no locus.
+fn other_species(kind: &str, species: Option<&str>, custom: bool) -> String {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(root.join("tests/data/tcr-other-species.fa")).unwrap();
+    let mut out = String::new();
+    for (k, record) in text.split('>').skip(1).enumerate() {
+        let (header, sequence) = record.split_once('\n').unwrap();
+        let mut fields = header.split(' ');
+        let label = fields.next().unwrap();
+        let attribute = |key: &str| {
+            header
+                .split(' ')
+                .find_map(|f| f.strip_prefix(key)?.strip_prefix('='))
+        };
+        if attribute("kind") != Some(kind)
+            || species.is_some_and(|s| attribute("species") != Some(s))
+        {
+            continue;
+        }
+        let name = if custom {
+            let locus = label[2..3].to_ascii_lowercase();
+            format!("Q{locus}x{}_{k}", &label[3..])
+        } else {
+            label.to_string()
+        };
+        out += &format!(">{name}\n{}", sequence);
+    }
+    out
+}
+
+/// The locus a custom name of [`other_species`] stands for.
+fn true_locus(name: &str) -> Locus {
+    let code = format!("TR{}", name[1..2].to_ascii_uppercase());
+    Locus::from_name(&code).unwrap()
+}
+
+/// TCR alleles of species outside the panel, all custom-named: no V, J or
+/// C is placed outside its own locus, and none in an IG locus, so the loci
+/// the database falls back to are TCR loci too. The cases are those the
+/// panel once misplaced: TRDV5 of rabbit, ferret and sheep and ferret TRAV33
+/// (TRA and TRD share V genes; a relative of another species does not tell
+/// them apart), and short J alleles whose closest panel relatives are of
+/// another locus (TRBJ1-2 of cat, camel and sheep near IGLJ).
+#[test]
+fn custom_tcr_alleles_of_other_species_stay_in_their_own_loci() {
+    let [v, d, j, c] = ["V", "D", "J", "C"].map(|kind| other_species(kind, None, true));
+    let texts = GermlineTexts {
+        v: &v,
+        d: Some(&d),
+        j: &j,
+        c: Some(&c),
+    };
+    let database = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+    let tcr = Loci::parse_list("TRA,TRB,TRD,TRG").unwrap();
+    let mut wrong = Vec::new();
+    for set in [
+        Some(&database.v),
+        database.d.as_ref(),
+        Some(&database.j),
+        database.c.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for allele in set.alleles() {
+            let own = Loci::of(true_locus(&allele.name));
+            if !allele.loci.pairs_with(own) || allele.loci.union(tcr) != tcr {
+                wrong.push(format!("{} {:?}", allele.name, allele.loci));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:?}");
+}
+
+/// A TCR database of a species outside the panel (rabbit), every allele
+/// custom-named: TRA and TRG reads get no D, as with the IMGT names, and
+/// TRD reads keep the D, J and C calls the IMGT names give them, though
+/// their V (rabbit TRDV5) is closest to a human TRAV.
+#[test]
+fn an_all_custom_tcr_database_of_another_species_keeps_every_locus_whole() {
+    let rabbit = Some("Oryctolagus_cuniculus_Thorbecke_inbred");
+    let [v, d, j, c] = ["V", "D", "J", "C"].map(|kind| other_species(kind, rabbit, false));
+    let [cv, cd, cj, cc] = ["V", "D", "J", "C"].map(|kind| other_species(kind, rabbit, true));
+    let assigner = |v: &str, d: &str, j: &str, c: &str| {
+        let texts = GermlineTexts {
+            v,
+            d: Some(d),
+            j,
+            c: Some(c),
+        };
+        let database = PreparedDatabase::from_fasta(texts, AnnotateOptions::default()).unwrap();
+        let config = CallingProfile::ROptimized.config();
+        DefaultAssigner::from_config(&config, database.v, database.d, database.j)
+            .unwrap()
+            .with_constant(database.c.unwrap(), &config.c)
+            .unwrap()
+    };
+    let (named, custom) = (assigner(&v, &d, &j, &c), assigner(&cv, &cd, &cj, &cc));
+    let set = |kind, text: &str| GermlineSet::from_fasta(kind, text).unwrap();
+    let (sv, sd, sj, sc) = (
+        set(SegmentKind::V, &v),
+        set(SegmentKind::D, &d),
+        set(SegmentKind::J, &j),
+        set(SegmentKind::C, &c),
+    );
+    let reads = Simulator::new(&sv, Some(&sd), &sj, SimParams::mid())
+        .unwrap()
+        .with_constant(&sc)
+        .unwrap()
+        .reads(600, 51)
+        .unwrap();
+    // The read's D presence, J and C, as IMGT labels (custom ones mapped
+    // back by their locus letter: `QdxJ1*01_30` → `TRDJ1*01`).
+    let calls = |assigner: &DefaultAssigner, read: &[u8]| {
+        let call = assigner.assign(read, &mut assigner.workspace());
+        let label = |kind, allele| {
+            let name = &assigner.segment(kind).unwrap().set().allele(allele).name;
+            let name = name.split('_').next().unwrap().replace('x', "");
+            match name.strip_prefix('Q') {
+                Some(rest) => format!("TR{}{}", rest[..1].to_ascii_uppercase(), &rest[1..]),
+                None => name,
+            }
+        };
+        let path = call.path.as_ref();
+        let segment = |kind| {
+            path.and_then(|p| {
+                p.segments
+                    .iter()
+                    .map(|s| &call.placements[s.placement])
+                    .find(|p| p.kind == kind)
+            })
+        };
+        (
+            segment(SegmentKind::D).is_some(),
+            segment(SegmentKind::J).map(|p| label(SegmentKind::J, p.primary_allele())),
+            call.c.as_ref().map(|k| {
+                label(
+                    SegmentKind::C,
+                    call.constant[k.segment.placement].primary_allele(),
+                )
+            }),
+        )
+    };
+    let (mut no_d_reads, mut d_on_no_d) = (0, 0);
+    let (mut trd, mut trd_d_same, mut trd_jc_differ) = (0, 0, Vec::new());
+    for read in &reads {
+        let locus = sv.allele(read.v as u32).loci;
+        let sequence = encode(&read.sequence);
+        let got = calls(&custom, &sequence);
+        if locus == Loci::of(Locus::Tra) || locus == Loci::of(Locus::Trg) {
+            no_d_reads += 1;
+            d_on_no_d += usize::from(got.0);
+        } else if locus == Loci::of(Locus::Trd) {
+            trd += 1;
+            let want = calls(&named, &sequence);
+            trd_d_same += usize::from(got.0 == want.0);
+            if (&got.1, &got.2) != (&want.1, &want.2) {
+                trd_jc_differ.push((sv.allele(read.v as u32).name.clone(), got, want));
+            }
+        }
+    }
+    assert!(no_d_reads > 250 && trd > 60, "{no_d_reads} {trd}");
+    assert_eq!(d_on_no_d, 0, "TRA and TRG reads with a D");
+    assert!(trd_jc_differ.is_empty(), "TRD reads: {trd_jc_differ:?}");
+    // D presence differs only on a few chance D of a few bases.
+    assert!(trd_d_same * 100 >= trd * 90, "{trd_d_same} of {trd}");
+}

@@ -14,14 +14,20 @@
 //     whose locus a custom-named allele is inferred from when the database
 //     names none of its relatives (engine/src/locus_infer.rs).
 //
+//   node scripts/build-locus-data.mjs others <pack.json.gz> <out.fa>
+//     TCR alleles of species outside the panel for the engine's tests
+//     (engine/tests/data/tcr-other-species.fa): a subset of the rabbit's
+//     TCR loci, and the V and J alleles of other species that the panel
+//     once placed outside their locus (engine/tests/loci.rs).
+//
 // The pack is only read.
 
 import fs from "node:fs";
 import zlib from "node:zlib";
 
 const [, , mode, packPath, outPath] = process.argv;
-if (!["labels", "panel"].includes(mode) || !packPath || !outPath) {
-  console.error("Usage: node scripts/build-locus-data.mjs labels|panel <pack.json.gz> <out>");
+if (!["labels", "panel", "others"].includes(mode) || !packPath || !outPath) {
+  console.error("Usage: node scripts/build-locus-data.mjs labels|panel|others <pack.json.gz> <out>");
   process.exit(2);
 }
 
@@ -48,6 +54,37 @@ if (mode === "labels") {
     }
   }
   fs.writeFileSync(outPath, `${lines.join("\n")}\n`);
+} else if (mode === "others") {
+  const OTHERS = {
+    "Oryctolagus cuniculus_Thorbecke inbred": "TRAV10*01 TRAV12*01 TRAV13-1*01 TRAV14-1*01 TRAV16*01 TRAV17*01 TRDV1*01 TRDV3*01 TRDV5*01 TRBV1*01 TRBV10*01 TRBV12*01 TRBV13*01 TRGV1-1*01 TRGV2*01 TRBD1*01 TRDD1*01 TRDD2*01 TRAJ10*01 TRAJ11*01 TRAJ12*01 TRAJ13*01 TRAJ14*01 TRAJ15*01 TRBJ1-1*01 TRBJ1-2*01 TRBJ1-3*01 TRBJ1-4*01 TRDJ1*01 TRDJ2*01 TRDJ3*01 TRGJ1*01 TRGJ2*01 TRAC*01 TRBC1*01 TRBC2*01 TRDC*01 TRGC*01",
+    "Mustela putorius furo": "TRAV33*01 TRDV5*01",
+    "Mustela putorius furo_sable": "TRBJ1-5*01",
+    "Ovis aries_Rambouillet": "TRDV5*01",
+    "Ovis aries_Romanov": "TRBJ1-2*01",
+    "Camelus dromedarius": "TRBJ1-2*01",
+    "Felis catus_Abyssinian": "TRBJ1-2*01 TRGJ2-2*01 TRGJ3-2*01",
+    "Oncorhynchus mykiss": "TRBJ3*01",
+  };
+  const out = [];
+  for (const [speciesName, labels] of Object.entries(OTHERS)) {
+    const species = pack.species.find((s) => s.name === speciesName);
+    if (!species) throw new Error(`no ${speciesName} in the pack`);
+    for (const label of labels.split(" ")) {
+      const found = [];
+      for (const locus of LOCI) {
+        for (const kind of KINDS) {
+          for (const record of species.loci[locus]?.[kind] ?? []) {
+            if (record[0] === label) found.push([kind, record[1]]);
+          }
+        }
+      }
+      if (found.length !== 1) throw new Error(`${speciesName} ${label}: ${found.length} records`);
+      const [kind, sequence] = found[0];
+      out.push(`>${label} kind=${kind} species=${speciesName.replace(/[ /]/g, "_")}`);
+      out.push(sequence.toUpperCase().replace(/[^ACGTN]/g, ""));
+    }
+  }
+  fs.writeFileSync(outPath, `${out.join("\n")}\n`);
 } else {
   // The representatives measured in the design (scratchpad design4/locus,
   // "family-representative panel"): per human V family its first allele,

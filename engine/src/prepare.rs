@@ -274,6 +274,15 @@ fn definite_loci(set: &GermlineSet) -> Loci {
         .fold(Loci::NONE, |loci, a| loci.union(a.loci))
 }
 
+/// The loci the panel may place a J or C allele in ([`infer_loci`]): those
+/// of the definite V alleles, or every locus when no V allele is definite.
+fn v_loci(v: &GermlineSet) -> Loci {
+    match definite_loci(v) {
+        Loci::NONE => Loci::ANY,
+        loci => loci,
+    }
+}
+
 /// Give the alleles of `set` of unknown locus ([`LocusSource::Any`]) the
 /// loci the database names, `database` (those of its definite alleles of
 /// every kind): a D allele those of them with D genes, if any. The loci a
@@ -313,10 +322,9 @@ pub fn prepare(
         v = grouped;
     }
     // Alleles whose name places no locus: their relatives' loci, else the
-    // database's.
-    for set in [&mut v, &mut j] {
-        infer_loci(set);
-    }
+    // database's. V first: the panel places a J only in loci of the V.
+    infer_loci(&mut v, Loci::ANY);
+    infer_loci(&mut j, v_loci(&v));
     let database = [Some(&v), d.as_ref(), Some(&j)]
         .into_iter()
         .flatten()
@@ -382,7 +390,7 @@ impl PreparedDatabase {
     /// relatives, else those the database names ([`prepare`]).
     pub fn with_constant(mut self, mut c: GermlineSet) -> Result<Self, DatabaseError> {
         deduplicate(&mut c, &mut self.merged)?;
-        infer_loci(&mut c);
+        infer_loci(&mut c, v_loci(&self.v));
         let database = [Some(&self.v), self.d.as_ref(), Some(&self.j)]
             .into_iter()
             .flatten()

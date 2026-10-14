@@ -290,13 +290,35 @@ settled once per database, in this order:
    the best score `S`, when `S ≥ max(30, 0.3·S_self)` (`S_self = 2·length`).
    Undecided alleles are compared the same way with an embedded panel of
    human and mouse family representatives (122 V, 118 J, 29 C from the IMGT
-   pack) at `S ≥ max(30, 0.1·S_self)`. In the design's leave-one-allele-out
-   test over the pack (unbanded scores), the database rule placed 6,670 of
-   8,027 BCR/TCR V, J and C alleles in their locus or a superset of it,
-   wrongly only 12 of 1,277 TCR J. The panel, on 1,500 V alleles of species
-   outside it, placed 1,385 at the 0.1 floor with none wrong (without the
-   floor all 1,500, one wrong and 142 supersets). The 0.1 floor sits
-   above the 30–40 that unrelated V sequences reach by chance;
+   pack) at `S ≥ max(30, 0.1·S_self)` for V and C and `0.5·S_self` for J.
+   A placement narrows pairing (a light-chain V loses D, a J or C pairs
+   only with V of its loci), and for most databases the panel is of
+   another species, so it is held to what it places reliably: a J or C
+   it places keeps only the loci of the database's V alleles of steps 1–3
+   (none left: step 4), and a V whose best panel relative scores below
+   `0.25·S_self` in TRA alone or TRD alone takes both, as the two loci
+   share V genes. In the design's leave-one-allele-out test over the pack
+   (unbanded scores), the database rule placed 6,670 of 8,027 BCR/TCR V,
+   J and C alleles in their locus or a superset of it, wrongly only 12 of
+   1,277 TCR J. Over all distinct alleles of the pack's species outside
+   the panel (5,846 V, 1,530 J, 491 C; banded scores), the panel places
+   5,254 V (140 with an extra locus, 33 of them by the TRA/TRD rule),
+   1,102 J (39 with an extra locus) and 362 C, none outside its locus.
+   Without the TRA/TRD rule, 4 V lost their locus (TRDV5 of rabbit, ferret
+   and sheep placed in TRA at 0.10–0.14 `S_self`, ferret TRAV33 in TRD at
+   0.22); at a J floor of 0.1, 7 J did (TRBJ1-2 of cat, camel and sheep
+   placed in IGL, cat TRGJ2-2 and TRGJ3-2 in IGH|TRA|TRB, ferret TRBJ1-5
+   and trout TRBJ3 in TRA|TRD), and 74 J were placed across IG and TR. On
+   all-custom TCR databases of rabbit and cat, those placements cost up to
+   12.6 pp of D allele, 2.3 pp of J allele and 2.2 pp of C allele against
+   the IMGT names. On all-custom databases of nine species outside the
+   panel (pig, cow, lemur, chicken BCR, Salmo IGH; cat, dog, naked mole-rat,
+   rabbit TCR; 2,000 simulated reads each) the calls now equal 0.39.3's on
+   J allele and junction, differ from them by at most 1.9 pp of D allele
+   (rabbit: 4 reads with a D of at most 7 nt, McNemar p = 0.13) and 0.3 pp
+   of C allele (dog, p = 0.18), and gain 19–35 pp of no-D accuracy where
+   the database has a locus without D. The 0.1 floor sits above the 30–40
+   that unrelated V sequences reach by chance;
 4. otherwise the loci the database names (steps 1–3, any kind): a D, too
    short for step 3, takes those with D genes. Such an allele stays callable
    in each of its loci but counts in no locus' gene numbers when the locus
