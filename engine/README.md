@@ -14,7 +14,7 @@ instead of tuned patches. Every component is a replaceable, statically
 dispatched trait, and every search shortcut is either lossless or measured
 on simulated repertoires.
 
-The crate and binary are `swig` 0.39.4. The workspace member `wasm/` (crate
+The crate and binary are `swig` 0.39.5. The workspace member `wasm/` (crate
 `swig_wasm`) is the WebAssembly module. There are no dependencies; Rust ≥
 1.89, edition 2024. The alignment kernel runs on AVX-512BW, AVX2, NEON,
 WebAssembly SIMD or portable lanes, chosen at run time (on WebAssembly, at
