@@ -8,8 +8,9 @@ use std::collections::{HashMap, HashSet};
 use super::decode::{Topology, Within};
 use super::units::{Columns, Flank, FlankTable, ReadContext, ReadModel};
 use super::{
-    Adjudicator, CallModel, CalledSegment, DagScratch, EngineeringObjective, EvidenceModel,
-    Grammar, Mode, PathModel, PathScore, PlacementDag, Units, VdjGrammar, divergence,
+    Adjudicator, CallModel, CallPath, CalledSegment, DagScratch, EngineeringObjective,
+    EvidenceModel, Grammar, Mode, PathModel, PathScore, PlacementDag, Units, VdjGrammar,
+    divergence,
 };
 use crate::alphabet::encode;
 use crate::config::{DefaultAssigner, EngineConfig};
@@ -681,4 +682,271 @@ fn open_flank_dag_equals_exhaustive_enumeration() {
         checked >= 600 && charged >= 50 && differs >= 20 && blocked >= 20,
         "{checked} optima, {charged} charged, {differs} changed by the cost, {blocked} blocking"
     );
+}
+
+/// Reads of the shapes the pair guards and the open-flank cost act on:
+/// whole, cut two bases after their D (V–D), from ten bases before their D
+/// (D–J), a V followed by 100 random bases, 100 random bases followed by a
+/// J, and a V and D with their J beyond the junction span.
+fn guarded_fixtures(db: &SyntheticDatabase) -> Vec<Vec<u8>> {
+    use crate::sim::Region;
+    let mut rng = crate::sim::Rng::new(41);
+    let mut reads = Vec::new();
+    for (preset, seed) in [(SimParams::mid(), 43), (SimParams::hard(), 44)] {
+        let sim = Simulator::new(&db.v, Some(&db.d), &db.j, preset).unwrap();
+        for read in sim.reads(40, seed).unwrap() {
+            let f = &read.forward;
+            let (Some(v), Some(d), Some(j)) = (
+                read.span(Region::V),
+                read.span(Region::D),
+                read.span(Region::J),
+            ) else {
+                continue;
+            };
+            reads.push(f.clone());
+            reads.push(f[..(d.end + 2).min(f.len())].to_vec());
+            reads.push(f[d.start.saturating_sub(10)..].to_vec());
+            reads.push([&f[..v.end], &rng.bases(100)[..]].concat());
+            reads.push([&rng.bases(100)[..], &f[j.start..]].concat());
+            let gap = 230usize.saturating_sub(d.end - v.end);
+            reads.push([&f[..d.end], &rng.bases(gap)[..], &f[j.start..]].concat());
+        }
+    }
+    reads
+}
+
+/// The pair guards with the open-flank cost, under both call models with
+/// posteriors: on every read of [`guarded_fixtures`],
+/// * the call keeps the guards (a D beside a V or a J at the read's open
+///   end is allowed and charged);
+/// * the call's key re-scores, on all the read's placements and in the
+///   read's context, to the exhaustive oracle's value of its path, and its
+///   fixed score is the oracle's fixed-scale value: the DAG, the oracle and
+///   `path_score` agree on the guarded call;
+/// * it never beats the unguarded optimum, and equals it when that keeps
+///   the guards; otherwise it is the best of the guard subsets' optima
+///   (each the DAG's and the exhaustive search's alike) that hold an
+///   anchor and keep the guards, the earlier subset on an exact tie;
+/// * its posterior is the forward–backward pass over the subset that gave
+///   the call, in the same context, so that under the per-read model the
+///   call is a mode of the reported distribution.
+#[test]
+fn guarded_calls_with_open_flanks_equal_the_exhaustive_subset_optima() {
+    let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 11);
+    let reads = guarded_fixtures(&db);
+    let mut posterior = super::PosteriorScratch::default();
+    let mut scratch = DagScratch::default();
+    let (mut table, mut fixed_table) = (FlankTable::default(), FlankTable::default());
+    for calls in [CallModel::PerRead, CallModel::FixedScale] {
+        let config = EngineConfig {
+            calls,
+            ..EngineConfig::default()
+        };
+        let assigner =
+            DefaultAssigner::from_config(&config, db.v.clone(), Some(db.d.clone()), db.j.clone())
+                .unwrap();
+        let dag = &assigner.adjudicator;
+        let flank = dag.model.open_flank;
+        assert!(flank.is_some() && dag.charges_open_flank());
+        let mut ws = assigner.workspace();
+        let (mut fallbacks, mut open_ends, mut open_subsets) = (0, 0, 0);
+        for read in &reads {
+            let call = assigner.assign(&encode(read), &mut ws);
+            let placed = &call.placements;
+            let (query, path) = (&call.query, call.path.as_ref());
+            let (subsets, keeps) = assigner.guard_check(query, placed, path);
+            assert!(keeps, "the call breaks the guards");
+            let Some(path) = path else {
+                continue;
+            };
+            let context = ReadContext::of(placed, query.len() as u32);
+            assert_eq!(path.context, context);
+            let read_model = dag.read_model(context.divergence);
+            let fill = |table: &mut FlankTable,
+                        model: &ReadModel,
+                        calls: CallModel,
+                        placements: &[Placement]| {
+                table.fill(
+                    flank.as_ref(),
+                    dag.model.presence,
+                    model,
+                    calls,
+                    &context,
+                    placements,
+                );
+            };
+            // The call's value and fixed score, re-scored on every placement.
+            fill(&mut table, &read_model, calls, placed);
+            let mut all = Brute::new(dag, placed, read_model, &table);
+            assert_eq!(all.rescore(&path.segments), path.value.score);
+            let unguarded = all.best().expect("a call has a path");
+            assert!(path.value <= unguarded);
+            fill(&mut fixed_table, &fixed(dag), CallModel::FixedScale, placed);
+            let oracle = Brute::new(dag, placed, fixed(dag), &fixed_table).rescore(&path.segments);
+            assert_eq!(Units::from(path.score.score), oracle);
+            let kind = |s: &CalledSegment| placed[s.placement].kind;
+            let (first, last) = (kind(&path.segments[0]), kind(path.segments.last().unwrap()));
+            let open = (first == SegmentKind::D) || (last == SegmentKind::D);
+            open_ends += usize::from(open);
+            // Which subset the call came from: all placements when their
+            // optimum keeps the guards, else the best of the guard subsets.
+            let traced =
+                dag.viterbi(placed, &read_model, &table, &mut scratch)
+                    .map(|(value, segments)| CallPath {
+                        score: dag.path_score(placed, &segments, &table),
+                        segments,
+                        value,
+                        context,
+                        model: calls,
+                    });
+            let (_, all_keep) = assigner.guard_check(query, placed, traced.as_ref());
+            let anchored = |placements: &[Placement], segments: &[CalledSegment]| {
+                segments
+                    .iter()
+                    .any(|s| placements[s.placement].anchors(&s.span))
+            };
+            let chosen: Vec<usize> = if all_keep
+                && traced
+                    .as_ref()
+                    .is_some_and(|t| anchored(placed, &t.segments))
+            {
+                assert_eq!(traced.as_ref().unwrap().value, path.value);
+                (0..placed.len()).collect()
+            } else {
+                fallbacks += 1;
+                let mut best: Option<(usize, PathScore<Units>)> = None;
+                for (k, ids) in subsets.iter().enumerate() {
+                    let subset: Vec<Placement> = ids.iter().map(|&i| placed[i].clone()).collect();
+                    fill(&mut table, &read_model, calls, &subset);
+                    let (fast, exhaustive) =
+                        dag_and_brute_with(dag, &subset, read_model, &table, &mut scratch);
+                    assert_eq!(fast, exhaustive, "subset {ids:?}");
+                    let Some((value, segments)) =
+                        dag.viterbi(&subset, &read_model, &table, &mut scratch)
+                    else {
+                        continue;
+                    };
+                    let candidate = CallPath {
+                        score: dag.path_score(&subset, &segments, &table),
+                        segments,
+                        value,
+                        context,
+                        model: calls,
+                    };
+                    if !anchored(&subset, &candidate.segments)
+                        || !assigner.guard_check(query, &subset, Some(&candidate)).1
+                    {
+                        continue;
+                    }
+                    if best.is_none_or(|(_, b)| value > b) {
+                        best = Some((k, value));
+                    }
+                }
+                let (k, value) = best.expect("the call is a subset optimum");
+                assert_eq!(value, path.value);
+                // Only the open-end subsets hold a D without both a V and a J.
+                let has = |kind| subsets[k].iter().any(|&i| placed[i].kind == kind);
+                open_subsets += usize::from(
+                    has(SegmentKind::D) && !(has(SegmentKind::V) && has(SegmentKind::J)),
+                );
+                subsets[k].clone()
+            };
+            // The reported posterior is the chosen subset's.
+            let subset: Vec<Placement> = chosen.iter().map(|&i| placed[i].clone()).collect();
+            fill(&mut table, &read_model, calls, &subset);
+            let nats = dag.nats(context.divergence).expect("posteriors are on");
+            let expected = dag
+                .posterior(&subset, &nats, &table, &mut posterior)
+                .expect("the subset has a path");
+            let reported = call.marginals.as_ref().expect("posteriors are on");
+            let mut mapped = vec![0.0; placed.len()];
+            for (&id, &p) in chosen.iter().zip(&expected.placement) {
+                mapped[id] = p;
+            }
+            for (a, b) in reported.placement.iter().zip(&mapped) {
+                assert!((a - b).abs() <= 1e-12, "{a} != {b}");
+            }
+            assert_eq!(reported.d_count.len(), expected.d_count.len());
+            for (a, b) in reported.d_count.iter().zip(&expected.d_count) {
+                assert!((a - b).abs() <= 1e-12, "{a} != {b}");
+            }
+        }
+        assert!(
+            fallbacks >= 40 && open_ends >= 100 && open_subsets >= 5,
+            "{calls:?}: {fallbacks} fallbacks, {open_ends} open-ended calls, \
+             {open_subsets} from an open-end subset"
+        );
+    }
+}
+
+/// The two switches of [`guarded_calls_with_open_flanks_equal_the_exhaustive_subset_optima`]:
+/// without the open-flank cost a D is called only between a V and a J
+/// (Swig 0.39.4's rule), and without the pair guards the call is the
+/// exhaustive optimum over every placement, the cost included.
+#[test]
+fn without_the_cost_or_the_guards() {
+    let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 11);
+    let reads = guarded_fixtures(&db);
+    let mut table = FlankTable::default();
+    for calls in [CallModel::PerRead, CallModel::FixedScale] {
+        let mut closed = EngineConfig {
+            calls,
+            ..EngineConfig::default()
+        };
+        closed.objective.open_flank = None;
+        let mut free = EngineConfig {
+            calls,
+            ..EngineConfig::default()
+        };
+        free.options.guards = None;
+        let build = |config: &EngineConfig| {
+            DefaultAssigner::from_config(config, db.v.clone(), Some(db.d.clone()), db.j.clone())
+                .unwrap()
+        };
+        let (closed, free) = (build(&closed), build(&free));
+        assert!(!closed.adjudicator.charges_open_flank());
+        let (mut ws, mut free_ws) = (closed.workspace(), free.workspace());
+        let (mut with_d, mut open_ends) = (0, 0);
+        for read in &reads {
+            let call = closed.assign(&encode(read), &mut ws);
+            if let Some(path) = &call.path {
+                let kinds: Vec<SegmentKind> = path
+                    .segments
+                    .iter()
+                    .map(|s| call.placements[s.placement].kind)
+                    .collect();
+                if kinds.contains(&SegmentKind::D) {
+                    with_d += 1;
+                    assert_eq!(kinds.first(), Some(&SegmentKind::V));
+                    assert_eq!(kinds.last(), Some(&SegmentKind::J));
+                }
+            }
+            let call = free.assign(&encode(read), &mut free_ws);
+            let Some(path) = &call.path else {
+                continue;
+            };
+            let dag = &free.adjudicator;
+            let context = ReadContext::of(&call.placements, call.query.len() as u32);
+            let model = dag.read_model(context.divergence);
+            table.fill(
+                dag.model.open_flank.as_ref(),
+                dag.model.presence,
+                &model,
+                calls,
+                &context,
+                &call.placements,
+            );
+            let best = Brute::new(dag, &call.placements, model, &table).best();
+            assert_eq!(best, Some(path.value));
+            let kind = |s: &CalledSegment| call.placements[s.placement].kind;
+            open_ends += usize::from(
+                kind(&path.segments[0]) == SegmentKind::D
+                    || kind(path.segments.last().unwrap()) == SegmentKind::D,
+            );
+        }
+        assert!(
+            with_d >= 50 && open_ends >= 100,
+            "{with_d} D calls, {open_ends} open ends"
+        );
+    }
 }

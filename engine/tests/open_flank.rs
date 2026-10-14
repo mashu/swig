@@ -1,6 +1,7 @@
 //! Chance D on reads without one: a D that ends its path (no J after it)
 //! or starts it (no V before it) pays for the J (V) its read would show
-//! beyond it ([`swig::config::OpenFlank`]). Reads of a full V followed by
+//! beyond it ([`swig::config::OpenFlank`]), and the pair guards let it be
+//! called ([`swig::pipeline::PairGuards`]). Reads of a full V followed by
 //! random sequence, or random sequence followed by a J, get no D; reads
 //! whose real D sits near their end keep it.
 
@@ -151,8 +152,9 @@ fn a_full_v_followed_by_random_bases_gets_no_d() {
 
 /// (b) 100 random bases followed by a J (and its C): a chance D first on
 /// its path would assert a junction whose V the read does not show. Swig
-/// 0.39.3 calls a D on all 100 reads at mean presence 0.99; the cost on 14,
-/// at 0.41. The V side prices less than the J side: the read's only anchor
+/// 0.39.3 calls a D on all 100 reads at mean presence 0.99; the cost on 16,
+/// at 0.40 (14 without the pair guards: on two reads a chance V of the
+/// random bases, which the guards drop, took the call from the D). The V side prices less than the J side: the read's only anchor
 /// is its J, whose few columns leave the V's divergence uncertain, and a V
 /// stays hidden in more bases than a J (on human IGH 12 against 8: accept
 /// scores 24 and 16, as measured on reads cut inside them). This bound is
@@ -164,7 +166,7 @@ fn random_bases_followed_by_a_j_get_few_ds() {
     let reads = random_then_j(&simulated(&db, SimParams::mid(), 100, 12), 102);
     let (called, presence) = summary(&d_calls(&v, &d, &j, &RunOptions::default(), &reads));
     assert!(
-        called <= 15 && presence < 0.45,
+        called <= 16 && presence < 0.45,
         "{called} D calls, mean presence {presence:.3}"
     );
 }
@@ -185,7 +187,9 @@ fn a_full_v_followed_by_random_bases_gets_no_d_in_a_bcr_database() {
 
 /// (d) Fixture (a) under `--calls fixed`: the fixed scale charges the cost
 /// as `⌊P*_D + c/λ_D⌋ − ⌊P*_D⌋` score units, its posterior `c` nats. Swig
-/// 0.39.3: 55 D calls at mean presence 0.62; the cost: 8, at 0.17.
+/// 0.39.3: 55 D calls at mean presence 0.62; the cost: 4, at 0.22 (8 at
+/// 0.17 without the pair guards: a read whose best path pairs its V with a
+/// chance J falls back to its V–D path, whose posterior holds no J).
 #[test]
 fn a_full_v_followed_by_random_bases_gets_no_d_on_the_fixed_scale() {
     let db = heavy();
@@ -195,7 +199,7 @@ fn a_full_v_followed_by_random_bases_gets_no_d_on_the_fixed_scale() {
     options.set("calls", Some("fixed")).unwrap();
     let (called, presence) = summary(&d_calls(&v, &d, &j, &options, &reads));
     assert!(
-        called <= 10 && presence < 0.2,
+        called <= 10 && presence < 0.25,
         "{called} D calls, mean presence {presence:.3}"
     );
 }
@@ -251,7 +255,10 @@ fn guard_a_read_starting_just_before_its_d_keeps_it() {
 /// divergence of the read's V, at which those bases could well hide a J,
 /// so the D pays little. A model that took the read for unmutated drops 5
 /// of these D calls. The reference is the same run with
-/// `--d-open-flank off`, which reproduces Swig 0.39.3.
+/// `--d-open-flank off --no-pair-guards`, which gives Swig 0.39.3's calls
+/// (114 D calls, 51 right; the cost: 115, 51). With `--d-open-flank off`
+/// alone, Swig 0.39.4's rule, a D needs a J the V pairs with, and these
+/// reads keep 81 (37 right).
 #[test]
 fn guard_a_mutated_read_ending_in_a_short_j_keeps_its_d() {
     let db = heavy();
@@ -283,11 +290,14 @@ fn guard_a_mutated_read_ending_in_a_short_j_keeps_its_d() {
     };
     let mut off = RunOptions::default();
     off.set("d-open-flank", Some("off")).unwrap();
-    // 114 D calls, 51 of them right, as with the cost (52).
+    let mut free = off.clone();
+    free.set("no-pair-guards", None).unwrap();
     let (called_off, correct_off) = calls(&off);
+    let (called_free, correct_free) = calls(&free);
     let (called, correct) = calls(&RunOptions::default());
     assert!(
-        called + 1 >= called_off && correct + 1 >= correct_off,
-        "{called} D calls ({correct} right), off: {called_off} ({correct_off})"
+        called + 1 >= called_free && correct + 1 >= correct_free,
+        "{called} D calls ({correct} right), unguarded without the cost: {called_free} ({correct_free})"
     );
+    assert!(called > called_off && correct > correct_off);
 }

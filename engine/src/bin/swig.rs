@@ -89,8 +89,10 @@ options:
                        when it faces its junction (V within 45 nt of its 3' end, J
                        within 30 of its 5' start, >= 80 columns together), holds a
                        long split (V >= 80, J >= 30) or aligns both anchors in order,
-                       with <= 225 nt between V and J; D only between a V and a J;
-                       a junction only from aligned anchors, Cys-W/F <= 231 nt
+                       with <= 225 nt between V and J; a D only between a V and a
+                       J, or beside one at the read's open end where it pays the
+                       open-flank cost (--d-open-flank); a junction only from
+                       aligned anchors, Cys-W/F <= 231 nt
   --calls MODEL        the model the call maximises: per-read (each read's own, the
                        model its posteriors come from) | fixed (the (2, -3) scores)
   --d-allele RULE      the reported D allele: map (the call's) | max-marginal (largest
@@ -100,8 +102,9 @@ options:
                        offsets x positions) at D-presence rate R, 0 < R < 1, instead
                        of genes x positions at even odds (docs/ALGORITHM.md 2.3)
   --d-open-flank on|off  charge a D that ends (starts) its path for the J (V) the
-                       read would show in the bases after (before) it (default on;
-                       docs/ALGORITHM.md 2.3)
+                       read would show in the bases after (before) it, and call such
+                       a D under the pair guards (default on; off: a D only between
+                       a V and a J, as in 0.39.4; docs/ALGORITHM.md 2.3)
   --min-d-match N      shortest exact run of an admissible D (default: the profile's)
   --d-mismatch S       D mismatch score, -1000 to -1 (default: the profile's)
   --j-mismatch S       J mismatch score, -1000 to -1 (default: the profile's)

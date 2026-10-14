@@ -160,17 +160,24 @@ impl Default for AssignerOptions {
 ///   over every locus never paired.
 /// * **Junction span.** At most `max_junction_span` read bases lie between
 ///   the V's end and the J's start (`max_junction_span`).
-/// * **D only in a rearrangement.** A call holds a D only with a V before it
-///   and a J after it. The best path is found without that rule, so a D
-///   never draws in a chance J (or V) to keep its place; a read whose best
-///   path holds a D without its V or J gets its V or J alone.
+/// * **D only beside a V or a J it can be charged for.** Without the
+///   open-flank cost (`--d-open-flank off`) a call holds a D only with a V
+///   before it and a J after it, as in SwiftIG. With it (the default), a D
+///   may also end its path (no J after it) or start it (no V before it),
+///   paying for the J or V the read would show beyond it
+///   ([`crate::config::OpenFlank`]); a path of a D alone is never a call.
+///   The best path is found without that rule, so a D never draws in a
+///   chance J (or V) to keep its place: a read whose best path holds a D
+///   and a V and a J that do not pair gets the best of its V alone, its J
+///   alone, a pair that passes, and its V–D or D–J path.
 /// * **Split segments stay viable.** Where the path clips a V or J, the
 ///   part of its local alignment it keeps scores above 0 and meets the
 ///   identity floor (`--min-identity`).
 ///
 /// When the best path breaks a guard, the call is the best path among those
 /// that keep them: the V alone, the J alone, or a V–J pair that passes
-/// (with its D), as in SwiftIG. A chimeric read, a V fragment that stops
+/// (with its D), as in SwiftIG, or, under the open-flank cost, a V–D or
+/// D–J path. A chimeric read, a V fragment that stops
 /// short of its 3′ end, a J aligned only deep inside, or a V and J hundreds
 /// of bases apart then keeps its better segment instead of becoming a
 /// rearrangement. The junction itself is reported only from anchors
@@ -396,12 +403,17 @@ impl<A, RV, RJ, RD, W, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj> {
     /// Whether `path` over `placed` (on `query`) keeps the pair guards:
     /// each of its V and J keeps a positive score and the identity floor
     /// where the path clips it, as SwiftIG required of a split V and J; a D
-    /// has a V and a J; and its V and J (when it has both) pair, with at
-    /// most `max_junction_span` read bases between the V's exit and the J's
+    /// has a V and a J, or, when `open_d` (the adjudicator charges the
+    /// open-flank cost, [`Adjudicator::charges_open_flank`]), at least one
+    /// of them: a D may then end the path (no J after it) or start it (no
+    /// V before it) and pays for the J or V the read would show beyond it;
+    /// and its V and J (when it has both) pair, with at most
+    /// `max_junction_span` read bases between the V's exit and the J's
     /// entry.
     fn keeps_guards(
         &self,
         guards: &PairGuards,
+        open_d: bool,
         query: &[u8],
         placed: &[Placement],
         path: &CallPath,
@@ -446,7 +458,9 @@ impl<A, RV, RJ, RD, W, Adm, Adj> Assigner<A, RV, RJ, RD, W, Adm, Adj> {
             .any(|s| placed[s.placement].kind == SegmentKind::D);
         let of = |kind: SegmentKind| flanks.clone().find(|s| placed[s.placement].kind == kind);
         let (Some(v), Some(j)) = (of(SegmentKind::V), of(SegmentKind::J)) else {
-            return !has_d;
+            // A D at the open end of its path: allowed only where it pays
+            // the open-flank cost, and only beside a V or a J.
+            return !has_d || (open_d && flanks.clone().next().is_some());
         };
         j.span.q_lo.saturating_sub(v.span.q_hi) <= guards.max_junction_span
             && self.pairs(guards, &placed[v.placement], &placed[j.placement])
@@ -901,32 +915,18 @@ where
         (Some(path), marginals)
     }
 
-    /// The call of `placed` ([`Self::adjudicate_unguarded`]) under the pair
-    /// guards ([`PairGuards`]). When the best path breaks them, the call is
-    /// the best path that keeps them, of the V placements alone, the J
-    /// placements alone, or, for each J placement, the V placements that
-    /// pair with it, with every D placement and without: SwiftIG's pairs and
-    /// its V-only or J-only fallback. All are read in the same context
-    /// ([`ReadContext`]: the read's divergence, length and anchored
-    /// columns), so they compare by [`CallPath::value`]; an exact tie keeps
-    /// the earlier subset. The marginals are those of the subset that gives
-    /// the call. A read whose best path keeps the guards pays one check.
-    fn adjudicate_read(
+    /// The placement subsets whose optima are the candidates of a call that
+    /// breaks the pair guards ([`Self::adjudicate_read`]), as ids into
+    /// `placed`, in order of preference on an exact tie: the V placements,
+    /// the J placements, for each J the V placements that pair with it with
+    /// every D and without, and, when `open_d`, the V placements with every
+    /// D and every D with the J placements.
+    fn guard_subsets(
         &self,
-        adjudicator: &Adj,
-        query: &[u8],
+        guards: &PairGuards,
+        open_d: bool,
         placed: &[Placement],
-        context: &ReadContext,
-        scratch: &mut Adj::Scratch,
-    ) -> (Option<CallPath>, Option<Marginals>) {
-        let found = self.adjudicate_unguarded(adjudicator, query, placed, context, scratch);
-        let Some(guards) = &self.options.guards else {
-            return found;
-        };
-        match &found.0 {
-            Some(path) if !self.keeps_guards(guards, query, placed, path) => {}
-            _ => return found,
-        }
+    ) -> Vec<Vec<usize>> {
         let of = |kind: SegmentKind| -> Vec<usize> {
             (0..placed.len())
                 .filter(|&i| placed[i].kind == kind)
@@ -953,15 +953,82 @@ where
                 subsets.push(pair);
             }
         }
+        // A D at the open end, after the V or before the J: last, so that
+        // an exact tie keeps SwiftIG's subsets.
+        if open_d && !ds.is_empty() {
+            for flank in [&vs, &js] {
+                if !flank.is_empty() {
+                    let mut open = flank.clone();
+                    open.extend(&ds);
+                    open.sort_unstable();
+                    subsets.push(open);
+                }
+            }
+        }
+        subsets.retain(|ids| !ids.is_empty());
+        subsets
+    }
+
+    /// [`Self::guard_subsets`] and [`Self::keeps_guards`] for the oracle
+    /// tests, under the assigner's guards and with the cost of its
+    /// single-locus adjudicator.
+    #[cfg(test)]
+    pub(crate) fn guard_check(
+        &self,
+        query: &[u8],
+        placed: &[Placement],
+        path: Option<&CallPath>,
+    ) -> (Vec<Vec<usize>>, bool) {
+        let guards = self.options.guards.expect("guarded assigner");
+        let open_d = self.adjudicator.charges_open_flank();
+        (
+            self.guard_subsets(&guards, open_d, placed),
+            path.is_none_or(|path| self.keeps_guards(&guards, open_d, query, placed, path)),
+        )
+    }
+
+    /// The call of `placed` ([`Self::adjudicate_unguarded`]) under the pair
+    /// guards ([`PairGuards`]). When the best path breaks them, the call is
+    /// the best path that keeps them, of the V placements alone, the J
+    /// placements alone, or, for each J placement, the V placements that
+    /// pair with it, with every D placement and without: SwiftIG's pairs and
+    /// its V-only or J-only fallback. When the adjudicator charges the
+    /// open-flank cost ([`Adjudicator::charges_open_flank`]), the V
+    /// placements with every D, and every D with the J placements, are
+    /// candidates too: a D at the open end of a read that holds no J (no V)
+    /// the V (J) pairs with is called and pays for the J (V) it lacks. All
+    /// are read in the same context ([`ReadContext`]: the read's divergence,
+    /// length and anchored columns), so they compare by
+    /// [`CallPath::value`]; an exact tie keeps the earlier subset. The
+    /// marginals are those of the subset that gives the call. A read whose
+    /// best path keeps the guards pays one check.
+    fn adjudicate_read(
+        &self,
+        adjudicator: &Adj,
+        query: &[u8],
+        placed: &[Placement],
+        context: &ReadContext,
+        scratch: &mut Adj::Scratch,
+    ) -> (Option<CallPath>, Option<Marginals>) {
+        let found = self.adjudicate_unguarded(adjudicator, query, placed, context, scratch);
+        let Some(guards) = &self.options.guards else {
+            return found;
+        };
+        let open_d = adjudicator.charges_open_flank();
+        match &found.0 {
+            Some(path) if !self.keeps_guards(guards, open_d, query, placed, path) => {}
+            _ => return found,
+        }
+        let subsets = self.guard_subsets(guards, open_d, placed);
         let mut best: Option<(Vec<usize>, CallPath, Option<Marginals>)> = None;
-        for ids in subsets.into_iter().filter(|ids| !ids.is_empty()) {
+        for ids in subsets {
             let subset: Vec<Placement> = ids.iter().map(|&i| placed[i].clone()).collect();
             let (Some(path), marginals) =
                 self.adjudicate_unguarded(adjudicator, query, &subset, context, scratch)
             else {
                 continue;
             };
-            if !self.keeps_guards(guards, query, &subset, &path) {
+            if !self.keeps_guards(guards, open_d, query, &subset, &path) {
                 continue;
             }
             if best.as_ref().is_none_or(|(_, b, _)| path.value > b.value) {

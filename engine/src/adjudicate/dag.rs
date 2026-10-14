@@ -612,7 +612,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
     }
 
     /// The model a call at divergence `p` maximises.
-    fn read_model(&self, p: f64) -> ReadModel {
+    pub(super) fn read_model(&self, p: f64) -> ReadModel {
         match self.mode {
             Mode::Read {
                 evidence,
@@ -628,7 +628,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
 
     /// The posterior's model at divergence `p`, when the DAG reports
     /// posteriors: the call's own under [`CallModel::PerRead`].
-    fn nats(&self, p: f64) -> Option<PathNats> {
+    pub(super) fn nats(&self, p: f64) -> Option<PathNats> {
         let Mode::Read {
             evidence,
             calls,
@@ -699,6 +699,10 @@ impl<G: Grammar, M: PathModel> Adjudicator for PlacementDag<G, M> {
             } => Score::MIN,
             _ => self.model.d_floor(),
         }
+    }
+
+    fn charges_open_flank(&self) -> bool {
+        self.model.open_flank().is_some()
     }
 
     /// Under [`DAlleleDecoding::MaxMarginal`], a call with one D whose

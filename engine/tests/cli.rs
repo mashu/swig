@@ -363,30 +363,46 @@ fn d_column(tsv: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// FNV-1a of Swig 0.39.3's AIRR rows on [`v_then_random`].
-const FNV_0393: u64 = 0x9186_e1b9_be7f_d846;
+/// FNV-1a of Swig 0.39.4's AIRR rows on [`v_then_random`].
+const FNV_0394: u64 = 0x1b56_f1c2_c83c_b824;
+/// FNV-1a of Swig 0.39.4's AIRR rows on the 200 reads of `simulate
+/// --reads 200 --seed 5 --preset mid` on this database.
+const FNV_0394_SIMULATED: u64 = 0x78d7_5831_88a5_a108;
 
-/// (e) `--d-open-flank off` turns the open-flank cost off and gives Swig
-/// 0.39.3's rows on fixture (a), byte for byte: a chance D on all 20
-/// reads, where the cost leaves 2.
+/// (e) `--d-open-flank off` turns the open-flank cost off and, with it, the
+/// D at a read's open end: a D is then called only between a V and a J that
+/// pair, and the rows are Swig 0.39.4's, byte for byte, on fixture (a) and
+/// on simulated full-length reads. On fixture (a) Swig 0.39.3 called a
+/// chance D on all 20 reads, 0.39.4 on none; the cost leaves 1. The
+/// full-length reads show a V and a J, and the cost changes none of them.
 #[test]
 fn the_open_flank_cost_can_be_turned_off() {
     let dir = workspace("open-flank");
     fs::write(dir.join("reads.fa"), v_then_random()).unwrap();
-    let call = |extra: &[&str]| {
+    let simulate = [
+        "--out", "sim", "--reads", "200", "--seed", "5", "--preset", "mid",
+    ];
+    let output = run(&dir, &[&["simulate"], &GERMLINES[..], &simulate].concat());
+    assert!(output.status.success(), "{}", stderr(&output));
+    let call = |extra: &[&str], reads: &str| {
         let mut args = GERMLINES.to_vec();
         args.extend_from_slice(extra);
-        args.push("reads.fa");
+        args.push(reads);
         let output = run(&dir, &args);
         assert!(output.status.success(), "{}", stderr(&output));
         output.stdout
     };
-    let (on, off) = (call(&[]), call(&["--d-open-flank", "off"]));
-    // Swig 0.39.3's output on these reads.
-    assert_eq!(fnv(&off), FNV_0393);
+    let (on, off) = (
+        call(&[], "reads.fa"),
+        call(&["--d-open-flank", "off"], "reads.fa"),
+    );
+    assert_eq!(fnv(&off), FNV_0394);
     let count = |tsv: &[u8]| d_column(tsv).iter().filter(|d| !d.is_empty()).count();
-    assert_eq!((count(&on), count(&off)), (2, 20));
-    assert_eq!(call(&["--d-open-flank", "on"]), on);
+    assert_eq!((count(&on), count(&off)), (1, 0));
+    assert_eq!(call(&["--d-open-flank", "on"], "reads.fa"), on);
+    let off = call(&["--d-open-flank", "off"], "sim.fasta");
+    assert_eq!(fnv(&off), FNV_0394_SIMULATED);
+    assert_eq!(call(&[], "sim.fasta"), off);
     let bad = run(&dir, &["--d-open-flank", "maybe", "reads.fa"]);
     assert_eq!(bad.status.code(), Some(2));
     assert!(

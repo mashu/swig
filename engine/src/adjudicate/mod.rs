@@ -148,6 +148,15 @@ pub trait Adjudicator: Send + Sync {
         Score::MIN
     }
 
+    /// Whether a path that ends on a D (no J after it) or starts on one (no
+    /// V before it) pays the open-flank cost for the J or V it lacks
+    /// ([`ResolvedOpenFlank`]). The pair guards then let such a path be
+    /// called ([`crate::pipeline::PairGuards`]); without the cost a D is
+    /// called only between a V and a J.
+    fn charges_open_flank(&self) -> bool {
+        false
+    }
+
     /// Posterior marginals of `placements` given the adjudicated `path`, for
     /// adjudicators with a probabilistic reading that are configured to
     /// compute them. With the scratch of the adjudication that returned
