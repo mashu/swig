@@ -165,7 +165,7 @@ a usage error before any database is read: `--c-evalue` and
 `long-span` without `--d`. An option that only tunes a stage the run does
 not have is run and named in a warning, since it changes nothing: the D
 options (`--min-d-match`, `--d-mismatch`, `--d-presence-rate`, `--d-allele`,
-`--no-anchor-window`) without `--d`, the screen's rules without
+`--no-anchor-window`, `--d-open-flank off`) without `--d`, the screen's rules without
 `--double-d`, and `--d-allele max-marginal` with `--no-posterior`. A
 profile is a bundle and is never reported. With the screen on, D alleles
 shorter than `--double-d-seed-length` are named too, since the screen

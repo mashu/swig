@@ -17,7 +17,8 @@ A second audit, made after Swig 0.39.1, covered the input layer, retrieval,
 alignment, adjudication, the pipeline, the interfaces and the simulator. It
 re-checked this review's open items as well. Its fixes are one commit each,
 with a regression test that fails without them. Of this review's open
-items, these are now fixed:
+items, and of the third review's below (rows marked §0), these are now
+fixed:
 
 | Item | Fix |
 |---|---|
@@ -33,6 +34,8 @@ items, these are now fixed:
 | 4.1–4.3, 4.7, 4.8 | one acceptance mechanism; the adjudication mode as a validated type; the lattice recursion written once; typed notes; one test kit |
 | 4.5 (part) | the tandem-D grammar and the residual path are gone |
 | §0 13 (part) IGHT, IGHZ and IGHO without a locus | every IGH isotype letter names IGH; a custom-named V, J or C takes its relatives' locus (the database's named alleles, else an embedded panel, which places a J or C only in loci of the database's V), a custom D the loci with D genes, with a warning asking for `locus=`; C follows the locus the path shares; Swig Web and swig-cli write `locus=` for custom records |
+| §0 11 gene identity from allele names | a V name without `*` joins the gene of a `*`-named relative within about 2 %, or groups with other such names at that level (`gene=`; ALGORITHM §3a); the 8.2 pp V allele loss at 30 % SHM with every `*` replaced is now +0.10 pp (not significant); names with `*` keep their genes |
+| §0 13 (part) options without their database | `--c-evalue`, `--c-prefix-identity` above 0 and `--double-d all` or `long-span` are refused without `--c` or `--d`, on the command line and in the WebAssembly module; options that only tune a stage the run does not have are run and named in a warning, as are the D alleles the double-D screen cannot see |
 
 The audit's own fixes are listed in the commit log; the README and
 ALGORITHM describe the behaviour they changed. Still open, by priority:
@@ -85,11 +88,11 @@ ALGORITHM describe the behaviour they changed. Still open, by priority:
 
 A third review, after Swig 0.39.2, found 2 major and 13 minor defects. Swig
 0.39.3 fixes 13 of them outright and 2 in part, each with a regression test
-that fails on 0.39.2; `RELEASE_NOTES_0.39.3.md` lists them. Still open from
-that review:
+that fails on 0.39.2; `RELEASE_NOTES_0.39.3.md` lists them. Still open, or
+open in part, from that review:
 
-10. **Chance D on reads without a J or a V.** Resolved for chance Ds more
-    than about 30 bases from the anchor: a D that ends its path (no J after
+10. **Chance D on reads without a J or a V.** *Partly resolved,* for chance
+    Ds more than about 30 bases from the anchor: a D that ends its path (no J after
     it) or starts it (no V before it) now pays for the J (V) its read would
     show in the bases beyond it (ALGORITHM §2.3, `--d-open-flank`). This
     holds with a derived D prior (the default profile and `sensitive-d`);
@@ -126,11 +129,6 @@ that review:
     N1/N2 gap hinge first proposed here was measured and rejected (−8 to
     −12 pp D allele at 30 % SHM); a geometric N-length allowance traced the
     same trade-off as the fixed one.
-11. **Gene identity from allele names.** *Resolved:* a V name without `*`
-    joins the gene of a `*`-named relative within about 2 %, or groups with
-    other such names at that level (`gene=`; ALGORITHM §3a). The 8.2 pp V
-    allele loss at 30 % SHM with every `*` replaced is now +0.10 pp (not
-    significant); names with `*` keep their genes.
 12. **Junk V by circular divergence.** With the V presence cost, 7 of 1,200
     V-less test reads still get a V: the read's divergence is estimated
     partly from the junk V's own columns, which raises its per-read value.
