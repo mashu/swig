@@ -108,6 +108,8 @@ interface ParsedRecord {
   rawSequence: string;
   sequence: string;
   locus: GermlineLocus;
+  /** `locus=` written for the engine; empty when the name places the record. */
+  locusKey: string;
   metadata?: CompactMetadata;
 }
 
@@ -224,6 +226,54 @@ function compactMetadata(
 function inferLocus(value: string): GermlineLocus | null {
   const upper = value.toUpperCase();
   return LOCI.find((locus) => upper.includes(locus)) ?? null;
+}
+
+const IGH_ISOTYPE_LETTERS = "AEFGMOTWXYZ";
+
+/**
+ * The loci the Swig engine reads from an allele label (engine/src/locus.rs,
+ * `Loci::named_in`): a locus code at the start of a word followed by a
+ * segment letter or, for IGH, an isotype letter with at most one more letter
+ * after it; a shared TRAV…/DV… gene belongs to TRA and TRD. Empty when the
+ * label names no locus, as a custom name does: the engine then has to infer
+ * it, so the host writes `locus=` for such records.
+ */
+export function namedLoci(label: string): GermlineLocus[] {
+  const upper = label.toUpperCase();
+  for (let at = 0; at < upper.length; at += 1) {
+    if (at > 0 && /[A-Z0-9]/.test(upper[at - 1])) continue;
+    const locus = LOCI.find((code) => upper.startsWith(code, at));
+    if (!locus) continue;
+    const next = upper[at + locus.length];
+    if (next === undefined) continue;
+    let named = "VDJC".includes(next);
+    if (!named && locus === "IGH" && IGH_ISOTYPE_LETTERS.includes(next)) {
+      named = !/^[A-Z]{2}/.test(upper.slice(at + locus.length + 1));
+    }
+    if (!named) continue;
+    return locus === "TRA" && upper.includes("/DV") ? ["TRA", "TRD"] : [locus];
+  }
+  return [];
+}
+
+/** The `locus=` value of a FASTA header, if it has one. */
+function declaredLocus(header: string): string | undefined {
+  return /(?:^|\s)locus=([A-Za-z,]+)(?=\s|$)/.exec(header)?.[1]?.toUpperCase();
+}
+
+/**
+ * The `locus=` value to write for a record the engine cannot place by its
+ * name: the one its header declares, else the loci of the template its
+ * metadata came from when they hold the record's locus (TRA,TRD for a
+ * TRAV…/DV… relative), else the record's own locus. Empty when the name
+ * places the record.
+ */
+function locusKey(name: string, header: string, locus: GermlineLocus, template?: string): string {
+  const declared = declaredLocus(header);
+  if (declared) return declared;
+  if (namedLoci(name).length) return "";
+  const relative = template ? namedLoci(template) : [];
+  return relative.includes(locus) ? relative.join(",") : locus;
 }
 
 function inferSegment(name: string): GermlineSegment | null {
@@ -945,7 +995,15 @@ export function preprocessGermlineFasta(
       warnings.push(`${name}: ${segment === "V" ? "no validated IMGT FWR/CDR delineation" : segment === "J" ? "no unique frame-consistent F/W-G J motif" : "no segment metadata"}.`);
     }
     loci.add(locus);
-    records.push({ header: input.header, name, rawSequence: input.rawSequence, sequence: normalized.sequence, locus, metadata });
+    records.push({
+      header: input.header,
+      name,
+      rawSequence: input.rawSequence,
+      sequence: normalized.sequence,
+      locus,
+      locusKey: locusKey(name, input.header, locus, transfer?.template),
+      metadata,
+    });
     if (matchOptions.includeDiagnostics) {
       diagnostics.push({
         segment,
@@ -966,7 +1024,9 @@ export function preprocessGermlineFasta(
   }
 
   const annotated = records.filter((record) => annotationPresent(segment, record.metadata)).length;
-  const fasta = records.map((record) => `>${record.name}${metadataHeader(record.metadata)}\n${record.sequence}\n`).join("");
+  // A record whose name places no locus carries the locus the host checked
+  // (`locus=`), which the engine would otherwise have to infer.
+  const fasta = records.map((record) => `>${record.name}${metadataHeader(record.metadata)}${record.locusKey ? ` locus=${record.locusKey}` : ""}\n${record.sequence}\n`).join("");
   return {
     fasta,
     count: records.length,

@@ -9,6 +9,7 @@ import {
   applyIgblastInternalData,
   prepareIgblastStyleGermlineFasta,
   preprocessGermlineFasta,
+  namedLoci,
   preprocessGermlineFastaAcrossTiers,
   type MetadataAllele,
 } from "../src/germline-preprocess.ts";
@@ -241,4 +242,57 @@ test("every bundled KIMDB macaque V and J record receives validated in-browser a
       assert.equal((report.fasta.match(/SWIGMETA=/g) ?? []).length, report.count);
     }
   }
+});
+
+test("the host reads a locus from an allele name exactly as the engine does", () => {
+  for (const [label, loci] of [
+    ["IGHV1-2*02", ["IGH"]],
+    ["IGHT2D*01", ["IGH"]],
+    ["IGHZ*01", ["IGH"]],
+    ["IGHO*01", ["IGH"]],
+    ["IGHG2A*01", ["IGH"]],
+    ["IGHEP1*01", ["IGH"]],
+    ["IGHD1-1*01", ["IGH"]],
+    ["TRAV14/DV4*01", ["TRA", "TRD"]],
+    ["Homo_sapiens_IGKV1-5*01", ["IGK"]],
+    ["IGHTEST1", []],
+    ["IgNAR*01", []],
+    ["novel_1", []],
+    ["myIGHV1", []],
+    ["TRANSFER", []],
+  ] as const) {
+    assert.deepEqual(namedLoci(label), loci, label);
+  }
+});
+
+test("a custom-named allele is written with the locus of its template", () => {
+  const template = firstAnnotated(humanIghV, "V");
+  const changed = `${template[1].slice(0, 145)}${template[1][145] === "A" ? "C" : "A"}${template[1].slice(146)}`;
+  const report = preprocessGermlineFasta(
+    `>novel_7 IGH sample allele\n${changed}\n>${template[0]}\n${template[1]}\n`,
+    "V",
+    humanIghV,
+    ["IGH"],
+  );
+  assert.equal(report.transferred, 2);
+  assert.match(report.fasta, /^>novel_7 SWIGMETA=[\d,-]+ locus=IGH$/m);
+  // A name the engine places carries no key.
+  assert.doesNotMatch(report.fasta, new RegExp(`^>${template[0].replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*locus=`, "m"));
+  // A declared locus is kept, and survives the next template tier.
+  const declared = preprocessGermlineFastaAcrossTiers(">sample_d1 locus=TRB,TRD\nGGGACAGGGGGC\n", "D", [], ["TRB", "TRD"]);
+  assert.match(declared.fasta, /^>sample_d1 locus=TRB,TRD$/m);
+});
+
+test("a custom FASTA in a reference cell is given the cell's locus", () => {
+  const custom = ">sample_k1\nACGTACGTACGT\n>IGKV1-5*99\nACGTACGTACGA\n>other locus=IGL\nACGTACGTACGC\n";
+  const composed = composeReferenceOverrides(
+    ["IGH", "IGK", "IGL"],
+    { [referenceCellKey("IGK", "V")]: { text: custom } },
+    (locus, segment) => (human.loci[locus]?.[segment] ?? []).map((allele: MetadataAllele) => `>${allele[0]}\n${allele[1]}\n`).join(""),
+  );
+  assert.match(composed.V ?? "", /^>sample_k1 locus=IGK$/m);
+  assert.match(composed.V ?? "", /^>IGKV1-5\*99$/m);
+  assert.match(composed.V ?? "", /^>other locus=IGL$/m);
+  // Pack records are untouched.
+  assert.doesNotMatch(composed.V ?? "", /^>IGHV.* locus=/m);
 });
