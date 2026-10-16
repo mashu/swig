@@ -208,7 +208,7 @@ interface ResultSession {
   projectStatus?: string;
 }
 
-const APP_VERSION = "0.39.5";
+const APP_VERSION = "0.39.6";
 const SEGMENTS: SegmentKey[] = ["V", "D", "J", "C"];
 const PAGE_SIZE = 50;
 const MAX_INLINE_COUNT_BYTES = 2 * 1024 * 1024;
@@ -890,7 +890,7 @@ function ResultDetail({ row, onClose }: { row: AirrRow; onClose: () => void }) {
   return (
     <article className="detail-panel">
       <header className="detail-header">
-        <div><span className="section-kicker">Selected rearrangement</span><h2>{row.sequence_id}</h2><div className="detail-tags"><span>{row.locus || "unassigned"}</span>{row.sample_id&&<span>sample · {row.sample_id}</span>}{row.subject_id&&<span>donor · {row.subject_id}</span>}{row.swig_timepoint&&<span>{row.swig_timepoint}</span>}{row.swig_compartment&&<span>{row.swig_compartment}</span>}<span className={row.productive === "T" ? "good" : "warn"}>{row.productive === "T" ? "Productive" : "Non-productive"}</span>{row.d2_call && <span>VDDJ screen-supported</span>}{isotype && <span className="isotype-tag">{isotype}</span>}{row.rev_comp === "T" && <span>Reverse complement</span>}</div></div>
+        <div><span className="section-kicker">Selected rearrangement</span><h2>{row.sequence_id}</h2><div className="detail-tags"><span>{row.locus || "unassigned"}</span>{row.sample_id&&<span>sample · {row.sample_id}</span>}{row.subject_id&&<span>donor · {row.subject_id}</span>}{row.swig_timepoint&&<span>{row.swig_timepoint}</span>}{row.swig_compartment&&<span>{row.swig_compartment}</span>}<span className={row.productive === "T" ? "good" : row.productive === "F" ? "warn" : undefined}>{row.productive === "T" ? "Productive" : row.productive === "F" ? "Non-productive" : "Productivity unresolved"}</span>{row.d2_call && <span>VDDJ screen-supported</span>}{isotype && <span className="isotype-tag">{isotype}</span>}{row.rev_comp === "T" && <span>Reverse complement</span>}</div></div>
         <button className="close-detail" type="button" onClick={onClose}>Close <span>×</span></button>
       </header>
 
@@ -1456,7 +1456,7 @@ function ResultsPage({ session, onNewAnalysis }: { session: ResultSession; onNew
                 <td><span className="locus-pill">{row.locus || "—"}</span></td>
                 <td title={row.vCall}>{row.vCall || <i>—</i>}</td><td title={[row.dCall, row.d2Call].filter(Boolean).join(" → ")}>{row.dCall || <i>—</i>}{row.d2Call && <small className="d2-table-call">→ {row.d2Call}</small>}</td><td title={row.jCall}>{row.jCall || <i>—</i>}</td><td>{row.isotype || <i>—</i>}</td>
                 <td className="cdr3-table-cell"><code title={row.cdr3Aa || row.cdr3}>{row.cdr3Aa || row.cdr3 || "—"}</code>{row.cdr3Aa && row.cdr3 ? <small title={row.cdr3}>{row.cdr3}</small> : null}</td>
-                <td><span className={`productive-dot ${row.productive === "T" ? "yes" : "no"}`} />{row.productive === "T" ? "Yes" : row.productive === "F" ? "No" : "—"}</td>
+                <td><span className={`productive-dot ${row.productive === "T" ? "yes" : row.productive === "F" ? "no" : "unknown"}`} />{row.productive === "T" ? "Yes" : row.productive === "F" ? "No" : "—"}</td>
                 <td><button type="button" aria-label={`Open ${row.sequenceId}`}>→</button></td>
               </tr>)}</tbody>
             </table>
