@@ -238,13 +238,20 @@ items 10 and 12, it leaves open:
     and one under the fixed scale is beaten by a path the rule admits
     (its VDJ optimum's V clip stretches the span past 225 bases, so the
     whole subset is passed over; 0.39.4's subsets).
-20. **Junctions withheld on mutated anchors.** The anchor rule withholds
-    the junction of a read whose Cys104 or Trp/Phe118 codon is mutated so
-    that its alignment stops before the codon: 0.84 points of templated
-    junctions on simulated mid reads, 3.95 on hard ones. Projecting an
-    anchor across a short, mismatched alignment end, as far as a bound on
-    unexplained bases allows, would recover some without the spurious
-    junctions the rule removed.
+20. **Junctions withheld on mutated anchors.** Partly addressed in
+    0.39.6. The anchor rule withholds the junction of a read whose Cys104
+    or Trp/Phe118 codon is mutated so that its alignment stops before the
+    codon: 0.84 points of templated junctions on simulated mid reads, 3.95
+    on hard ones. Since 0.39.6 a V that stops at most 18 germline bases
+    before an intact Cys104 codon gets it back when no gapped alignment of
+    the stretch scores as well (SwiftIG 0.38.12's rule; ALGORITHM §4c,
+    *Clipped Cys104*). On 5,000 simulated human IGH reads per preset,
+    exact templated junctions went from 99.29 to 99.29 % (mid) and from
+    96.27 to 96.36 % (hard), and reads without a templated junction that
+    get one from 82.57 to 82.57 % and from 21.63 to 22.05 %
+    (RELEASE_NOTES_0.39.6.md). A mutated cysteine codon, and a J that
+    stops before Trp/Phe118, still lose their junction; projecting the J
+    anchor across a short, mismatched start the same way is the next step.
 21. **J-mode CHMMAIRRa** (outside the aligner). Swig's chimera filter now
     extends the V and J alignments toward the junction before threading,
     which restores V mode, but J mode flags 35 of 60 and 130 of 200

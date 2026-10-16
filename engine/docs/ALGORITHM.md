@@ -978,6 +978,41 @@ falls at or after the J's start, or its codon overlaps Trp/Phe118's), FWR3
 ends where the V alignment ends, guards or not; until 0.39.3 FWR3 was then
 empty.
 
+**Clipped Cys104** (SwiftIG 0.38.12's `clipped_v_anchor`, since 0.39.6).
+A local V alignment can end before Cys104 because clustered substitutions
+before it lower its score, which left an intact coding read without a
+junction. When the called V, span `[q_lo, q_hi) × [r_lo, r_hi)`, does not
+align the first base of its allele's anchor `a`, `clipped_cys104` places
+Cys104 at the projection along the span's end diagonal,
+`q = q_hi + (a − r_hi)`, if
+
+```text
+germline codon at a is TGT/TGC ∧ a ≥ r_hi ∧ a + 3 − r_hi ≤ 18
+∧ q + 3 ≤ the first read base of the called D or J
+∧ read codon at q is TGT/TGC
+∧ the co-linear stretch holds no ambiguous base, in read or germline
+∧ S_gapped < S_co-linear
+```
+
+The co-linear stretch starts at the `k ≤ 12` gapless aligned columns that
+end the V span, so an indel across the end cannot pass for a co-linear
+tail, and runs through the codon: germline `[r_hi − k, a + 3)` against read
+`[q_hi − k, q + 3)`, scored with the V's own profile. `S_gapped` is the best
+score of an alignment of the same germline stretch that holds a gap,
+anchored at both starts, the read free to end anywhere up to 18 bases past
+the co-linear end and before the D or J; a tie blocks the recovery. It is
+an affine DP over at most 30 × 48 cells that keeps only gapped paths, with
+the co-linear diagonal's prefix scores as the sources of their first gap
+and no local reset; it runs only for a read whose called V stops short of
+Cys104 under the guards. No other cysteine is searched for, and the junction
+need not be in frame. Calls, scores, alignments and segment coordinates
+do not change; the junction, CDR3, `vj_in_frame`, `productive`,
+`complete_vdj`, the reading frame and `d_frame` follow the recovered codon,
+and the stop-codon and frameshift vetoes still decide `productive`. The
+codon's coordinate is structural evidence only: junctional additions can
+rebuild a deleted codon. Without the guards the anchor is projected however
+far, as before.
+
 ## 5. Search
 
 Each stage narrows the hypotheses the DAG sees. The table states what each
