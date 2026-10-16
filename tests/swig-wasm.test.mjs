@@ -745,6 +745,94 @@ test("the bounded repeated-sequence cache preserves identifiers and FASTQ qualit
   assert.equal(cachedSecond.rows[0].quality, secondQuality);
 });
 
+// Swig 0.38.12's alpaca regression read: clustered substitutions before
+// Cys104 end the IGHV3S66*01 alignment 12 germline bases short of its codon.
+const clippedVQuery = fs.readFileSync(new URL("fixtures/clipped-v-anchor.fasta", import.meta.url), "utf8")
+  .split(/\r?\n/).filter((line) => !line.startsWith(">")).join("");
+
+async function clippedVRuntime(profile = "r_optimized") {
+  const alpaca = pack.species.find((entry) => entry.name === "Vicugna pacos").loci.IGH;
+  const runtime = await makeRuntime();
+  assert.equal(runtime.setCallingProfile(profile), 0);
+  runtime.initialize({ V: asFasta(alpaca.V), D: asFasta(alpaca.D), J: asFasta(alpaca.J), C: "" });
+  return runtime;
+}
+
+test("a clipped alpaca V cysteine is recovered without changing the selected segment alignment", async () => {
+  // The rival check scores with the profile's V scores. Under a V gap open
+  // of -5 (Truth-optimized, IgBLAST-agreement) a gapped alignment of Dyl's
+  // clipped stretch scores 18, as the co-linear one does, so the tie
+  // leaves the anchor unresolved; under -9 the best gapped one scores 10.
+  for (const [profile, recovered] of [["r_optimized", true], ["sensitive_d", true], ["truth_optimized", false], ["igblast_compatible", false]]) {
+    const runtime = await clippedVRuntime(profile);
+    for (const [id, sequence] of [["Dyl", clippedVQuery], ["Dyl_reverse", reverseComplement(clippedVQuery)]]) {
+      const row = runtime.annotate(`>${id}\n${sequence}\n`, 1).rows[0];
+      const label = `${profile} ${id}`;
+      assert.equal(row.v_call, "IGHV3S66*01", label);
+      assert.equal(row.j_call, "IGHJ4*01", label);
+      assert.equal(row.v_score, "452", label);
+      assert.equal(row.v_sequence_end, "276", label);
+      assert.equal(row.v_germline_end, "276", label);
+      assert.match(row.v_cigar, /96S$/, label);
+      assert.equal(row.rev_comp, id === "Dyl" ? "F" : "T", label);
+      if (!recovered) {
+        assert.equal(row.cdr3, "", label);
+        assert.equal(row.productive, "", label);
+        continue;
+      }
+      assert.equal(row.cdr3_start, "289", label);
+      assert.equal(row.cdr3_end, "339", label);
+      assert.equal(row.cdr3_aa, "AARFAGIVAGPWDEYNY", label);
+      assert.equal(row.junction_aa, "CAARFAGIVAGPWDEYNYW", label);
+      assert.equal(row.productive, "T", label);
+      assert.equal(row.stop_codon, "F", label);
+      assert.equal(row.vj_in_frame, "T", label);
+    }
+  }
+});
+
+test("recovered V anchors keep the stop-codon, junction-frame and V-frameshift vetoes", async () => {
+  const runtime = await clippedVRuntime();
+  const cases = [
+    ["stop", clippedVQuery.slice(0, 120) + "TAA" + clippedVQuery.slice(123), "stop_codon"],
+    ["junction_shift", clippedVQuery.slice(0, 300) + "A" + clippedVQuery.slice(300), "vj_in_frame"],
+    ["v_shift", clippedVQuery.slice(0, 120) + "A" + clippedVQuery.slice(120), "v_frameshift"],
+  ];
+  for (const [id, sequence, veto] of cases) {
+    const row = runtime.annotate(`>${id}\n${sequence}\n`, 1).rows[0];
+    assert.ok(row.cdr3, `${id}: the anchor was not recovered before productivity was judged`);
+    assert.equal(row.productive, "F", `${id}: a nonproductive sequence became productive`);
+    assert.equal(row[veto], veto === "vj_in_frame" ? "F" : "T", id);
+  }
+});
+
+test("V anchor recovery does not replace a deleted anchor with a later junction cysteine", async () => {
+  const runtime = await clippedVRuntime();
+  const sequence = clippedVQuery.slice(0, 276) + "AACCAACCAACC" +
+    clippedVQuery.slice(288, 315) + "TGT" + clippedVQuery.slice(318);
+  const row = runtime.annotate(`>trimmed_cys\n${sequence}\n`, 1).rows[0];
+  assert.equal(row.v_sequence_end, "276");
+  assert.equal(row.cdr3, "");
+  assert.equal(row.productive, "");
+});
+
+test("unknown clipped V bases and competing indel mappings stay unresolved", async () => {
+  const runtime = await clippedVRuntime();
+  const cases = [
+    ["unknown_tail", clippedVQuery.slice(0, 279) + "N" + clippedVQuery.slice(280)],
+    ["shifted_cys", clippedVQuery.slice(0, 279) + "A" + clippedVQuery.slice(279)],
+    // A cysteine sits at the projected coordinate, but an anchored gapped
+    // mapping scores as well: the codon alone must not recover the anchor.
+    ["competing_gap", clippedVQuery.slice(0, 276) + "TCAGTTGCGTGT" + clippedVQuery.slice(288)],
+  ];
+  for (const [id, sequence] of cases) {
+    const row = runtime.annotate(`>${id}\n${sequence}\n`, 1).rows[0];
+    assert.equal(row.v_sequence_end, "276", id);
+    assert.equal(row.cdr3, "", id);
+    assert.equal(row.productive, "", id);
+  }
+});
+
 test("WASM annotates FASTA, FASTQ, and AIRR; handles heavy, light, TCR, strand, and J-only swaps", async () => {
   const human = pack.species.find((entry) => entry.name === "Homo sapiens");
   assert.ok(human, "human reference set is missing");
