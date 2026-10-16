@@ -1252,6 +1252,7 @@ input[type="range"] { width: 100%; accent-color: var(--teal); }
 .productive-dot { display: inline-block; width: 6px; height: 6px; margin-right: 5px; border-radius: 50%; }
 .productive-dot.yes { background: var(--teal); }
 .productive-dot.no { background: var(--coral); }
+.productive-dot.unknown { background: var(--muted); }
 .empty-results { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 320px; color: var(--muted); text-align: center; }
 .empty-results span { font: 50px Georgia, serif; }
 .empty-results h3 { margin: 8px 0 4px; color: var(--ink); font-size: 16px; }

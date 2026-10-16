@@ -14,7 +14,7 @@ instead of tuned patches. Every component is a replaceable, statically
 dispatched trait, and every search shortcut is either lossless or measured
 on simulated repertoires.
 
-The crate and binary are `swig` 0.39.5. The workspace member `wasm/` (crate
+The crate and binary are `swig` 0.39.6. The workspace member `wasm/` (crate
 `swig_wasm`) is the WebAssembly module. There are no dependencies; Rust ≥
 1.89, edition 2024. The alignment kernel runs on AVX-512BW, AVX2, NEON,
 WebAssembly SIMD or portable lanes, chosen at run time (on WebAssembly, at
@@ -256,8 +256,9 @@ read, then the engine's five posterior columns.
   bases of its germline start and the J ends within 3 of its germline end.
   Under the pair guards (the default), `junction`, `cdr3`, `vj_in_frame`,
   `productive` and `complete_vdj` are reported only when the called V
-  aligns the first base of Cys104 and the called J the first base of
-  Trp/Phe118, at most 231 bases apart (see *Plausibility guards*). FWR3
+  aligns the first base of Cys104 (or an intact Cys104 just past a clipped
+  V is recovered) and the called J the first base of Trp/Phe118, at most
+  231 bases apart (see *Plausibility guards*). FWR3
   ends after Cys104's codon, or where the V alignment ends when Cys104 is
   not placed (an allele without an anchor, or a Cys104 that projects onto
   the J).
@@ -387,6 +388,21 @@ alignment's end diagonal however far, so a V trimmed past Cys104, or a J
 aligned only after Trp/Phe118, got a junction made of bases neither segment
 explains. The cost is the templated junctions whose anchor codon is so
 mutated that the alignment stops before it.
+
+**Clipped Cys104** (Swig 0.38.12's rule, since 0.39.6). Clustered
+substitutions before Cys104 can end a V's local alignment short of it. The
+anchor then still counts, at its projection along the called V's end
+diagonal, when:
+- the allele's anchor codon is a cysteine ending at most 18 germline bases
+  past the V;
+- the read has an intact `TGT`/`TGC` there, ending before the called D or J;
+- the compared bases are unambiguous;
+- no gapped alignment of the clipped stretch scores as well, under the
+  profile's V scores.
+
+Calls, scores and alignments do not change. On 80,000 simulated reads, 167
+gained a junction and no other read changed (ALGORITHM §4c;
+`RELEASE_NOTES_0.39.6.md`).
 
 Measured on 20,000 simulated human BCR reads (IGH, IGK and IGL) per preset
 against 0.39.3, which had no guards:
