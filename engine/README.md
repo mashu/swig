@@ -14,7 +14,7 @@ instead of tuned patches. Every component is a replaceable, statically
 dispatched trait, and every search shortcut is either lossless or measured
 on simulated repertoires.
 
-The crate and binary are `swig` 0.39.6. The workspace member `wasm/` (crate
+The crate and binary are `swig` 0.39.7. The workspace member `wasm/` (crate
 `swig_wasm`) is the WebAssembly module. There are no dependencies; Rust ≥
 1.89, edition 2024. The alignment kernel runs on AVX-512BW, AVX2, NEON,
 WebAssembly SIMD or portable lanes, chosen at run time (on WebAssembly, at
@@ -123,6 +123,8 @@ options (`swig --help` prints them):
 | `--d-allele map\|max-marginal` | report the call's D allele (default) or the one of largest posterior marginal given the call's D presence and topology (needs posteriors) |
 | `--d-presence-rate R` | D prior from the D search's own chance-hit count at D-presence rate R, 0 < R < 1 (see *The model in brief*) |
 | `--d-open-flank on\|off` | charge a D that ends (starts) its path for the J (V) the read would show in the bases after (before) it, and call such a D under the pair guards (default `on`; `off`: a D only between a V and a J that pair, 0.39.4's rule; see *The model in brief* and *Plausibility guards*) |
+| `--d-trim M5,M3\|off` | geometric priors on the germline bases a D loses at its 5′ and 3′ ends, means M5 and M3 (default `5,7` in `r` and `sensitive-d`, `off` in `truth` and `igblast`; see *The model in brief*) |
+| `--np-length M\|off` | geometric prior on the N/P lengths around a D, mean M: each base a D keeps is one N/P base fewer (default `8` in `r` and `sensitive-d`, `off` in `truth` and `igblast`) |
 | `--min-d-match N` | shortest exact run of an admissible D (default: the profile's) |
 | `--d-mismatch S`, `--j-mismatch S` | D or J mismatch score, negative (default: the profile's) |
 | `--min-j-length N` | fewest aligned J columns of a J hit (default none) |
@@ -167,7 +169,8 @@ a usage error before any database is read: `--c-evalue` and
 `long-span` without `--d`. An option that only tunes a stage the run does
 not have is run and named in a warning, since it changes nothing: the D
 options (`--min-d-match`, `--d-mismatch`, `--d-presence-rate`, `--d-allele`,
-`--no-anchor-window`, `--d-open-flank off`) without `--d`, `--c-min-identity`
+`--no-anchor-window`, `--d-open-flank off`, `--d-trim`, `--np-length`) without
+`--d`, `--c-min-identity`
 without `--c`, the screen's rules without `--double-d`, and `--d-allele
 max-marginal` with `--no-posterior`. `--no-pair-guards` acts on V and J,
 which every run has, and needs no database. A profile is a bundle and is
@@ -988,6 +991,21 @@ The full description, with the guarantee of each search step, is in
   measuring; at the simulator's own rate (0.94) D-free specificity fell
   14–26 pp. The rate has to come from the user, so it is not the default
   (ASSESSMENT §9.9).
+- **A D pays for the germline it trims** (since 0.39.7). Each base a D
+  clip trims from its allele costs `ln(6/5)` nats at the 5′ end and
+  `ln(8/7)` at the 3′ end, geometric trims of means 5 and 7. Each read
+  base it keeps is one N/P base fewer, worth `ln(9/8)` under geometric N/P
+  lengths of mean 8. The D cost is lowered by 1.85 nats, what a D with the
+  mean trims pays, so these terms re-rank Ds rather than decide D
+  presence. A short exact match deep inside a long allele no longer beats
+  the true D around it. Every term depends on one cut, so the DAG stays
+  exact and joint, and costs 0.6 % more instructions. On GenAIRR reads
+  this raised human IGH D by 0.3–3.1 points (`--d-trim off --np-length
+  off` restores 0.39.6's D calls; RELEASE_NOTES_0.39.7.md).
+- **A J is named at its own germline coordinates** (since 0.39.7). A J
+  allele tied with the call from other germline coordinates, such as
+  IGHJ5\*02 behind IGHJ4\*02 on their shared 3′ part, is listed in
+  `j_alternatives`, not in `j_call`.
 - **A D at a path's open end pays for the J (V) it implies.** A path that
   ends on a D claims a junction whose J the read does not show in the bases
   after it (a path that starts on a D, a V missed before it). Past 24 free
@@ -1604,6 +1622,10 @@ are accepted.
 | `sensitive-d` | (2,−3,−9,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 4 | derived, odds 2: 9.45 |
 | `truth` | (2,−3,−5,−1) | (2,−3,−13,−1) | (2,−3,−17,−2) | 6 | 0 |
 | `igblast` | (2,−3,−5,−1) | (2,−4,−11,−1) | (2,−4,−13,−1) | 5 | 0 |
+
+`r` and `sensitive-d` add the D trim and N/P length priors (`--d-trim 5,7`,
+`--np-length 8`). `truth` and `igblast` leave them off: they have no D cost
+for the priors' credit to lower.
 
 Every profile gates V and J hits by E-value (accept 1, anchor 10⁻³),
 stitches the co-linear V prefix and J suffix back onto the local alignment

@@ -62,9 +62,10 @@ python3 loss.py work/runs/igh_shm5.truth.tsv swig=work/runs/igh_shm5.swig.tsv   
 | `ablate.sh` | score each `dposterior` variant and swig's `--d-allele max-marginal` |
 
 The Python D posterior is slow, about 0.2 s per read. `dposterior/` runs
-the same model at 0.24–0.31 ms per read. Neither is how the engine would
-run it: the ablation finds that the gain is the trim and N-length priors,
-which fit swig's placement DAG as terms on its cuts.
+the same model at 0.24–0.31 ms per read. Neither is how the engine runs
+it. The ablation found that the gain is the trim and N-length priors,
+which swig 0.39.7 adds to its placement DAG as terms on its cuts, for
+0.6 % more instructions.
 
 ```sh
 cargo build --release --manifest-path dposterior/Cargo.toml

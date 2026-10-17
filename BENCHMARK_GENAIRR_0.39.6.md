@@ -343,34 +343,51 @@ every cut. The N-length prior is `ι`, which the recursion already
 supports. The expected cost is therefore close to zero; it has not been
 measured.
 
-## Implementing it in swig
+## Implemented in 0.39.7
 
-1. **D trim prior in the DAG** (`adjudicate/units.rs`, `dag.rs`,
-   `posterior.rs`). Add `ln P(t5)` to a D node's entry cut and `ln P(t3)`
-   to its exit cut, where `t5` is the germline index of the first
-   retained base and `t3` the germline bases after the last. Use
-   geometric priors with means 5 and 7, relative to an untrimmed D
-   (`ln P(t)/P(0)`), so that the D cost `P*_D` keeps its meaning.
-   - Each term depends on one cut. Separability holds, so Theorem 1
-     (exact Viterbi) and Theorem 2 (exact marginals) carry over, and the
-     brute-force oracles (`oracle.rs`) check both. V and J cuts stay
-     joint with the D.
-   - The DAG's D placements are local alignments, and their cuts cannot
-     reach past a terminal mismatch. The prototype can. If the oracles
-     or the ablation show that it matters, extend D placements ungapped
-     towards both germline ends, as V and J are towards their outer ends.
-2. **N-length prior as `ι`.** The per-base N/P score of a geometric prior
-   with mean 8 is `ln(8/9)` nats. It applies to every junction, VJ paths
-   included, so it shifts D presence. Check D-free specificity and
-   `d_presence_posterior` calibration on the IgSim suite before turning
-   it on, and re-derive `P*_D` if they move.
-3. **Positional tie sets** in `report.rs` (`called_report`). Replace or
-   filter `CoOptimal::names` with the alleles of maximal positional
-   matches at the primary allele's germline index along the called
-   alignment. That is about 200 alleles × 300 positions per V call, tens
-   of microseconds. It changes the reported names, not the placement.
-4. **Next**: allele-usage priors learned from the repertoire itself.
-   They matter when one gene is common; GenAIRR draws genes uniformly.
+Swig 0.39.7 builds the plan into the engine
+(RELEASE_NOTES_0.39.7.md, ALGORITHM §2.3):
+1. **D trim prior in the DAG.** Each germline base a D clip trims costs
+   `ln(6/5)` at the 5′ end and `ln(8/7)` at the 3′ end. The terms are
+   added to a D node's entry and exit cut values when the node is laid
+   out. The oracles check the Viterbi call and the marginals against
+   exhaustive enumeration with them on.
+2. **N/P length prior.** It is not the junction-wide `ι` the plan
+   proposed: that would also have priced V–J junctions and changed D
+   presence. Each base a D keeps gains `ln(9/8)`, which is the same prior
+   among Ds. The D cost is read in matched columns worth that much more,
+   and is credited with the mean trim cost, 1.85 nats. The credit is
+   needed because the trim prior alone left 420 of 10,000 reads at 10 %
+   SHM without a D, against 100.
+3. **Positional ties, for J only.** Positional D and V names gained
+   nothing.
+
+Extending D placements past terminal mismatches was not needed. The
+one-offset ablation above, the DAG's own hypothesis space, loses at most
+0.1 point.
+
+| GenAIRR set | swig 0.39.6 V / D / J | swig 0.39.7 V / D / J | prototype |
+|---|---|---|---|
+| IGH naive | 99.98 / 98.17 / 99.52 | 99.98 / 98.47 / 99.76 | 99.98 / 98.51 / 99.76 |
+| IGH 2 % SHM | 99.85 / 96.38 / 99.39 | 99.85 / 97.28 / 99.70 | 99.85 / 97.42 / 99.70 |
+| IGH 5 % SHM | 99.68 / 93.16 / 99.15 | 99.67 / 95.42 / 99.47 | 99.68 / 95.67 / 99.47 |
+| IGH 10 % SHM | 99.42 / 87.12 / 98.70 | 99.43 / 90.24 / 99.06 | 99.42 / 92.02 / 99.06 |
+| IGH realistic | 99.61 / 92.78 / 99.08 | 99.60 / 94.96 / 99.44 | 99.61 / 95.24 / 99.45 |
+| TRB realistic | 99.94 / 98.63 / 99.87 | 99.94 / 99.50 / 99.87 | – |
+
+The engine reaches 0.04–1.8 points less D than the prototype. At 10 % SHM
+the gap splits in two:
+- 1.0 point is the 103 reads the engine leaves without a D. The
+  prototype calls a D on every read; the engine still decides D presence.
+- 0.7 point is wrong-gene calls (6.78 against 6.09).
+
+The engine costs 0.6 % more instructions than 0.39.6, not the 37–47 % of a
+separate pass.
+
+## Next
+
+Allele-usage priors learned from the repertoire itself. They matter when
+one gene is common; GenAIRR draws genes uniformly.
 
 ## Reproduce
 
