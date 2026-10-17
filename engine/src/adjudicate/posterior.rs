@@ -75,7 +75,7 @@ use super::lattice::{Group, KINDS, Lattice, Node, column_steps};
 use super::model::{Grammar, PathModel};
 #[cfg(doc)]
 use super::units::CallModel;
-use super::units::{EvidenceScale, Flank, FlankTable, PathNats};
+use super::units::{DCut, DTerms, EvidenceScale, Flank, FlankTable, PathNats};
 use crate::germline::SegmentKind;
 use crate::placement::Placement;
 use crate::scoring::Score;
@@ -246,8 +246,10 @@ pub struct PosteriorScratch {
     tails: Vec<f64>,
     /// Per Match column: query position, the gap run before it, its
     /// substitution score ([`column_steps`]), and the evidence (nats) before and
-    /// through it.
+    /// through it, a D's terms included.
     columns: Vec<(u32, Score, Score, f64, f64)>,
+    /// Per Match column of a D with D terms: those terms ([`DTerms::cut`]).
+    d_cuts: Vec<DCut>,
     /// Uncentred evidence at each usable entry / exit offset (NaN elsewhere).
     entry_nats: Vec<f64>,
     exit_nats: Vec<f64>,
@@ -315,6 +317,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
             Some(w) if w.lambda == nats.lambda => w,
             _ => Weights::new(nats.lambda),
         };
+        let d = nats.d;
         let marginals = Pass {
             dag: self,
             placements,
@@ -322,6 +325,9 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
             flank,
             presence: nats.presence.map(|cost| (-cost).exp()),
             steps: nats.evidence.map(Steps::new),
+            d,
+            d_on: !d.is_off(),
+            d_step: ((-d.trim[0] - d.base).exp(), (d.trim[1] + d.base).exp()),
         }
         .run(scratch);
         scratch.weights = Some(weights);
@@ -341,6 +347,12 @@ struct Pass<'a, G, M> {
     presence: [f64; 3],
     /// Evidence steps per rearranged segment kind.
     steps: [Steps; 3],
+    /// The D terms in nats, and what they multiply a D's entry and exit
+    /// weights by from one column to the next, one base on in the read and
+    /// the germline: `e^{−trim₅ − base}` and `e^{trim₃ + base}`.
+    d: DTerms,
+    d_on: bool,
+    d_step: (f64, f64),
 }
 
 impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
@@ -397,7 +409,6 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
     fn layout(&self, s: &mut PosteriorScratch) -> bool {
         let placements = self.placements;
         let grammar = &self.dag.grammar;
-        let lambda0 = self.w.lambda;
         s.lattice.layout(placements, |_| true);
         s.lattice.set_closes(self.flank.closes());
         let cells = s.lattice.cells();
@@ -410,93 +421,146 @@ impl<G: Grammar, M: PathModel> Pass<'_, G, M> {
         }
         s.shift.clear();
         let any_d = |f: &dyn Fn(u8) -> bool| (0..=MAX_D).any(f);
-        for node in &s.lattice.nodes {
-            let p = &placements[node.placement];
-            let steps = &self.steps[p.kind.index()];
-            let EvidenceScale { lambda, mu } = steps.scale;
-            let (q_start, len, cuts) = (node.q_start, node.len, node.cuts);
+        for i in 0..s.lattice.nodes.len() {
+            let node = s.lattice.nodes[i];
+            let kind = placements[node.placement].kind;
             // Cuts a path can use: entries past the start only when a kind
             // can precede this one, exits before the end only when one can
             // follow it. Only those set the centres and the spread.
-            let starts = grammar.can_start(p.kind);
+            let starts = grammar.can_start(kind);
             let ends = SegmentKind::REARRANGED
                 .iter()
-                .any(|&f| any_d(&|d| grammar.can_end(f, p.kind, d)));
+                .any(|&f| any_d(&|d| grammar.can_end(f, kind, d)));
             let preceded = SegmentKind::REARRANGED
                 .iter()
-                .any(|&k| any_d(&|d| grammar.can_follow(k, p.kind, d)));
+                .any(|&k| any_d(&|d| grammar.can_follow(k, kind, d)));
             let followed = SegmentKind::REARRANGED
                 .iter()
-                .any(|&k| any_d(&|d| grammar.can_follow(p.kind, k, d)));
+                .any(|&k| any_d(&|d| grammar.can_follow(kind, k, d)));
             let entry_used = |o: u32| preceded || (starts && o == 0);
-            let exit_used = |o: u32| followed || (ends && o == len);
-
-            // Evidence nats: a substitution column scoring s adds λ_r·s + μ_r,
-            // an uninformative one (an N, s = 0) nothing; gaps keep λ.
-            s.columns.clear();
-            let mut previous: Option<f64> = None;
-            let (mut in_lo, mut in_hi) = (f64::INFINITY, f64::NEG_INFINITY);
-            let (mut out_lo, mut out_hi) = (f64::INFINITY, f64::NEG_INFINITY);
-            for (q, gap, column) in column_steps(p) {
-                let gap_nats = lambda0 * f64::from(gap);
-                let before = previous.map_or(gap_nats, |nats| nats + gap_nats);
-                let through = before
-                    + if column == 0 {
-                        0.0
-                    } else {
-                        lambda * f64::from(column) + mu
-                    };
-                if entry_used(q - q_start) {
-                    (in_lo, in_hi) = (in_lo.min(before), in_hi.max(before));
-                }
-                if exit_used(q + 1 - q_start) {
-                    (out_lo, out_hi) = (out_lo.min(through), out_hi.max(through));
-                }
-                s.columns.push((q, gap, column, before, through));
-                previous = Some(through);
-            }
-            if in_hi - in_lo > MAX_SPREAD || out_hi - out_lo > MAX_SPREAD {
+            let exit_used = |o: u32| followed || (ends && o == node.len);
+            let in_range = if kind == SegmentKind::D && self.d_on {
+                self.cut_weights::<true>(s, node, entry_used, exit_used)
+            } else {
+                self.cut_weights::<false>(s, node, entry_used, exit_used)
+            };
+            if !in_range {
                 return false;
             }
-            let centre = |lo: f64, hi: f64| if lo <= hi { 0.5 * (lo + hi) } else { 0.0 };
-            let (c_in, c_out) = (centre(in_lo, in_hi), centre(out_lo, out_hi));
-
-            // Running products along the alignment, `before` = e^{c_in − entry
-            // nats} and `inv` = e^{entry nats − c_out}, reseeded exactly
-            // wherever a used cut finds them out of range.
-            let substitution = |column: Score, up: bool| match (column, up) {
-                (0, _) => 1.0,
-                (c, true) => steps.up(c),
-                (c, false) => steps.down(c),
-            };
-            let (mut before, mut inv) = (f64::NAN, f64::NAN);
-            let mut last: Option<Score> = None;
-            for &(q, gap, column, nats, through) in &s.columns {
-                if let Some(previous) = last {
-                    before *= substitution(previous, false) * self.w.of(-gap);
-                    inv *= substitution(previous, true) * self.w.of(gap);
-                }
-                last = Some(column);
-                let o = q - q_start;
-                let usable = |v: f64| v.is_finite() && v > 0.0;
-                if entry_used(o) {
-                    if !usable(before) {
-                        before = (c_in - nats).exp();
-                    }
-                    s.entry_w[cuts + o as usize] = before;
-                    s.entry_nats[cuts + o as usize] = nats;
-                }
-                if exit_used(o + 1) {
-                    if !usable(inv) {
-                        inv = (nats - c_out).exp();
-                    }
-                    s.exit_w[cuts + o as usize + 1] = inv * substitution(column, true);
-                    s.exit_nats[cuts + o as usize + 1] = through;
-                }
-            }
-            s.shift.push(c_out - c_in);
         }
         self.overlaps_in_range(s)
+    }
+
+    /// The weights of `node`'s canonical cuts, the cuts `entry_used` and
+    /// `exit_used` (by offset) a path can use, with a D's terms when `D`
+    /// ([`DTerms`]); `false` when the used entries or exits span more than
+    /// [`MAX_SPREAD`] nats. Generic in `D` so that V and J columns pay
+    /// nothing for the D terms.
+    fn cut_weights<const D: bool>(
+        &self,
+        s: &mut PosteriorScratch,
+        node: Node,
+        entry_used: impl Fn(u32) -> bool,
+        exit_used: impl Fn(u32) -> bool,
+    ) -> bool {
+        let p = &self.placements[node.placement];
+        let lambda0 = self.w.lambda;
+        let steps = &self.steps[p.kind.index()];
+        let EvidenceScale { lambda, mu } = steps.scale;
+        let (q_start, cuts) = (node.q_start, node.cuts);
+
+        // Evidence nats: a substitution column scoring s adds λ_r·s + μ_r,
+        // an uninformative one (an N, s = 0) nothing; gaps keep λ. A D's
+        // cuts add its D terms, linear in the cut ([`DTerms`]).
+        s.columns.clear();
+        s.d_cuts.clear();
+        let mut previous: Option<f64> = None;
+        let (mut in_lo, mut in_hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        let (mut out_lo, mut out_hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for (q, r, gap, column) in column_steps(p) {
+            let gap_nats = lambda0 * f64::from(gap);
+            let before = previous.map_or(gap_nats, |nats| nats + gap_nats);
+            let through = before
+                + if column == 0 {
+                    0.0
+                } else {
+                    lambda * f64::from(column) + mu
+                };
+            previous = Some(through);
+            let (before, through) = if D {
+                let d = self.d.cut(p, q - q_start, r);
+                s.d_cuts.push(d);
+                (before + d.entry, through + d.exit)
+            } else {
+                (before, through)
+            };
+            if entry_used(q - q_start) {
+                (in_lo, in_hi) = (in_lo.min(before), in_hi.max(before));
+            }
+            if exit_used(q + 1 - q_start) {
+                (out_lo, out_hi) = (out_lo.min(through), out_hi.max(through));
+            }
+            s.columns.push((q, gap, column, before, through));
+        }
+        if in_hi - in_lo > MAX_SPREAD || out_hi - out_lo > MAX_SPREAD {
+            return false;
+        }
+        let centre = |lo: f64, hi: f64| if lo <= hi { 0.5 * (lo + hi) } else { 0.0 };
+        let (c_in, c_out) = (centre(in_lo, in_hi), centre(out_lo, out_hi));
+
+        // Running products along the alignment, `before` = e^{c_in − entry
+        // nats} and `inv` = e^{exit nats − column − c_out} (the column's own
+        // evidence joins at the exit), reseeded exactly wherever a used cut
+        // finds them out of range.
+        let substitution = |column: Score, up: bool| match (column, up) {
+            (0, _) => 1.0,
+            (c, true) => steps.up(c),
+            (c, false) => steps.down(c),
+        };
+        // A D's terms from column `k − 1` to `k`: one base on in the read and
+        // the germline, the common step, or across a gap.
+        let d_step = |k: usize| {
+            let (was, d) = (&s.d_cuts[k - 1], &s.d_cuts[k]);
+            if (d.o, d.t5, was.t3) == (was.o + 1, was.t5 + 1, d.t3 + 1) {
+                self.d_step
+            } else {
+                ((was.entry - d.entry).exp(), (d.exit - was.exit).exp())
+            }
+        };
+        let (mut before, mut inv) = (f64::NAN, f64::NAN);
+        let mut last: Option<Score> = None;
+        for (k, &(q, gap, column, nats, through)) in s.columns.iter().enumerate() {
+            if let Some(previous) = last {
+                before *= substitution(previous, false) * self.w.of(-gap);
+                inv *= substitution(previous, true) * self.w.of(gap);
+                if D {
+                    let (entry, exit) = d_step(k);
+                    before *= entry;
+                    inv *= exit;
+                }
+            }
+            last = Some(column);
+            let o = q - q_start;
+            let usable = |v: f64| v.is_finite() && v > 0.0;
+            if entry_used(o) {
+                if !usable(before) {
+                    before = (c_in - nats).exp();
+                }
+                s.entry_w[cuts + o as usize] = before;
+                s.entry_nats[cuts + o as usize] = nats;
+            }
+            if exit_used(o + 1) {
+                if !usable(inv) {
+                    // The evidence before the column, with its exit terms.
+                    let d = if D { s.d_cuts[k] } else { DCut::default() };
+                    inv = (nats - d.entry + d.exit - c_out).exp();
+                }
+                s.exit_w[cuts + o as usize + 1] = inv * substitution(column, true);
+                s.exit_nats[cuts + o as usize + 1] = through;
+            }
+        }
+        s.shift.push(c_out - c_in);
+        true
     }
 
     /// Whether every overlap between a node and a possible successor keeps
@@ -921,7 +985,14 @@ mod tests {
                 units += self.read.column(b.kind, column);
                 last = Some(after);
             }
-            (nats, units)
+            let span = b
+                .clip
+                .span(entry, exit)
+                .expect("canonical cuts keep a column");
+            (
+                nats + self.nats.d.span(b, &span),
+                units + self.read.d_span(b, &span),
+            )
         }
 
         /// `b`'s cut-independent term, its kind's presence cost.
@@ -1129,6 +1200,7 @@ mod tests {
             lambda: LAMBDA,
             evidence: [evidence; 3],
             presence: presence.map(|cost| LAMBDA * cost),
+            d: DTerms::default(),
         };
         check(dag, placements, nats, ReadModel::fixed(LAMBDA, presence));
     }
@@ -1136,7 +1208,7 @@ mod tests {
     /// One read model at divergence `p` for both passes: the Viterbi path is
     /// a mode of the posterior (the brute-force maximum of `e^{units/F}`).
     fn check_per_read(dag: &PlacementDag, placements: &[Placement], p: f64) {
-        let read = ReadModel::at(&EVIDENCE, p, dag.model.presence);
+        let read = ReadModel::at_with(&EVIDENCE, p, dag.model.presence, dag.model.d_terms);
         check(dag, placements, read.nats(), read);
     }
 
@@ -1200,6 +1272,7 @@ mod tests {
             kind: SegmentKind::J,
             alleles: vec![1],
             shifted: Vec::new(),
+            ends: (0, r as i32),
             clip,
             local_score: score,
             evidence: Evidence::default(),
@@ -1229,6 +1302,111 @@ mod tests {
             placement(SegmentKind::J, &query, &encode(&j), 21),
         ];
         (query, placements)
+    }
+
+    /// The junction read with its D placements on alleles longer than the
+    /// aligned bases, and a D with a one-base deletion: every D cut trims
+    /// germline at both ends, and the deletion steps the 5′ trim by two.
+    fn trimmed_d_junction() -> (Vec<u8>, Vec<Placement>) {
+        let (query, mut placements) = junction();
+        for (p, ends) in placements
+            .iter_mut()
+            .filter(|p| p.kind == SegmentKind::D)
+            .zip([(3, 14), (1, 17)])
+        {
+            p.ends = ends;
+        }
+        let scoring = AffineScoring::new(2, -3, -13, -1);
+        // A D on query 13..22 against GATTTACAGG: one reference base deleted.
+        let reference = encode(b"GATTTACAGG");
+        let profile = SubstitutionProfile::build(&scoring, &reference);
+        let mut ops = vec![Op::Match; 4];
+        ops.push(Op::Del);
+        ops.extend(std::iter::repeat_n(Op::Match, 5));
+        let (mut q, mut r, mut score) = (13usize, 0usize, 0);
+        for &op in &ops {
+            match op {
+                Op::Match => {
+                    score += profile.at(query[q], r);
+                    q += 1;
+                    r += 1;
+                }
+                _ => {
+                    score += scoring.gaps.open;
+                    r += 1;
+                }
+            }
+        }
+        let alignment = Alignment {
+            q_start: 13,
+            q_end: q as u32,
+            r_start: 0,
+            r_end: r as u32,
+            score,
+            ops,
+        };
+        let clip = ClipIndex::build(&alignment, &query, &profile, scoring.gaps);
+        placements.push(Placement {
+            kind: SegmentKind::D,
+            alleles: vec![2],
+            shifted: Vec::new(),
+            ends: (2, r as i32 + 6),
+            clip,
+            local_score: score,
+            evidence: Evidence::default(),
+            local_evidence: Evidence::default(),
+            anchor: Some(Score::MIN),
+            alignment,
+        });
+        (query, placements)
+    }
+
+    /// With the D trim and N/P length priors on, both passes still read one
+    /// integer model: the marginals equal exhaustive summation and the
+    /// Viterbi key its maximum, with and without a per-base N/P cost, so
+    /// the D terms keep every clip separable in its cuts.
+    #[test]
+    fn d_terms_keep_the_call_a_posterior_mode() {
+        let d_terms = DTerms::geometric(Some((5.0, 7.0)), Some(8.0));
+        let model = EngineeringObjective {
+            d_terms,
+            ..EngineeringObjective::priced([0.0, 4.5, 3.5])
+        };
+        let per_base = EngineeringObjective {
+            insertion_per_base: -1,
+            ..model
+        };
+        let delta0 = EVIDENCE.log_odds_divergence(SegmentKind::V);
+        let fixtures = [trimmed_d_junction().1, junction().1, j_reaching_over_d().1];
+        for p in [0.005, delta0, 0.3] {
+            for placements in &fixtures {
+                for grammar in [VdjGrammar::VDJ, TANDEM_D] {
+                    for objective in [model, per_base] {
+                        let dag = PlacementDag::new(grammar, objective, [4, 3, 4], Mode::Fixed);
+                        check_per_read(&dag, placements, p);
+                    }
+                }
+            }
+        }
+        // The terms change calls: on the trimmed fixture the D the call
+        // keeps differs from the call without them at some divergence.
+        let (_, placements) = trimmed_d_junction();
+        let without = EngineeringObjective::priced([0.0, 4.5, 3.5]);
+        let differs = [0.005, delta0, 0.3].iter().any(|&p| {
+            let call = |objective: EngineeringObjective| {
+                let dag = PlacementDag::new(VdjGrammar::VDJ, objective, [4, 3, 4], Mode::Fixed);
+                let read = ReadModel::at_with(&EVIDENCE, p, objective.presence, objective.d_terms);
+                dag.viterbi(
+                    &placements,
+                    &read,
+                    &FlankTable::default(),
+                    &mut DagScratch::default(),
+                )
+                .map(|(_, segments)| segments)
+            };
+            call(model) != call(without)
+        });
+        assert!(differs, "the D terms changed no call");
     }
 
     #[test]
@@ -1451,6 +1629,7 @@ mod tests {
             lambda: LAMBDA,
             evidence: [EvidenceScale::fixed(LAMBDA); 3],
             presence: dag.model.presence.map(|cost| LAMBDA * cost),
+            d: DTerms::default(),
         };
         let m = dag
             .posterior(
@@ -1478,6 +1657,7 @@ mod tests {
             lambda: LAMBDA,
             evidence: [EvidenceScale::fixed(LAMBDA); 3],
             presence: dag.model.presence.map(|cost| LAMBDA * cost),
+            d: DTerms::default(),
         };
         let m = dag
             .posterior(
@@ -1585,6 +1765,7 @@ mod tests {
                                     lambda: LAMBDA,
                                     evidence: [EvidenceScale::at_divergence(0.02, 2, -3); 3],
                                     presence: model.presence.map(|cost| LAMBDA * cost),
+                                    d: DTerms::default(),
                                 };
                                 let read = ReadModel::fixed(LAMBDA, model.presence);
                                 check_with(&dag, &placements, nats, read, &table);

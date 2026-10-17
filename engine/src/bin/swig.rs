@@ -105,6 +105,11 @@ options:
                        read would show in the bases after (before) it, and call such
                        a D under the pair guards (default on; off: a D only between
                        a V and a J, as in 0.39.4; docs/ALGORITHM.md 2.3)
+  --d-trim M5,M3|off   geometric priors on the bases a D loses at its 5' and 3' ends,
+                       means M5 and M3 (default 5,7; read by the per-read call and
+                       the posterior; docs/ALGORITHM.md 4)
+  --np-length M|off    geometric prior on the N/P lengths around a D, mean M: each
+                       base a D keeps is one N/P base fewer (default 8)
   --min-d-match N      shortest exact run of an admissible D (default: the profile's)
   --d-mismatch S       D mismatch score, -1000 to -1 (default: the profile's)
   --j-mismatch S       J mismatch score, -1000 to -1 (default: the profile's)

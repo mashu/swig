@@ -9,7 +9,7 @@
 //! separability is what lets running maxima (or sums) evaluate every pair of
 //! cuts in O(1) amortised per cut (see [`super::PlacementDag`]).
 
-use super::units::ResolvedOpenFlank;
+use super::units::{DTerms, ResolvedOpenFlank};
 use crate::germline::SegmentKind;
 use crate::scoring::Score;
 
@@ -128,6 +128,12 @@ pub trait PathModel: Send + Sync {
     fn open_flank(&self) -> Option<&ResolvedOpenFlank> {
         None
     }
+
+    /// The D trim and N/P length priors in nats ([`DTerms`]), read by a
+    /// per-read model only: they are fractions of a score unit.
+    fn d_terms(&self) -> DTerms {
+        DTerms::default()
+    }
 }
 
 impl<M: PathModel> PathModel for &M {
@@ -149,6 +155,10 @@ impl<M: PathModel> PathModel for &M {
 
     fn open_flank(&self) -> Option<&ResolvedOpenFlank> {
         (**self).open_flank()
+    }
+
+    fn d_terms(&self) -> DTerms {
+        (**self).d_terms()
     }
 }
 
@@ -180,6 +190,8 @@ impl<M: PathModel> PathModel for &M {
 ///   missed before it). It pays the log-likelihood ratio of that miss
 ///   against "no junction there" ([`super::units::FlankTable`]), which
 ///   removes chance Ds far from the anchor of reads without a D.
+/// * `d_terms` — geometric priors on a D's trims and on the N/P lengths
+///   around it ([`DTerms`]), read by the per-read model.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EngineeringObjective {
     pub pair_bonus: Score,
@@ -190,6 +202,8 @@ pub struct EngineeringObjective {
     pub insertion_per_base: Score,
     /// The cost at the open end of a D-first or D-last path (`None` = off).
     pub open_flank: Option<ResolvedOpenFlank>,
+    /// The D trim and N/P length priors (all 0 = off).
+    pub d_terms: DTerms,
 }
 
 #[cfg(test)]
@@ -202,6 +216,7 @@ impl EngineeringObjective {
             presence,
             insertion_per_base: 0,
             open_flank: None,
+            d_terms: DTerms::default(),
         }
     }
 }
@@ -248,6 +263,10 @@ impl PathModel for EngineeringObjective {
 
     fn open_flank(&self) -> Option<&ResolvedOpenFlank> {
         self.open_flank.as_ref()
+    }
+
+    fn d_terms(&self) -> DTerms {
+        self.d_terms
     }
 }
 

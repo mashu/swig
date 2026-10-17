@@ -152,12 +152,105 @@ impl EvidenceModel {
     /// unquantised, the prior terms at `lambda`, and the presence costs at
     /// the λ they were derived with, `λ_k·P*_k = ln(N·L) − ln odds`.
     pub fn nats(&self, p: f64, presence: [f64; 3]) -> PathNats {
+        self.nats_with(p, presence, DTerms::default())
+    }
+
+    /// [`EvidenceModel::nats`] with the D terms `d`; the D cost rises by
+    /// what its `P*_D/m` columns gain from `d.base` and falls by `d.credit`
+    /// ([`ReadModel::at_with`]).
+    pub fn nats_with(&self, p: f64, presence: [f64; 3], d: DTerms) -> PathNats {
+        let mut costs: [f64; 3] = std::array::from_fn(|k| self.presence_lambda[k] * presence[k]);
+        let (matched, _) = self.substitution[SegmentKind::D.index()];
+        costs[SegmentKind::D.index()] +=
+            presence[SegmentKind::D.index()] / f64::from(matched) * d.base - d.credit;
         PathNats {
             lambda: self.lambda,
             evidence: self.evidence(p),
-            presence: std::array::from_fn(|k| self.presence_lambda[k] * presence[k]),
+            presence: costs,
+            d,
         }
     }
+}
+
+/// The D terms of a path model, in nats: geometric priors on how many
+/// germline bases a D clip trims, and on the N/P lengths around it.
+///
+/// * `trim` — what a D clip pays per germline base it trims from its
+///   allele's 5′ and 3′ ends ([`Placement::trims`]): `ln((μ + 1)/μ)` for a
+///   geometric trim of mean `μ`, relative to an untrimmed D.
+/// * `base` — what a D clip gains per read base it keeps: with geometric
+///   N/P lengths (mean `μ`) the junction around a D pays `ln((μ + 1)/μ)`
+///   per N/P base, and every base the D keeps is one fewer. Only D clips
+///   gain it, so a V or J cut is valued as before.
+/// * `credit` — what the D cost is lowered by: the trim cost of a D with the
+///   prior's mean trims, `Σ μ·ln((μ + 1)/μ)` (1.85 nats for means 5 and 7).
+///   The trims then re-rank Ds without making a D with typical trims harder
+///   to call, while a chance hit deep inside a long allele pays more than
+///   before.
+///
+/// `trim` and `base` are linear in a cut's germline or read position, so a
+/// clip stays worth `exit(x) − entry(y)` and the DAG and the posterior keep
+/// their recursions ([`super::PlacementDag`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DTerms {
+    pub trim: [f64; 2],
+    pub base: f64,
+    pub credit: f64,
+}
+
+impl DTerms {
+    /// The terms of geometric 5′ and 3′ trims of means `trim` and N/P
+    /// lengths of mean `np` (`None`: that prior off).
+    pub fn geometric(trim: Option<(f64, f64)>, np: Option<f64>) -> Self {
+        let per_base = |mean: f64| ((mean + 1.0) / mean).ln();
+        Self {
+            trim: trim.map_or([0.0; 2], |(t5, t3)| [per_base(t5), per_base(t3)]),
+            base: np.map_or(0.0, per_base),
+            credit: trim.map_or(0.0, |(t5, t3)| t5 * per_base(t5) + t3 * per_base(t3)),
+        }
+    }
+
+    pub fn is_off(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// [`ReadModel::d_span`] in nats.
+    #[cfg(test)]
+    pub(crate) fn span(&self, placement: &Placement, span: &crate::clip::ClipSpan) -> f64 {
+        if placement.kind != SegmentKind::D {
+            return 0.0;
+        }
+        let (t5, t3) = placement.trims(span.r_lo, span.r_hi);
+        f64::from(span.q_len()) * self.base
+            - f64::from(t5) * self.trim[0]
+            - f64::from(t3) * self.trim[1]
+    }
+
+    /// [`ReadModel::d_cut`] in nats, for D `placement` (the trims and the
+    /// read offset `o` of the column, as integers, then the nats).
+    #[inline]
+    pub(crate) fn cut(&self, placement: &Placement, o: u32, r: u32) -> DCut {
+        let (t5, t3) = placement.trims(r, r + 1);
+        DCut {
+            t5,
+            t3,
+            o,
+            entry: f64::from(t5) * self.trim[0] + f64::from(o) * self.base,
+            exit: f64::from(o + 1) * self.base - f64::from(t3) * self.trim[1],
+        }
+    }
+}
+
+/// The D terms of the cuts around one `Match` column ([`DTerms::cut`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct DCut {
+    pub t5: u32,
+    pub t3: u32,
+    pub o: u32,
+    /// Nats an entry cut before the column adds to its prefix.
+    pub entry: f64,
+    /// Nats an exit cut after the column adds to its prefix.
+    pub exit: f64,
 }
 
 /// A read's path model in nats: the posterior is `P(path, cuts) ∝ e^{nats}`.
@@ -170,6 +263,8 @@ pub struct PathNats {
     pub evidence: [EvidenceScale; 3],
     /// What including a segment costs, per rearranged kind.
     pub presence: [f64; 3],
+    /// The D trim and N/P length terms.
+    pub d: DTerms,
 }
 
 /// One read's model in integer units (see the module documentation).
@@ -183,6 +278,10 @@ pub(crate) struct ReadModel {
     affine: [(Units, Units); 3],
     /// What including a segment costs, per [`SegmentKind::index`].
     presence: [Units; 3],
+    /// [`DTerms`]: per trimmed 5′ and 3′ germline base, per kept read base
+    /// (the credit is in the D cost).
+    d_trim: [Units; 2],
+    d_base: Units,
 }
 
 impl ReadModel {
@@ -194,27 +293,45 @@ impl ReadModel {
             u0: 1,
             affine: [(1, 0); 3],
             presence: presence.map(|cost| cost.floor() as Units),
+            d_trim: [0; 2],
+            d_base: 0,
         }
     }
 
     /// The read's own model at divergence `p`, in `1/F` nats, with the
     /// presence costs `c_k(p)` derived from `P*_k` (`presence`).
+    #[cfg(test)]
     pub fn at(model: &EvidenceModel, p: f64, presence: [f64; 3]) -> Self {
+        Self::at_with(model, p, presence, DTerms::default())
+    }
+
+    /// [`ReadModel::at`] with the D terms `d`. A matched D column is then
+    /// worth `a(p̂) + d.base`, and the D cost is read as `P*_D/m` such
+    /// columns, so untrimmed exact runs keep their classes
+    /// ([`super::units`]), less the credit `d.credit`.
+    pub fn at_with(model: &EvidenceModel, p: f64, presence: [f64; 3], d: DTerms) -> Self {
         let quantise = |nats: f64| (UNITS_PER_NAT * nats).round() as Units;
         let affine = model
             .evidence(p)
             .map(|e| (quantise(e.lambda), quantise(e.mu)));
+        let d_base = quantise(d.base);
         let cost = |kind: SegmentKind| {
             let matched = model.substitution[kind.index()].0;
             let (u, v) = affine[kind.index()];
-            let column = (Units::from(matched) * u + v) as f64;
-            (presence[kind.index()] * column / f64::from(matched)).floor() as Units
+            let (base, credit) = match kind {
+                SegmentKind::D => (d_base, quantise(d.credit)),
+                _ => (0, 0),
+            };
+            let column = (Units::from(matched) * u + v + base) as f64;
+            (presence[kind.index()] * column / f64::from(matched)).floor() as Units - credit
         };
         Self {
             per_nat: UNITS_PER_NAT,
             u0: quantise(model.lambda),
             affine,
             presence: SegmentKind::REARRANGED.map(cost),
+            d_trim: d.trim.map(quantise),
+            d_base,
         }
     }
 
@@ -240,6 +357,39 @@ impl ReadModel {
         self.presence[kind.index()]
     }
 
+    /// Whether the D terms are on ([`ReadModel::d_cut`]).
+    #[inline]
+    pub fn has_d_terms(&self) -> bool {
+        self.d_trim != [0; 2] || self.d_base != 0
+    }
+
+    /// The D terms of a cut of D `placement` on its `Match` column at read
+    /// offset `o` (from the placement's start) and reference position `r`:
+    /// what an entry cut before the column and an exit cut after it add to
+    /// their prefix values ([`DTerms`]).
+    #[inline]
+    pub fn d_cut(&self, placement: &Placement, o: u32, r: u32) -> (Units, Units) {
+        debug_assert_eq!(placement.kind, SegmentKind::D);
+        let (t5, t3) = placement.trims(r, r + 1);
+        (
+            Units::from(t5) * self.d_trim[0] + Units::from(o) * self.d_base,
+            Units::from(o + 1) * self.d_base - Units::from(t3) * self.d_trim[1],
+        )
+    }
+
+    /// The D terms of a whole clip of `placement` retaining `span`: what
+    /// [`ReadModel::d_cut`] adds at its two cuts, from the span's bounds.
+    #[cfg(test)]
+    pub fn d_span(&self, placement: &Placement, span: &crate::clip::ClipSpan) -> Units {
+        if placement.kind != SegmentKind::D {
+            return 0;
+        }
+        let (t5, t3) = placement.trims(span.r_lo, span.r_hi);
+        Units::from(span.q_len()) * self.d_base
+            - Units::from(t5) * self.d_trim[0]
+            - Units::from(t3) * self.d_trim[1]
+    }
+
     /// The same model in nats, `units / F` exactly (up to `f64` rounding of
     /// sums), for the posterior.
     pub fn nats(&self) -> PathNats {
@@ -251,6 +401,12 @@ impl ReadModel {
                 mu: nats(v),
             }),
             presence: self.presence.map(nats),
+            d: DTerms {
+                trim: self.d_trim.map(nats),
+                base: nats(self.d_base),
+                // Already in the D cost.
+                credit: 0.0,
+            },
         }
     }
 }
@@ -1043,14 +1199,14 @@ fn pays(p: &Placement, read: &ReadModel, (m, mu): (Score, Score)) -> bool {
     match p.kind {
         // The best prefix: from the start (after any leading gap) to an exit.
         SegmentKind::V => {
-            let Some((_, _, first)) = steps.next() else {
+            let Some((_, _, _, first)) = steps.next() else {
                 return false;
             };
             let mut value = read.column(p.kind, first);
             if value > cost {
                 return true;
             }
-            for (_, gap, column) in steps {
+            for (_, _, gap, column) in steps {
                 value += read.prior(gap) + read.column(p.kind, column);
                 if value > cost {
                     return true;
@@ -1061,7 +1217,7 @@ fn pays(p: &Placement, read: &ReadModel, (m, mu): (Score, Score)) -> bool {
         // The best suffix: from its best entry to the end.
         _ => {
             let (mut value, mut lowest) = (0, Units::MAX);
-            for (_, gap, column) in steps {
+            for (_, _, gap, column) in steps {
                 value += read.prior(gap);
                 lowest = lowest.min(value);
                 value += read.column(p.kind, column);

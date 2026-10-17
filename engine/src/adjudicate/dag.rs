@@ -217,14 +217,15 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         s.entry.resize(s.lattice.cells(), None);
         s.exit.clear();
         s.exit.resize(s.lattice.cells(), None);
+        let d_terms = read.has_d_terms();
         for node in &s.lattice.nodes {
-            let mut value: Units = 0;
-            for (q, gap, column) in column_steps(&placements[node.placement]) {
-                let o = (q - node.q_start) as usize;
-                value += read.prior(gap);
-                s.entry[node.cuts + o] = Some(value);
-                value += read.column(node.kind, column);
-                s.exit[node.cuts + o + 1] = Some(value);
+            let placement = &placements[node.placement];
+            let cells = node.cuts..node.cuts + node.width();
+            let (entry, exit) = (&mut s.entry[cells.clone()], &mut s.exit[cells]);
+            if d_terms && node.kind == SegmentKind::D {
+                prefix_values::<true>(read, placement, entry, exit);
+            } else {
+                prefix_values::<false>(read, placement, entry, exit);
             }
         }
         s.open.clear();
@@ -458,6 +459,32 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
     }
 }
 
+/// The prefix value of every canonical cut of `placement` under `read`, by
+/// offset from its start, with a D's terms when `D` (linear in the cut, so a
+/// clip stays `exit − entry`). Generic in `D` so that V and J columns pay
+/// nothing for them.
+fn prefix_values<const D: bool>(
+    read: &ReadModel,
+    placement: &Placement,
+    entry: &mut [Option<Units>],
+    exit: &mut [Option<Units>],
+) {
+    let mut value: Units = 0;
+    for (q, r, gap, column) in column_steps(placement) {
+        let o = q - placement.q_start();
+        let (d_entry, d_exit) = if D {
+            read.d_cut(placement, o, r)
+        } else {
+            (0, 0)
+        };
+        let o = o as usize;
+        value += read.prior(gap);
+        entry[o] = Some(value + d_entry);
+        value += read.column(placement.kind, column);
+        exit[o + 1] = Some(value + d_exit);
+    }
+}
+
 impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
     /// The best path under `read`, with its key.
     pub(crate) fn viterbi(
@@ -618,7 +645,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
                 evidence,
                 calls: CallModel::PerRead,
                 ..
-            } => ReadModel::at(&evidence, p, self.presence()),
+            } => ReadModel::at_with(&evidence, p, self.presence(), self.model.d_terms()),
             // One unit per score unit, λ nats each (1 without an evidence
             // model; nothing then reads them as nats).
             Mode::Read { evidence, .. } => ReadModel::fixed(evidence.lambda, self.presence()),
@@ -639,7 +666,7 @@ impl<G: Grammar, M: PathModel> PlacementDag<G, M> {
         };
         Some(match calls {
             CallModel::PerRead => self.read_model(p).nats(),
-            CallModel::FixedScale => evidence.nats(p, self.presence()),
+            CallModel::FixedScale => evidence.nats_with(p, self.presence(), self.model.d_terms()),
         })
     }
 }
