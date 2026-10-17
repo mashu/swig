@@ -1,0 +1,10 @@
+[package]
+name = "dposterior"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

@@ -58,6 +58,15 @@ python3 loss.py work/runs/igh_shm5.truth.tsv swig=work/runs/igh_shm5.swig.tsv   
 | `recall.py` | prototype: GenAIRR-style positional tie sets at swig's placement, through its CIGAR |
 | `d_posterior.py` | prototype: D call from a posterior over allele, offset and trims, reporting the set of best expected score |
 | `improve.sh`, `merge_calls.py`, `summary.py` | run the prototypes, combine their calls, tabulate |
+| `dposterior/` | the D posterior in Rust, with switches for priors, decision rule and offsets |
+| `ablate.sh` | score each `dposterior` variant and swig's `--d-allele max-marginal` |
 
-The prototypes are Python and slow (about 0.15 s per read for the D
-posterior); they measure what the engine would gain, not its speed.
+The Python D posterior is slow, about 0.2 s per read. `dposterior/` runs
+the same model at 0.24–0.31 ms per read. Neither is how the engine would
+run it: the ablation finds that the gain is the trim and N-length priors,
+which fit swig's placement DAG as terms on its cuts.
+
+```sh
+cargo build --release --manifest-path dposterior/Cargo.toml
+./ablate.sh work/ref_igh work/runs/igh_shm5
+```

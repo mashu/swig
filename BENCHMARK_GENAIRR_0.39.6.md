@@ -32,6 +32,14 @@ validation.
   With generic geometric trim and N-length priors, IGH D rises by 0.3–4.9
   points over swig 0.39.6 and 0.7–7.7 over IgBLAST; IGH J rises by
   0.2–0.4. GenAIRR's own trimming tables do no better.
+- **The D gain is the priors, not a different placement.** Swig already
+  places V, D and J jointly in its placement DAG. With flat priors the
+  prototype matches the DAG on the reads where swig calls a D (5 % SHM:
+  93.12 against 93.16). The trim prior and the N-length prior make the
+  whole gain, and the DAG's objective has neither. The expected-score set,
+  every offset of an allele, and a non-linear N-length prior add nothing
+  (see Ablation). Both priors fit the DAG as terms on its cuts. That keeps
+  the joint placement, and needs no separate pass.
 - **Reporting genuine ties pays, guessing does not.** MiXCR's top hit
   alone scores 0.2–8.4 points lower on V, and 7.6–8.2 lower on IGH D,
   than all of its top-tied hits.
@@ -252,25 +260,117 @@ start in 62 % (5 % SHM), with J often one base early or 2–5 late. The D
 posterior takes both as given. Modelling V tail, N1, D, N2 and J head
 together should add D accuracy at high SHM.
 
+### Ablation: what the D gain is made of
+
+Swig chooses V, D and J jointly: the placement DAG (`adjudicate/dag.rs`,
+ALGORITHM §4) runs a semi-Markov Viterbi over every admitted V, D and J
+placement and every cut between neighbours. Its posterior (§4a) sums over
+the same paths and cuts. The prototype does not replace it. It is post-
+processing that holds the DAG's V end and J start fixed and re-decides
+only the D between them. To find what the prototype adds,
+`benchmarks/genairr/dposterior/` reimplements it in Rust with switches,
+and `ablate.sh` scores each variant. V and J stay swig's, and the
+hypothesis window is 8 nats and 50 hypotheses.
+
+The variants:
+- *flat*: uniform trims, N lengths and alleles;
+- *trim*: geometric trim priors;
+- *N*: the negative-binomial N-length prior (shape 2), or a geometric one;
+- *mapset*: GenAIRR's tie set of the best hypothesis. It is the default
+  below; *jaccard* is the set of best expected score;
+- *one offset*: each allele only at its offset of best local score. The
+  DAG holds one D placement per allele.
+
+| D score | IGH naive | 2 % | 5 % | 10 % | realistic | TRB naive | TRB realistic |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| swig 0.39.6 (DAG) | 98.17 | 96.38 | 93.16 | 87.12 | 92.78 | 99.12 | 98.63 |
+| swig `--d-allele max-marginal` | 98.16 | 96.42 | 93.45 | 87.54 | 92.99 | 99.12 | 98.65 |
+| prototype, flat | 98.26 | 96.40 | 93.25 | 87.67 | 92.95 | 99.00 | 98.38 |
+| + trim | **98.88** | 97.53 | 95.39 | 91.04 | 94.93 | 99.11 | 98.72 |
+| + trim + N | 98.80 | **97.62** | 95.78 | 91.98 | 95.31 | 99.12 | 98.71 |
+| + trim + geometric N | 98.80 | **97.62** | **95.81** | 91.72 | **95.38** | 99.10 | 98.75 |
+| + trim + N, jaccard | 98.56 | 97.45 | 95.67 | **91.99** | 95.26 | 99.08 | 98.62 |
+| one offset, flat | 98.25 | 96.37 | 93.27 | 87.66 | 93.04 | 99.01 | 98.42 |
+| one offset, trim | **98.88** | 97.52 | 95.38 | 91.01 | 94.92 | **99.14** | 98.74 |
+| one offset, trim + geometric N | 98.80 | 97.61 | 95.80 | 91.67 | 95.34 | 99.13 | **98.77** |
+
+The prototype always calls a D. Swig declines one on 34–100 of the
+10,000 reads. The split shows that this policy difference is not where
+the gain comes from:
+
+| IGH, D score | on swig's D reads: swig | flat | trim + N | on swig's no-D reads: trim + N |
+|---|---:|---:|---:|---:|
+| naive | 98.17 | 98.19 | 98.56 | 0.24 |
+| 5 % SHM | 93.16 | 93.12 | 95.41 | 0.37 |
+| 10 % SHM | 87.12 | 87.50 | 91.53 | 0.46 |
+| realistic | 92.78 | 92.82 | 94.95 | 0.36 |
+
+- **The DAG's placement is not the loss.** On the reads where swig calls
+  a D, the flat prototype matches it to within 0.4 points.
+- **The trim prior is most of the gain**, +0.6 to +3.4 points over flat.
+  The DAG has no trim prior. A D placement's cuts cost only their
+  alignment evidence, so a short exact match deep inside a long allele
+  costs as little as an untrimmed short allele.
+- **The N-length prior adds up to +0.9 points** at 5–10 % SHM. A
+  geometric prior does as well as the negative binomial (within 0.26).
+  A geometric prior is linear in the N length, which is the DAG's per-base
+  N/P score `ι`, 0 by default.
+- **The decision rule and the hypothesis space do not matter.** The best
+  hypothesis's tie set is as good as the expected-score set. Holding each
+  allele to one offset, as the DAG does, costs at most 0.1 point.
+- **TRB D moves within ±0.25 points**, as it should with two genes.
+- **Swig's own posterior decoding** (`--d-allele max-marginal`, off by
+  default) gains 0.2–0.4 points at 5–10 % SHM and on the realistic set.
+  It decides over the DAG's model, which lacks the priors.
+
+### Speed
+
+| Single thread, IGH | per read |
+|---|---:|
+| swig 0.39.6, whole read | 0.66 ms |
+| D posterior, Python (`d_posterior.py`) | ~216 ms |
+| D posterior, Rust (`dposterior/`), standalone, 8 nats / 50 hypotheses | 0.24–0.31 ms |
+| positional J tie set, Rust core loop | 1–1.3 µs |
+
+The Rust D posterior matches the Python call on 99.4–99.7 % of reads at
+equal accuracy. It packs every allele's bases into bit masks and bounds
+each (allele, offset) pair by a Kadane pass over its matches. It
+evaluates pairs best bound first, until no bound reaches the kept
+hypotheses. As a separate pass it would add 37–47 % to swig's time. The
+ablation shows that no separate pass is needed. Inside the DAG, the trim
+prior is a table lookup per D cut in a recursion that already visits
+every cut. The N-length prior is `ι`, which the recursion already
+supports. The expected cost is therefore close to zero; it has not been
+measured.
+
 ## Implementing it in swig
 
-1. **Positional tie sets** in `report.rs` (`called_report`). Replace or
+1. **D trim prior in the DAG** (`adjudicate/units.rs`, `dag.rs`,
+   `posterior.rs`). Add `ln P(t5)` to a D node's entry cut and `ln P(t3)`
+   to its exit cut, where `t5` is the germline index of the first
+   retained base and `t3` the germline bases after the last. Use
+   geometric priors with means 5 and 7, relative to an untrimmed D
+   (`ln P(t)/P(0)`), so that the D cost `P*_D` keeps its meaning.
+   - Each term depends on one cut. Separability holds, so Theorem 1
+     (exact Viterbi) and Theorem 2 (exact marginals) carry over, and the
+     brute-force oracles (`oracle.rs`) check both. V and J cuts stay
+     joint with the D.
+   - The DAG's D placements are local alignments, and their cuts cannot
+     reach past a terminal mismatch. The prototype can. If the oracles
+     or the ablation show that it matters, extend D placements ungapped
+     towards both germline ends, as V and J are towards their outer ends.
+2. **N-length prior as `ι`.** The per-base N/P score of a geometric prior
+   with mean 8 is `ln(8/9)` nats. It applies to every junction, VJ paths
+   included, so it shifts D presence. Check D-free specificity and
+   `d_presence_posterior` calibration on the IgSim suite before turning
+   it on, and re-derive `P*_D` if they move.
+3. **Positional tie sets** in `report.rs` (`called_report`). Replace or
    filter `CoOptimal::names` with the alleles of maximal positional
    matches at the primary allele's germline index along the called
    alignment. That is about 200 alleles × 300 positions per V call, tens
-   of microseconds.
-2. **D refinement** after the call, for paths with a V and a J: the D
-   posterior above with the D database, the read's divergence and the
-   geometric priors. The best (allele, offset) over all trims takes
-   O(alleles × offsets × length): the 5′ and 3′ trims are independent
-   given the D's ends, so running maxima and prefix sums replace the trim
-   double loop, about 0.1 ms per read. The top hypotheses' tie sets give
-   the reported names. The best hypothesis gives `d_sequence_start/end`,
-   the D CIGAR and the NP lengths. `d_presence_posterior` can keep gating
-   reads that may have no D.
-3. **Next**: a joint junction model (V tail, N1, D, N2, J head); and
-   allele-usage priors learned from the repertoire itself, which matter
-   when one gene is common (GenAIRR draws genes uniformly).
+   of microseconds. It changes the reported names, not the placement.
+4. **Next**: allele-usage priors learned from the repertoire itself.
+   They matter when one gene is common; GenAIRR draws genes uniformly.
 
 ## Reproduce
 
