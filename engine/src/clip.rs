@@ -147,11 +147,19 @@ impl ClipIndex {
     /// kept first) and of an exit cut at `q + 1` (kept last). Every distinct
     /// clipped span has exactly one such pair of cuts.
     pub fn matches(&self) -> impl Iterator<Item = (u32, Score, Score)> + '_ {
+        self.match_columns()
+            .map(|(q, _, entry, exit)| (q, entry, exit))
+    }
+
+    /// [`ClipIndex::matches`] with each column's reference position `r`:
+    /// an entry cut there retains reference from `r`, an exit cut after it
+    /// up to `r + 1`.
+    pub fn match_columns(&self) -> impl Iterator<Item = (u32, u32, Score, Score)> + '_ {
         self.columns
             .iter()
             .enumerate()
             .filter(|(_, c)| c.op == Op::Match)
-            .map(|(k, c)| (c.q, self.prefix[k], self.prefix[k + 1]))
+            .map(|(k, c)| (c.q, c.r, self.prefix[k], self.prefix[k + 1]))
     }
 
     #[inline]

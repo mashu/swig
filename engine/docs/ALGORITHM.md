@@ -87,6 +87,7 @@ score(path) = Σ_segments S_clip(segment)
             − c_open(first) − c_open(last)                       (D-first / D-last paths)
             + pair_bonus · [path starts with V and ends with J]  (0 by default)
             + insertion_per_base · #N/P bases                    (0 by default)
+            + Σ_D (b·|D| − τ₅·t₅ − τ₃·t₃ + κ)                   (per-read model; D priors below)
 ```
 
 The non-alignment terms are log prior odds in score units:
@@ -215,6 +216,51 @@ The non-alignment terms are log prior odds in score units:
   alternative allowance: it traced the same trade-off between far chance
   Ds and real Ds behind long N regions, and the step won at the stated
   parameters (REVIEW §0 item 10).
+- **`τ₅`, `τ₃`, `b`, `κ`: the D trim and N/P length priors** (since 0.39.7;
+  `ObjectiveConfig::d_trim` and `np_length`, `--d-trim M5,M3|off` and
+  `--np-length M|off`; on in the `r` and `sensitive-d` profiles, off in
+  `truth` and `igblast`, which have no D cost to credit). A D clip that
+  retains germline `[r_lo, r_hi)` of its allele trims `t₅ = r_lo` bases at
+  the allele's 5′ end and `t₃ = L − r_hi` at its 3′ end
+  (`Placement::trims`; over merged alleles each side takes the fewest).
+  - *Trims.* Under geometric trims of means 5 and 7, each trimmed base
+    costs `τ = ln((μ + 1)/μ)`: 0.18 nats at the 5′ end, 0.13 at the 3′ end,
+    relative to an untrimmed D.
+  - *N/P lengths.* Under geometric N/P lengths of mean 8, a junction pays
+    `ln(9/8)` per N/P base. Every read base a D keeps is one N/P base
+    fewer, so the D gains `b = ln(9/8)` = 0.12 nats per retained base.
+    Only D clips gain it: V and J cuts are valued as before. A matched D
+    column is then worth `a(p̂) + b`, and the D cost is read as `P*_D/m`
+    such columns (§4, *Values*), so an untrimmed exact run wins or loses
+    as before.
+  - *Credit.* The D cost is lowered by `κ = Σ μ·τ` = 1.85 nats, the trim
+    cost of a D with the prior's mean trims. The trims then re-rank Ds,
+    while a typical D is called as before and a chance hit deep inside a
+    long allele pays more.
+
+  Without the priors a D placement's cuts cost only their alignment
+  evidence. A short exact match deep inside a long allele was then worth
+  as much as an untrimmed short allele. On GenAIRR reads, calling the
+  wrong D gene inside the right tract was most of the D loss, 4.7 and
+  10.0 points at 5 and 10 % SHM; the priors bring it to 3.0 and 6.8.
+  - Every term depends on one cut, through its germline or read position.
+    A clip stays worth `exit(x) − entry(y)`, so §4's recursion and
+    Theorem 1 are unchanged; the oracles of §4 check them with the priors
+    on.
+  - The terms are fractions of a score unit, so the fixed scale has none
+    (`--calls fixed`); its posterior reads them.
+  - Each mean was measured against alternatives in a Python prototype
+    (BENCHMARK_GENAIRR_0.39.6.md). A negative binomial trim of shape 4 lost
+    on short D genes, and GenAIRR's own trim tables did no better. A
+    geometric N/P prior, linear in the length, did as well as a negative
+    binomial of shape 2. The expected-score D set, and every offset of an
+    allele, gained nothing over the DAG's best path and its one D
+    placement per allele.
+  - The credit was chosen on IgSim from no credit, half, the full one and
+    a per-allele expected trim cost (RELEASE_NOTES_0.39.7.md). The full
+    credit keeps the IGH D-presence Brier score and calls the most right
+    Ds. TRB's 12- and 16-base D genes trim less than the prior expects,
+    so there it gives 4 more points of D-free reads a D.
 
 The adjudicator returns the path maximising, lexicographically:
 
@@ -232,7 +278,14 @@ per-read call equal matches and mismatches too) are all reported, the
 best-supported of those that span the called read bases first: on the fixed
 scale a clip that starts later or ends earlier can tie (the bases it leaves
 net 0), and the row's coordinates and alignment, taken from the first, would
-then drop read bases the N/P regions do not hold. The reported `path_score` is the fixed-scale score
+then drop read bases the N/P regions do not hold. A J's names are positional (since 0.39.7): a tied
+J allele is named only when its clip covers the first allele's own germline
+coordinates. IGHJ4\*02 and IGHJ5\*02 trimmed to their shared 3′ part tie
+from different germline offsets: each is another trim of another gene, and
+germline support chose one. The other stays a tied placement, counted by the
+posterior and listed in `j_alternatives`. Positional D or V names gained
+nothing on GenAIRR reads (D −0.05 to −0.08 points, V ±0.00), so they stay
+as they were. The reported `path_score` is the fixed-scale score
 above, open-flank terms included, whichever model chose the path.
 
 ### 2.4 Significance
@@ -525,6 +578,12 @@ Theorem 1 carry over to integers unchanged, and every tie is exact.
 - *D floor.* For a per-read call the floor `P_D + 1` bounds nothing: 8
   matches and 2 mismatches score 10 but are worth 6.40 nats at `p̂ = 0.3`,
   above `c_D = 5.38`. Every admissible D is kept, as with posteriors.
+- *D priors* (§2.3). `τ₅`, `τ₃` and `b` are `round(F·τ)` units, added to
+  a D node's entry and exit prefix values once, when the node is laid out
+  (`prefix_values`): `τ₅·t₅ + b·o` at an entry, `b·(o + 1) − τ₃·t₃` at an
+  exit, `o` the cut's read offset. The D cost becomes
+  `⌊P*_D·(m·u_D + v_D + b)/m⌋ − round(F·κ)`. The recursions do no extra
+  work, and V and J nodes take a path without the terms.
 - *Co-optimal names* are the placements of equal clipped score *and* equal
   matches and mismatches on the called interval, which makes
   `λ_r·S_sub + μ_r·n + λ·S_gap` equal at every divergence.
@@ -678,6 +737,15 @@ scores exactly this event. Under a grammar with `max_d > 1` (not one the
 engine builds) a path can hold two such D placements, so the sum is clamped
 to 1 and is then an upper bound.
 `d_presence_posterior = 1 − P(no D)`.
+
+**D priors.** The posterior reads the per-read model's D terms (§2.3) in
+nats, `units/F`. A D node's cut evidence adds them before the centres and
+the spread are taken. The running products step them by `e^{−τ₅−b}` at
+an entry and `e^{τ₃+b}` at an exit, one base on in the read and the
+germline, with an exact `exp` only across a gap. V and J nodes take the
+path without them. `d_terms_keep_the_call_a_posterior_mode` checks the
+marginals and the Viterbi key against exhaustive summation, on fixtures
+whose Ds trim germline at both ends and one D with a deletion.
 
 **Max-marginal D allele** (`adjudicate/decode.rs`, `--d-allele
 max-marginal`, off by default). The call is the single best explanation;
@@ -1177,7 +1245,9 @@ this objective can do better.
    against D-free specificity (ASSESSMENT §9.9). What the posterior's
    residual miscalibration tracks is junction length (short junctions want
    1–2 nats more cost, long ones less), which points to a prior on N/P
-   lengths, not to the D search.
+   lengths, not to the D search. 0.39.7's N/P length prior (§2.3) acts
+   only among Ds and is credited back on the D cost. It re-ranks Ds and
+   does not decide D presence, so this item stays open.
 
    *Chance Ds on reads without one.* The far ones are solved by the
    open-flank cost (§2.3): a chance D more than about 30 bases from the read

@@ -622,10 +622,21 @@ test("every J allele is aligned, so strongly mutated reads keep their J and D", 
     runtime.initialize(references);
     const rows = runtime.annotate(query, 1).rows;
     const atoms = (value) => String(value ?? "").split(/[,/]/).filter(Boolean);
+    // Since 0.39.7 a J tied with the call from other germline coordinates
+    // (sim_0000292's IGHJ5-4, trimmed to the 3′ part it shares with the
+    // called IGHJ4-3) is a near-tied alternative of the call's score, not
+    // one of its names.
+    const tiedAlternative = (row, name) => String(row.j_alternatives ?? "")
+      .split(";")
+      .map((alternative) => alternative.split("|"))
+      .some(([allele, score]) => allele === name && Number(score) === Number(row.j_score));
     for (let index = 0; index < selected.length; index += 1) {
       const truth = selected[index].truth;
       assert.ok(atoms(rows[index].v_call).includes(truth.vCall), `${profile} V`);
-      assert.ok(atoms(rows[index].j_call).includes(truth.jCall), `${profile} J`);
+      assert.ok(
+        atoms(rows[index].j_call).includes(truth.jCall) || tiedAlternative(rows[index], truth.jCall),
+        `${profile} J`,
+      );
       assert.ok(atoms(rows[index].d_call).includes(truth.dCalls[0]), `${profile} D`);
     }
   }

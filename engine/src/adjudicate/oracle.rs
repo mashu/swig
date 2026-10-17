@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::decode::{Topology, Within};
-use super::units::{Columns, Flank, FlankTable, ReadContext, ReadModel};
+use super::units::{Columns, DTerms, Flank, FlankTable, ReadContext, ReadModel};
 use super::{
     Adjudicator, CallModel, CallPath, CalledSegment, DagScratch, EngineeringObjective,
     EvidenceModel, Grammar, Mode, PathModel, PathScore, PlacementDag, Units, VdjGrammar,
@@ -96,7 +96,11 @@ impl<'a, G: Grammar> Brute<'a, G> {
             value += self.read.column(p.kind, after - before);
             last = Some(after);
         }
-        value
+        let span = p
+            .clip
+            .span(entry, exit)
+            .expect("canonical cuts keep a column");
+        value + self.read.d_span(p, &span)
     }
 
     /// The cut-independent term of `p`, its kind's presence cost.
@@ -348,9 +352,16 @@ fn per_read_dag_equals_exhaustive_enumeration() {
             let mut placements = top_by_kind(&call.placements, SegmentKind::V, 3);
             placements.extend(top_by_kind(&call.placements, SegmentKind::D, 6));
             placements.extend(top_by_kind(&call.placements, SegmentKind::J, 3));
-            for iota in [0, -1] {
+            let on = DTerms::geometric(Some((5.0, 7.0)), Some(8.0));
+            for (iota, d_terms) in [
+                (0, DTerms::default()),
+                (-1, DTerms::default()),
+                (0, on),
+                (-1, on),
+            ] {
                 let objective = EngineeringObjective {
                     insertion_per_base: iota,
+                    d_terms,
                     ..base
                 };
                 let dag = PlacementDag::new(TANDEM_D, objective, config.min_retained, Mode::Fixed);
@@ -364,16 +375,20 @@ fn per_read_dag_equals_exhaustive_enumeration() {
                 };
                 let own = divergence(&placements);
                 for p in [own, 1e-3, 0.02, 0.3] {
-                    let model = ReadModel::at(&evidence, p, objective.presence);
+                    let model = ReadModel::at_with(&evidence, p, objective.presence, d_terms);
                     let (fast, exhaustive) = dag_and_brute(&dag, &placements, model, &mut scratch);
-                    assert_eq!(fast, exhaustive, "p {p}, iota {iota}");
+                    assert_eq!(fast, exhaustive, "p {p}, iota {iota}, {d_terms:?}");
                     let (_, path) = dag
                         .viterbi(&placements, &model, &FlankTable::default(), &mut scratch)
                         .unwrap();
                     differs += usize::from(path != fixed_path);
                     checked += 1;
                 }
-                // At δ0 the per-read model is the fixed one times u0.
+                // At δ0 the per-read model is the fixed one times u0
+                // (without the D terms, which are fractions of a unit).
+                if !d_terms.is_off() {
+                    continue;
+                }
                 let integer = PlacementDag::new(
                     TANDEM_D,
                     EngineeringObjective {

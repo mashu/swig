@@ -11,13 +11,15 @@ use crate::scoring::AffineScoring;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CallingProfile {
-    /// Legacy human-IGH tuples. V gap-open −5, `min_d_match` 6, no D-presence cost.
+    /// Legacy human-IGH tuples. V gap-open −5, `min_d_match` 6, no D-presence
+    /// cost, no D trim or N/P length priors.
     TruthOptimized,
     /// Default. V gap-open −9, `min_d_match` 4, `P_D` derived from the D
     /// database at even prior odds (`P*_D` = 10.55 for the 32 genes of human
-    /// IGH, 10 on the fixed scale).
+    /// IGH, 10 on the fixed scale), geometric D trim and N/P length priors.
     ROptimized,
-    /// IgBLAST-agreement: D `(2,−4,−11,−1)`, J `(2,−4,−13,−1)`, `min_d_match` 5.
+    /// IgBLAST-agreement: D `(2,−4,−11,−1)`, J `(2,−4,−13,−1)`, `min_d_match`
+    /// 5, no D trim or N/P length priors.
     IgBlastAgreement,
     /// R-optimized scoring with D twice as likely a priori (`P*_D` = 9.45 for
     /// human IGH).
@@ -60,6 +62,8 @@ impl CallingProfile {
                 config.d.min_exact_run = 6;
                 config.min_retained[SegmentKind::D.index()] = 6;
                 config.objective.d_prior = DPrior::Fixed(0);
+                config.objective.d_trim = None;
+                config.objective.np_length = None;
             }
             Self::IgBlastAgreement => {
                 config.v.scoring = AffineScoring::new(2, -3, -5, -1);
@@ -68,6 +72,8 @@ impl CallingProfile {
                 config.d.min_exact_run = 5;
                 config.min_retained[SegmentKind::D.index()] = 5;
                 config.objective.d_prior = DPrior::Fixed(0);
+                config.objective.d_trim = None;
+                config.objective.np_length = None;
             }
             Self::SensitiveD => {
                 config.objective.d_prior = DPrior::Derived {

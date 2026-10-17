@@ -21,6 +21,12 @@ pub struct Placement {
     /// The merged alleles whose germline coordinates differ from the
     /// first's, with the difference ([`Placement::germline_shift`]).
     pub shifted: Vec<(AlleleId, i32)>,
+    /// Where the alleles' germline ends lie in the first's coordinates: a
+    /// clip retaining germline `[r_lo, r_hi)` trims `r_lo + ends.0` bases
+    /// from the 5′ end and `ends.1 − r_hi` from the 3′ end
+    /// ([`Placement::trims`]). Over merged alleles each side keeps the
+    /// fewest trimmed bases.
+    pub ends: (i32, i32),
     /// Query coordinates are absolute (whole oriented query).
     pub alignment: Alignment,
     pub clip: ClipIndex,
@@ -55,6 +61,7 @@ impl Placement {
             kind,
             alleles: vec![allele],
             shifted: Vec::new(),
+            ends: (0, reference.len() as i32),
             local_score: alignment.score,
             alignment,
             clip,
@@ -95,6 +102,17 @@ impl Placement {
             .map_or(0, |&(_, shift)| shift)
     }
 
+    /// The germline bases a clip retaining reference `[r_lo, r_hi)` trims
+    /// from the allele's 5′ and 3′ ends ([`Placement::ends`]).
+    #[inline]
+    pub fn trims(&self, r_lo: u32, r_hi: u32) -> (u32, u32) {
+        let trimmed = |bases: i64| bases.max(0) as u32;
+        (
+            trimmed(i64::from(r_lo) + i64::from(self.ends.0)),
+            trimmed(i64::from(self.ends.1) - i64::from(r_hi)),
+        )
+    }
+
     /// Whether `span`, a clip of this placement, anchors a call: the bases
     /// a path keeps are significant on their own. A significant local
     /// alignment is not enough, since the outer flank stitched onto it and
@@ -119,6 +137,9 @@ pub fn merge_identical(placements: &mut Vec<Placement>, from: usize) {
                 let start = |p: &Placement| i64::from(p.alignment.r_start);
                 let shift = (start(&placements[i]) - start(&placements[k])) as i32;
                 let merged = std::mem::take(&mut placements[i].alleles);
+                let (head, tail) = placements[i].ends;
+                let ends = &mut placements[k].ends;
+                *ends = (ends.0.min(head + shift), ends.1.min(tail - shift));
                 for allele in merged {
                     if !placements[k].alleles.contains(&allele) {
                         let own = shift + placements[i].germline_shift(allele);
@@ -155,6 +176,8 @@ mod tests {
             p.alleles = vec![allele];
             p.alignment.r_start += r_start;
             p.alignment.r_end += r_start;
+            // The extra 5′ bases lengthen the allele; the 3′ ends agree.
+            p.ends = (0, r_start as i32 + 10);
             p
         };
         let mut merged = vec![at(0, 0), at(1, 3), at(2, 0)];
@@ -162,6 +185,10 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].alleles, [0, 1, 2]);
         assert_eq!([0, 1, 2].map(|a| merged[0].germline_shift(a)), [0, 3, 0]);
+        // Allele 1 trims 3 more bases at the 5′ end of any clip: the
+        // placement keeps the fewer.
+        assert_eq!(merged[0].ends, (0, 10));
+        assert_eq!(merged[0].trims(2, 8), (2, 2));
         // A placement merged earlier brings its own alleles' shifts along.
         let mut later = vec![at(5, 1), merged.remove(0)];
         merge_identical(&mut later, 0);
@@ -170,5 +197,8 @@ mod tests {
             [5, 0, 1, 2].map(|a| later[0].germline_shift(a)),
             [0, -1, 2, -1]
         );
+        // In allele 5's coordinates, alleles 0 and 2 start one base later.
+        assert_eq!(later[0].ends, (-1, 11));
+        assert_eq!(later[0].trims(3, 9), (2, 2));
     }
 }

@@ -1,0 +1,6 @@
+work/
+venv/
+igblast/
+mixcr/
+__pycache__/
+dposterior/target/

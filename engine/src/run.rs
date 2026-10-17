@@ -118,6 +118,13 @@ pub struct RunOptions {
     /// show beyond it ([`crate::config::OpenFlank`]); `false` turns the cost
     /// off.
     pub d_open_flank: bool,
+    /// Means of the geometric D trim priors, 5′ and 3′ (`Some(None)` turns
+    /// them off); `None` keeps the profile's ([`crate::config::ObjectiveConfig::d_trim`]).
+    pub d_trim: Option<Option<(f64, f64)>>,
+    /// Mean of the geometric N/P length prior around a D (`Some(None)` turns
+    /// it off); `None` keeps the profile's
+    /// ([`crate::config::ObjectiveConfig::np_length`]).
+    pub np_length: Option<Option<f64>>,
     /// Call C at an anchored E-value at most this (needs a C database).
     pub c_evalue: Option<f64>,
     /// Report C only where the germline from its first base reaches this
@@ -155,6 +162,8 @@ impl Default for RunOptions {
             d_allele: None,
             d_presence_rate: None,
             d_open_flank: true,
+            d_trim: None,
+            np_length: None,
             c_evalue: None,
             c_prefix_identity: None,
             c_min_identity: None,
@@ -206,7 +215,7 @@ fn with_mismatch(scoring: AffineScoring, mismatch: Score) -> AffineScoring {
 
 impl RunOptions {
     /// Every option [`Self::set`] reads, and whether it takes a value.
-    pub const NAMES: [(&'static str, bool); 26] = [
+    pub const NAMES: [(&'static str, bool); 28] = [
         ("profile", true),
         ("chain", true),
         ("strand", true),
@@ -216,6 +225,8 @@ impl RunOptions {
         ("d-allele", true),
         ("d-presence-rate", true),
         ("d-open-flank", true),
+        ("d-trim", true),
+        ("np-length", true),
         ("c-evalue", true),
         ("c-prefix-identity", true),
         ("c-min-identity", true),
@@ -310,6 +321,29 @@ impl RunOptions {
                     "off" => Some(false),
                     _ => None,
                 })?;
+            }
+            "d-trim" => {
+                let means = |v: &str| match v {
+                    "off" => Some(None),
+                    _ => {
+                        let (t5, t3) = v.split_once(',')?;
+                        let mean = |m: &str| m.trim().parse().ok().filter(|m: &f64| *m > 0.0);
+                        Some(Some((mean(t5)?, mean(t3)?)))
+                    }
+                };
+                self.d_trim = Some(parsed(
+                    name,
+                    value,
+                    "two positive means, 5',3', or off",
+                    means,
+                )?);
+            }
+            "np-length" => {
+                let mean = |v: &str| match v {
+                    "off" => Some(None),
+                    _ => v.parse().ok().filter(|m: &f64| *m > 0.0).map(Some),
+                };
+                self.np_length = Some(parsed(name, value, "a positive mean or off", mean)?);
             }
             "c-evalue" => {
                 let evalue = |v: &str| v.parse().ok().filter(|e: &f64| *e > 0.0);
@@ -414,6 +448,8 @@ impl RunOptions {
                     (no_d && self.d_allele.is_some(), "--d-allele"),
                     (no_d && !self.anchor_window, "--no-anchor-window"),
                     (no_d && !self.d_open_flank, "--d-open-flank off"),
+                    (no_d && self.d_trim.is_some(), "--d-trim"),
+                    (no_d && self.np_length.is_some(), "--np-length"),
                 ],
                 "a D database (--d)",
             ),
@@ -484,6 +520,12 @@ impl RunOptions {
         }
         if !self.d_open_flank {
             config.objective.open_flank = None;
+        }
+        if let Some(d_trim) = self.d_trim {
+            config.objective.d_trim = d_trim;
+        }
+        if let Some(np_length) = self.np_length {
+            config.objective.np_length = np_length;
         }
         if let Some(evalue) = self.c_evalue {
             config.c.evalue = evalue;
@@ -884,6 +926,8 @@ mod tests {
             ("d-allele", Some("max-marginal")),
             ("d-presence-rate", Some("0.9")),
             ("d-open-flank", Some("off")),
+            ("d-trim", Some("4,6")),
+            ("np-length", Some("off")),
             ("c-evalue", Some("0.01")),
             ("c-prefix-identity", Some("0.97")),
             ("c-min-identity", Some("0.8")),
@@ -915,6 +959,8 @@ mod tests {
             d_allele: Some(DAlleleDecoding::MaxMarginal),
             d_presence_rate: Some(0.9),
             d_open_flank: false,
+            d_trim: Some(Some((4.0, 6.0))),
+            np_length: Some(None),
             c_evalue: Some(0.01),
             c_prefix_identity: Some(0.97),
             c_min_identity: Some(0.8),
@@ -947,6 +993,8 @@ mod tests {
         assert_eq!(config.d.min_exact_run, 5);
         assert_eq!(config.d.scoring, AffineScoring::new(2, -4, -11, -1));
         assert_eq!(config.j.accept.min_subst, 12);
+        assert_eq!(config.objective.d_trim, Some((4.0, 6.0)));
+        assert_eq!(config.objective.np_length, None);
         assert_eq!(
             RunOptions::default().config(),
             CallingProfile::ROptimized.config()
@@ -967,6 +1015,9 @@ mod tests {
             ("j-mismatch", Some("-2147483648")),
             ("double-d", Some("some")),
             ("d-open-flank", Some("yes")),
+            ("d-trim", Some("5")),
+            ("d-trim", Some("5,-7")),
+            ("np-length", Some("0")),
             ("d-open-flank", None),
             ("simd", Some("mmx")),
             ("profile", None),

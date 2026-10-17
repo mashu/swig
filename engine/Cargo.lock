@@ -4,11 +4,11 @@ version = 4
 
 [[package]]
 name = "swig"
-version = "0.39.6"
+version = "0.39.7"
 
 [[package]]
 name = "swig_wasm"
-version = "0.39.6"
+version = "0.39.7"
 dependencies = [
  "swig",
 ]

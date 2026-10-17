@@ -555,16 +555,37 @@ fn a_c_placement_never_reaches_the_vdj_report() {
 /// the report rates at least as probable as the call's. The row names the
 /// decoded allele first, also when it shares its placement's alignment with
 /// another allele, and reports that allele's own germline: its bases
-/// between the reported germline coordinates.
+/// between the reported germline coordinates. With and without the D trim
+/// and N/P length priors; the reads whose decoded allele shares a placement
+/// come from the model without them.
 #[test]
 fn max_marginal_d_keeps_the_topology_and_raises_the_d_mass() {
-    use swig::sim::{SimParams, Simulator, SyntheticDatabase, SyntheticSpec};
+    use swig::sim::{SyntheticDatabase, SyntheticSpec};
     let db = SyntheticDatabase::generate(&SyntheticSpec::default(), 11);
+    let mut merged = 0;
+    for priors in [true, false] {
+        merged += max_marginal_d_on(&db, priors);
+    }
+    assert!(
+        merged > 0,
+        "some decoded alleles share a placement ({merged})"
+    );
+}
+
+/// The checks of [`max_marginal_d_keeps_the_topology_and_raises_the_d_mass`]
+/// with the D priors on or off; the reads whose decoded allele shares its
+/// placement.
+fn max_marginal_d_on(db: &swig::sim::SyntheticDatabase, priors: bool) -> usize {
+    use swig::sim::{SimParams, Simulator};
     let assigner = |d_allele| {
-        let config = EngineConfig {
+        let mut config = EngineConfig {
             d_allele,
             ..EngineConfig::default()
         };
+        if !priors {
+            config.objective.d_trim = None;
+            config.objective.np_length = None;
+        }
         DefaultAssigner::from_config(&config, db.v.clone(), Some(db.d.clone()), db.j.clone())
             .unwrap()
     };
@@ -639,11 +660,11 @@ fn max_marginal_d_keeps_the_topology_and_raises_the_d_mass() {
         changed += 1;
         merged += usize::from(alleles[0] != chosen);
     }
-    assert!(changed > 0, "some D calls should change ({changed})");
     assert!(
-        merged > 0,
-        "some decoded alleles share a placement ({merged})"
+        changed > 0,
+        "some D calls should change ({changed}, priors {priors})"
     );
+    merged
 }
 
 #[test]

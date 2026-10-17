@@ -10,8 +10,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::adjudicate::{
-    Adjudicator, CallModel, DAlleleDecoding, EngineeringObjective, EvidenceModel, Flank, Mode,
-    PlacementDag, ResolvedOpenFlank, VdjGrammar,
+    Adjudicator, CallModel, DAlleleDecoding, DTerms, EngineeringObjective, EvidenceModel, Flank,
+    Mode, PlacementDag, ResolvedOpenFlank, VdjGrammar,
 };
 use crate::admission::{AnyOf, DefaultAdmission, DistributedEvidence, ExactRunFloor};
 use crate::align::{Backend, InterSequenceGotoh};
@@ -315,6 +315,14 @@ impl OpenFlank {
     }
 }
 
+/// Means of the default geometric D trim priors, 5′ and 3′ (bases): what
+/// human IGHD loses at each end ([`ObjectiveConfig::d_trim`]).
+pub const D_TRIM_MEANS: (f64, f64) = (5.0, 7.0);
+
+/// Mean of the default geometric N/P length prior around a D (bases)
+/// ([`ObjectiveConfig::np_length`]).
+pub const NP_LENGTH_MEAN: f64 = 8.0;
+
 /// Declarative form of [`EngineeringObjective`]; the priors are resolved
 /// against the V, D and J databases when the assigner is built.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -336,6 +344,12 @@ pub struct ObjectiveConfig {
     /// The cost at the open end of a D-first or D-last path ([`OpenFlank`];
     /// `None` = off).
     pub open_flank: Option<OpenFlank>,
+    /// Means of the geometric priors on how many bases a D loses at its 5′
+    /// and 3′ ends (`None` = off), read by the per-read model ([`DTerms`]).
+    pub d_trim: Option<(f64, f64)>,
+    /// Mean of the geometric prior on the N/P lengths around a D (`None` =
+    /// off): every base a D keeps is one N/P base fewer ([`DTerms`]).
+    pub np_length: Option<f64>,
 }
 
 impl Default for ObjectiveConfig {
@@ -347,6 +361,8 @@ impl Default for ObjectiveConfig {
             j_prior: DPrior::DERIVED,
             insertion_per_base: 0,
             open_flank: Some(OpenFlank::DEFAULT),
+            d_trim: Some(D_TRIM_MEANS),
+            np_length: Some(NP_LENGTH_MEAN),
         }
     }
 }
@@ -387,6 +403,7 @@ impl ObjectiveConfig {
                 .open_flank
                 .filter(|_| d.is_some())
                 .map(|flank| flank.resolve(v, v_config, &d_config.scoring, j, j_config)),
+            d_terms: DTerms::geometric(self.d_trim, self.np_length),
         }
     }
 }

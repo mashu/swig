@@ -82,20 +82,24 @@ impl Node {
 }
 
 /// A placement's canonical cuts along its alignment: per `Match` column,
-/// its read position `q`, the score of the gap run since the previous
-/// `Match` column (or the alignment's start) and its substitution score.
-/// A pass accumulates their values once per node: the entry cut at `q` is
-/// worth the prefix through the gap run, the exit cut at `q + 1` the prefix
-/// through the column. Canonical cuts never split a gap run.
+/// its read position `q`, its reference position `r`, the score of the gap
+/// run since the previous `Match` column (or the alignment's start) and its
+/// substitution score. A pass accumulates their values once per node: the
+/// entry cut at `q` is worth the prefix through the gap run, the exit cut at
+/// `q + 1` the prefix through the column. Canonical cuts never split a gap
+/// run.
 pub(super) fn column_steps(
     placement: &Placement,
-) -> impl Iterator<Item = (u32, Score, Score)> + '_ {
+) -> impl Iterator<Item = (u32, u32, Score, Score)> + '_ {
     let mut previous = 0;
-    placement.clip.matches().map(move |(q, entry, exit)| {
-        let gap = entry - previous;
-        previous = exit;
-        (q, gap, exit - entry)
-    })
+    placement
+        .clip
+        .match_columns()
+        .map(move |(q, r, entry, exit)| {
+            let gap = entry - previous;
+            previous = exit;
+            (q, r, gap, exit - entry)
+        })
 }
 
 /// Whether a path may step from `b` to `e`: a V that cannot open a D's

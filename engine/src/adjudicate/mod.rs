@@ -34,7 +34,7 @@ pub use model::{EngineeringObjective, Grammar, PathModel, VdjGrammar};
 pub use posterior::{MAX_SPREAD, Marginals, OVERLAP_SPREAD, PosteriorScratch};
 pub(crate) use ties::{CoOptimal, co_optimal};
 pub use units::{
-    CallModel, Columns, DivergenceCounts, EvidenceModel, EvidenceScale, Flank, PathNats,
+    CallModel, Columns, DTerms, DivergenceCounts, EvidenceModel, EvidenceScale, Flank, PathNats,
     ReadContext, ResolvedOpenFlank, UNITS_PER_NAT, Units, beta_binomial_tail, divergence,
     divergence_counts,
 };
