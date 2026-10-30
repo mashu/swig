@@ -87,8 +87,9 @@ hypothesis as a log-likelihood ratio and chooses the alleles and the cut
 points of V, D and J jointly, by an exact semi-Markov Viterbi recursion over a
 placement graph. The recursion considers every pair of cuts between
 neighbouring segments in time linear in their overlaps, and is checked
-against exhaustive enumeration. The prior cost of each segment is derived from
-the number of hypotheses its search tries rather than tuned. A D also pays
+against exhaustive enumeration. The prior cost of each segment is derived as
+prior odds over the gene-and-position hypotheses it competes with, rather
+than tuned. A D also pays
 geometric trim and N/P-length priors, and, at an open read end, the
 likelihood ratio of the flanking segment the read would have shown. Each read
 is valued at its own divergence, and forward--backward over the same graph
@@ -154,21 +155,25 @@ points between neighbouring segments. Its contributions are:
     semi-Markov Viterbi recursion is exact over all grammatical paths and all
     cut pairs, in time linear in the overlaps between placements
     (\cref{sec:dag});
-  \item segment priors \emph{derived} from the number of hypotheses searched,
+  \item segment priors \emph{derived} as prior odds over the hypotheses
+    a segment competes with,
     D trim and N/P-length priors that re-rank D alleles without changing
     how often a typical D is called, and an \emph{open-flank} cost for a D at
     a truncated read end (\cref{sec:objective});
   \item calls valued at each read's own divergence in exact integer
     arithmetic, with forward--backward posteriors over the same graph, so
     the call is a mode of the reported distribution (\cref{sec:perread,sec:posterior});
-  \item a search whose every shortcut is labelled exact, lossless, bounded or
-    heuristic, including lossless sibling bounds over gene frames
+  \item a search whose every shortcut is labelled with its guarantee (exact,
+    lossless, bounded, defined, approximate or heuristic), including lossless
+    sibling bounds over gene frames
     (\cref{sec:search}), and an inter-sequence SIMD kernel that is
     bit-identical to a scalar Gotoh across x86-64, AArch64 and WebAssembly
     (\cref{sec:implementation});
   \item an evaluation on two independent simulators with paired statistics,
-    a negative-control suite, ablations of every modelling term and an
+    a negative-control suite, ablations of the D priors, the per-read call,
+    the open-flank cost and the plausibility constraints, and an
     attribution of the remaining D errors to search or model
+
     (\cref{sec:evaluation,sec:results}).
 \end{enumerate}
 
@@ -213,8 +218,10 @@ hypotheses.
 V and J alignments are extended co-linearly, without gaps, towards the
 germline's outer end (V~5$'$, J~3$'$) or the read's end, whichever comes
 first. The extension stops before the column at which its running score
-falls 30 below the alignment's edge (an X-drop~\cite{altschul1997gapped} of
-10 net mismatches), so an adapter or a random 5$'$ flank is not taken for V.
+falls more than 30 below the alignment's edge (an
+X-drop~\cite{altschul1997gapped} of 10 net mismatches), so an adapter or a
+random 5$'$ flank is cut after at most about 10--17 bases instead of being
+taken for V.
 Each stage keeps its best alignments both by extended and by local score, so
 that a hit at the read's end, which pays for no flank, cannot take every slot
 from a locally stronger hit that pays for a mutated one.
@@ -263,7 +270,7 @@ sequential annotator lets a J alignment ``eat'' the D.
   \draw[kept=cD] (64,2.0) rectangle (82,2.7);
   \draw[seg=cD] (68,3.0) rectangle (80,3.6);
   % J
-  \draw[seg=cJ] (76,4.2) rectangle (124,5.0);
+  \draw[seg=cJ] (50,4.2) rectangle (124,5.0);
   \draw[kept=cJ] (90,4.2) rectangle (124,5.0);
   % cuts
   \foreach \x/\l in {58/x_V,64/y_D,82/x_D,90/y_J} {
@@ -276,8 +283,8 @@ sequential annotator lets a J alignment ``eat'' the D.
   \draw[decorate,decoration={brace,mirror,amplitude=3pt}] (82,-0.3) -- (90,-0.3)
      node[midway,below=3pt,lab] {N2};
   % annotation of J reaching back over the D
-  \draw[{Latex[length=1.5mm]}-,cJ!60!black] (77,4.15) to[out=-60,in=180] (100,3.1)
-     node[right,lab,text=cJ!60!black,align=left] {the J alignment starts\\inside the D};
+  \node[anchor=east,lab,text=cJ!60!black] (jnote) at (46,5.9) {the J alignment starts before the D};
+  \draw[-{Latex[length=1.5mm]},cJ!60!black] (jnote.east) -- (50.4,5.08);
 \end{tikzpicture}
 \caption{Placements and cuts (schematic; the junction is drawn wider than to scale). Pale bars are candidate local alignments
 (placements) of V, D and J alleles to one read; saturated bars are the parts a
@@ -304,7 +311,12 @@ The score of a path is
 \label{eq:objective}
 \end{equation}
 where $S_{\text{clip}}$ is the score of the kept columns. The other terms are
-log prior odds in score units and are derived, not tuned.
+log prior odds: $P_V$, $P_D$ and $P_J$ in score units, $c_{\text{open}}$ and
+the D terms in nats, read at the call's scale (the fixed scale of
+\cref{sec:perread} converts $c_{\text{open}}$ to score units and has no D
+trim or N/P terms). Each has a stated derivation; the constants it leaves
+free (the open-flank allowance, the trim and N/P means and the credit
+$\kappa$) were set on simulated reads (\cref{sec:discussion}).
 
 \paragraph{Segment presence.} A D hypothesis is one of $N$ D genes placed at
 one of $L$ junction positions, so its prior is spread over $NL$ alternatives.
@@ -315,19 +327,23 @@ none, which gives
   \pD \;=\; \frac{\ln(NL) - \ln \pi_D}{\lambda}.
   \label{eq:pd}
 \end{equation}
-For human IGH ($N=32$, $L=25$, even odds) $\pD=10.55$: an exact 5-mer
-(score 10) loses and an exact 6-mer (12) wins. For TRB ($N=2$) $\pD=6.17$.
-V and J pay the same kind of cost over their own genes ($P^{*}_J=7.91$ for the
-6 human IGHJ genes, $P^{*}_V=12.70$ for 125 IGHV genes). Without $P_J$ and
+Genes are counted after identical sequences are merged. For the human IGH set
+of \cref{sec:evaluation} ($N=30$, $L=25$, even odds) $\pD=10.45$: an exact
+5-mer (score 10) loses and an exact 6-mer (12) wins. For TRB ($N=2$)
+$\pD=6.17$. V and J pay the same kind of cost over their own genes
+($P^{*}_J=7.91$ for its 6 IGHJ genes, $P^{*}_V=12.54$ for its 113 IGHV genes).
+Without $P_J$ and
 $P_V$, any positive clip completes or starts a path for free, so a read that
 stops before its J or starts after its V receives a J or V from a few chance
 bases. The cost is kept unrounded; on the integer fixed scale charging
 $\lfloor \pD\rfloor$ decides $S>\pD$ exactly. A database of several loci
 gives each locus its own costs. An alternative derivation counts the
 hypotheses a local D search actually tries, every allele offset and read
-position, through the Karlin--Altschul expectation $K m n_D e^{-\lambda S}$;
-it is available as an option but needs a D-presence rate that does not
-follow from the search (\cref{sec:discussion}).
+position, through the Karlin--Altschul expectation $K w n_D e^{-\lambda S}$
+($w$ read positions, $n_D$ allele offsets). It is available as an option
+(\code{-{}-d-presence-rate}) but needs a D-presence rate that does not follow
+from the search: at the simulator's own rate (0.94) $\pD$ falls below 10 and
+exact 5-mers win.
 
 \paragraph{D trims and N/P lengths.} A D clip that keeps germline
 $[r_{\text{lo}},r_{\text{hi}})$ of an allele of length $L_a$ trims
@@ -352,26 +368,31 @@ log-likelihood ratio of those bases under ``no junction, or a junction whose
 J (V) was missed'' against ``a junction whose J (V) was missed'':
 \begin{equation}
 \begin{gathered}
-  c(x) = \ln\!\Bigl(1 + \pi\,\frac{1-\varepsilon_{\text{eff}}(x)}{\varepsilon_{\text{eff}}(x)}\Bigr),
-  \qquad \varepsilon_{\text{eff}}(x)=\varepsilon(x-N_{\text{open}}),\\
-  \varepsilon(\ell) = \max\Bigl(\varepsilon_{\min},\ \min_{\ell'\leq \ell}
+  c(x) = \ln\!\Bigl(1 + \rho\,\frac{1-\varepsilon_{\text{eff}}(x)}{\varepsilon_{\text{eff}}(x)}\Bigr),
+  \qquad \varepsilon_{\text{eff}}(x)=\varepsilon\bigl(\min(x-N_{\text{open}},\,64)\bigr),\\
+  \varepsilon(\ell) = \max\Bigl(\varepsilon_{\min},\ \min_{1\le\ell'\leq \ell}
      \Pr\bigl[X_{\ell'} \geq k(\ell')\bigr]\Bigr),
-  \qquad X_\ell \sim \operatorname{BetaBinomial}\bigl(\min(\ell,64),\,a,\,b\bigr),
+  \qquad X_\ell \sim \operatorname{BetaBinomial}(\ell,\,\alpha,\,\beta),
 \end{gathered}
 \label{eq:openflank}
 \end{equation}
 where $k(\ell)$ is the number of mismatches among $\ell$ visible bases that
-keeps them below the smallest score the missing segment's stage would accept,
-and $\operatorname{Beta}(a,b)$ is the read's mismatch rate from its anchored V
-and J columns ($a=k+\tfrac12$, $b=n-k+\tfrac12$). $\varepsilon(\ell)$ is thus
-the probability that a segment present in the read would have stayed below
-the detection threshold. The free allowance $N_{\text{open}}=24$ is the
-99.9th percentile of the simulated distance from a called D to the true J
-start; $\pi=\tfrac12$ and $\varepsilon_{\min}=10^{-3}$ (the anchor E-value
-gate) bound the cost to $[0,\,6.2]$ nats. At high divergence a missing
-segment could well have been missed and the cost falls accordingly (64
-visible bases cost 0.93 nats on a J-only read at 30\,\% SHM, against 6.2 on a
-clean read). A real D lies within its N/P region of the read end, a chance D
+keeps them below the smallest score the missing segment's stage would accept
+($\varepsilon=1$ for $\ell\le0$ and while no $\ell$ bases can reach that
+score), and $\operatorname{Beta}(\alpha,\beta)$ is the read's mismatch rate
+from its anchored V and J columns ($\alpha=k_a+\tfrac12$,
+$\beta=n_a-k_a+\tfrac12$ for $k_a$ mismatches among $n_a$ columns).
+$\varepsilon(\ell)$ is thus the probability that a segment present in the
+read would have stayed below the detection threshold, and the cost is
+constant beyond 64 visible bases. The free allowance $N_{\text{open}}=24$ is
+the largest 99.9th percentile (22--24 across simulated sets) of the distance
+from a called D to the true J start, or from the V end to the D;
+$\rho=\tfrac12$ (even odds) and $\varepsilon_{\min}=10^{-3}$ (the anchor
+E-value gate) bound the cost to $[0,\,6.2]$ nats. At high divergence a
+missing segment could well have been missed and the cost falls accordingly:
+with 13 mismatches among 45 anchored columns (about 30\,\% SHM), 64 visible
+bases cost 0.99 nats for a missing J and 0.71 for a missing V, against 6.2 on
+a clean read. A real D lies within its N/P region of the read end, a chance D
 anywhere in the search window, so the cost removes far chance Ds while
 keeping real Ds of reads that stop at their D or start in CDR3
 (\cref{sec:truncated}).
@@ -386,8 +407,9 @@ junction base that can belong to either side; the allele with more support
 admits more cuts with the same score and hence has the larger likelihood
 summed over cuts. Co-optimal alleles, equal in clipped score and in matches
 and mismatches on the called interval, are all reported. J names are
-positional: a tied J allele is named only when its clip covers the first
-allele's own germline coordinates, so IGHJ4*02 and IGHJ5*02 trimmed to their
+positional: a tied J allele is named only when it explains the called read
+bases at the first allele's own germline coordinates (the same germline
+interval), so IGHJ4*02 and IGHJ5*02 trimmed to their
 shared 3$'$ part, which tie from different germline offsets, are not both
 named; the other remains a tied alternative counted by the posterior.
 
@@ -395,8 +417,9 @@ named; the other remains a tied alternative counted by the posterior.
 \label{sec:significance}
 
 Each V and J hit receives a Karlin--Altschul E-value~\cite{karlin1990}
-$E=K m n e^{-\lambda S}$ against its database, with $m$ the length of the
+$E=K w n e^{-\lambda S}$ against its database, with $w$ the length of the
 searched read window and $n$ the database length, using exact ungapped
+
 $\lambda$ and $K$ for the scoring in use. A hit is kept only at $E\le 1$, and a
 read is \emph{called} only when its path contains an \emph{anchor}: a V or J
 hit at $E\le 10^{-3}$ whose clip on that path still reaches the anchor score.
@@ -437,12 +460,15 @@ then by read start. Every transition between kinds goes forward in this
 order wherever the two alignments start, and the cuts alone decide whether
 it is feasible ($x\le y$). The paths through a node with a given D count and
 first segment kind form a \emph{slot}, which holds one value per canonical
-entry cut $y$ of the node: the best key of a path prefix entering there. With
-a linear N/P score $\iota(y-x)$ ($\iota=0$ by default) the recursion is
+entry cut $y$ of the node: the best key of a path prefix entering there. A
+path's first segment keeps its start and its last segment its end, since V
+and J are extended outward on purpose; a path can therefore start at a node
+only at the node's own start, in the slot whose first kind is the node's.
+With a linear N/P score $\iota(y-x)$ ($\iota=0$ by default) the recursion is
 \begin{align}
   X(b,x) &= \operatorname{exit}_b(x) - P_{k(b)} + \max_{y\le x-m_b}\bigl[F(b,y)-\operatorname{entry}_b(y)\bigr], \label{eq:rec-exit}\\
   F(e,y') &= \max_b \max_{x\le y'} \bigl[X(b,x) + \iota\,(y'-x)\bigr]
-     \quad\bigl(-c_{\text{open}}(e)\text{ at a path start}\bigr), \label{eq:rec-entry}\\
+     \quad\bigl(-c_{\text{open}}(e)\text{ at }y'=\operatorname{start}(e)\text{ for a path starting at }e\bigr), \label{eq:rec-entry}\\
   \text{best} &= \max_b\; X\bigl(b,\operatorname{end}(b)\bigr) + \operatorname{end}(g,b) - c_{\text{open}}(b), \label{eq:rec-best}
 \end{align}
 over every exit $x$ of the predecessor $b$ and every entry $y'\ge x$ of the
@@ -454,15 +480,22 @@ default). Because each term depends on one cut:
   \item the best entry for an exit, $\max_{y\le x-m_b}[F(b,y)-\operatorname{entry}_b(y)]$,
     is a running maximum along the node;
   \item the best exit for an entry, $\max_{x\le y'}[X(b,x)-\iota x]$, is a
-    second running maximum along $b$, one per successor kind;
+    second running maximum along $b$, built once per slot of $b$ and per
+    successor kind, not per edge;
   \item every entry $y'\ge\operatorname{end}(b)$ sees the same best exit of
     $b$, so the edge $b\to e$ adds it once at $e$'s first entry at or after
     $\operatorname{end}(b)$, and a prefix maximum over $e$'s entries carries
     it to the rest.
 \end{enumerate}
 An edge therefore costs $O(\text{overlap}+1)$ and a read
-$O\bigl(\sum_{\text{slots}}\text{len}+\sum_{\text{edges}}(\text{overlap}+1)\bigr)$;
-\cref{alg:dag} gives the recursion as pseudocode.
+$O\bigl(\sum_{\text{slots}}\text{len}+\sum_{\text{edges}}(\text{overlap}+1)\bigr)$,
+plus one scan of each node's predecessor slots; \cref{alg:dag} gives the
+recursion as pseudocode.
+With the open-flank cost on, one transition is barred when the lattice opens
+its slots: a V or J none of whose clips pays its presence cost may not
+precede or follow a D, since such a placement is no evidence of the
+junction's V or J (a junk J of a base or two would otherwise close a D's
+flank for less than the cost).
 The open-flank cost is a constant of the node and the read added once where a
 path starts and once where it ends, and the D priors are added to a D node's
 entry and exit prefix values once, when the node is laid out; neither breaks
@@ -474,7 +507,8 @@ hidden boundaries.
 \label{thm:dag}
 The recursion of \cref{eq:rec-exit,eq:rec-entry,eq:rec-best} returns the
 optimum of \cref{eq:objective}, with the tie order of \cref{sec:objective},
-over all grammatical paths, all placements and all pairs of canonical cuts.
+over all grammatical paths (with the transition rule above when the
+open-flank cost is on), all placements and all pairs of canonical cuts.
 \end{theorem}
 \begin{proof}[Proof sketch]
 Every grammatical predecessor of a node precedes it in the order by kind, so
@@ -498,15 +532,18 @@ maxima.}
   for each placement $b$ the prefix values $\operatorname{entry}_b(y)$ and
   $\operatorname{exit}_b(x)$ at its canonical cuts, D priors included
 \For{each node $e$ in order, and each slot of $e$ (D count, first kind)}
-  \State $F(e,y)\gets -c_{\text{open}}(e)$ if $e$ may start a path, else $-\infty$, for every entry $y$
+  \State $F(e,y)\gets-\infty$ for every entry $y$
+  \If{this is $e$'s start slot and $e$ may start a path}
+    \State $F(e,\operatorname{start}(e))\gets -c_{\text{open}}(e)$
+  \EndIf
   \For{each predecessor $b$ whose slot and kind may precede $e$}
-    \State $M(x)\gets\max_{x'\le x}\bigl[X(b,x')-\iota x'\bigr]$ \Comment{running maximum along $b$}
-    \State $F(e,y)\gets\max\bigl(F(e,y),\,M(y)+\iota y\bigr)$ for every entry $y<\operatorname{end}(b)$
-    \State offer $M(\operatorname{end}(b))+\iota y_0$ at the first entry $y_0\ge\operatorname{end}(b)$
+    \State $F(e,y)\gets\max\bigl(F(e,y),\,M_b(y)+\iota y\bigr)$ for every entry $y<\operatorname{end}(b)$
+    \State offer $M_b(\operatorname{end}(b))+\iota y_0$ at the first entry $y_0\ge\operatorname{end}(b)$
   \EndFor
   \State carry the offers to later entries by a prefix maximum, $+\iota$ per base
   \State $G(x)\gets\max_{y\le x-m_e}\bigl[F(e,y)-\operatorname{entry}_e(y)\bigr]$ \Comment{running maximum along $e$}
   \State $X(e,x)\gets\operatorname{exit}_e(x)-P_{k(e)}+G(x)$ for every exit $x$
+  \State $M_e(x)\gets\max_{x'\le x}\bigl[X(e,x')-\iota x'\bigr]$, once per kind that may follow $e$
 \EndFor
 \State \Return $\max_b X(b,\operatorname{end}(b))+\operatorname{end}(g,b)-c_{\text{open}}(b)$ and its trace-back
 \end{algorithmic}
@@ -536,10 +573,13 @@ between two alleles is worth $\ln(3(1-p)/p)=8.0$ nats at $p=0.1\,\%$ rather
 than $\lambda\cdot 5=3.2$, and heavily mutated reads over-confident. \swig{}
 therefore estimates the read's divergence $\phat$ before adjudication from
 the columns no path contests---the best V's match columns before every D and
-J placement and the best J's after every V and D placement---as the Jeffreys
-predictive rate $(k+\tfrac12)/(n+1)$~\cite{jeffreys1946}, clamped to
-$[10^{-4},\,0.5]$. The junction bases are not among these columns, so they
-are not used twice. A substitution column of score $s\neq 0$ is then worth
+J placement and the best J's after every V and D placement, N columns
+excluded, or all columns of the two placements when fewer than 50
+remain---as the Jeffreys predictive rate $(k+\tfrac12)/(n+1)$ for $k$
+mismatches among $n$ columns~\cite{jeffreys1946}, clamped to
+$[10^{-4},\,0.5]$. Apart from that fallback the junction bases are not among
+these columns, so they are not used twice. A substitution column of score
+$s\neq 0$ is then worth
 $\lambda_r s+\mu_r$ nats, with $(\lambda_r,\mu_r)$ chosen so that a match is
 worth $\ln 4(1-\phat)$ and a mismatch $\ln(4\phat/3)$; at $\phat=\delta$,
 $\lambda_r=\lambda$ and $\mu_r=0$. Gaps stay at the prior $\lambda$, since
@@ -548,18 +588,23 @@ $\phat$ measures substitutions.
 Every term is an integer in units of $1/F$ nats, $F=2^{16}$: a column is
 $s\,u_r+v_r$ with $u_r=\operatorname{round}(F\lambda_r)$ and
 $v_r=\operatorname{round}(F\mu_r)$, so the maximum and every tie are exact,
-the fixed scale is an exact special case at $\phat=\delta$, and the
-recursion and \cref{thm:dag} carry over unchanged. The D cost is read as
-$\pD/m$ matched D columns,
+and the recursion and \cref{thm:dag} carry over unchanged. At
+$\phat=\delta$ every column is the fixed score times
+$u_0=\operatorname{round}(F\lambda)$, so with integer presence costs and the
+D priors off the fixed scale (\code{-{}-calls fixed}, which has no D trim or
+N/P terms) is an exact special case. The D cost is read as $\pD/m$ matched D
+columns, with $m$ the D match score,
 \begin{equation}
-  c_D(\phat) = \Bigl\lfloor \pD\,\frac{m u_D+v_D+F b}{m}\Bigr\rfloor - \operatorname{round}(F\kappa),
+  c_D(\phat) = \Bigl\lfloor \pD\,\frac{m u_D+v_D+\operatorname{round}(F b)}{m}\Bigr\rfloor - \operatorname{round}(F\kappa),
 \end{equation}
 rather than as a constant number of nats. The cost is a threshold against
 chance D hits in random N/P sequence, whose null distribution does not depend
-on $\phat$ and is dominated by exact runs; read in matched columns it keeps
-the fixed scale's admitted classes of exact runs at every divergence (runs of
-5 lose, runs of 6 win), whereas a cost constant in nats would admit exact
-5-mers on unmutated reads.
+on $\phat$ and is dominated by exact runs. Read in matched columns it keeps
+the fixed scale's admitted classes of exact runs at every divergence for a D
+with the prior's mean trims (runs of 5 lose, runs of 6 win when their trims
+cost $\kappa$); the trim terms move runs that are trimmed less or more than
+that across the threshold. A cost constant in nats would instead admit
+exact 5-mers on unmutated reads whatever their trims.
 
 \subsection{Posterior probabilities}
 \label{sec:posterior}
@@ -595,9 +640,15 @@ marginals with exhaustive summation under VJ, VDJ and VDDJ grammars, with
 N/P costs, N columns, insertions, long costly gaps, the open-flank cost and
 the D priors.
 
-An optional decoder reports the D allele of largest posterior marginal
-given the call's D presence and topology, $a^{*}=\argmax_a\sum_{p\ni a}P(p)$,
-re-tracing the path on the lattice masked to $a^{*}$'s placements.
+An optional decoder (off by default) takes a call with exactly one D and
+finds the allele of largest posterior marginal,
+$a^{*}=\argmax_a\sum_{p\ni a}P(p)$ over D placements $p$; the marginal is
+not conditioned on the call's topology. When $a^{*}$ beats the call's
+allele, the path is re-traced with the call's first and last kind and D
+count on the lattice masked to the V and J placements and $a^{*}$'s D
+placements, and kept when it stays anchored and its reported D posterior is
+no lower.
+
 
 % ===========================================================================
 \section{Plausibility constraints}
@@ -607,22 +658,28 @@ On full-length simulated reads the optimum of \cref{eq:objective} almost
 always pairs a V and a J that could form one rearrangement, but on
 truncated, chimeric and cross-locus reads it need not. \swig{} applies, as
 constraints outside the objective and on by default, the plausibility checks
-of SwiftIG, the aligner whose method note \swig{} began as an
-implementation of: minimum hit lengths of 24 (V) and 10 (J) local alignment
-columns; a V--J pairing rule (the V and J face their junction, hold a long
-split, or align both conserved codons in order); a span of at most 225
-bases between the V's exit and the J's entry; and a D only beside a V or a J.
-A D at an open end is admissible only because it pays the open-flank cost
-and lies within 60 bases of the segment the read shows. The call is the
-unconstrained optimum when it satisfies the constraints; otherwise the
-lattice is re-adjudicated over subsets of placements (each J with the V
-placements it pairs with, with and without the Ds; under the open-flank cost
-also V and D placements within reach of each other, and D and J placements),
-and the call is the best admissible subset optimum. Within each subset the
-key is the exhaustive optimum, but a subset whose optimum breaks a constraint
+of SwiftIG, an earlier C++ aligner (unpublished) whose method note \swig{}
+began as a Rust implementation of: minimum hit lengths of 24 (V) and 10 (J)
+local alignment columns; a V--J pairing rule (the V and J face their
+junction, hold a long split, or align both conserved codons in order), to
+which \swig{} adds that a V shorter than 80 columns pairs only with a J that
+is significant on its own; and a span of at most 225 bases between the V's
+exit and the J's entry. SwiftIG called a D only between a V and a J that
+pair. \swig{} also admits a D beside a V or a J alone, but only when it pays
+the open-flank cost and lies within 60 bases of the segment the read shows.
+The call is the unconstrained optimum when it satisfies the constraints;
+otherwise the lattice is re-adjudicated over subsets of placements (the V
+placements alone, the J placements alone, and each J with the V placements
+it pairs with, with and without the Ds; under the open-flank cost also V and
+D placements within reach of each other, and D and J placements), and the
+call is the best admissible subset optimum. Within each subset the key is the
+exhaustive optimum, but a subset whose optimum breaks a constraint
 contributes nothing, so the guarded call is \emph{defined} rather than exact.
-On the test suite's 435 checked calls no admissible path beat the call under
-the per-read model. Junctions are reported only from conserved anchors
+On the test suite's 435 checked calls, no admissible path over any choice of
+at most one V, D and J among a read's best 4, 8 and 4 placements beat the
+call under the per-read model (one did under the fixed scale). Junctions are
+reported only from conserved anchors
+
 (Cys104, Trp/Phe118) that the called alignments actually align, with a
 bounded recovery of a Cys104 lying just past a clipped V end.
 
@@ -631,11 +688,13 @@ bounded recovery of a Cys104 lying just past a clipped V end.
 \label{sec:search}
 
 Each stage narrows the hypotheses the lattice sees. \Cref{tab:search} states
-what each step can lose, as one of four guarantees: \emph{exact};
-\emph{lossless}, which provably drops nothing the model could choose;
-\emph{bounded}, which drops only what lies outside a stated geometric bound;
-and \emph{heuristic}, which is measured, not proven. \Cref{fig:pipeline}
-shows the flow.
+what each step can lose: \emph{exact}; \emph{lossless}, which provably drops
+nothing the model could choose; \emph{bounded}, which drops only what lies
+outside a stated geometric bound; \emph{defined}, a stated selection rule
+whose output is the definition of the result rather than an approximation
+of an optimum; \emph{approximate}, a known gap to the model's optimum; and
+\emph{heuristic}, which is measured, not proven. \Cref{fig:pipeline} shows
+the flow.
 
 \begin{figure}[t]
 \centering
@@ -650,7 +709,7 @@ shows the flow.
   \node[box=cD,left=of j] (d) {\textbf{D}\\junction windows,\\4-mer prefilter};
   \node[box=black,left=of d] (dag) {\textbf{placement DAG}\\Viterbi + forward--\\backward at $\hat p$};
   \node[box=black,left=of dag] (guard) {\textbf{gates}\\anchor $E\le10^{-3}$,\\pair guards};
-  \node[box=cC,below=7mm of guard] (c) {\textbf{C} (optional)\\anchored at the\\J exit, $|\delta|\le7$};
+  \node[box=cC,below=7mm of guard] (c) {\textbf{C} (optional)\\anchored within\\7 bases of the J exit};
   \node[box=gray,right=of c] (out) {AIRR row,\\posteriors};
   \draw[arr] (read) -- (strand);
   \draw[arr] (strand) -- (vret);
@@ -678,26 +737,26 @@ windows, admission, adjudication and the gates are decided per read.
 \toprule
 Step & Guarantee & Rule and justification \\
 \midrule
-Strand & heuristic & Count read positions whose 11-mer occurs in the V/J germline on each strand; trusted when the winner exceeds its Poisson null $\lambda_0+3\sqrt{\lambda_0}$, otherwise compare V seed votes on both strands. \\
-V retrieval & heuristic & Seed votes per gene frame (9-mers weight 4; 7-mers weight 1 while the leader holds fewer than 25 nine-mer seeds). Keep 3 genes, and up to 16 while their votes are within $z\sqrt{2\cdot 4\cdot L}$ of the leader's $L$, $z=2$: two standard deviations of the difference of two seed counts, so the net widens for weakly supported, mutated reads. Every allele of a kept gene is a candidate. \\
+Strand & heuristic & Count read positions whose 11-mer occurs in the V/J germline on each strand; trusted when the winner exceeds its Poisson null $\lambda_0+3\sqrt{\lambda_0}$ ($\lambda_0$: the read's $k$-mer count times the germline's 11-mer density), otherwise compare V seed votes on both strands. \\
+V retrieval & heuristic & Seed votes per gene frame (9-mers weight 4; 7-mers weight 1 while the leader holds fewer than 25 nine-mer seeds). Keep 3 genes, and up to 16 while their votes are within $z\sqrt{2\cdot 4\cdot L}$ of the leader's $L$, $z=2$: about two standard deviations of the difference of two seed counts, so the margin is proportionally wider for weakly supported, mutated reads. Every allele of a kept gene is a candidate. \\
 V band & bounded & The seed cluster's diagonal range $\pm 8$, spanning both clusters around a seeded indel; holds unless an indel longer than 8 escapes the seeds. \\
 V, J scoring & lossless & One representative $R$ per gene frame is aligned; a sibling $A$ satisfies $\underline{L}\le S^{*}(A)\le S^{*}(R)+\Delta(R,A)$ and is skipped when the upper bound is below the third-largest lower bound. The ranking from the third score up equals full scoring. \\
 V/J keep & defined & Top 3 by extended and top 3 by local score with $E\le1$, plus ties. \\
-J & bounded & Every J allele of the anchoring V's locus, unbanded, from 12 bases before the earliest V end; the whole read when no V is an anchor. \\
-D windows & bounded & $[\text{V end}-12,\ \text{J start}+12)$ from the best anchoring V and J, plus the conserved-anchor window $[\text{Cys104}+3,\ \text{Trp/Phe118})$; an open side reaches 60 bases. \\
+J & bounded & Every J allele of the anchoring V's locus, unbanded, from 12 bases before the earliest V end to at most 225 bases plus the longest J past the last anchoring V's end; the whole read when no V is an anchor. \\
+D windows & bounded & $[\text{V end}-12,\ \text{J start}+12)$ from the best anchoring V and the best J placement, plus the conserved-anchor window $[\text{Cys104}+3,\ \text{Trp/Phe118})$; an open side reaches 60 bases. \\
 D prefilter & lossless & An allele is aligned only if it shares an $\ell$-mer with the window, $\ell$ derived from the admission gate (exact run $\ge 4$). \\
-D alignment & approx. & One optimal local alignment per allele and window; its clip at the chosen cuts need not be the best clip of that allele. \\
+D alignment & approximate & One optimal local alignment per allele and window, the best 32 admissible ones (plus ties) per window; its clip at the chosen cuts need not be the best clip of that allele. \\
 Adjudication & exact & \Cref{thm:dag}. \\
 Guards & defined & Best admissible subset optimum (\cref{sec:guards}). \\
-C & exact for $|\delta|\le 7$ & Anchored DP at the J exit (\cref{sec:constant}). \\
+C & exact within 7 bases & Anchored DP at the J exit (\cref{sec:constant}). \\
 \bottomrule
 \end{tabularx}
 \end{table}
 
 \paragraph{Gene frames and the index.} The alleles of a gene share almost
 all seeds. An allele joins its gene's coordinate frame when at least 30\,\%
-of its seeds occur in the gene's longest allele and at least 90\,\% of those
-agree on one offset; SNP and truncated alleles join, an allele with an
+of its seeds occur in the gene's longest allele and every one of those
+shared seeds agrees on one offset; SNP and truncated alleles join, an allele with an
 internal indel gets its own frame. The $k$-mer index is built over frames in
 compressed-sparse-row form, with 2-bit packed keys used directly as array
 indices, so a seed shared by twenty alleles is one posting and one vote and
@@ -706,9 +765,11 @@ retrieval work scales with genes rather than alleles. Votes are packed into
 best diagonal cluster per frame. Seeds with more than 256 postings are
 skipped, and a seed repeated within a frame does not vote, so repeats cannot
 collect quadratic votes. We measured closed and open syncmers and
-minimisers~\cite{edgar2021syncmers,shaw2022syncmers} as seed samplers; under
-the noise-based gene margin every $k$-mer was more sensitive at high SHM for
-0.4\,\% more instructions, so it is the default.
+minimisers~\cite{edgar2021syncmers,shaw2022syncmers} as seed samplers
+(minimisers only under an earlier fixed gene margin). Under the noise-based
+margin every $k$-mer beat closed syncmers by 1.1 points of mean V gene
+accuracy (4.4 at 30\,\% SHM) for 0.4\,\% more instructions, and beat open
+syncmers too, so it is the default.
 
 \paragraph{Sibling bounds.} For a sibling $A$ aligned in the same frame
 diagonals as its representative $R$, $\Delta(R,A)$ sums the best profile gain
@@ -724,10 +785,13 @@ kept ranking is that of aligning every allele.
 \paragraph{D search.} The junction windows reclaim 12 bases into V and J,
 and the conserved-anchor window depends on where the J's Trp/Phe118 lands,
 not on how far its alignment reaches left; with the lattice's ordering by
-kind, the J cannot remove a D from consideration. Each D allele sharing an
-$\ell$-mer with a window contributes its optimal local alignment there,
-unbanded. D admission requires an exact run of at least 4 bases; 3, 5 and 6
-were measured and are worse.
+kind, the read's own J cannot remove its D from consideration. A chance J
+placement between the V and the D of a read that stops at its D can, since
+the window ends 12 bases after the best J placement, used or not. Each D
+allele sharing an $\ell$-mer with a window is aligned there, unbanded, and
+its optimal local alignment competes for the 32 places (plus ties) that the
+window's admissible D hits have in the lattice. D admission requires an
+exact run of at least 4 bases; 3, 5 and 6 were measured and are worse.
 
 \subsection{Constant region}
 \label{sec:constant}
@@ -736,14 +800,15 @@ With a C database the constant region is assigned after adjudication, from
 finished calls only, so V, D and J calls are unchanged by construction. J and
 C are joined by an RNA splice at fixed phase, so C's germline base 0 lies at
 the called J's exit $x$, up to reference conventions and indels near the J's
-3$'$ end; hypothesis $H(a,\delta)$ places base 0 of allele $a$ at $x+\delta$,
-$|\delta|\le s=7$. An alignment anchored at $C[0]$ on one of $2s+1$
-diagonals is computed exactly by any local aligner run on $[N]+C$ whose first
-column scores a bonus larger than any alignment avoiding it, so the SIMD
-kernel serves unchanged. Alleles whose sequences agree on the reachable
-prefix form reach classes and are aligned once (human IGHC has 81 distinct
-alleles but 7 distinct 32-nt prefixes). C is called when its anchored E-value
-$E_C=N_C(2s+1)e^{-\lambda S}\le 10^{-3}$, from a Lundberg-type bound for the
+3$'$ end; hypothesis $H(a,o)$ places base 0 of allele $a$ at $x+o$,
+$|o|\le 7$. An alignment anchored at $C[0]$ on one of these 15 diagonals is
+computed exactly by any local aligner run on $[N]+C$ whose first column
+scores a bonus larger than any alignment avoiding it, so the SIMD kernel
+serves unchanged. Alleles whose sequences agree on the reachable prefix form
+reach classes and are aligned once (the IMGT human IGHC set used here has 105
+distinct alleles but only 13 distinct 32-nt prefixes). C is called when its
+anchored E-value $E_C=15\,N_C\,e^{-\lambda S}\le 10^{-3}$, with $N_C$ the
+number of C genes of the J's locus, from a Lundberg-type bound for the
 walk from each start, on at least 12 aligned columns at 90\,\% identity, and
 its posterior is computed at C's own divergence, since C is not
 hypermutated.
@@ -761,10 +826,12 @@ and of the Cys23 position. Every derived value that may be wrong carries an
 allele's locus is read from its name or inferred from its relatives and,
 failing that, from an embedded panel of human and mouse family
 representatives; the locus decides which alleles may form one
-rearrangement and which gene counts price a segment. Alleles named without
-a gene separator join the gene of a close relative ($\ge 0.95$ of the
-smaller self-score), so the gene-level retrieval budget does not silently
-become an allele cap.
+rearrangement and which gene counts price a segment. V alleles named
+without the \code{*} allele separator join the gene of their nearest named
+relative ($\ge 0.95$ of the smaller self-score; the rest are grouped among
+themselves), so the gene-level retrieval budget does not silently become an
+allele cap.
+
 
 % ===========================================================================
 \section{Implementation}
@@ -781,9 +848,11 @@ one changes the type and the pipeline monomorphises without trait objects.
 16-bit lane runs the scalar Gotoh recurrence for a different read--allele job
 rather than striping one alignment~\cite{farrar2007}. The kernel is written
 once over a lane abstraction and compiled for AVX-512BW (32 lanes), AVX2,
-NEON, WebAssembly \code{simd128}~\cite{haas2017wasm} and portable lanes (16).
-The backend is chosen at run time (at build time for WebAssembly); AVX-512 is
-used on request, since 512-bit instructions lower the clock of many CPUs.
+NEON, WebAssembly~\cite{haas2017wasm} \code{simd128} and portable lanes (16).
+By default the fastest of AVX2, NEON and portable lanes is chosen at run time;
+AVX-512BW runs only on request (\code{-{}-simd avx512}), since 512-bit
+instructions lower the clock of many CPUs. On WebAssembly the backend is
+fixed at build time (\code{simd128}, or the scalar kernel without it).
 Banded jobs use band-relative coordinates, so lanes whose
 bands start on different diagonals walk the same grid~\cite{chao1992band}.
 When every lane's profile depends on base identity alone a cell's
@@ -791,8 +860,10 @@ substitution is one comparison and one blend; otherwise five profile rows are
 selected by mask, exact for any substitution model. The horizontal gap state
 uses $D'=\max(t+g_o,\,D+\max(g_o,g_e))$ with $t=\max(0,\text{diag},I)$, which
 shortens the loop-carried dependency to one add and one maximum and is exact
-for any gap costs. Arithmetic saturates in 16 bits, with a per-job admission
-check that sends jobs that could approach the sentinel to the scalar kernel.
+for any gap costs. Arithmetic saturates in 16 bits; a job enters a lane only
+if its attainable local score is at most 30,000, no step costs less than
+$-1{,}000$ and its dimensions fit 16-bit positions, so saturation never clips
+a real cell, and other jobs run on the scalar kernel.
 Traceback codes are bit-identical to the scalar kernel's, so one traceback
 walk serves both.
 
@@ -807,18 +878,23 @@ tracebacks, the batched pipeline equals the per-read scalar pipeline, and
 output is byte-identical across backends and between x86-64 and AArch64.
 
 \paragraph{Input, output and interfaces.} Reads are FASTA, FASTQ or an AIRR
-Rearrangement table, streamed in batches of 16,384; repeated sequences are
-assigned once through a cache of recent rows. Output is the AIRR
-Rearrangement schema~\cite{vanderheiden2018airr} with the
-posteriors, E-values, alternatives and region coordinates. The crate exposes
+Rearrangement table, streamed in batches of 16,384; identical sequences are
+assigned once per batch, and across batches through a cache of the 4,096
+most recently assigned distinct sequences, which changes no output. Output is
+the AIRR Rearrangement schema~\cite{vanderheiden2018airr} with the
+posteriors, E-values, alternatives and region coordinates. The crate provides
 a command line (\code{swig}, with \code{prepare}, \code{simulate} and
-\code{evaluate} subcommands), a Rust library, and a WebAssembly module with a
-C ABI, all sharing one run implementation.
+\code{evaluate} subcommands) and a Rust library; a companion workspace crate
+(\code{swig\_wasm}) builds a WebAssembly module with a C ABI. All three share
+one run implementation.
 
-\paragraph{Tests.} The suite of 350 tests, all passing on the version described
-(five long-running tests run on demand), includes the exhaustive oracles for
-\cref{thm:dag} and the posterior marginals, kernel equivalence on random
-batches for every backend, the guards on constructed reads, robustness on
+\paragraph{Tests.} The suite of 350 tests, all passing on the version
+described (one long-running accuracy test of 20,000 reads per preset runs on
+demand), includes the exhaustive oracles for \cref{thm:dag} and the
+posterior marginals, kernel equivalence on random batches for every backend
+the host runs (AVX-512BW, AVX2 and portable lanes on x86-64; NEON and
+\code{simd128} on AArch64 and WebAssembly builds), the guards on constructed
+reads, robustness on
 degenerate input (empty, all-N, IUPAC, low-complexity, 20\,kb and chimeric
 reads, and every prefix and suffix of a read), and accuracy floors on
 simulated reads. It runs on release code with debug assertions and overflow
@@ -832,7 +908,9 @@ All reads in this paper are simulated, so that every call can be scored
 against a known answer; none of the results is external biological
 validation (\cref{sec:discussion}). Two independent simulators are used. The
 numbers in \cref{sec:results} were produced with \swig{} 0.39.7 for this
-paper, except where a table states otherwise.
+paper, except the MiXCR results and the D-prior prototype measurements of
+\cref{sec:genairr}, which come from an earlier run of the GenAIRR benchmark
+on the same reads.
 
 \paragraph{GenAIRR.} GenAIRR 2.3.1~\cite{konstantinovsky2024genairr}
 simulates reads with its built-in references (human IGH from
@@ -859,9 +937,12 @@ generative model and presets of IgSim.jl~\cite{igsimjl}: uniform allele
 choice, exonuclease trims, N additions, random flanks, gated SHM with
 single-base indels, and instrument substitutions, with every read base
 labelled by its germline origin. The presets are \emph{easy} (no SHM),
-\emph{mid} (IgM-like: SHM on 40\,\% of reads at 0.5--7\,\%, 1-nt indels on
-8\,\%) and \emph{hard} (IgG-like: SHM on 97\,\% of reads, median about 7\,\%,
-indels on 15\,\%); we also fix the SHM rate at 30\,\% to probe the extreme.
+\emph{mid} (IgM-like: SHM on 40\,\% of reads at 0.5--7\,\%; 1-nt indels
+switched on for 8\,\% of reads at up to 0.2\,\% per base, so about 2\,\% carry
+one) and \emph{hard} (IgG-like: SHM on 97\,\% of reads, median about 7\,\%;
+indels on 15\,\% at up to 0.4\,\% per base, about 7\,\% carry one); we also run
+the \emph{hard} preset with the SHM rate fixed at 30\,\% on every read to
+probe the extreme.
 The germline is the human IGH set of IMGT/GENE-DB~\cite{giudicelli2005genedb}
 release 202632-7 (480 V, 48 D and 15 J alleles, of which \swig{} merges
 identical sequences to 457, 41 and 15), given to every tool as plain FASTA:
@@ -871,17 +952,21 @@ rest on the annotation it is meant to test. An allele call is correct when it
 is \emph{germline-equivalent} to the truth: the called allele contains the
 trimmed, pre-mutation germline that was simulated, so no method could
 separate the two from the read. Junctions are correct when they equal the
-true Cys104--Trp/Phe118 sequence. Because the trade-off between finding short
+true Cys104--Trp/Phe118 sequence; junction accuracy is over the reads whose
+two anchor codons are templated in the read (9,953, 8,130 and 4,667 of
+10,000 on \emph{easy}, \emph{mid} and \emph{hard}; 1,441 of 3,000 at 30\,\%
+SHM). Because the trade-off between finding short
 D remnants and leaving D-free junctions without a D can be moved at will, D
 accuracy is always reported together with the share of D-free reads that are
 given a D, and by remnant length.
 
 \paragraph{Comparisons and statistics.} Two callers or settings are compared
-on identical reads. For each metric we report the accuracy difference with
-its 95\,\% paired Wald interval and an exact two-sided McNemar
-test~\cite{mcnemar1947} on the reads only one of them gets right, computed by
-\code{swig evaluate}, which scores any AIRR Rearrangement table and so serves
-every tool alike. Posteriors are scored by reliability bins, the expected
+on identical reads. For each metric \code{swig evaluate}, which scores any
+AIRR Rearrangement table and so serves every tool alike, computes the
+accuracy difference with its 95\,\% paired Wald interval and an exact
+two-sided McNemar test~\cite{mcnemar1947} on the reads only one of them gets
+right; we report the differences and the McNemar $p$-values.
+ Posteriors are scored by reliability bins, the expected
 calibration error~\cite{naeini2015ece}
 $\text{ECE}=\sum_b n_b\,|\bar p_b-\bar e_b|/n$ and the Brier
 score~\cite{brier1950}.
@@ -917,14 +1002,18 @@ the realistic set. MiXCR's top-tied hits trail on D by 3.9--9.2 points over
 the IGH sets; its single top hit, which drops genuine ties, scores lower
 still (IGH D 73.5--86.4\,\%, V 94.6--99.6\,\%). On TRB \swig{} has the best D
 (99.9 and 99.5\,\% against at most 98.2\,\%) but trails IgBLAST and MiXCR by
-0.04--0.11 points on J: a few reads keep fewer J columns than the 10 that
-the plausibility constraints require.
+0.04--0.11 points on J: on a few reads the J is trimmed 31--40 bases into its
+germline, past its Trp/Phe codon, and its 13--22 remaining bases fail the V--J
+pairing rule of the plausibility constraints (the J starts more than 30 bases
+into its germline, holds fewer than 30 columns and aligns no conserved
+codon).
 
 \begin{table}[t]
 \centering
 \caption{Accuracy against GenAIRR's ambiguity-aware truth (mean Jaccard
 score of the reported allele set against the truth's tie set, \%), 10,000
-reads per set. MiXCR counts every hit tied with its top score. Bold: best of
+reads per set. MiXCR counts every hit tied with its top score; its figures
+come from an earlier run of the benchmark on the same reads. Bold: best of
 the row. A dash: the locus has no D.}
 \label{tab:genairr}
 \footnotesize
@@ -945,7 +1034,7 @@ IGK, realistic   & 99.48 & -- & 98.11 & 97.99 & -- & 97.09 & \textbf{99.63} & --
 IGL, 5\,\% SHM   & 99.53 & -- & 98.32 & 98.48 & -- & 98.16 & \textbf{99.63} & -- & \textbf{99.10} \\
 IGL, realistic   & 99.34 & -- & 98.32 & 97.16 & -- & 96.49 & \textbf{99.51} & -- & \textbf{98.49} \\
 TRB, no SHM      & \textbf{99.97} & 98.17 & 99.93 & 99.94 & 94.10 & \textbf{100.00} & \textbf{99.97} & \textbf{99.91} & 99.89 \\
-TRB, realistic   & \textbf{99.94} & 97.65 & 99.92 & 99.80 & 93.66 & \textbf{99.92} & \textbf{99.94} & \textbf{99.50} & 99.87 \\
+TRB, realistic   & \textbf{99.94} & 97.65 & \textbf{99.92} & 99.80 & 93.66 & \textbf{99.92} & \textbf{99.94} & \textbf{99.50} & 99.87 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -981,8 +1070,9 @@ the previous release.}
 \paragraph{Where the D gain comes from.} Without its D trim and N/P-length
 priors \swig{} 0.39.7 makes the D calls of its previous release, which was
 level with IgBLAST at 2 and 5\,\% SHM (\cref{fig:genairr}). An analysis of that
-release's errors on these sets found that about 90\,\% of its wrong-gene D
-calls overlapped the true D: the D had been found, but a short exact match of
+release's errors on a 2,000-read sample of the 5\,\% SHM set found that 95 of
+its 103 wrong-gene D calls overlapped the true D: the D had been found, but a
+short exact match of
 another gene inside a mutated true D (for example \code{CTACAAT} inside
 \code{ACTACAATAA}) outscored it by local alignment. A post-processing
 prototype that held the placement graph's V end and J start fixed and
@@ -1053,9 +1143,10 @@ IgBLAST).
 At a fixed 30\,\% SHM, beyond IgSim's IgG-like regime, the picture is mixed.
 \swig{} keeps a large lead on D ($+7.3$ points) and J ($+13.6$), but IgBLAST
 is better on V allele ($+3.4$) and V gene (95.0 against 89.7\,\%) and on
-junctions. \swig{} mis-orients 3.5\,\% of these reads and leaves 4.4\,\%
-uncalled, because its strand test and seed retrieval run out of intact
-$k$-mers (\cref{sec:discussion}).
+junctions. \swig{} leaves 4.4\,\% of these reads uncalled, 3.5\,\% of them
+because its strand test chose the wrong strand, as the strand test and seed
+retrieval run out of intact $k$-mers (\cref{sec:discussion}); every read it
+calls is correctly oriented.
 
 \begin{table}[t]
 \centering
@@ -1064,7 +1155,7 @@ accuracy, \%), forward strand; 10,000 reads per preset and 3,000 at 30\,\% SHM.
 ``D, $\ge 8$'': reads whose D remnant is at least 8\,nt. ``D-free given a
 D'': share of reads without a D remnant that receive a D call (lower is
 better). Bold: significantly better in a paired comparison (exact McNemar
-$p<0.01$).}
+$p<0.01$); V-gene accuracy was tested separately with the same rule.}
 \label{tab:igsim}
 \footnotesize
 \setlength{\tabcolsep}{4pt}
@@ -1085,7 +1176,7 @@ Preset & Tool & V allele & V gene & D allele & D, $\ge 8$ & D-free given a D & J
  & \swig   & \textbf{92.63} & 99.62 & \textbf{86.91} & \textbf{91.70} & \textbf{15.8} & \textbf{92.67} & 96.81 \\
 \addlinespace
 \multirow{2}{*}{30\,\% SHM}
- & IgBLAST & \textbf{64.97} & 95.03 & 35.74 & 35.82 & 80.6 & 40.60 & \textbf{52.46} \\
+ & IgBLAST & \textbf{64.97} & \textbf{95.03} & 35.74 & 35.82 & 80.6 & 40.60 & \textbf{52.46} \\
  & \swig   & 61.60 & 89.67 & \textbf{43.03} & \textbf{44.57} & \textbf{53.8} & \textbf{54.20} & 46.01 \\
 \bottomrule
 \end{tabular}
@@ -1097,7 +1188,7 @@ Preset & Tool & V allele & V gene & D allele & D, $\ge 8$ & D-free given a D & J
 \swig{} made no call on 2,000 random reads with the length distribution of
 the \emph{mid} set, and none on 1,000 IGK reads assigned against the IGH
 database: the anchor gate requires a V or J hit at $E\le10^{-3}$. IgBLAST,
-which reports its best hits without a significance threshold, gave a V to
+whose default E-value threshold for saving hits is a permissive 20, gave a V to
 1,272 random reads (and a junction to 93) and an IGHV to 997 of the IGK
 reads. Filtering its V hits at $E\le10^{-3}$ removes every random-read call
 but keeps an IGHV on 470 of the 1,000 IGK reads.
@@ -1154,24 +1245,26 @@ N/P priors raise D accuracy on both presets ($+0.37$ and $+1.08$ points;
 $p=0.02$ and $3\cdot10^{-9}$) and, on \emph{mid}, also leave 6.1 points more
 D-free reads without a D. Calling at each read's own divergence instead of
 the fixed $(2,-3)$ scale leaves 9.1 points more D-free reads without a D on
-\emph{mid} and gains 0.8 points of D on \emph{hard}. The open-flank cost,
-the conserved-anchor D window and the max-marginal D decoder change
-essentially nothing on full-length reads: they act on reads the
-\emph{mid} and \emph{hard} presets rarely produce (\cref{tab:truncated}).
-Skipping posteriors leaves every call unchanged. On GenAIRR reads the
-max-marginal decoder adds up to 0.2 points of IGH D (95.55 against 95.42 at
-5\,\% SHM), which is why it remains an option rather than the default. The alternative calling
-profiles move along a single trade-off between D accuracy and D-free
-specificity (\cref{fig:operating}): a more liberal D prior (\code{sensitive-d},
-prior odds 2) gains 0.8--1.0 points of D for 6--17 points more D-free reads
-given a D, and profiles without a D prior give a D to 64--91\,\% of D-free
-reads.
+\emph{mid} and gains 0.8 points of D on \emph{hard}. The open-flank cost and
+the conserved-anchor D window change essentially nothing on full-length
+reads: they act on reads that stop in or start after the junction, which the
+\emph{mid} and \emph{hard} presets rarely produce (\cref{tab:truncated} for
+the cost). The max-marginal D decoder changes the D allele of a few dozen
+full-length reads but gains exactly as many as it loses on IgSim (6 against
+6 on \emph{mid}, 26 against 26 on \emph{hard}); on GenAIRR reads it adds up
+to 0.2 points of IGH D (95.55 against 95.42 at 5\,\% SHM), too little to make
+it the default. Skipping posteriors leaves every call unchanged. Raising the
+prior odds of a D (\code{sensitive-d}, prior odds 2) gains 0.8--1.0 points of
+D for 6--17 points more D-free reads given a D (\cref{fig:operating}). The
+profiles without a D prior give a D to 64--91\,\% of D-free reads and are
+dominated: on \emph{hard} they also lose 0.8--1.9 points of D.
 
 \begin{table}[t]
 \centering
 \caption{Ablations on IgSim (10,000 reads per preset). $\Delta$: change
 against the default in percentage points (positive: better), paired on the
-same reads; ``n.s.'' $p\ge0.05$ (exact McNemar). ``D-free given a D'' and
+same reads; ``0'': no read changes correctness; ``n.s.'': $p\ge0.05$ (exact
+McNemar). ``D-free given a D'' and
 the D-presence Brier score are absolute (default: 18.4\,\% and 0.0217 on
 \emph{mid}, 15.8\,\% and 0.0227 on \emph{hard}).}
 \label{tab:ablation}
@@ -1188,8 +1281,8 @@ D trim and N/P priors off       & $-0.37$ & 24.5 & n.s.     & 0.0240 & $-1.08$ &
 fixed-scale call                & n.s.    & 27.6 & $+0.25$  & 0.0224 & $-0.82$ & 16.4 & $+0.28$  & 0.0222 \\
 open-flank cost off             & 0       & 18.4 & 0        & 0.0217 & $-0.06$ & 15.8 & 0        & 0.0239 \\
 plausibility constraints off    & 0       & 18.4 & $+0.44$  & 0.0217 & n.s.    & 15.8 & $+2.85$  & 0.0223 \\
-conserved-anchor window off     & n.s.    & 18.4 & n.s.     & 0.0216 & n.s.    & 16.0 & n.s.     & 0.0222 \\
-max-marginal D allele           & 0       & 18.4 & n.s.     & 0.0217 & n.s.    & 15.8 & 0        & 0.0227 \\
+conserved-anchor window off     & n.s.    & 18.4 & n.s.     & 0.0216 & n.s.    & 16.0 & 0        & 0.0222 \\
+max-marginal D allele           & n.s.    & 18.4 & n.s.     & 0.0217 & n.s.    & 15.8 & 0        & 0.0227 \\
 no posteriors                   & 0       & 18.4 & 0        & --     & 0       & 15.8 & 0        & --     \\
 \addlinespace
 profile \code{sensitive-d}      & $+1.03$ & 35.0 & 0        & 0.0232 & $+0.84$ & 22.1 & n.s.     & 0.0217 \\
@@ -1242,7 +1335,8 @@ as the D prior intends for evidence this weak.
 
 The same holds for V and J. Aligning every allele unbanded under the same
 objective (an exhaustive oracle) found no V search error in 2,000 reads per
-preset and 1 and 3 J search errors on \emph{mid} and \emph{hard}; the
+preset (from the same sample as \cref{tab:derrors}) and 1 and 3 J search
+errors on \emph{mid} and \emph{hard}; the
 remaining V errors are ties (26 and 84 reads) and model errors (12 and 68),
 in which the exhaustive optimum itself is not the truth because mutations
 fall on the positions that separate alleles.
@@ -1250,7 +1344,8 @@ fall on the positions that separate alleles.
 \begin{table}[t]
 \centering
 \caption{Attribution of D errors (\% of reads with a D remnant in the class),
-10,000 IgSim reads per preset. ``Adjudication'': a placement of an
+on a separate sample of 10,000 IgSim reads per preset (\cref{tab:igsim,tab:ablation,tab:calibration}
+use another sample). ``Adjudication'': a placement of an
 equivalent allele existed but the path took another D or none; ``not
 found'': no such placement survived the D search.}
 \label{tab:derrors}
@@ -1278,7 +1373,8 @@ called J covers $\ge 3$ bases of the true D & 0.04 & 0.14 & 0.51 & 0.99 \\
 
 Posteriors are well calibrated wherever the candidates contain the truth
 (\cref{fig:calibration}). The expected calibration error is at most 0.5\,\%
-for V and 0.8\,\% for J on every preset, and 1.9\,\% for the D allele and
+for V and 0.8\,\% for J on the \emph{easy}, \emph{mid} and \emph{hard}
+presets, and 1.9\,\% for the D allele and
 1.1\,\% for D presence on \emph{hard} (\cref{tab:calibration}). The D-allele
 posterior is over-confident in the 0.5--0.95 range: reported probabilities
 of 85\,\% correspond to 77--78\,\% observed. At 30\,\% SHM the V and J
@@ -1342,8 +1438,9 @@ equivalence'', that of D presence ``the read has a simulated D''.}
 
 \subsection{Constant region}
 
-On IgSim reads that continue into one of the 101 human IGHC alleles with a
-complete coding start (10,000 per preset, both strands), the primary C call
+On 10,000 IgSim reads per preset (both strands), about 80\,\% of which
+continue into one of the 101 human IGHC alleles with a complete coding
+start, the primary C call
 is anchored-equivalent to the truth on 98.5--99.2\,\% of reads with 16--31
 nucleotides of C and on at least 99.65\,\% from 32 nucleotides, and C was
 called on at most 0.05\,\% of the about 2,000 reads per preset that stop
@@ -1359,9 +1456,10 @@ clock of the whole command, including database preparation (about 40\,ms
 for the IMGT IGH set, every allele annotated on load). On four threads
 \swig{} assigns 6,800--7,600 reads per second with posteriors, 76--88 times
 IgBLAST's throughput on the same reads and machine, and 8,300--10,200 without
-them; posteriors add 22--35\,\% to the run time. On the GenAIRR sets IgBLAST
-took 81--90\,s per 10,000 reads and \swig{} 1.0--1.4\,s. The SIMD kernel
-gives 2.4--2.7 times the throughput of the scalar kernel on one thread,
+them; posteriors add 22--35\,\% to the run time. On the four out-of-sample
+GenAIRR IGH sets (\cref{tab:oos}; machine lightly loaded) IgBLAST took
+81--90\,s per 10,000 reads and \swig{} 1.0--1.4\,s. The SIMD kernel gives
+2.5--2.7 times the throughput of the scalar kernel on one thread,
 AVX-512BW's 32 lanes adding 2--7\,\% over AVX2's 16. Every backend and every
 thread count produced byte-identical output on both sets.
 
@@ -1369,7 +1467,9 @@ thread count produced byte-identical output on both sets.
 \centering
 \caption{Throughput on 10,000 IgSim reads (reads per second; wall clock of
 the whole command including database preparation; median of three runs for
-\swig). The default kernel on this CPU is AVX2.}
+\swig). The default kernel on this CPU is AVX2: the default and AVX2
+one-thread rows are the same configuration timed separately and differ by
+run-to-run variation (about 5\,\%).}
 \label{tab:speed}
 \footnotesize
 \begin{tabular}{@{}l rr@{}}
@@ -1386,7 +1486,7 @@ Configuration & \emph{mid} & \emph{hard} \\
 \swig, 1 thread, portable lanes (16)      & 1,575  & 1,612 \\
 \swig, 1 thread, scalar kernel            & 842    & 877   \\
 \addlinespace
-IgBLAST 1.22, 4 threads                   & 85     & 90    \\
+IgBLAST 1.22, 4 threads                   & 85.5   & 89.6  \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -1417,9 +1517,11 @@ The pair of simulators matters. GenAIRR scores calls against tie sets that
 count only the bases a read actually shows, which rewards reporting genuine
 ties and penalises over-reporting; IgSim scores germline equivalence and
 separates D accuracy from D-free specificity and remnant length. On both,
-the IgBLAST comparison favours \swig{} on D and V; on IgSim, IgBLAST reports
-more exact junctions because \swig{} withholds a junction whose anchor codon
-its alignments do not reach.
+the IgBLAST comparison favours \swig{} on V and D up to IgG-like mutation,
+except D on IgM-like reads, where IgBLAST's lead comes from 1--3-nt remnants.
+On IgSim, IgBLAST reports more exact junctions because \swig{} withholds a
+junction whose anchor codon its alignments do not reach, and at 30\,\% SHM
+IgBLAST's V calls are better.
 
 \subsection{Limitations}
 
@@ -1453,8 +1555,9 @@ its alignments do not reach.
     trimmed as much as the prior expects, the D-cost credit gives D-free
     reads a D more often.
   \item \emph{Extreme mutation.} At 30\,\% SHM the strand test and seed
-    retrieval lose intact $k$-mers: 3.5\,\% of reads are mis-oriented, V
-    accuracy falls below IgBLAST's, and the V and J posteriors are
+    retrieval lose intact $k$-mers: 4.4\,\% of reads are left uncalled, 3.5\,\%
+    because the wrong strand was chosen, V accuracy falls below IgBLAST's, and
+    the V and J posteriors are
     over-confident because the true gene is no longer among the candidates.
   \item \emph{Statistics.} E-values use exact ungapped $\lambda$ and $K$
     (anti-conservative for gapped scores) and the total database length
@@ -1481,12 +1584,16 @@ on real data.
 \swig{} shows that germline assignment can be posed as one likelihood ratio
 and solved exactly, fast enough for whole repertoires: an exact semi-Markov
 recursion over every pair of cuts between neighbouring segments, priors
-derived from the hypotheses searched, calls valued at each read's own
-divergence and posteriors from the same recursion. Every search shortcut
-carries a stated guarantee, and the remaining errors are located by
-construction. On two independent simulators it is the most accurate of the
-tools compared on D and, on immunoglobulin loci, on V and J, while running
-nearly two orders of magnitude faster than IgBLAST.
+derived as prior odds over the hypotheses each segment competes with, calls
+valued at each read's own divergence and posteriors from the same recursion.
+Every search shortcut carries a stated guarantee, and the remaining errors
+are located by construction. On GenAIRR reads it is the most accurate of the
+tools compared on V, D and J on every immunoglobulin set and on D for TRB,
+including on reads disjoint from those its D priors were designed on; on
+IgSim reads it leads IgBLAST on V and D up to IgG-like mutation (except
+IgM-like D, where IgBLAST's lead comes from unidentifiable 1--3-nt remnants)
+and trails on junction exactness and on V at 30\,\% SHM. It runs nearly two
+orders of magnitude faster than IgBLAST.
 
 \section*{Availability}
 
@@ -1497,8 +1604,9 @@ and runs on x86-64 and AArch64 and as WebAssembly. The command
 \code{swig -{}-v V.fasta -{}-d D.fasta -{}-j J.fasta reads.fastq} writes AIRR
 Rearrangement TSV; \code{swig simulate} and \code{swig evaluate} reproduce
 the IgSim evaluation for any germline set and any tool's AIRR output. The
-scripts and settings that produce every number in this paper are distributed
-with the source.
+scripts and settings that produce every \swig{} and IgBLAST number in this
+paper are distributed with the source.
+
 
 \section*{Acknowledgements}
 
