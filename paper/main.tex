@@ -344,7 +344,7 @@ position, through the Karlin--Altschul expectation $K w n_D e^{-\lambda S}$
 ($w$ read positions, $n_D$ allele offsets). It is available as an option
 (\code{-{}-d-presence-rate}) but needs a D-presence rate that does not follow
 from the search: at the D-presence rate of the IgSim \emph{mid} reads
-(94.7\,\% carry a D remnant) $\pD$ falls to 9.87, below an exact 5-mer's
+(94.74\,\% carry a D remnant) $\pD$ falls to 9.86, below an exact 5-mer's
 score of 10, and exact 5-mers win.
 
 \paragraph{D trims and N/P lengths.} A D clip that keeps germline
@@ -588,24 +588,27 @@ worth $\ln 4(1-\phat)$ and a mismatch $\ln(4\phat/3)$; at $\phat=\delta$,
 $\lambda_r=\lambda$ and $\mu_r=0$. Gaps, $\iota$ and the pair bonus stay at
 the prior $\lambda$, since $\phat$ measures substitutions.
 
-Every term is an integer in units of $1/F$ nats, $F=2^{16}$: a column is
-$s\,u_r+v_r$ with $u_r=\operatorname{round}(F\lambda_r)$ and
-$v_r=\operatorname{round}(F\mu_r)$, so the maximum and every tie are exact,
+Every term is an integer in units of $1/F$ nats, $F=2^{16}$: a column of
+kind $k\in\{V,D,J\}$ is $s\,u_k+v_k$ with $u_k=\operatorname{round}(F\lambda_r)$
+and $v_k=\operatorname{round}(F\mu_r)$, $(\lambda_r,\mu_r)$ computed from that
+kind's own match and mismatch scores (identical for the default $(2,-3)$),
+so the maximum and every tie are exact,
 and the recursion and \cref{thm:dag} carry over unchanged. At
 $\phat=\delta$ every column is the fixed score times
 $u_0=\operatorname{round}(F\lambda)$, so with integer presence costs, the D
 priors off and the open-flank cost off, the fixed scale (\code{-{}-calls
-fixed}, which has no D trim or N/P terms and rounds the open-flank cost to
-whole score units) is an exact special case. Each presence cost is read as
-$P^{*}_k/m$ matched columns of its kind, with $m$ the match score (2 for
-every kind): $c_V(\phat)=\lfloor P^{*}_V(m u_V+v_V)/m\rfloor$ and
-$c_J(\phat)=\lfloor P^{*}_J(m u_J+v_J)/m\rfloor$. A matched D column also
+fixed}, which has no D trim or N/P terms and charges the open-flank cost in
+whole score units as $\lfloor\pD+c_{\text{open}}/\lambda\rfloor-\lfloor\pD\rfloor$)
+is an exact special case. Each presence cost is read as $P^{*}_k/m$ matched
+columns of its kind rather than as a constant number of nats, with $m$ the
+match score (2 for every kind): $c_V(\phat)=\lfloor P^{*}_V(m u_V+v_V)/m\rfloor$
+and $c_J(\phat)=\lfloor P^{*}_J(m u_J+v_J)/m\rfloor$. A matched D column also
 earns the N/P term $\operatorname{round}(Fb)$, and the D cost is lowered by
-the credit,
+the credit:
 \begin{equation}
-  c_D(\phat) = \Bigl\lfloor \pD\,\frac{m u_D+v_D+\operatorname{round}(F b)}{m}\Bigr\rfloor - \operatorname{round}(F\kappa),
+  c_D(\phat) = \Bigl\lfloor \pD\,\frac{m u_D+v_D+\operatorname{round}(F b)}{m}\Bigr\rfloor - \operatorname{round}(F\kappa).
 \end{equation}
-rather than as constant numbers of nats. The D cost is a threshold against
+The D cost is a threshold against
 chance D hits in random N/P sequence, whose null distribution does not depend
 on $\phat$ and is dominated by exact runs. Read in matched columns it keeps
 the fixed scale's admitted classes of exact runs at every divergence for a D
@@ -748,7 +751,7 @@ Step & Guarantee & Rule and justification \\
 \midrule
 Strand & heuristic & Count read positions whose 11-mer occurs in the V/J germline on each strand; trusted when the winner exceeds its Poisson null $\lambda_0+3\sqrt{\lambda_0}$ ($\lambda_0$: the read's $k$-mer count times the germline's 11-mer density), otherwise compare V seed votes on both strands. \\
 V retrieval & heuristic & Seed votes per gene frame (9-mers weight 4; 7-mers weight 1 while the leader holds fewer than 25 nine-mer seeds). Keep 3 genes, and up to 16 while their votes are within $z\sqrt{2\cdot 4\cdot L}$ of the leader's $L$, $z=2$: about two standard deviations of the difference of two seed counts, so the margin is proportionally wider for weakly supported, mutated reads. Every allele of a kept gene is a candidate. \\
-V band & bounded & The seed cluster's diagonal range $\pm 8$. A runner-up cluster is taken as the far side of an indel, and the band spans both, when the two lie within 64 diagonals, the runner-up holds at least the votes of 3 nine-mers and 1/8 of the leader's, and the leader those of 25. Holds unless a longer indel is not joined this way (unseeded on one side, longer than 64, or on a weakly seeded read). \\
+V band & bounded & The seed cluster's diagonal range $\pm 8$. A frame's runner-up cluster is taken as the far side of an indel, and the band spans both, when the two span at most 64 diagonals, the runner-up holds at least the votes of 3 nine-mers and 1/8 of the frame's best cluster, and that cluster those of 25. Holds unless a longer indel is not joined this way: its far side is unseeded or below those shares (e.g.\ an indel 20 bases from a V end), the two span more than 64 diagonals, or the frame's best cluster is weakly seeded. \\
 V, J scoring & lossless & One representative $R$ per gene frame is aligned; a sibling $A$ satisfies $\underline{L}\le S^{*}(A)\le S^{*}(R)+\Delta(R,A)$ and is skipped when the upper bound is below the third-largest lower bound. The ranking from the third score up equals full scoring. \\
 V/J keep & defined & Top 3 by extended and top 3 by local score with $E\le1$, plus ties. \\
 J & bounded & Every J allele of the anchoring V's locus, unbanded, from 12 bases before the earliest V end to at most 225 bases plus the longest J past the last anchoring V's end; the whole read when no V is an anchor. \\
@@ -1259,9 +1262,16 @@ jcut100   & 100 random bases + J\ldots    & any D (\%)   & 27.2 & 0.0 & 28.2 & 9
 \emph{hard} sets and compares with the default read by read. The D trim and
 N/P priors raise D accuracy on both presets ($+0.37$ and $+1.08$ points;
 $p=0.02$ and $3\cdot10^{-9}$) and, on \emph{mid}, also leave 6.1 points more
-D-free reads without a D. Calling at each read's own divergence instead of
-the fixed $(2,-3)$ scale leaves 9.1 points more D-free reads without a D on
-\emph{mid} and gains 0.8 points of D on \emph{hard}. The open-flank cost and
+D-free reads without a D. The fixed $(2,-3)$ scale (\code{-{}-calls fixed})
+cannot carry the D trim and N/P terms, so its row changes the scale and drops
+those priors together. Against the run with the priors off, which differs
+only in the call model, calling at each read's own divergence leaves 3.0
+points more D-free reads without a D on \emph{mid} (24.5 against 27.6\,\%;
+0.4 fewer on \emph{hard}) and changes D by $-0.2$ and $-0.3$ points (93.02
+against 93.24\,\% on \emph{mid}, 85.83 against 86.09\,\% on \emph{hard}).
+Its value lies in making the call a mode of the reported posterior, in
+D-free specificity on \emph{mid}, and in the D priors it makes possible, not
+in D accuracy by itself. The open-flank cost and
 the conserved-anchor D window change essentially nothing on full-length
 reads: they act on reads that stop in or start after the junction, which the
 \emph{mid} and \emph{hard} presets rarely produce (\cref{tab:truncated} for
@@ -1297,7 +1307,7 @@ Change & $\Delta$D & D-free & $\Delta$junction & Brier & $\Delta$D & D-free & $\
  &  & given a D & & D pres. & & given a D & & D pres. \\
 \midrule
 D trim and N/P priors off       & $-0.37$ & 24.5 & n.s.     & 0.0240 & $-1.08$ & 16.8 & n.s.     & 0.0218 \\
-fixed-scale call                & n.s.    & 27.6 & $+0.25$  & 0.0224 & $-0.82$ & 16.4 & $+0.28$  & 0.0222 \\
+fixed-scale call (no D priors)  & n.s.    & 27.6 & $+0.25$  & 0.0224 & $-0.82$ & 16.4 & $+0.28$  & 0.0222 \\
 open-flank cost off             & 0       & 18.4 & 0        & 0.0217 & $-0.06$ & 15.8 & 0        & 0.0239 \\
 plausibility constraints off    & 0       & 18.4 & $+0.44$  & 0.0217 & n.s.    & 15.8 & $+2.85$  & 0.0223 \\
 conserved-anchor window off     & n.s.    & 18.4 & n.s.     & 0.0216 & n.s.    & 16.0 & 0        & 0.0222 \\
@@ -1322,11 +1332,11 @@ profile \code{igblast}          & $+1.16$ & 86.1 & $-0.30$  & 0.0474 & $-0.78$ &
   nodes near coords,point meta=explicit symbolic,
   every node near coord/.style={font=\tiny,anchor=south west,inner sep=1pt}]
 \nextgroupplot[title={\emph{mid}},ylabel={D allele accuracy (\%)},ymin=92.6,ymax=95.0]
-\addplot[only marks,mark=*,cSwig] coordinates {(18.44,93.39)[default] (27.57,93.24)[fixed] (34.98,94.43)[sensitive-d] (64.45,93.67)[truth] (86.12,94.55)[igblast]};
+\addplot[only marks,mark=*,cSwig] coordinates {(18.44,93.39)[default] (27.57,93.24)[fixed, no priors] (34.98,94.43)[sensitive-d] (64.45,93.67)[truth] (86.12,94.55)[igblast]};
 \addplot[only marks,mark=*,cSwig,every node near coord/.style={font=\tiny,anchor=north west,inner sep=1pt}] coordinates {(24.52,93.02)[priors off]};
 \addplot[only marks,mark=triangle*,cIgb,every node near coord/.style={font=\tiny,anchor=north west,inner sep=1pt}] coordinates {(49.43,93.92)[IgBLAST]};
 \nextgroupplot[title={\emph{hard}},ymin=84.4,ymax=88.2]
-\addplot[only marks,mark=*,cSwig] coordinates {(15.79,86.91)[default] (16.4,86.09)[fixed] (22.06,87.76)[sensitive-d] (69.43,85.04)[truth]};
+\addplot[only marks,mark=*,cSwig] coordinates {(15.79,86.91)[default] (16.4,86.09)[fixed, no priors] (22.06,87.76)[sensitive-d] (69.43,85.04)[truth]};
 \addplot[only marks,mark=*,cSwig,every node near coord/.style={font=\tiny,anchor=north west,inner sep=1pt}] coordinates {(16.8,85.83)[priors off]};
 \addplot[only marks,mark=*,cSwig,every node near coord/.style={font=\tiny,anchor=south east,inner sep=1pt}] coordinates {(91.09,86.14)[igblast]};
 \addplot[only marks,mark=triangle*,cIgb] coordinates {(30.77,84.76)[IgBLAST]};
@@ -1349,8 +1359,11 @@ on \emph{hard}) and almost never covered by the called J or V, the failure
 mode of sequential annotation. Most errors are adjudication errors: a
 placement of a correct allele existed, but the path chose another allele.
 These are short, mutated remnants that another allele explains as well or
-better under the model. On remnants of 1--7 nucleotides about half of the errors are a declined D,
-as the D prior intends for evidence this weak.
+better under the model. On remnants of 1--7 nucleotides about half of the
+errors (53 and 58\,\%) are a missing D: in 38 and 40\,\% of the errors
+adjudication declined a D although a placement of an equivalent allele
+existed, as the D prior intends for evidence this weak, and in 16 and
+17\,\% no such placement survived the D search.
 
 The same holds for V and J. Aligning every allele unbanded under the same
 objective (an exhaustive oracle) found no V search error in 2,000 reads per
@@ -1478,7 +1491,8 @@ IgBLAST's throughput on the same reads and machine, and 8,300--10,200 without
 them; posteriors add 22--35\,\% to the run time. On the four out-of-sample
 GenAIRR IGH sets (\cref{tab:oos}; machine lightly loaded) IgBLAST took
 81--90\,s per 10,000 reads and \swig{} 1.0--1.4\,s. The SIMD kernel gives
-2.5--2.7 times the throughput of the scalar kernel on one thread;
+2.3--2.7 times the throughput of the scalar kernel on one thread (2.3--2.5
+for the default AVX2 kernel across its two timings);
 AVX-512BW's 32 lanes ran 2--7\,\% faster than AVX2's 16, a difference of
 the order of the run-to-run variation (about 5\,\%). Every backend and every
 thread count produced byte-identical output on both sets.
@@ -1609,7 +1623,8 @@ valued at each read's own divergence and posteriors from the same recursion.
 Every search shortcut carries a stated guarantee, and the remaining errors
 are located by construction. On GenAIRR reads it is the most accurate of the
 tools compared on V, D and J on every immunoglobulin set and on D for TRB,
-including on reads disjoint from those its D priors were designed on; on
+and on human IGH reads disjoint from those its D priors were designed on it
+still leads IgBLAST on V, D and J; on
 IgSim reads it leads IgBLAST on V and D up to IgG-like mutation (except
 IgM-like D, where IgBLAST's lead comes from unidentifiable 1--3-nt remnants)
 and trails on junction exactness and on V at 30\,\% SHM. It runs nearly two

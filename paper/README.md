@@ -24,7 +24,10 @@ Needs a TeX Live with `pgfplots`, `siunitx`, `booktabs`, `cleveref`,
 
 ## Status
 
-A starting point, not a submission. Before submitting:
+A starting point, not a submission. Every claim was checked against the
+code, the regenerated outputs and the references in three adversarial review
+rounds (seven, four and two reviewers, each finding re-derived by an
+independent verifier; 109 corrections applied). Before submitting:
 
 - authors, affiliations, acknowledgements and funding are placeholders;
 - every result is on simulated reads; a real-data evaluation is the main
@@ -44,22 +47,22 @@ Ubuntu 24.04, Rust 1.97.0.
 
 | Paper item | Produced by | Output |
 |---|---|---|
-| Table 2, Figure 3 (GenAIRR) | `scripts/genairr.sh` | `work/genairr/scores.txt` |
-| MiXCR columns of Table 2 and Figure 3 | `BENCHMARK_GENAIRR_0.39.6.md` (MiXCR 3.0.13 built from source; not re-run) | same reads: GenAIRR seed 7; the regenerated reads reproduce that report's IgBLAST and swig scores to every digit |
-| Out-of-sample GenAIRR check (seed 50000, reads disjoint from seed 7) | `scripts/genairr.sh` | `work/genairr/scores.txt`, section `seed50000` |
-| Table 3 (IgSim, swig vs IgBLAST) | `scripts/igsim.sh` | `work/igsim/results.json`, `igh_*.swig.tsv` / `igh_*.igblast.tsv` |
+| GenAIRR table and figure (`tab:genairr`, `fig:genairr`) | `scripts/genairr.sh` | `work/genairr/scores.txt` |
+| MiXCR columns of the GenAIRR table and figure | `BENCHMARK_GENAIRR_0.39.6.md` (MiXCR 3.0.13 built from source; not re-run) | same reads: GenAIRR seed 7; the regenerated reads reproduce that report's IgBLAST and swig scores to every digit |
+| Out-of-sample GenAIRR table (`tab:oos`; seed 50000, reads disjoint from seed 7) | `scripts/genairr.sh` | `work/genairr/scores.txt`, section `seed50000` |
+| IgSim table, swig vs IgBLAST (`tab:igsim`) | `scripts/igsim.sh` | `work/igsim/results.json`, `igh_*.swig.tsv` / `igh_*.igblast.tsv` |
 | Specificity (random and IGK reads) | `scripts/igsim.sh` | `work/igsim/controls.txt` |
-| Table 4 (truncated reads) | `scripts/igsim.sh`, `scripts/truncated.py` | `work/igsim/trunc/summary.txt` |
-| Table 5, Figure 4 (ablations) | `scripts/igsim.sh` | `work/igsim/results.json` (`paired`) |
-| Table 6 (D errors), search vs model errors | `engine/examples/d_errors.rs`, `diagnose.rs` via `scripts/igsim.sh` | `work/igsim/d_errors_*.txt`, `diagnose_*.txt` |
-| Table 7, Figure 5 (calibration) | `scripts/igsim.sh` | `work/igsim/results.json` (`ece`, `brier`, `bins`) |
+| Truncated reads (`tab:truncated`) | `scripts/igsim.sh`, `scripts/truncated.py` | `work/igsim/trunc/summary.txt` |
+| Ablations (`tab:ablation`, `fig:operating`) | `scripts/igsim.sh` | `work/igsim/results.json` (`paired`) |
+| D errors (`tab:derrors`) and search vs model errors (separate sample, seed 1) | `engine/examples/d_errors.rs`, `diagnose.rs` via `scripts/igsim.sh` | `work/igsim/d_errors_*.txt`, `diagnose_*.txt` |
+| Calibration (`tab:calibration`, `fig:calibration`) | `scripts/igsim.sh` | `work/igsim/results.json` (`ece`, `brier`, `bins`) |
 | Constant region paragraph | `scripts/igsim.sh` (`ighc_*` sets) | `work/igsim/results.json` (`c_length`) |
-| Table 8 (speed) | `scripts/timing.sh` on an idle machine | `work/igsim/timing/summary.txt` |
+| Speed (`tab:speed`) | `scripts/timing.sh` on an idle machine | `work/igsim/timing/summary.txt` |
 
 Design measurements quoted in the methods to justify a constant (for
 example the open-flank allowance, the 435 checked guarded calls, the
-prototype's 93.12 against 93.16, the 37–47 % cost of a separate D pass) are
-taken from `engine/docs/ALGORITHM.md`, `BENCHMARK_GENAIRR_0.39.6.md` and
+prototype's 93.12 against 93.16, the 37–47 % cost of a separate D pass, the
+0.6 % instruction cost of the D priors) are taken from `engine/docs/ALGORITHM.md`, `BENCHMARK_GENAIRR_0.39.6.md` and
 `RELEASE_NOTES_0.39.7.md`, which state them for the current design.
 
 ## Reproduce
