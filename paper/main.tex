@@ -98,7 +98,8 @@ Gotoh kernel make the search fast. On reads simulated by GenAIRR and scored
 against its ambiguity-aware truth, \swig{} 0.39.7 has the highest V, D and J
 accuracy of \swig{}, IgBLAST 1.22 and MiXCR 3.0.13 on every human
 immunoglobulin set, raising human IGH D accuracy over IgBLAST by
-0.7--6.0 percentage points across 0--10\,\% SHM, and runs 60--160 times
+0.7--6.0 percentage points across 0--10\,\% SHM (0.9--6.3 on reads disjoint
+from those its D priors were designed on), and runs 60--160 times
 faster than IgBLAST on four threads.
 % NUMBERS: filled from results; see README.md.
 
@@ -992,8 +993,35 @@ allele to one offset, as the graph does, cost at most 0.1 point. Moving both
 priors into the graph as cut terms (\cref{sec:objective}) recovered most of
 the prototype's gain (95.42 against 95.67 at 5\,\% SHM) at 0.6\,\% more
 instructions, whereas the prototype as a separate pass would have added
-37--47\,\% to the run time. Because the priors were designed on these
-reads, we re-simulated the IGH sets with a fresh seed (\cref{sec:discussion}).
+37--47\,\% to the run time.
+
+Because the priors were designed on these reads, we simulated four IGH
+scenarios again from a disjoint part of GenAIRR's random stream, sharing no
+read with the sets above (\cref{tab:oos}). The picture is unchanged: the
+priors add 0.5--3.4 points of D, at least as much as on the design sets, and
+\swig{} leads IgBLAST on V, D and J in every scenario, on D by 0.9--6.3
+points.
+
+\begin{table}[t]
+\centering
+\caption{Out-of-sample check: GenAIRR human IGH reads disjoint from those of
+\cref{tab:genairr} (10,000 per scenario; mean Jaccard score, \%). ``Priors
+off'': \swig{} 0.39.7 with \code{-{}-d-trim off -{}-np-length off}.}
+\label{tab:oos}
+\footnotesize
+\begin{tabular}{@{}l rrr r rrr@{}}
+\toprule
+ & \multicolumn{3}{c}{\swig{} 0.39.7} & priors off & \multicolumn{3}{c}{IgBLAST 1.22} \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-5}\cmidrule(l){6-8}
+Scenario & V & D & J & D & V & D & J \\
+\midrule
+no SHM     & 99.98 & 98.40 & 99.65 & 97.89 & 99.82 & 97.54 & 99.48 \\
+5\,\% SHM  & 99.66 & 94.97 & 99.39 & 92.71 & 99.59 & 92.65 & 99.15 \\
+10\,\% SHM & 99.46 & 90.20 & 98.97 & 86.82 & 99.44 & 83.94 & 98.47 \\
+realistic  & 99.54 & 94.75 & 99.33 & 92.43 & 99.44 & 92.12 & 99.13 \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \subsection{Germline-equivalent accuracy, D-free junctions and junctions}
 \label{sec:igsim}
@@ -1129,7 +1157,9 @@ the fixed $(2,-3)$ scale leaves 9.1 points more D-free reads without a D on
 the conserved-anchor D window and the max-marginal D decoder change
 essentially nothing on full-length reads: they act on reads the
 \emph{mid} and \emph{hard} presets rarely produce (\cref{tab:truncated}).
-Skipping posteriors leaves every call unchanged. The alternative calling
+Skipping posteriors leaves every call unchanged. On GenAIRR reads the
+max-marginal decoder adds up to 0.2 points of IGH D (95.55 against 95.42 at
+5\,\% SHM), which is why it remains an option rather than the default. The alternative calling
 profiles move along a single trade-off between D accuracy and D-free
 specificity (\cref{fig:operating}): a more liberal D prior (\code{sensitive-d},
 prior odds 2) gains 0.8--1.0 points of D for 6--17 points more D-free reads
@@ -1367,8 +1397,8 @@ its alignments do not reach.
     an analysis of the previous release's losses on the GenAIRR sets of
     \cref{tab:genairr}. The priors' means (5, 7 and 8 bases) are generic
     rather than fitted, and GenAIRR's own trim tables did no better in the
-    prototype, but the GenAIRR gains are not out-of-sample.
-    OUT-OF-SAMPLE-PLACEHOLDER
+    prototype; on GenAIRR reads disjoint from the design sets the priors
+    gained as much (\cref{tab:oos}), but both come from one simulator.
     Validation on real repertoires, for example donors with sequenced
     germline genotypes, is the most important next step.
   \item \emph{Comparisons.} We did not compare with partis, IMGT/V-QUEST
