@@ -87,9 +87,9 @@ hypothesis as a log-likelihood ratio and chooses the alleles and the cut
 points of V, D and J jointly, by an exact semi-Markov Viterbi recursion over a
 placement graph. The recursion considers every pair of cuts between
 neighbouring segments in time linear in their overlaps, and is checked
-against exhaustive enumeration. The prior cost of each segment is derived as
-prior odds over the gene-and-position hypotheses it competes with, rather
-than tuned. A D also pays
+against exhaustive enumeration. The prior cost of each segment is set by the
+number of gene-and-position hypotheses it competes with, rather than tuned on
+accuracy. A D also pays
 geometric trim and N/P-length priors, and, at an open read end, the
 likelihood ratio of the flanking segment the read would have shown. Each read
 is valued at its own divergence, and forward--backward over the same graph
@@ -314,10 +314,11 @@ where $S_{\text{clip}}$ is the score of the kept columns. The other terms are
 log prior odds: $P_V$, $P_D$ and $P_J$ in score units, $c_{\text{open}}$ and
 the D terms in nats, read at the call's scale (the fixed scale of
 \cref{sec:perread} converts $c_{\text{open}}$ to score units and has no D
-trim or N/P terms). Each has a stated derivation; of the constants it
-leaves free, the open-flank allowance and the credit $\kappa$ were set on
-simulated reads, while the trim and N/P means are generic rather than fitted
-(\cref{sec:discussion}).
+trim or N/P terms). Each has a stated derivation. Of the constants the
+derivations leave free, the number of junction positions $L=25$ and the even
+prior odds of a segment are chosen rather than derived, the open-flank
+allowance and the credit $\kappa$ were set on simulated reads, and the trim
+and N/P means are generic rather than fitted (\cref{sec:discussion}).
 
 \paragraph{Segment presence.} A D hypothesis is one of $N$ D genes placed at
 one of $L$ junction positions, so its prior is spread over $NL$ alternatives.
@@ -331,8 +332,9 @@ none, which gives
 Genes are counted after identical sequences are merged. For the IMGT human
 IGH set of \cref{sec:evaluation} ($N=30$, $L=25$, even odds) $\pD=10.45$: an exact
 5-mer (score 10) loses and an exact 6-mer (12) wins. For TRB ($N=2$)
-$\pD=6.17$. V and J pay the same kind of cost over their own genes
-($P^{*}_J=7.91$ for its 6 IGHJ genes, $P^{*}_V=12.54$ for its 113 IGHV genes).
+$\pD=6.17$. V and J pay the same kind of cost over their own genes, with the
+same $L$ and even odds ($P^{*}_J=7.91$ for the 6 IGHJ genes of that set,
+$P^{*}_V=12.54$ for its 113 IGHV genes).
 Without $P_J$ and
 $P_V$, any positive clip completes or starts a path for free, so a read that
 stops before its J or starts after its V receives a J or V from a few chance
@@ -740,11 +742,11 @@ windows, admission, adjudication and the gates are decided per read.
 \label{fig:pipeline}
 \end{figure}
 
-\begin{table}[t]
+\begin{table}[tp]
 \centering
 \caption{Search steps and what each can lose.}
 \label{tab:search}
-\small
+\footnotesize
 \begin{tabularx}{\linewidth}{@{}l l X@{}}
 \toprule
 Step & Guarantee & Rule and justification \\
@@ -1026,7 +1028,7 @@ pairing rule of the plausibility constraints (the J starts more than 30 bases
 into its germline, holds fewer than 30 columns and aligns no conserved
 codon).
 
-\begin{table}[t]
+\begin{table}[tbp]
 \centering
 \caption{Accuracy against GenAIRR's ambiguity-aware truth (mean Jaccard
 score of the reported allele set against the truth's tie set, \%), 10,000
@@ -1111,7 +1113,7 @@ priors add 0.5--3.4 points of D, at least as much as on the design sets, and
 \swig{} leads IgBLAST on V, D and J in every scenario, on D by 0.9--6.3
 points.
 
-\begin{table}[t]
+\begin{table}[tbp]
 \centering
 \caption{Out-of-sample check: GenAIRR human IGH reads disjoint from those of
 \cref{tab:genairr} (10,000 per scenario; mean Jaccard score, \%). ``Priors
@@ -1144,8 +1146,9 @@ fewer D-free junctions (18.4 against 49.4\,\% on \emph{mid}, 15.8 against
 30.8\,\% on \emph{hard}). On remnants of 8 or more nucleotides \swig's D is
 better on every preset. IgBLAST's 0.5-point higher D accuracy on \emph{mid}
 ($p=0.017$) comes entirely from remnants of 1--3 nucleotides (74.3 against
-36.6\,\%), which no method can identify: almost any allele containing the
-remnant is germline-equivalent to it, so a tool that always calls a D is
+36.6\,\%), which no method can identify: most D alleles contain so short a
+remnant and are therefore germline-equivalent to it (on \emph{mid}, 36 of the
+48 IMGT D names on average), so a tool that always calls a D is mostly
 credited there, and pays for it on D-free junctions.
 
 IgBLAST reports more exact junctions (99.94 against 99.53\,\% on \emph{mid},
@@ -1167,7 +1170,7 @@ strand, as the strand test and seed
 retrieval run out of intact $k$-mers (\cref{sec:discussion}); every read it
 calls is correctly oriented.
 
-\begin{table}[t]
+\begin{table}[tbp]
 \centering
 \caption{IgSim reads against the IMGT human IGH set (germline-equivalent
 accuracy, \%), forward strand; 10,000 reads per preset and 3,000 at 30\,\% SHM.
@@ -1215,8 +1218,8 @@ but keeps an IGHV on 470 of the 1,000 IGK reads.
 \subsection{Truncated reads and the open-flank cost}
 \label{sec:truncated}
 
-Real reads often stop at their D (short reads, 3$'$ fragments) or start
-inside CDR3, and a random tail beyond a V or before a J offers a D search
+Real reads can stop at their D (short or 3$'$-truncated reads) or start
+inside CDR3 (5$'$-truncated reads), and a random tail beyond a V or before a J offers a D search
 window where no D exists. \Cref{tab:truncated} cuts IgSim reads accordingly.
 With the open-flank cost, a D at the read's open end is called right on 88\,\%
 (\emph{mid}) and 82\,\% (\emph{hard}) of reads cut at the D's end and on 94 and
@@ -1227,7 +1230,7 @@ chance Ds but also every real D at an open end. Chance Ds within about 30
 bases of the V remain (68 and 77\,\%): they sit where a real D of a truncated
 read sits, and no length or window term can separate them.
 
-\begin{table}[t]
+\begin{table}[tbp]
 \centering
 \caption{Truncated IgSim reads (2,000 per set and preset): right D calls on
 reads that hold a D, and any D call on D-free constructs. ``Cost'' is the
@@ -1263,15 +1266,20 @@ jcut100   & 100 random bases + J\ldots    & any D (\%)   & 27.2 & 0.0 & 28.2 & 9
 N/P priors raise D accuracy on both presets ($+0.37$ and $+1.08$ points;
 $p=0.02$ and $3\cdot10^{-9}$) and, on \emph{mid}, also leave 6.1 points more
 D-free reads without a D. The fixed $(2,-3)$ scale (\code{-{}-calls fixed})
-cannot carry the D trim and N/P terms, so its row changes the scale and drops
-those priors together. Against the run with the priors off, which differs
-only in the call model, calling at each read's own divergence leaves 3.0
-points more D-free reads without a D on \emph{mid} (24.5 against 27.6\,\%;
-0.4 fewer on \emph{hard}) and changes D by $-0.2$ and $-0.3$ points (93.02
-against 93.24\,\% on \emph{mid}, 85.83 against 86.09\,\% on \emph{hard}).
-Its value lies in making the call a mode of the reported posterior, in
-D-free specificity on \emph{mid}, and in the D priors it makes possible, not
-in D accuracy by itself. The open-flank cost and
+cannot carry the D trim and N/P terms, so its call changes the scale and
+drops those priors together; its posterior, and so its Brier score, still
+reads the evidence at the read's divergence with the priors. Against the run
+with the priors off, whose call differs only in the call model, calling at
+each read's own divergence leaves 3.0 points more D-free reads without a D
+on \emph{mid} (24.5 against 27.6\,\%, $p=0.002$; not significant on
+\emph{hard}), but gets 0.2--0.3 points fewer D alleles right (93.02 against
+93.24\,\% on \emph{mid}, $p=0.06$; 85.83 against 86.09\,\% on \emph{hard},
+$p=0.014$) and 0.2--0.3 points fewer junctions exact (99.51 against
+99.78\,\% on \emph{mid}, $p=5\cdot10^{-7}$; 96.87 against 97.09\,\% on
+\emph{hard}, $p=0.03$). By itself it buys specificity at a small cost in
+accuracy; its value lies in making the call a mode of the reported
+posterior and in the D priors it makes possible, which more than recover
+the loss. The open-flank cost and
 the conserved-anchor D window change essentially nothing on full-length
 reads: they act on reads that stop in or start after the junction, which the
 \emph{mid} and \emph{hard} presets rarely produce (\cref{tab:truncated} for
@@ -1288,14 +1296,16 @@ profiles without a D prior give a D to 64--91\,\% of D-free reads. On
 \code{igblast} profile's 0.1-point edge in D over \code{sensitive-d} (94.55
 against 94.43\,\%) costs 51 points more D-free reads given a D.
 
-\begin{table}[t]
+\begin{table}[tbp]
 \centering
 \caption{Ablations on IgSim (10,000 reads per preset). $\Delta$: change
 against the default in percentage points (positive: better), paired on the
 same reads; ``0'': no read changes correctness; ``n.s.'': $p\ge0.05$ (exact
 McNemar). ``D-free given a D'' and
 the D-presence Brier score are absolute (default: 18.4\,\% and 0.0217 on
-\emph{mid}, 15.8\,\% and 0.0227 on \emph{hard}).}
+\emph{mid}, 15.8\,\% and 0.0227 on \emph{hard}). The fixed-scale row changes
+only the call: its posterior, and so its Brier score, keeps the evidence at
+the read's divergence and the D priors.}
 \label{tab:ablation}
 \footnotesize
 \setlength{\tabcolsep}{3.5pt}
@@ -1373,7 +1383,7 @@ remaining V errors are ties (26 and 84 reads) and model errors (12 and 68),
 in which the exhaustive optimum itself is not the truth because mutations
 fall on the positions that separate alleles.
 
-\begin{table}[t]
+\begin{table}[tbp]
 \centering
 \caption{Attribution of D errors (\% of reads with a D remnant in the class),
 on a separate sample of 10,000 IgSim reads per preset (\cref{tab:igsim,tab:ablation,tab:calibration}
@@ -1413,7 +1423,7 @@ of 85\,\% correspond to 77--78\,\% observed. At 30\,\% SHM the V and J
 posteriors are over-confident (ECE 9.8 and 13.2\,\%): when retrieval misses
 the true gene, no candidate can carry its mass.
 
-\begin{table}[t]
+\begin{table}[tbp]
 \centering
 \caption{Calibration of the reported posteriors on IgSim reads: expected
 calibration error (\%) and Brier score.}
@@ -1490,14 +1500,17 @@ for the IMGT IGH set, every allele annotated on load). On four threads
 IgBLAST's throughput on the same reads and machine, and 8,300--10,200 without
 them; posteriors add 22--35\,\% to the run time. On the four out-of-sample
 GenAIRR IGH sets (\cref{tab:oos}; machine lightly loaded) IgBLAST took
-81--90\,s per 10,000 reads and \swig{} 1.0--1.4\,s. The SIMD kernel gives
-2.3--2.7 times the throughput of the scalar kernel on one thread (2.3--2.5
-for the default AVX2 kernel across its two timings);
-AVX-512BW's 32 lanes ran 2--7\,\% faster than AVX2's 16, a difference of
-the order of the run-to-run variation (about 5\,\%). Every backend and every
+81--90\,s per 10,000 reads and \swig{} 1.0--1.4\,s. The AVX2 and AVX-512BW
+backends give 2.3--2.7 times the throughput of the scalar kernel on one
+thread (2.3--2.5 for the default AVX2 kernel across its two timings), and
+the portable lanes, which leave vectorisation to the compiler, 1.8--1.9
+times. AVX-512BW's 32 lanes ran 2--7\,\% faster than AVX2's 16 in the AVX2
+timing taken alongside them (7--13\,\% against the default-row timing of
+the same configuration), a gain these runs do not clearly separate from the
+run-to-run variation (about 5\,\%). Every backend and every
 thread count produced byte-identical output on both sets.
 
-\begin{table}[t]
+\begin{table}[tbp]
 \centering
 \caption{Throughput on 10,000 IgSim reads (reads per second; wall clock of
 the whole command including database preparation; median of three runs for
@@ -1541,8 +1554,11 @@ moving two cut-local prior terms into the graph raised IGH D accuracy on
 GenAIRR reads by up to 3.1 points at no measurable cost in speed. Second,
 because every non-alignment term is a log prior odds with a stated
 derivation, the trade-off between finding short D remnants and leaving D-free
-junctions alone has a single, interpretable knob, the prior odds of a D
-(\cref{fig:operating}), rather than a set of thresholds. Third, the posterior
+junctions alone is moved by an interpretable prior rather than by ad hoc
+score thresholds: its user-facing knob is the prior odds of a D
+(\cref{fig:operating}). The default operating point also depends on the
+credit $\kappa$, chosen on simulated reads, and on the 4-base D admission
+run. Third, the posterior
 is a by-product of the same recursion and the call is its mode, so the
 reported probabilities describe the call that is reported; they are well
 calibrated up to IgG-like mutation levels.
@@ -1617,14 +1633,14 @@ on real data.
 
 \swig{} shows that germline assignment can be posed as one likelihood ratio
 and solved exactly, fast enough for whole repertoires: an exact semi-Markov
-recursion over every pair of cuts between neighbouring segments, priors
-derived as prior odds over the hypotheses each segment competes with, calls
+recursion over every pair of cuts between neighbouring segments, priors set
+by the number of hypotheses each segment competes with, calls
 valued at each read's own divergence and posteriors from the same recursion.
 Every search shortcut carries a stated guarantee, and the remaining errors
 are located by construction. On GenAIRR reads it is the most accurate of the
 tools compared on V, D and J on every immunoglobulin set and on D for TRB,
-and on human IGH reads disjoint from those its D priors were designed on it
-still leads IgBLAST on V, D and J; on
+and on human IGH reads disjoint from those its D priors were designed on,
+it still leads IgBLAST on V, D and J; on
 IgSim reads it leads IgBLAST on V and D up to IgG-like mutation (except
 IgM-like D, where IgBLAST's lead comes from unidentifiable 1--3-nt remnants)
 and trails on junction exactness and on V at 30\,\% SHM. It runs nearly two

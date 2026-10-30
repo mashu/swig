@@ -25,9 +25,9 @@ Needs a TeX Live with `pgfplots`, `siunitx`, `booktabs`, `cleveref`,
 ## Status
 
 A starting point, not a submission. Every claim was checked against the
-code, the regenerated outputs and the references in three adversarial review
-rounds (seven, four and two reviewers, each finding re-derived by an
-independent verifier; 109 corrections applied). Before submitting:
+code, the regenerated outputs and the references in four adversarial review
+rounds (seven, four, two and two reviewers, each finding re-derived by an
+independent verifier; 120 confirmed findings applied). Before submitting:
 
 - authors, affiliations, acknowledgements and funding are placeholders;
 - every result is on simulated reads; a real-data evaluation is the main
