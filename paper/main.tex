@@ -1022,11 +1022,13 @@ the realistic set. MiXCR's top-tied hits trail on D by 3.9--9.2 points over
 the IGH sets; its single top hit, which drops genuine ties, scores lower
 still (IGH D 73.5--86.4\,\%, V 94.6--99.6\,\%). On TRB \swig{} has the best D
 (99.9 and 99.5\,\% against at most 98.2\,\%) but trails IgBLAST and MiXCR by
-0.04--0.11 points on J: on a few reads the J is trimmed 31--40 bases into its
-germline, past its Trp/Phe codon, and its 13--22 remaining bases fail the V--J
-pairing rule of the plausibility constraints (the J starts more than 30 bases
-into its germline, holds fewer than 30 columns and aligns no conserved
-codon).
+0.04--0.11 points on J. On ten reads of each TRB set the J is trimmed 31--42
+bases into its germline, past its Trp/Phe codon, and keeps only 8--19 bases;
+these fall below the 10-column minimum J hit or fail the V--J pairing rule of
+the plausibility constraints (the J starts more than 30 bases into its
+germline, holds fewer than 30 columns and aligns no conserved codon), so no
+J is called. One more read, its J trimmed 31 bases with 22 left, is given a
+wrong J.
 
 \begin{table}[tbp]
 \centering
@@ -1267,8 +1269,8 @@ N/P priors raise D accuracy on both presets ($+0.37$ and $+1.08$ points;
 $p=0.02$ and $3\cdot10^{-9}$) and, on \emph{mid}, also leave 6.1 points more
 D-free reads without a D. The fixed $(2,-3)$ scale (\code{-{}-calls fixed})
 cannot carry the D trim and N/P terms, so its call changes the scale and
-drops those priors together; its posterior, and so its Brier score, still
-reads the evidence at the read's divergence with the priors. Against the run
+drops those priors together; its posterior still reads the evidence at the
+read's divergence with the priors, but with presence costs constant in nats. Against the run
 with the priors off, whose call differs only in the call model, calling at
 each read's own divergence leaves 3.0 points more D-free reads without a D
 on \emph{mid} (24.5 against 27.6\,\%, $p=0.002$; not significant on
@@ -1278,8 +1280,11 @@ $p=0.014$) and 0.2--0.3 points fewer junctions exact (99.51 against
 99.78\,\% on \emph{mid}, $p=5\cdot10^{-7}$; 96.87 against 97.09\,\% on
 \emph{hard}, $p=0.03$). By itself it buys specificity at a small cost in
 accuracy; its value lies in making the call a mode of the reported
-posterior and in the D priors it makes possible, which more than recover
-the loss. The open-flank cost and
+posterior and in the D priors it makes possible. The priors more than
+recover the D-allele loss on \emph{hard} (0.82 points above the fixed-scale
+call; not significant on \emph{mid}), but not the junction loss: they leave
+junctions unchanged, and the fixed-scale call keeps 0.25 and 0.28 points more
+junctions exact (\cref{tab:ablation}). The open-flank cost and
 the conserved-anchor D window change essentially nothing on full-length
 reads: they act on reads that stop in or start after the junction, which the
 \emph{mid} and \emph{hard} presets rarely produce (\cref{tab:truncated} for
@@ -1303,9 +1308,11 @@ against the default in percentage points (positive: better), paired on the
 same reads; ``0'': no read changes correctness; ``n.s.'': $p\ge0.05$ (exact
 McNemar). ``D-free given a D'' and
 the D-presence Brier score are absolute (default: 18.4\,\% and 0.0217 on
-\emph{mid}, 15.8\,\% and 0.0227 on \emph{hard}). The fixed-scale row changes
-only the call: its posterior, and so its Brier score, keeps the evidence at
-the read's divergence and the D priors.}
+\emph{mid}, 15.8\,\% and 0.0227 on \emph{hard}). The fixed-scale row's
+posterior still reads the evidence at the read's divergence with the D
+priors, but charges each presence cost as a constant number of nats rather
+than as $P^{*}_k/m$ matched columns, so its Brier score differs slightly from
+the default's.}
 \label{tab:ablation}
 \footnotesize
 \setlength{\tabcolsep}{3.5pt}
