@@ -46,7 +46,7 @@ Ubuntu 24.04, Rust 1.97.0.
 |---|---|---|
 | Table 2, Figure 3 (GenAIRR) | `scripts/genairr.sh` | `work/genairr/scores.txt` |
 | MiXCR columns of Table 2 and Figure 3 | `BENCHMARK_GENAIRR_0.39.6.md` (MiXCR 3.0.13 built from source; not re-run) | same reads: GenAIRR seed 7; the regenerated reads reproduce that report's IgBLAST and swig scores to every digit |
-| Out-of-sample GenAIRR check (seed 8) | `scripts/genairr.sh` | `work/genairr/scores.txt`, section `seed8` |
+| Out-of-sample GenAIRR check (seed 50000, reads disjoint from seed 7) | `scripts/genairr.sh` | `work/genairr/scores.txt`, section `seed50000` |
 | Table 3 (IgSim, swig vs IgBLAST) | `scripts/igsim.sh` | `work/igsim/results.json`, `igh_*.swig.tsv` / `igh_*.igblast.tsv` |
 | Specificity (random and IGK reads) | `scripts/igsim.sh` | `work/igsim/controls.txt` |
 | Table 4 (truncated reads) | `scripts/igsim.sh`, `scripts/truncated.py` | `work/igsim/trunc/summary.txt` |

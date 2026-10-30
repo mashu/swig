@@ -3,7 +3,10 @@
 #   1. simulate the 11 sets (seed 7) and run swig and IgBLAST on them
 #      (benchmarks/genairr/run_matrix.sh; MiXCR is not run here, see README.md)
 #   2. swig with the D priors off, and with the max-marginal D decoder
-#   3. a fresh seed (8) for the IGH sets: swig, swig with the D priors off, IgBLAST
+#   3. disjoint reads for the IGH sets (seed 50000): swig, swig with the D priors
+#      off, IgBLAST. GenAIRR's seed offsets one record stream (seed s starts at
+#      record s), so consecutive seeds share all but one read; seed 50000 shares none
+#      with the seed-7 sets.
 #   4. score everything against GenAIRR's tie sets -> $WORK/genairr/scores.txt
 # Run setup.sh first.
 set -uo pipefail
@@ -29,10 +32,10 @@ for run in igh_naive igh_shm2 igh_shm5 igh_shm10 igh_realistic tcrb_naive tcrb_t
   swig_run ref_${run%%_*} runs/$run.fasta runs/$run.swig-maxmarg.tsv --d-allele max-marginal
 done
 
-mkdir -p seed8
+mkdir -p seed50000
 for scen in naive shm5 shm10 realistic; do
-  p=seed8/igh_$scen
-  [[ -f $p.truth.tsv ]] || $PYTHON $B/genairr_bench.py simulate human_igh $scen 10000 8 $p
+  p=seed50000/igh_$scen
+  [[ -f $p.truth.tsv ]] || $PYTHON $B/genairr_bench.py simulate human_igh $scen 10000 50000 $p
   [[ -s $p.igblast.tsv ]] || "$B/run_tools.sh" ref_igh $p.fasta $p
   swig_run ref_igh $p.fasta $p.swig-priors-off.tsv --d-trim off --np-length off
 done
@@ -48,8 +51,8 @@ for run in igh_naive igh_shm2 igh_shm5 igh_shm10 igh_realistic igk_shm5 igk_real
   python3 genairr_bench.py score $W/runs/$run.truth.tsv "${args[@]}"
 done
 for scen in naive shm5 shm10 realistic; do
-  p=$W/seed8/igh_$scen
-  echo "## seed8 igh_$scen"
+  p=$W/seed50000/igh_$scen
+  echo "## seed50000 igh_$scen"
   python3 genairr_bench.py score $p.truth.tsv swig=$p.swig.tsv swig-priors-off=$p.swig-priors-off.tsv igblast=$p.igblast.tsv
 done
 } > $W/scores.txt 2>&1
