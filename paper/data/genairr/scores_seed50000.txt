@@ -1,0 +1,21 @@
+## seed50000 igh_naive
+10000 reads
+swig                     V  99.98  D  98.40  J  99.65
+swig-priors-off          V  99.98  D  97.89  J  99.65
+igblast                  V  99.82  D  97.54  J  99.48
+## seed50000 igh_shm5
+10000 reads
+swig                     V  99.66  D  94.97  J  99.39
+swig-priors-off          V  99.66  D  92.71  J  99.39
+igblast                  V  99.59  D  92.65  J  99.15
+## seed50000 igh_shm10
+10000 reads
+swig                     V  99.46  D  90.20  J  98.97
+swig-priors-off          V  99.44  D  86.82  J  98.97
+igblast                  V  99.44  D  83.94  J  98.47
+## seed50000 igh_realistic
+10000 reads
+swig                     V  99.54  D  94.75  J  99.33
+swig-priors-off          V  99.54  D  92.43  J  99.33
+igblast                  V  99.44  D  92.12  J  99.13
+exit 0

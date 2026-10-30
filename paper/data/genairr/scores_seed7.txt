@@ -1,0 +1,78 @@
+## igh_naive
+10000 reads
+swig                     V  99.98  D  98.47  J  99.76
+swig-priors-off          V  99.98  D  98.17  J  99.76
+swig-maxmarg             V  99.98  D  98.47  J  99.76
+igblast                  V  99.86  D  97.80  J  99.48
+## igh_shm2
+10000 reads
+swig                     V  99.85  D  97.28  J  99.70
+swig-priors-off          V  99.85  D  96.38  J  99.70
+swig-maxmarg             V  99.85  D  97.30  J  99.70
+igblast                  V  99.80  D  96.55  J  99.36
+## igh_shm5
+10000 reads
+swig                     V  99.67  D  95.42  J  99.47
+swig-priors-off          V  99.68  D  93.16  J  99.47
+swig-maxmarg             V  99.67  D  95.55  J  99.47
+igblast                  V  99.64  D  93.24  J  99.14
+## igh_shm10
+10000 reads
+swig                     V  99.43  D  90.24  J  99.06
+swig-priors-off          V  99.42  D  87.12  J  99.06
+swig-maxmarg             V  99.42  D  90.32  J  99.06
+igblast                  V  99.36  D  84.28  J  98.48
+## igh_realistic
+10000 reads
+swig                     V  99.60  D  94.96  J  99.44
+swig-priors-off          V  99.61  D  92.78  J  99.44
+swig-maxmarg             V  99.60  D  95.15  J  99.44
+igblast                  V  99.53  D  92.56  J  99.05
+## igk_shm5
+10000 reads
+swig                     V  99.74  J  99.43
+igblast                  V  99.63  J  98.88
+## igk_realistic
+10000 reads
+swig                     V  99.63  J  99.02
+igblast                  V  99.48  J  98.11
+## igl_shm5
+10000 reads
+swig                     V  99.63  J  99.10
+igblast                  V  99.53  J  98.32
+## igl_realistic
+10000 reads
+swig                     V  99.51  J  98.49
+igblast                  V  99.34  J  98.32
+## tcrb_naive
+10000 reads
+swig                     V  99.97  D  99.91  J  99.89
+swig-priors-off          V  99.97  D  99.12  J  99.89
+swig-maxmarg             V  99.97  D  99.91  J  99.89
+igblast                  V  99.97  D  98.17  J  99.93
+## tcrb_tcr_realistic
+10000 reads
+swig                     V  99.94  D  99.50  J  99.87
+swig-priors-off          V  99.94  D  98.63  J  99.87
+swig-maxmarg             V  99.94  D  99.53  J  99.87
+igblast                  V  99.94  D  97.65  J  99.92
+## seed8 igh_naive
+10000 reads
+swig                     V  99.98  D  98.47  J  99.76
+swig-priors-off          V  99.98  D  98.17  J  99.76
+igblast                  V  99.86  D  97.80  J  99.48
+## seed8 igh_shm5
+10000 reads
+swig                     V  99.67  D  95.42  J  99.47
+swig-priors-off          V  99.68  D  93.16  J  99.47
+igblast                  V  99.64  D  93.24  J  99.14
+## seed8 igh_shm10
+10000 reads
+swig                     V  99.43  D  90.24  J  99.06
+swig-priors-off          V  99.42  D  87.12  J  99.06
+igblast                  V  99.36  D  84.28  J  98.48
+## seed8 igh_realistic
+10000 reads
+swig                     V  99.60  D  94.96  J  99.44
+swig-priors-off          V  99.61  D  92.78  J  99.44
+igblast                  V  99.53  D  92.56  J  99.05

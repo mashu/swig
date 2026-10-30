@@ -10,6 +10,11 @@
 \usepackage{lmodern}
 \usepackage[margin=2.5cm]{geometry}
 \usepackage{microtype}
+\usepackage{placeins}
+\renewcommand{\topfraction}{0.85}
+\setcounter{topnumber}{3}
+\renewcommand{\textfraction}{0.1}
+\renewcommand{\floatpagefraction}{0.75}
 \usepackage{amsmath,amssymb,amsthm}
 \usepackage{mathtools}
 \usepackage{booktabs}
@@ -1282,9 +1287,10 @@ $p=0.014$) and 0.2--0.3 points fewer junctions exact (99.51 against
 accuracy; its value lies in making the call a mode of the reported
 posterior and in the D priors it makes possible. The priors more than
 recover the D-allele loss on \emph{hard} (0.82 points above the fixed-scale
-call; not significant on \emph{mid}), but not the junction loss: they leave
-junctions unchanged, and the fixed-scale call keeps 0.25 and 0.28 points more
-junctions exact (\cref{tab:ablation}). The open-flank cost and
+call; not significant on \emph{mid}), but not the junction loss: their effect on junctions is not significant
+(99.53 against 99.51\,\% on \emph{mid}, 96.81 against 96.87\,\% on
+\emph{hard}; \cref{tab:ablation}), and the fixed-scale call keeps 0.25 and
+0.28 points more junctions exact than the default. The open-flank cost and
 the conserved-anchor D window change essentially nothing on full-length
 reads: they act on reads that stop in or start after the junction, which the
 \emph{mid} and \emph{hard} presets rarely produce (\cref{tab:truncated} for
@@ -1410,8 +1416,8 @@ D correct                                  & 97.90 & 91.76 & 51.85 & 44.83 \\
 wrong D, adjudication                      & 1.91 & 6.90 & 17.25 & 16.60 \\
 wrong D, not found                         & 0.12 & 0.83 & 5.34 & 6.76 \\
 wrong D, outside the windows               & 0.00 & 0.04 & 0.00 & 0.00 \\
-missing D, adjudication                    & 0.03 & 0.23 & 18.07 & 22.27 \\
-missing D, not found                       & 0.04 & 0.26 & 7.50 & 9.54 \\
+missing D, adjudication                    & 0.04 & 0.22 & 18.07 & 22.27 \\
+missing D, not found                       & 0.04 & 0.26 & 7.49 & 9.54 \\
 called J covers $\ge 3$ bases of the true D & 0.04 & 0.14 & 0.51 & 0.99 \\
 \bottomrule
 \end{tabular}
@@ -1546,6 +1552,7 @@ IgBLAST 1.22, 4 threads                   & 85.5   & 89.6  \\
 \end{table}
 
 % ===========================================================================
+\FloatBarrier
 \section{Discussion}
 \label{sec:discussion}
 

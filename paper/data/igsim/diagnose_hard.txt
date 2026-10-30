@@ -1,0 +1,9 @@
+database: V 457 alleles, D 41, J 15 (30 identical sequences merged as aliases); chain heavy; V anchors: 342 motif, 32 missing, 48 low-confidence, 35 transfer; J anchors: 15 motif
+V: correct 1848, ties 84, search errors 0, model errors 68, mis-oriented 0 (of 2000)
+    DAG chose Some(("IGHJ5*04", 63, 392, 426)); truth span Some(384..426)
+J search error: truth IGHJ4*02 (exhaustive Some(69)), called Some("IGHJ5*04") (exhaustive Some(65)); shm 0.061, placements ["IGHJ4*02:69", "IGHJ5*04:65", "IGHJ4*01:64"]
+    DAG chose Some(("IGHJ5*02", 57, 348, 384)); truth span Some(340..384)
+J search error: truth IGHJ4*02 (exhaustive Some(58)), called Some("IGHJ5*02") (exhaustive Some(57)); shm 0.081, placements ["IGHJ4*02:58", "IGHJ5*02:57", "IGHJ4*01:53"]
+    DAG chose None; truth span Some(436..470)
+J search error: truth IGHJ4*02 (exhaustive Some(14)), called None (exhaustive None); shm 0.293, placements []
+J: correct 1873, ties 63, search errors 3, model errors 61, mis-oriented 0 (of 2000)

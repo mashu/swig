@@ -10,6 +10,7 @@ exact adjudication, search, implementation and evaluation.
 | `references.bib` | Bibliography (natbib, `unsrtnat`) |
 | `main.pdf` | The compiled draft |
 | `scripts/` | Everything that produces the paper's numbers (below) |
+| `data/` | The outputs behind the paper's numbers, as produced for this draft: parsed `swig evaluate` results (`igsim/results.json`), raw paired evaluations, truncated-read, D-error, search-vs-model, control and timing summaries, GenAIRR scores (seed 7 and the disjoint seed 50000), and the test-suite summary |
 
 ## Build
 
@@ -26,8 +27,9 @@ Needs a TeX Live with `pgfplots`, `siunitx`, `booktabs`, `cleveref`,
 
 A starting point, not a submission. Every claim was checked against the
 code, the regenerated outputs and the references in four adversarial review
-rounds (seven, four, two and two reviewers, each finding re-derived by an
-independent verifier; 120 confirmed findings applied). Before submitting:
+rounds and two stop checks (each finding re-derived by an independent
+verifier; 126 confirmed findings applied), until a round found no
+substantive error. Before submitting:
 
 - authors, affiliations, acknowledgements and funding are placeholders;
 - every result is on simulated reads; a real-data evaluation is the main
@@ -74,7 +76,8 @@ bash paper/scripts/genairr.sh    # GenAIRR experiments (about 60 min on 4 cores,
 bash paper/scripts/timing.sh     # throughput; run alone on an idle machine
 ```
 
-`WORK` (default `paper/work`, ignored by git) holds every intermediate file.
+`WORK` (default `paper/work`, ignored by git) holds every intermediate file;
+`data/` keeps the compact outputs of the run behind this draft.
 The germline for IgSim is the human set of the IMGT/GENE-DB release 202632-7
 pack shipped in `public/references/`, exported as plain FASTA; swig annotates
 its anchors itself. IgBLAST's auxiliary file lacks IGHJ5\*03 and IGHJ5\*04;

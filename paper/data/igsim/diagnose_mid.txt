@@ -1,0 +1,5 @@
+database: V 457 alleles, D 41, J 15 (30 identical sequences merged as aliases); chain heavy; V anchors: 342 motif, 32 missing, 48 low-confidence, 35 transfer; J anchors: 15 motif
+V: correct 1962, ties 26, search errors 0, model errors 12, mis-oriented 0 (of 2000)
+    DAG chose Some(("IGHJ1*01", 64, 436, 473)); truth span Some(433..473)
+J search error: truth IGHJ4*01 (exhaustive Some(66)), called Some("IGHJ1*01") (exhaustive Some(64)); shm 0.061, placements ["IGHJ4*01:66", "IGHJ1*01:64"]
+J: correct 1971, ties 18, search errors 1, model errors 10, mis-oriented 0 (of 2000)

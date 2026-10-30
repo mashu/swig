@@ -1,0 +1,26 @@
+swig igh_mid threads=1 posterior=on reads=10000 seconds=5.033650948 reads_per_s=1986
+swig igh_mid threads=1 posterior=off reads=10000 seconds=3.717167060 reads_per_s=2690
+swig igh_mid threads=4 posterior=on reads=10000 seconds=1.324117847 reads_per_s=7552
+swig igh_mid threads=4 posterior=off reads=10000 seconds=.979329514 reads_per_s=10211
+swig igh_mid simd=avx512 threads=1 reads=10000 seconds=4.472525807 reads_per_s=2235
+swig igh_mid simd=avx2 threads=1 reads=10000 seconds=4.784717755 reads_per_s=2089
+swig igh_mid simd=portable threads=1 reads=10000 seconds=6.346715142 reads_per_s=1575
+swig igh_mid simd=scalar threads=1 reads=10000 seconds=11.874868031 reads_per_s=842
+identical igh_mid avx2 avx512
+identical igh_mid avx2 portable
+identical igh_mid avx2 scalar
+identical igh_mid 1-thread 4-thread
+igblast igh_mid threads=4 reads=10000 seconds=117.001016264 reads_per_s=85.469
+swig igh_hard threads=1 posterior=on reads=10000 seconds=4.870624541 reads_per_s=2053
+swig igh_hard threads=1 posterior=off reads=10000 seconds=3.975730707 reads_per_s=2515
+swig igh_hard threads=4 posterior=on reads=10000 seconds=1.476146275 reads_per_s=6774
+swig igh_hard threads=4 posterior=off reads=10000 seconds=1.208806494 reads_per_s=8272
+swig igh_hard simd=avx512 threads=1 reads=10000 seconds=4.568559095 reads_per_s=2188
+swig igh_hard simd=avx2 threads=1 reads=10000 seconds=4.646598901 reads_per_s=2152
+swig igh_hard simd=portable threads=1 reads=10000 seconds=6.199779770 reads_per_s=1612
+swig igh_hard simd=scalar threads=1 reads=10000 seconds=11.390845281 reads_per_s=877
+identical igh_hard avx2 avx512
+identical igh_hard avx2 portable
+identical igh_hard avx2 scalar
+identical igh_hard 1-thread 4-thread
+igblast igh_hard threads=4 reads=10000 seconds=111.605562974 reads_per_s=89.601

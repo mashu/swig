@@ -1,0 +1,13 @@
+database: V 457 alleles, D 41, J 15 (30 identical sequences merged as aliases); chain heavy; V anchors: 342 motif, 32 missing, 48 low-confidence, 35 transfer; J anchors: 15 motif
+D remnant ≥ 8 nt: 8483 reads, correct 91.76 %
+  wrong D:   adjudication 6.90 %  not found 0.83 %  outside windows 0.04 %
+  missing D, adjudication     J covers 0.02 %  V covers 0.04 %  neither 0.17 %
+  missing D, not found        J covers 0.00 %  V covers 0.00 %  neither 0.26 %
+  missing D, outside windows  J covers 0.00 %  V covers 0.00 %  neither 0.00 %
+  called J covers ≥ 3 bases of the true D: 0.14 %; called V: 0.08 %
+D remnant 1–7 nt: 1006 reads, correct 44.83 %
+  wrong D:   adjudication 16.60 %  not found 6.76 %  outside windows 0.00 %
+  missing D, adjudication     J covers 0.89 %  V covers 0.80 %  neither 20.58 %
+  missing D, not found        J covers 0.10 %  V covers 0.10 %  neither 9.34 %
+  missing D, outside windows  J covers 0.00 %  V covers 0.00 %  neither 0.00 %
+  called J covers ≥ 3 bases of the true D: 0.99 %; called V: 0.99 %

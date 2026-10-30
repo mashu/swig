@@ -1,0 +1,50 @@
+dcut 2000
+cdr3start 2000
+vcut30 2000
+vcut100 2000
+jcut100 2000
+mid dcut default reads 2000  D called 93.7%  right D 88.0%
+mid dcut open_flank_off reads 2000  D called 0.1%  right D 0.0%
+mid dcut no_guards reads 2000  D called 92.8%  right D 86.5%
+mid dcut no_guards_open_flank_off reads 2000  D called 92.8%  right D 86.5%
+mid cdr3start default reads 2000  D called 98.0%  right D 93.6%
+mid cdr3start open_flank_off reads 2000  D called 0.0%  right D 0.0%
+mid cdr3start no_guards reads 2000  D called 98.0%  right D 93.5%
+mid cdr3start no_guards_open_flank_off reads 2000  D called 98.0%  right D 93.5%
+mid vcut30 default reads 2000  D called 67.5%  right D nan%
+mid vcut30 open_flank_off reads 2000  D called 0.1%  right D nan%
+mid vcut30 no_guards reads 2000  D called 66.0%  right D nan%
+mid vcut30 no_guards_open_flank_off reads 2000  D called 66.0%  right D nan%
+mid vcut100 default reads 2000  D called 2.6%  right D nan%
+mid vcut100 open_flank_off reads 2000  D called 0.2%  right D nan%
+mid vcut100 no_guards reads 2000  D called 5.7%  right D nan%
+mid vcut100 no_guards_open_flank_off reads 2000  D called 88.3%  right D nan%
+mid jcut100 default reads 2000  D called 9.7%  right D nan%
+mid jcut100 open_flank_off reads 2000  D called 0.1%  right D nan%
+mid jcut100 no_guards reads 2000  D called 10.4%  right D nan%
+mid jcut100 no_guards_open_flank_off reads 2000  D called 91.8%  right D nan%
+dcut 2000
+cdr3start 2000
+vcut30 2000
+vcut100 2000
+jcut100 2000
+hard dcut default reads 2000  D called 91.4%  right D 81.5%
+hard dcut open_flank_off reads 2000  D called 0.2%  right D 0.0%
+hard dcut no_guards reads 2000  D called 89.8%  right D 79.3%
+hard dcut no_guards_open_flank_off reads 2000  D called 90.0%  right D 79.3%
+hard cdr3start default reads 2000  D called 92.1%  right D 83.2%
+hard cdr3start open_flank_off reads 2000  D called 0.0%  right D 0.0%
+hard cdr3start no_guards reads 2000  D called 92.2%  right D 83.2%
+hard cdr3start no_guards_open_flank_off reads 2000  D called 92.2%  right D 83.2%
+hard vcut30 default reads 2000  D called 76.6%  right D nan%
+hard vcut30 open_flank_off reads 2000  D called 0.2%  right D nan%
+hard vcut30 no_guards reads 2000  D called 74.4%  right D nan%
+hard vcut30 no_guards_open_flank_off reads 2000  D called 74.5%  right D nan%
+hard vcut100 default reads 2000  D called 11.2%  right D nan%
+hard vcut100 open_flank_off reads 2000  D called 0.8%  right D nan%
+hard vcut100 no_guards reads 2000  D called 14.8%  right D nan%
+hard vcut100 no_guards_open_flank_off reads 2000  D called 93.2%  right D nan%
+hard jcut100 default reads 2000  D called 27.2%  right D nan%
+hard jcut100 open_flank_off reads 2000  D called 0.0%  right D nan%
+hard jcut100 no_guards reads 2000  D called 28.2%  right D nan%
+hard jcut100 no_guards_open_flank_off reads 2000  D called 90.6%  right D nan%

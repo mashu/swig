@@ -1,0 +1,4 @@
+random swig reads=2000 any=0 V=0 D=0 J=0 junction=0
+random igblast reads=2000 any=1272 V=1272 D=645 J=432 junction=93
+igk_mid swig reads=1000 any=0 V=0 D=0 J=0 junction=0
+igk_mid igblast reads=1000 any=997 V=997 D=0 J=0 junction=0
