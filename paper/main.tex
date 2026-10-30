@@ -99,9 +99,8 @@ against its ambiguity-aware truth, \swig{} 0.39.7 has the highest V, D and J
 accuracy of \swig{}, IgBLAST 1.22 and MiXCR 3.0.13 on every human
 immunoglobulin set, raising human IGH D accuracy over IgBLAST by
 0.7--6.0 percentage points across 0--10\,\% SHM (0.9--6.3 on reads disjoint
-from those its D priors were designed on), and runs 60--160 times
-faster than IgBLAST on four threads.
-% NUMBERS: filled from results; see README.md.
+from those its D priors were designed on), and assigns about 7,000 reads per
+second on four threads, 76--88 times the throughput of IgBLAST.
 
 \noindent\textbf{Availability.}
 \swig{} is open source under the MIT licence at
@@ -782,8 +781,10 @@ one changes the type and the pipeline monomorphises without trait objects.
 16-bit lane runs the scalar Gotoh recurrence for a different read--allele job
 rather than striping one alignment~\cite{farrar2007}. The kernel is written
 once over a lane abstraction and compiled for AVX-512BW (32 lanes), AVX2,
-NEON, WebAssembly \code{simd128}~\cite{haas2017wasm} and portable lanes (16),
-chosen at run time. Banded jobs use band-relative coordinates, so lanes whose
+NEON, WebAssembly \code{simd128}~\cite{haas2017wasm} and portable lanes (16).
+The backend is chosen at run time (at build time for WebAssembly); AVX-512 is
+used on request, since 512-bit instructions lower the clock of many CPUs.
+Banded jobs use band-relative coordinates, so lanes whose
 bands start on different diagonals walk the same grid~\cite{chao1992band}.
 When every lane's profile depends on base identity alone a cell's
 substitution is one comparison and one blend; otherwise five profile rows are
@@ -1353,7 +1354,42 @@ without the C stage by construction.
 \subsection{Speed}
 \label{sec:speed}
 
-SPEED-PLACEHOLDER
+\Cref{tab:speed} gives throughput on the 10,000-read IgSim sets, as wall
+clock of the whole command, including database preparation (about 40\,ms
+for the IMGT IGH set, every allele annotated on load). On four threads
+\swig{} assigns 6,800--7,600 reads per second with posteriors, 76--88 times
+IgBLAST's throughput on the same reads and machine, and 8,300--10,200 without
+them; posteriors add 22--35\,\% to the run time. On the GenAIRR sets IgBLAST
+took 81--90\,s per 10,000 reads and \swig{} 1.0--1.4\,s. The SIMD kernel
+gives 2.4--2.7 times the throughput of the scalar kernel on one thread,
+AVX-512BW's 32 lanes adding 2--7\,\% over AVX2's 16. Every backend and every
+thread count produced byte-identical output on both sets.
+
+\begin{table}[t]
+\centering
+\caption{Throughput on 10,000 IgSim reads (reads per second; wall clock of
+the whole command including database preparation; median of three runs for
+\swig). The default kernel on this CPU is AVX2.}
+\label{tab:speed}
+\footnotesize
+\begin{tabular}{@{}l rr@{}}
+\toprule
+Configuration & \emph{mid} & \emph{hard} \\
+\midrule
+\swig, 4 threads                          & 7,552  & 6,774 \\
+\swig, 4 threads, no posteriors           & 10,211 & 8,272 \\
+\swig, 1 thread                           & 1,986  & 2,053 \\
+\swig, 1 thread, no posteriors            & 2,690  & 2,515 \\
+\addlinespace
+\swig, 1 thread, AVX-512BW (32 lanes)     & 2,235  & 2,188 \\
+\swig, 1 thread, AVX2 (16 lanes)          & 2,089  & 2,152 \\
+\swig, 1 thread, portable lanes (16)      & 1,575  & 1,612 \\
+\swig, 1 thread, scalar kernel            & 842    & 877   \\
+\addlinespace
+IgBLAST 1.22, 4 threads                   & 85     & 90    \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 % ===========================================================================
 \section{Discussion}
@@ -1449,8 +1485,8 @@ derived from the hypotheses searched, calls valued at each read's own
 divergence and posteriors from the same recursion. Every search shortcut
 carries a stated guarantee, and the remaining errors are located by
 construction. On two independent simulators it is the most accurate of the
-tools compared on D and, on immunoglobulin loci, on V and J, while being
-orders of magnitude faster than IgBLAST.
+tools compared on D and, on immunoglobulin loci, on V and J, while running
+nearly two orders of magnitude faster than IgBLAST.
 
 \section*{Availability}
 
