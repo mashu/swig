@@ -25,157 +25,180 @@ for immune receptor germline assignment}
 % ===========================================================================
 \begin{abstract}
 \noindent\textbf{Motivation.}
-A rearranged adaptive immune receptor gene, from a B or a T cell, is built
-from germline segments: a V and a J, and, in immunoglobulin heavy chains and
-T-cell receptor $\beta$ and $\delta$ chains, a D between them. Each segment
-is trimmed at the joints, and randomly inserted bases separate them.
-Germline assignment names the allele of each segment and locates where it
-starts and ends. It is the first step of repertoire analysis, and every
-later step inherits its errors. D assignment is uncertain: the segment is
-short and trimmed at both ends, somatic hypermutation (SHM) blurs the
-differences between alleles, and a junction base can belong to either
-neighbouring segment. An aligner can over-call a D on a junction that has
-none, and it can miss a D that is present: IgBLAST, IMGT/V-QUEST and MiXCR
-place V and J first and only then search the bases left between them, so a
-V or J alignment can absorb a short remnant, and a remnant can fail a fixed
-match or score threshold. Either error leaves a less accurate D assignment
-for downstream methods. The same tools are slow for the millions of reads
-in a repertoire.
+Analysis of an immune repertoire begins with germline assignment. A
+rearranged B- or T-cell receptor gene is built from germline segments: a V
+and a J and, in immunoglobulin heavy chains and in T-cell receptor $\beta$
+and $\delta$ chains, a D between them. The segments are trimmed where they
+join, and random bases are inserted at the joints. For every sequencing
+read, germline assignment names the allele of each segment and locates where
+the segment starts and ends. All later steps of the analysis inherit its
+errors. The D segment is the hardest to assign: it is short and trimmed at
+both ends, somatic hypermutation (SHM) blurs the differences between
+alleles, and a base at a joint can belong to either neighbouring segment.
+IgBLAST, IMGT/V-QUEST and MiXCR place V and J first and only then search the
+bases left between them for a D, which they accept by a fixed match or score
+threshold. A V or J alignment can therefore absorb a short D, a real D can
+fall below the threshold, and a D can be called on a junction that has none.
+These tools are also slow for the millions of reads in a repertoire.
 
 \noindent\textbf{Results.}
-We present \swig, a dependency-free aligner written in Rust that decides the
-V, D and J alleles and their boundaries together rather than one after
-another. Each way of dividing a read into segments is scored as a
-log-likelihood ratio, that is, by how much better it explains the read than
-random sequence does. Among the candidate alignments of a read, \swig{}
-finds the best-scoring division exactly, with a dynamic-programming
-recursion that tries every pair of boundary positions between neighbouring
-segments. The cost of including a segment is derived from how many
-alternative alleles and positions it competes with instead of being tuned
-for benchmark accuracy, and alignments are scored at the mutation rate
-estimated for each read. The same recursion, run forward and backward, gives
-a posterior probability for every call, and the reported call is the most
-probable explanation under these probabilities.
+We present \swig, an aligner that decides the V, D and J alleles and all of
+their boundaries together. Each way of dividing a read into segments
+receives one score, a log-likelihood ratio that measures how much better
+this division explains the read than random sequence does. Among the
+candidate alignments of a read, a dynamic-programming recursion finds the
+best-scoring division exactly: it covers every pair of boundary positions
+between neighbouring segments. The cost of including a segment is derived
+from the number of alternative alleles and positions with which the segment
+competes; it is not tuned for benchmark accuracy. Alignments are scored at
+the mutation rate estimated for each read. Run forward and backward, the
+same recursion yields a posterior probability for every call, and the
+reported call is the most probable explanation under these probabilities.
 
-We evaluated \swig{} 0.39.7, IgBLAST 1.22 and MiXCR 4.7.0 on reads from
-two simulators, GenAIRR and IgSim. GenAIRR's truth
-for each segment of a read is the set of alleles that best match the read's
-bases there, several when the read cannot tell them apart, and a call scores
-the overlap between its alleles and that set (the Jaccard index). On 13
-GenAIRR sets, two rhesus IGH panels of
-50,000 reads from the IgBench harness and 11 human IGH, IGK, IGL and TRB
-sets of 10,000, \swig{} had the most accurate D call on every set with a D,
-the most accurate V call on every set except TRB, where it tied with
-IgBLAST, and a J accuracy within 0.05 points of the best. Its D accuracy was
-2.2 and 5.9 percentage points above IgBLAST's on the rhesus IgM- and
-IgG-like panels and 0.7--6.0 points above on the five human IGH sets
-(0--10\,\% SHM). MiXCR reports one allele per segment even when several
-align equally well; credited instead with every allele tied for its best
-alignment score, the more favourable scoring for MiXCR, it was 3.6 and 7.0
-points below \swig{} on rhesus D and 2.3--7.8 points below on human IGH D.
-IgSim, the second simulator, counts a call correct when the called allele
-contains the trimmed germline sequence the read was simulated from. On its
-human IGH reads \swig{} called V more accurately than both tools up to
-IgG-like mutation and D on unmutated and IgG-like reads, and gave a D to 18
-and 16\,\% of D-free junctions on IgM- and IgG-like reads, against 49 and
-31\,\% for IgBLAST and 61 and 39\,\% for MiXCR. On eight threads \swig{}
-assigned about 16,000 reads per second on the IgBench panels, about 50 times
-IgBLAST's throughput and 3.3--3.6 times MiXCR's on the same cores, and on
-four threads 86--153 and 8--13 times as fast on nine human GenAIRR sets.
+We compared \swig{} 0.39.7 with IgBLAST 1.22 and MiXCR 4.7.0 on simulated
+reads, for which the correct assignment is known. From the GenAIRR simulator
+we used 13 data sets: two rhesus IGH panels of 50,000 reads and 11 human
+IGH, IGK, IGL and TRB sets of 10,000 reads. Every call was scored against
+the set of alleles that the read cannot tell apart. \swig{} made the most
+accurate D call on every set with a D, and the most accurate V call on every
+set except TRB, where it tied with IgBLAST; its J accuracy was within 0.05
+percentage points of the best. Its D accuracy was 2.2 and 5.9 points above
+IgBLAST's on the two rhesus panels and 0.7--6.0 points above on the five
+human IGH sets (0--10\,\% SHM). Against MiXCR the corresponding margins
+were 3.6 and 7.0 points and 2.3--7.8 points, even though MiXCR was credited
+with every allele tied for its best alignment score. On human IGH reads from
+a second simulator,
+IgSim, \swig{} called V more accurately than both tools up to IgG-like
+mutation levels, and D more accurately on unmutated and IgG-like reads.
+Where a junction contained no D, \swig{} still called one on 18\,\% of
+IgM-like and 16\,\% of IgG-like reads, against 49 and 31\,\% for IgBLAST and
+61 and 39\,\% for MiXCR. \swig{} was also the fastest of the three tools. On
+eight threads it assigned about 16,000 reads per second on the rhesus
+panels, about 50 times IgBLAST's throughput and 3.3--3.6 times MiXCR's on
+the same cores. On four threads, on nine human GenAIRR sets, it was 86--153
+times as fast as IgBLAST and 8--13 times as fast as MiXCR.
 
 \noindent\textbf{Availability.}
 \swig{} is open source under the MIT licence at
-\url{https://github.com/mashu/swig} (crate \code{engine/}); it builds with
+\url{https://github.com/mashu/swig} (crate \code{engine/}). It builds with
 Rust $\geq 1.89$, has no dependencies, and compiles to native code and to
 WebAssembly.
 
 \noindent\textbf{Supplementary information.}
-The model with its derivations, the proof of exactness, the search, the
-implementation and further results are in the Supplementary Information.
+The Supplementary Information gives the model with its derivations, the
+proof of exactness, the search, the implementation and further results.
 \end{abstract}
 
 % ===========================================================================
 \section{Introduction}
 
 High-throughput sequencing of B- and T-cell receptor repertoires (AIRR-seq)
-turns millions of rearranged receptor transcripts into reads. Each read is a
-mosaic: a V, a D (heavy chains and TRB/TRD only) and a J gene segment, trimmed
-by exonucleases at the joints and separated by non-templated N and
-palindromic P nucleotides, and, in B cells, overlaid with somatic
-hypermutation (SHM). Germline assignment names the allele of each segment and
-locates its boundaries, which fixes the junction (CDR3). Clonal grouping,
-mutation analysis, lineage reconstruction and inference of novel alleles all
-start from these calls, so their errors propagate.
+produces millions of reads, each from one rearranged receptor transcript. A
+rearranged receptor gene is a mosaic of germline gene segments: a V and a J
+segment, with a D segment between them in immunoglobulin heavy chains (IGH)
+and in the T-cell receptor $\beta$ and $\delta$ chains (TRB and TRD). During
+rearrangement, exonucleases trim the ends of the segments, and non-templated
+(N) and palindromic (P) nucleotides are added at the joints. In B cells,
+somatic hypermutation (SHM) then introduces point mutations into the
+rearranged gene. \emph{Germline assignment} reconstructs this history for
+each read: it names the allele of each segment and locates the boundaries of
+the segment in the read. The boundaries in turn delimit the junction, which
+contains the third complementarity-determining region (CDR3). Clonal
+grouping, mutation analysis, lineage reconstruction and the inference of
+novel alleles all start from these calls, so their errors propagate.
 
-Three properties make the assignment uncertain rather than merely
-expensive. First, human IGHD genes are 11--37 nucleotides long and lose
-several bases at each end; a remnant of 4--8 nucleotides is common, and
-random sequence matches a few bases of some D gene by chance at many
-junction positions. Second, under SHM a mismatch may be a mutation, a
-sequencing error or the base that separates two alleles. Third, an N base
-that happens to match the neighbouring germline can be explained by either
-segment, so where V ends, where D starts and where J starts are decided
-together. The task is therefore to choose the most probable explanation
-among many partial ones, and to say how probable it is.
+Three properties make the assignment uncertain, and not merely expensive.
+First, the D segment leaves little evidence. Human IGHD genes are 11--37
+nucleotides long and lose several bases at each end, so the part that
+remains in the read, the D \emph{remnant}, is commonly only 4--8 nucleotides
+long. Random sequence matches a few bases of some D gene by chance at many
+positions of a junction, so a short remnant is hard to tell from N
+nucleotides. Second, a mismatch has several possible causes. Under SHM it
+may be a mutation, a sequencing error, or the base that distinguishes one
+allele from another. Third, the boundaries depend on one another. An N
+nucleotide that happens to match the neighbouring germline can be explained
+by either segment, so where V ends, where D starts and ends, and where J
+starts cannot be settled one at a time. The task is therefore to choose the
+most probable explanation of a read among many partial ones, and to say how
+probable it is.
 
-Widely used tools decide the segments in sequence.
-IgBLAST~\cite{ye2013igblast} aligns the read to the V germlines first and
-then searches the rest of the read for D and J. IMGT/V-QUEST~\cite{brochet2008vquest},
-through IMGT/JunctionAnalysis~\cite{yousfimonod2004junction}, delimits V and
-J and then compares each D with the bases between them.
+The most widely used tools nevertheless decide the segments one after
+another. IgBLAST~\cite{ye2013igblast} aligns the read to the V germlines
+first and then searches the rest of the read for D and J.
+IMGT/V-QUEST~\cite{brochet2008vquest}, through
+IMGT/JunctionAnalysis~\cite{yousfimonod2004junction}, delimits V and J and
+then compares each D with the bases between them.
 MiXCR~\cite{bolotin2015mixcr} uses $k$-mer seeding and alignment for speed
-and likewise aligns D only between its V and J alignments. Each accepts a D
-by a fixed rule. IgBLAST 1.22 by default requires at least 5 consecutive
-matching D bases. MiXCR 4.7.0 drops D alignments scoring below 25, the
-score of five matched bases, and keeps further D hits only within 85\,\% of
-the best. IMGT/JunctionAnalysis allows at most a set number of D mismatches,
-by default 4 for IGH and 0 for TRB.
-Joint models also exist: SoDA~\cite{volpe2006soda} aligns V, D and J
-together by dynamic programming, and iHMMune-align~\cite{gaeta2007ihmmune}
-and partis~\cite{ralph2016partis} use hidden Markov models, those of partis
-with parameters inferred from the repertoire, at a much higher computational
-cost. Benchmarks with an ambiguity-aware
-simulator~\cite{konstantinovsky2024genairr} show that these aligners make
-distinct errors, most of them in D. Deciding segments in sequence lets a
-neighbour's local alignment absorb a short D, and fixed thresholds for
-accepting a D trade sensitivity on short remnants against spurious D calls
-on D-free junctions in ways that are hard to interpret.
+and likewise aligns D only between its V and J alignments. Each tool then
+accepts or rejects a D by a fixed rule. IgBLAST 1.22 requires at least 5
+consecutive matching D bases by default. MiXCR 4.7.0 drops D alignments that
+score below 25, the score of five matched bases, and keeps further D hits
+only if they score within 85\,\% of the best. IMGT/JunctionAnalysis allows
+at most a set number of D mismatches, by default 4 for IGH and 0 for TRB.
 
-\swig{} instead defines one objective, a log-likelihood ratio over the whole
-read, and maximises it exactly over the segment alleles and every pair of cut
-points between neighbouring segments. Its contributions are:
+This design has two weaknesses. Because V and J are aligned before a D is
+considered, the local alignment of a neighbouring segment can absorb a short
+D, which is then never found. And because a D is accepted by a fixed
+threshold, sensitivity to short remnants is traded against spurious D calls
+on junctions that have no D, in a way that is hard to interpret. Benchmarks
+with a simulator that records which alleles a read cannot
+distinguish~\cite{konstantinovsky2024genairr} show that these aligners make
+distinct errors and that most of the errors concern D.
+
+Models that decide the segments jointly also exist.
+SoDA~\cite{volpe2006soda} aligns V, D and J together by dynamic programming.
+iHMMune-align~\cite{gaeta2007ihmmune} and partis~\cite{ralph2016partis} use
+hidden Markov models, in partis with parameters inferred from the repertoire
+itself, at a much higher computational cost.
+
+Here we present \swig, which treats germline assignment as one optimisation
+problem and solves it exactly. \swig{} first collects candidate alignments
+of V, D and J alleles to the read. It then scores every way of combining
+them, that is, every choice of alleles and every position of the boundaries
+between neighbouring segments, with a single objective: a log-likelihood
+ratio over the whole read. The assignment that it reports maximises this
+objective. The contributions of this work are the following.
 \begin{enumerate}
-  \item a \emph{placement graph} over candidate V, D and J alignments whose
-    semi-Markov Viterbi recursion is exact over all grammatical paths and all
-    cut pairs, in time linear in the overlaps between placements
-    (\cref{sec:overview}; proof in \cref{S-sec:dag});
-  \item segment priors \emph{derived} as prior odds over the hypotheses
-    a segment competes with,
-    D trim and N/P-length priors that re-rank D alleles without changing
-    how often a typical D is called, and an \emph{open-flank} cost for a D at
-    a truncated read end (\cref{S-sec:objective});
-  \item alignments scored at each read's own estimated mutation rate, in
-    exact integer arithmetic, with forward--backward posteriors over the same
-    graph, so that the call is the most probable assignment under the
-    reported posterior (\cref{S-sec:perread,S-sec:posterior});
-  \item a search whose every shortcut is labelled with its guarantee (exact,
-    lossless, bounded, defined, approximate or heuristic), including lossless
-    sibling bounds over gene frames
-    (\cref{S-sec:search}), and an inter-sequence SIMD kernel that is
-    bit-identical to a scalar Gotoh across x86-64, AArch64 and WebAssembly
-    (\cref{S-sec:implementation});
-  \item a comparison with IgBLAST and MiXCR against ambiguity-aware GenAIRR
-    truth, on rhesus IGH panels through the IgBench harness and on 11 human
-    IG and TR sets, and on IgSim reads with
-    paired statistics and a negative-control suite
-    (\cref{sec:evaluation,sec:results}), backed by ablations of every
-    modelling term, a calibration of the posteriors and an attribution of the
-    remaining D errors to search or model (\cref{S-sec:supresults}).
+  \item \emph{An exact joint decision.} The candidate alignments form a
+    \emph{placement graph}. A dynamic-programming recursion over this graph
+    returns the best assignment over all combinations of alleles and all
+    pairs of boundary positions, in time linear in the overlaps between the
+    candidates (\cref{sec:overview}; proof in \cref{S-sec:dag}).
+  \item \emph{Costs that are derived, not tuned.} The cost of including a
+    segment follows from the number of alternative alleles and positions
+    with which the segment competes. Priors on the trimming of a D and on
+    the length of the N/P regions rank competing D alleles without changing
+    how often a typical D is called, and a further cost applies to a D at
+    the truncated end of a read (\cref{S-sec:objective}).
+  \item \emph{Read-specific evidence and a probability for every call.}
+    Alignments are valued at the mutation rate estimated for each read, in
+    exact integer arithmetic. The same graph yields posterior probabilities,
+    under which the reported call is the most probable assignment
+    (\cref{S-sec:perread,S-sec:posterior}).
+  \item \emph{A search with stated guarantees.} Every shortcut that limits
+    the candidates is labelled with what it can lose, from \emph{exact} to
+    \emph{heuristic}; among the shortcuts that provably lose nothing are
+    score bounds that spare \swig{} the alignment of most alleles of a gene
+    (\cref{S-sec:search}). The SIMD alignment kernel returns the same
+    result, bit for bit, as a scalar implementation on x86-64, AArch64 and
+    WebAssembly (\cref{S-sec:implementation}).
+  \item \emph{An evaluation on two simulators.} We compare \swig{} with
+    IgBLAST and MiXCR on GenAIRR reads, whose truth records the alleles that
+    a read cannot distinguish (rhesus IGH panels run through the IgBench
+    harness, and 11 human IG and TR sets), and on IgSim reads, with paired
+    statistics and negative controls (\cref{sec:evaluation,sec:results}).
+    Ablations of every modelling term, a calibration of the posteriors and
+    an attribution of the remaining D errors to the search or to the model
+    support the comparison (\cref{S-sec:supresults}).
 \end{enumerate}
 
-\Cref{sec:overview} outlines the method. The Supplementary Information gives
-the model with every derivation, the exact recursion and its proof, the
-plausibility constraints, the search and the implementation in full
+\Cref{sec:overview} outlines the method. \Cref{sec:evaluation} describes the
+simulated data, the scoring rules and the settings of the three tools,
+\cref{sec:results} reports the results, and \cref{sec:discussion} discusses
+them together with the limitations of this study. The Supplementary
+Information gives the model with every derivation, the exact recursion and
+its proof, the plausibility constraints, the search and the implementation
+in full
 (\cref{S-sec:model,S-sec:dag,S-sec:guards,S-sec:search,S-sec:implementation});
 its sections, figures, tables and equations are numbered S1, S2, \ldots
 
@@ -183,30 +206,136 @@ its sections, figures, tables and equations are numbered S1, S2, \ldots
 \section{Method overview}
 \label{sec:overview}
 
-This section outlines how \swig{} assigns a read. The model, the derivation
-of every prior term, the recursion with its proof, the search and the
-implementation are given in full in the Supplementary Information.
+Given a read and germline databases of V, D and J alleles, \swig{} reports
+the strand of the read, the alleles of its V, D and J segments (zero or one
+D), and the coordinates of each segment in the read and in its germline
+allele. These coordinates determine the N/P regions and the junction. With
+an optional database of constant-region (C) alleles, \swig{} also reports
+the constant region.
 
-\paragraph{Segments as log-odds.} Given a read and germline databases of V,
-D, J and optionally C alleles, \swig{} reports the strand, the alleles of the
-V, D (zero or one) and J segments with their read and germline coordinates,
-hence the N/P regions and the junction, and optionally the constant region.
-A segment hypothesis, an allele and a read interval, is scored by affine-gap
-local alignment~\cite{smith1981,gotoh1982}. The default $+2/-3$ substitution
-scores are log-likelihood ratios~\cite{altschul1991,karlin1990} of
-``templated by this allele'' against ``random'' at 11.2\,\% divergence
-($\lambda=0.634$ nats per score unit), so alignment scores and prior terms
-add on one scale (\cref{S-sec:scores}).
+\swig{} assigns a read in two stages (\cref{fig:pipeline}). The first stage
+is a \emph{search}: it orients the read and collects, for each kind of
+segment, a small set of candidate local alignments of alleles to the read.
+The second stage is a \emph{decision}: among the candidates, it chooses the
+combination of V, D and J alignments, and the boundaries between them, that
+best explains the whole read. The decision is the main contribution of this
+work, and it defines what the search has to deliver. We therefore describe
+the decision first
+(\cref{sec:ov-evidence,sec:ov-paths,sec:ov-objective,sec:ov-exact,sec:ov-posterior,sec:ov-constraints})
+and the search and its implementation afterwards (\cref{sec:ov-search}). The
+Supplementary Information gives every derivation and proof.
 
-\paragraph{Placement graph.} A \emph{placement} is an aligned segment
-hypothesis and a \emph{path} a sequence of placements allowed by the grammar
-V\,$\to$\,D$^{\{0,1\}}$\,$\to$\,J, partial paths included but never a lone D.
-Between consecutive placements the earlier one exits at a cut $x$, the later
-one enters at a cut $y\ge x$, and the bases between are N/P
-(\cref{fig:dag}). Overlapping placements may split an overlap anywhere or
-leave it to neither, and placements are ordered by segment kind rather than
-by read start, so a D may precede a J whose alignment reaches back over it:
-the configuration in which a sequential annotator lets the J ``eat'' the D.
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[font=\scriptsize,
+  box/.style={draw=#1!70!black,fill=#1!12,rounded corners=2pt,align=center,
+    text width=38mm,minimum height=11mm,inner sep=2pt},
+  data/.style={box=gray,fill=white},
+  arr/.style={-{Latex[length=1.6mm]},line width=0.6pt},
+  phase/.style={-{Latex[length=2.2mm,width=2.6mm]},line width=1.6pt,gray!55},
+  panel/.style={draw=gray!40,fill=gray!5,rounded corners=4pt},
+  ptitle/.style={anchor=north,font=\footnotesize\bfseries,text=black!80}]
+  \def\dy{1.5}
+  % column A: input
+  \node[data] (read) at (0,2*\dy) {\textbf{read}\\FASTA, FASTQ or AIRR table};
+  \node[box=gray] (strand) at (0,\dy) {\textbf{strand}\\orientation from 11-mer counts against a Poisson null};
+  % column B: candidate placements
+  \node[box=cV] (vret) at (4.9,3*\dy) {\textbf{V retrieval}\\candidate genes by 9/7-mer votes over gene frames};
+  \node[box=cV] (valn) at (4.9,2*\dy) {\textbf{V alignment}\\banded Gotoh; siblings skipped by score bounds};
+  \node[box=cJ] (j) at (4.9,\dy) {\textbf{J alignment}\\every J allele of the V's locus, downstream of the V};
+  \node[box=cD] (d) at (4.9,0) {\textbf{D alignment}\\junction window between V and J, 4-mer prefilter};
+  % column C: decision and output
+  \node[box=black] (dag) at (9.8,3*\dy) {\textbf{placement graph}\\exact best path and its posteriors over all paths};
+  \node[box=gray] (gates) at (9.8,2*\dy) {\textbf{gates}\\V or J anchor at ${E\le10^{-3}}$; plausible V--J pairing};
+  \node[box=cC] (c) at (9.8,\dy) {\textbf{C} (optional)\\constant region within 7 bases of the J end};
+  \node[data] (out) at (9.8,0) {\textbf{output}\\AIRR row with posteriors};
+  % flow within each column
+  \foreach \a/\b in {read/strand,vret/valn,valn/j,j/d,dag/gates,gates/c,c/out}
+    \draw[arr] (\a.south) -- (\b.north);
+  % panels and the flow between them
+  \begin{scope}[on background layer]
+    \draw[panel] (-2.15,\dy-0.8) rectangle (2.15,2*\dy+1.2);
+    \node[ptitle] at (0,2*\dy+1.12) {Input};
+    \foreach \x/\t in {4.9/Candidate placements,9.8/Decision and output} {
+      \draw[panel] (\x-2.15,-0.8) rectangle (\x+2.15,3*\dy+1.2);
+      \node[ptitle] at (\x,3*\dy+1.12) {\t};
+    }
+  \end{scope}
+  \draw[phase] (2.2,1.5*\dy) -- (2.7,1.5*\dy);
+  \draw[phase] (7.1,1.5*\dy) -- (7.6,1.5*\dy);
+\end{tikzpicture}
+\caption{The two stages of \swig{} for one read; each column runs from top
+to bottom. Left: the read is oriented. Centre, the search: candidate
+alignments (\emph{placements}) are collected for V, then J, then D. Right,
+the decision: the placement graph returns the best path under
+\cref{eq:objective} and its posterior probabilities, the gates require a
+significant V or J hit (an \emph{anchor}) and a plausible V--J pairing, and
+the optional C stage adds the constant region. Alignments are computed for
+chunks of 64 reads at a time on the inter-sequence SIMD kernel (16 or 32
+lanes); every other step is decided read by read. \Cref{S-tab:search} gives
+the guarantee of each step.}
+\label{fig:pipeline}
+\end{figure}
+
+\subsection{Evidence: alignment scores as log-likelihood ratios}
+\label{sec:ov-evidence}
+
+A \emph{segment hypothesis} is an allele together with the interval of the
+read that the allele is proposed to explain. \swig{} scores it by local
+alignment with affine gap penalties~\cite{smith1981,gotoh1982}, by default
+with $+2$ for a match and $-3$ for a mismatch. Such scores have a
+probabilistic meaning~\cite{altschul1991,karlin1990}: multiplied by a
+constant $\lambda$, the score of an aligned base is the log-likelihood ratio
+of ``templated by this allele, with a certain probability of substitution''
+against ``random''. For $+2/-3$, $\lambda=0.634$ nats per score unit, and
+the substitution probability that the scores imply, the \emph{divergence},
+is 11.2\,\% (\cref{S-sec:scores}). Alignment scores and log prior odds can
+therefore be added on one scale, and the objective of
+\cref{sec:ov-objective} relies on this.
+
+A fixed pair of scores is a log-likelihood ratio at one divergence only. At
+$+2/-3$, unmutated reads are scored under-confidently, because a single base
+that separates two alleles is stronger evidence than the scores grant, and
+heavily mutated reads are scored over-confidently. \swig{} therefore
+estimates the divergence $\phat$ of each read before the decision. It then
+values a match at $\ln 4(1-\phat)$ nats and a mismatch at $\ln(4\phat/3)$
+nats, the log-likelihood ratios of ``templated at divergence $\phat$''
+against ``random''. The estimate comes from the V and J columns that no
+assignment disputes: the columns of the best V alignment that lie before
+every D and J candidate, and the columns of the best J alignment that lie
+after every V and D candidate. The junction bases are therefore normally not
+used twice. All values are integer multiples of $2^{-16}$ nats, so that
+maxima and ties are exact (\cref{S-sec:perread}). Below, $W$ denotes the
+value of alignment columns on this read-specific scale; on the optional
+fixed scale, $W$ is $\lambda$ times the alignment score.
+
+\subsection{Placements, cuts and paths}
+\label{sec:ov-paths}
+
+We call an aligned segment hypothesis a \emph{placement}. The decision
+receives several placements of each kind and has to combine them. A
+\emph{path} is a sequence of placements in the order V, D, J with at most
+one D. A path may be partial, as when a read is truncated, but it never
+consists of a D alone, so the possible paths are V, J, VJ, VD, DJ and VDJ.
+The placements are the nodes of a graph, the \emph{placement graph}, and
+every such path is a path through it.
+
+Placements on one path usually cannot be kept whole, because the local
+alignments of neighbouring segments often overlap: a base near a joint may
+match both the end of the V allele and the start of the D allele. A path
+therefore also states where each placement is cut (\cref{fig:dag}). Between
+two consecutive placements, the earlier one is kept up to its \emph{exit}
+position $x$ and the later one from its \emph{entry} position $y\ge x$. The
+$y-x$ read bases between the two cuts are N/P nucleotides. An overlap can
+thus be divided between the two segments at any point, and any part of it
+can be left to neither segment and counted as N/P.
+
+The order of the placements on a path is given by their kind, not by where
+their alignments start in the read. This matters when the alignment of a J
+allele reaches back over the bases of a D. The path V\,$\to$\,D\,$\to$\,J
+then remains available, with the J entered after the exit of the D. This is
+the very configuration in which a sequential annotator, which has already
+fixed its J alignment, lets the J ``eat'' the D.
 
 \begin{figure}[t]
 \centering
@@ -249,28 +378,37 @@ the configuration in which a sequential annotator lets the J ``eat'' the D.
   \node[anchor=east,lab,text=cJ!60!black] (jnote) at (46,5.9) {the J alignment starts before the D};
   \draw[-{Latex[length=1.5mm]},cJ!60!black] (jnote.east) -- (50.4,5.08);
 \end{tikzpicture}
-\caption{Placements and cuts (schematic; the junction is drawn wider than to scale). Pale bars are candidate local alignments
-(placements) of V, D and J alleles to one read; saturated bars are the parts a
-path keeps. Between consecutive segments the earlier one exits at $x$, the
-later one enters at $y\ge x$, and the bases between are N/P. Overlaps can be
-split anywhere or left to N/P. Because nodes are ordered by segment kind, not
-by read start, the path V$\to$D$\to$J is available even though the J
-alignment reaches back over the D. The placement graph maximises the
-objective of \cref{eq:objective} over all such paths, alleles and cut pairs.}
+\caption{Placements and cuts (schematic; the junction is drawn wider than to
+scale). Pale bars are placements, the candidate local alignments of V, D and
+J alleles to one read. Saturated bars are the parts that one path keeps, and
+dashed lines mark its cuts: the V is left at its exit $x_V$, the D is
+entered at $y_D$ and left at $x_D$, and the J is entered at $y_J$. The read
+bases between an exit and the next entry are N/P nucleotides (N1 and N2). An
+overlap between two placements can be split at any point or left to N/P.
+Although the J alignment starts before the D, the path V$\to$D$\to$J is
+available, because placements are ordered by segment kind and not by read
+start. The placement graph maximises the objective of \cref{eq:objective}
+over all such paths, alleles and pairs of cuts.}
 \label{fig:dag}
 \end{figure}
 
-\paragraph{Objective.} Read positions run from 0 to $|q|$. A path is a
-sequence
+\subsection{The objective}
+\label{sec:ov-objective}
+
+To choose among paths, \swig{} gives each path a value. Let $q$ be the read,
+with positions running from 0 to $|q|$. Formally, a path is a sequence
 \begin{equation*}
   \pi=\bigl((p_1,y_1,x_1),\dots,(p_n,y_n,x_n)\bigr)
 \end{equation*}
-of placements $p_i$, each of kind $k(p_i)\in\{\mathrm V,\mathrm D,\mathrm J\}$,
-entered at read position $y_i$ and left at $x_i$, whose kinds spell V, J, VJ,
-VD, DJ or VDJ, with $y_1=\operatorname{start}(p_1)$,
-$x_n=\operatorname{end}(p_n)$ and $x_i\le y_{i+1}$; cuts fall on aligned
-bases, and the full conditions are in \cref{S-sec:objective}. Its value, in
-nats, is
+of placements $p_i$, each of a kind
+$k(p_i)\in\{\mathrm V,\mathrm D,\mathrm J\}$, entered at read position $y_i$
+and left at $x_i$, whose kinds spell one of the six paths of
+\cref{sec:ov-paths}. The first placement is entered at its own start and the
+last is left at its own end,
+$y_1=\operatorname{start}(p_1)$ and $x_n=\operatorname{end}(p_n)$;
+consecutive placements do not overlap once they are cut, $x_i\le y_{i+1}$;
+and cuts fall on aligned bases. \Cref{S-sec:objective} states the conditions
+in full. The value of a path, in nats, is
 \begin{equation}
 \begin{aligned}
   v(\pi) \;&=\; \sum_{i=1}^{n} w(p_i,y_i,x_i)
@@ -283,274 +421,401 @@ nats, is
 \end{aligned}
 \label{eq:objective}
 \end{equation}
-where $\ind[\cdot]$ is 1 when its condition holds and 0 otherwise.
-$W_p(y,x)$ is the log-likelihood ratio of the alignment columns that $p$
-keeps between read positions $y$ and $x$: $\lambda$ times their alignment
-score at the fixed scale, and by default their worth at the read's own
-divergence (below). Every other term is a log prior odds or log-likelihood
-ratio with a stated derivation (\cref{S-sec:objective}). The presence cost
-$C_k$ of a segment of kind $k$ follows from the number of gene-and-position
-hypotheses the segment competes with, $P^{*}_k$ score units: for the IMGT
-human IGH set $\pD=10.45$, so an exact 5-mer D (score 10) loses and an exact
-6-mer (12) wins, without a threshold tuned for benchmark accuracy. For a D,
-geometric trim priors charge $\tau_5$ and $\tau_3$ for each of the
-$t_5(p,y)$ and $t_3(p,x)$ germline bases its clip leaves out at the 5$'$ and
-3$'$ ends of the allele, an N/P-length prior credits $\nu$ for each of the
-$x-y$ read bases it keeps, and the credit $\kappa$ keeps a D with the prior's
-mean trims as likely to be called as before. A D that starts or ends the
-path pays the open-flank cost $\copen{V}$ or $\copen{J}$ of the read bases
-between it and the read end, the log-likelihood ratio that those bases would
-have shown the missing V or J. Ties go to fewer
-Ds and then to more germline support, and co-optimal alleles are all
-reported. A read is called only when its path holds a V or J anchor at
-$E\le10^{-3}$ (\cref{S-sec:significance}).
+where $\ind[\cdot]$ is 1 when its condition holds and 0 otherwise. The first
+line sums one term $w$ per placement and subtracts two costs that can arise
+only at the two ends of the path. Each $w$ combines the evidence of an
+alignment with prior terms, and every prior term is a log prior odds or a
+log-likelihood ratio with a stated derivation (\cref{S-sec:objective}). We
+explain the terms in turn.
 
-\paragraph{Exact adjudication.} Every term of \cref{eq:objective} depends on
-at most one cut, so the best pair of cuts on an edge of the graph factorises
-into two running maxima. A semi-Markov Viterbi
-recursion~\cite{viterbi1967,yu2010hsmm} over the placements therefore returns
-the exact optimum over all grammatical paths, alleles and cut pairs, in time
-linear in the overlaps between placements (\cref{S-thm:dag,S-alg:dag}). The
-test suite checks it against exhaustive enumeration of every path and cut
-pair, including on constructed reads that restricted searches get wrong.
+\paragraph{Evidence.} $W_p(y,x)$ is the value, on the scale of
+\cref{sec:ov-evidence}, of the alignment columns that placement $p$ keeps
+between read positions $y$ and $x$.
 
-\paragraph{Per-read divergence and posteriors.} The $+2/-3$ scores are
-log-odds only at 11.2\,\% divergence, which makes unmutated reads
-under-confident and heavily mutated reads over-confident. \swig{} therefore
-estimates each read's divergence from the V and J columns no path contests
-and values every column at it, in exact integer arithmetic
-(\cref{S-sec:perread}). Forward--backward over the same graph gives the
-posterior of every placement and of D presence; the call is a mode of the
-reported distribution (\cref{S-sec:posterior}).
+\paragraph{Presence cost.} Every placement on a path pays a cost $C_k$ that
+depends only on its kind $k$ and reflects the number of alternatives from
+which the placement was chosen. A D hypothesis, for example, is one of $N$ D
+genes at one of $L$ junction positions, so the prior probability of a D is
+spread over $NL$ alternatives. The best of them is a more probable
+explanation than no D only if its evidence exceeds
+$\ln(NL)-\ln\omega_{\mathrm D}$ nats, where $\omega_{\mathrm D}$ is the
+prior odds of a D against none. In score units this threshold is
+$\pD=(\ln(NL)-\ln\omega_{\mathrm D})/\lambda$ (\cref{S-eq:pd}). For the IMGT
+human IGH set ($N=30$ genes, $L=25$ positions, even odds), $\pD=10.45$:
+taken alone, the cost rejects an exact match of 5 bases, which scores 10,
+and accepts an exact match of 6 bases, which scores 12. The threshold thus
+follows from the size of the germline database; it is not tuned for
+benchmark accuracy. V and J pay costs derived in the same way from their own
+gene counts. On the read-specific scale, each cost is charged as the value
+of $P^{*}_k/2$ matched bases, so that an exact match of a given length is
+accepted or rejected alike at every mutation rate (\cref{S-sec:perread}).
 
-\paragraph{Plausibility constraints.} On truncated, chimeric and cross-locus
-reads the optimum need not pair a V and a J that can form one rearrangement.
-Minimum hit lengths, a V--J pairing rule and a span limit are applied outside
-the objective; when the optimum breaks them the call is the best admissible
-subset optimum (\cref{S-sec:guards}). Junctions are reported only from
-conserved anchors (Cys104, Trp/Phe118) that the called alignments align.
+\paragraph{D trimming and N/P length.} Four further terms apply to a D only.
+They rank competing D placements by how plausible the trimming is that each
+of them implies. Without these terms, a short exact match deep inside a long
+D allele is worth as much as an untrimmed short allele. Let $t_5(p,y)$ and
+$t_3(p,x)$ be the numbers of germline bases that the kept part of the D
+leaves out at the 5$'$ and 3$'$ ends of its allele. Under geometric priors
+on the trim lengths, with means of 5 and 7 bases, each of these bases costs
+$\tau_5=\ln(6/5)$ or $\tau_3=\ln(8/7)$ nats. Under a geometric prior on the
+length of an N/P region, with a mean of 8 bases, every N/P base costs
+$\ln(9/8)$ nats; each of the $x-y$ read bases that the D keeps is one N/P
+base fewer and therefore earns $\nu=\ln(9/8)$ nats. Finally, the credit
+$\kappa=5\tau_5+7\tau_3=1.85$ nats refunds the trim cost of a D with the
+mean trims of the prior. The priors thus change which D wins, while a D with
+average trims is called as readily as without them.
 
-\paragraph{Search and implementation.} \Cref{fig:pipeline} shows the
-pipeline of one read. V candidates are retrieved by $k$-mer votes over gene
-frames, aligned in a band around the seed diagonals and ranked with lossless
-sibling bounds; J is aligned to every allele of the V's locus; D is searched
-in junction windows behind a lossless $k$-mer prefilter. Each step is
-labelled with what it can lose: exact, lossless, bounded, defined,
-approximate or heuristic (\cref{S-tab:search}). Alignments run on an
-inter-sequence SIMD Gotoh kernel~\cite{rognes2011} (AVX-512BW, AVX2, NEON,
-WebAssembly \code{simd128} or portable lanes) whose scores and tracebacks are
-bit-identical to a scalar Gotoh, so the output is byte-identical across
-backends, thread counts and platforms (\cref{S-sec:implementation}). \swig{}
-reads FASTA, FASTQ or AIRR tables and writes the AIRR Rearrangement
-schema~\cite{vanderheiden2018airr} with posteriors, from a command line, a
-Rust library or a WebAssembly module.
+\paragraph{Open flank.} A path may start or end with a D, as it should for a
+read that starts or stops inside its junction. Such a path asserts that the
+V or the J lies outside the read. This is plausible when few read bases lie
+beyond the D, and implausible when many do and none of them resembles a V or
+a J. A D that starts a path therefore pays the \emph{open-flank cost}
+$\copen{V}(\ell)$ for the $\ell=\operatorname{start}(p_1)$ read bases before
+it, and a D that ends a path pays $\copen{J}(\ell)$ for the
+$\ell=|q|-\operatorname{end}(p_n)$ bases after it. The cost is the
+log-likelihood ratio by which these bases, which show no V or J, speak
+against the junction that the D implies. It is zero within an allowance of
+24 bases, which was set from simulated junction lengths, and it never
+exceeds 6.2 nats (\cref{S-eq:openflank}).
 
-\begin{figure}[t]
-\centering
-\begin{tikzpicture}[font=\scriptsize,
-  box/.style={draw=#1!70!black,fill=#1!12,rounded corners=2pt,align=center,
-    text width=38mm,minimum height=11mm,inner sep=2pt},
-  data/.style={box=gray,fill=white},
-  arr/.style={-{Latex[length=1.6mm]},line width=0.6pt},
-  phase/.style={-{Latex[length=2.2mm,width=2.6mm]},line width=1.6pt,gray!55},
-  panel/.style={draw=gray!40,fill=gray!5,rounded corners=4pt},
-  ptitle/.style={anchor=north,font=\footnotesize\bfseries,text=black!80}]
-  \def\dy{1.5}
-  % column A: input
-  \node[data] (read) at (0,2*\dy) {\textbf{read}\\FASTA, FASTQ or AIRR table};
-  \node[box=gray] (strand) at (0,\dy) {\textbf{strand}\\orientation from 11-mer counts against a Poisson null};
-  % column B: candidate placements
-  \node[box=cV] (vret) at (4.9,3*\dy) {\textbf{V retrieval}\\candidate genes by 9/7-mer votes over gene frames};
-  \node[box=cV] (valn) at (4.9,2*\dy) {\textbf{V alignment}\\banded Gotoh; siblings skipped by score bounds};
-  \node[box=cJ] (j) at (4.9,\dy) {\textbf{J alignment}\\every J allele of the V's locus, downstream of the V};
-  \node[box=cD] (d) at (4.9,0) {\textbf{D alignment}\\junction window between V and J, 4-mer prefilter};
-  % column C: decision and output
-  \node[box=black] (dag) at (9.8,3*\dy) {\textbf{placement graph}\\exact best path and its posteriors over all paths};
-  \node[box=gray] (gates) at (9.8,2*\dy) {\textbf{gates}\\V or J anchor at ${E\le10^{-3}}$; plausible V--J pairing};
-  \node[box=cC] (c) at (9.8,\dy) {\textbf{C} (optional)\\constant region within 7 bases of the J end};
-  \node[data] (out) at (9.8,0) {\textbf{output}\\AIRR row with posteriors};
-  % flow within each column
-  \foreach \a/\b in {read/strand,vret/valn,valn/j,j/d,dag/gates,gates/c,c/out}
-    \draw[arr] (\a.south) -- (\b.north);
-  % panels and the flow between them
-  \begin{scope}[on background layer]
-    \draw[panel] (-2.15,\dy-0.8) rectangle (2.15,2*\dy+1.2);
-    \node[ptitle] at (0,2*\dy+1.12) {Input};
-    \foreach \x/\t in {4.9/Candidate placements,9.8/Decision and output} {
-      \draw[panel] (\x-2.15,-0.8) rectangle (\x+2.15,3*\dy+1.2);
-      \node[ptitle] at (\x,3*\dy+1.12) {\t};
-    }
-  \end{scope}
-  \draw[phase] (2.2,1.5*\dy) -- (2.7,1.5*\dy);
-  \draw[phase] (7.1,1.5*\dy) -- (7.6,1.5*\dy);
-\end{tikzpicture}
-\caption{Pipeline of one read; each column runs top to bottom. The read is
-oriented (left). Candidate placements are then found for V, J and D in turn
-(centre): V by $k$-mer retrieval and banded alignment, J downstream of the
-V, and D in the junction window between them. The placement graph picks the
-best path under \cref{eq:objective} and computes its posteriors, the gates
-require a significant V or J anchor and a plausible V--J pairing, and the
-optional C stage adds the constant region (right). Alignments run over
-chunks of 64 reads on the inter-sequence SIMD kernel (16 or 32 lanes); every
-other step is decided per read. \Cref{S-tab:search} gives the guarantee of
-each step.}
-\label{fig:pipeline}
-\end{figure}
+\paragraph{Decision rule.} \swig{} reports the path with the largest value.
+Among paths of equal value it prefers the one with fewer D segments, so that
+a D is called only when it strictly improves the explanation, and then the
+one with the larger germline support, the summed scores of its placements
+before they are cut. Alleles that explain the called bases equally well are
+\emph{co-optimal}, and all of them are reported. Finally, a read is called
+only when its path contains an \emph{anchor}: a V or J alignment that is
+significant on its own, with an E-value of at most $10^{-3}$ against its
+database. A read without an anchor, such as random sequence, receives no
+call (\cref{S-sec:significance}).
+
+\subsection{Exact maximisation}
+\label{sec:ov-exact}
+
+The number of paths is large: every combination of placements, multiplied by
+every pair of cut positions between neighbours. \swig{} nevertheless finds
+the maximum of \cref{eq:objective} exactly. It can do so because every term
+of the objective depends on at most one cut. For two neighbouring
+placements, the best pair of cuts is then found without trying all pairs:
+one running maximum over the exit positions of the earlier placement and one
+over the entry positions of the later placement suffice. Processing the
+placements in the order V, D, J with these running maxima is a Viterbi
+recursion of the semi-Markov kind~\cite{viterbi1967,yu2010hsmm}, in which a
+state, here a segment, covers a variable number of read positions. The
+recursion returns the optimum over all paths, alleles and pairs of cuts, in
+time linear in the overlaps between placements
+(\cref{S-thm:dag,S-alg:dag}). The test suite checks the recursion against
+an exhaustive enumeration of every path and cut pair. The test reads include
+constructed cases on which two more restricted searches return a worse path:
+a search that tries cuts only inside the overlap of two placements, and a
+search that orders placements by their start in the read.
+
+\subsection{Posterior probabilities}
+\label{sec:ov-posterior}
+
+The objective is a log-likelihood ratio, so it also defines a probability
+distribution over the possible assignments of a read: the probability of a
+path is proportional to the exponential of its value. The forward--backward
+form of the recursion, in which sums replace maxima, computes from this
+distribution the posterior probability of every placement and the
+probability that the read contains a D. \swig{} reports these probabilities
+with each call. Because the call and the probabilities come from one model,
+the call is a mode of the reported distribution: no other path is more
+probable (\cref{S-sec:posterior}).
+
+\subsection{Plausibility constraints}
+\label{sec:ov-constraints}
+
+The objective describes a read that contains one rearrangement. On truncated
+and chimeric reads, and on reads of a locus that the database does not
+contain (cross-locus reads), its maximum need not pair a V and a J that can
+form one rearrangement. \swig{} therefore applies three checks outside the
+objective: a minimum length for V and J hits (24 and 10 alignment columns),
+a rule that decides whether a V and a J can belong to one rearrangement, and
+a limit of 225 bases between the two. When the best path fails a check,
+\swig{} repeats the decision on subsets of the placements and reports the
+best result that passes (\cref{S-sec:guards}).
+
+One further constraint concerns the junction, which is delimited by two
+conserved codons: Cys104 near the end of the V and Trp/Phe118 in the J.
+\swig{} reports a junction only when the called V and J alignments cover
+these codons, apart from a bounded recovery of a Cys104 that lies just
+beyond the end of the V alignment.
+
+\subsection{Search and implementation}
+\label{sec:ov-search}
+
+The decision is exact over the placements that it receives, so the result
+also depends on the search that supplies them (\cref{fig:pipeline}). The
+read is first oriented by counting the 11-mers that each strand shares with
+the V and J germlines. For V, \swig{} retrieves candidate genes by counting
+shared $k$-mers and aligns their alleles in a band around the diagonals on
+which the shared $k$-mers lie. Because the alleles of one gene are nearly
+identical, it aligns one representative of each group of alleles that share
+a coordinate frame, derives bounds on the score of every other allele of the
+group, and skips the alleles that cannot rank among the best. Every J allele
+of the V's locus is then aligned downstream of the V. Finally, D alleles are
+aligned in a window that spans the junction between the V and the J. A D
+allele is admitted only if it matches the window exactly over at least four
+bases, and a 4-mer filter that cannot miss such an allele spares the
+alignment of the others. With a C database, the constant region is assigned
+after the decision, from the finished call, so that it cannot change the V,
+D and J calls.
+
+No step of this search is exhaustive, so each step is labelled with what it
+can lose (\cref{S-tab:search}). An \emph{exact} step returns the optimum. A
+\emph{lossless} step provably discards nothing that the model could choose;
+the score bounds and the 4-mer filter are lossless. A \emph{bounded} step
+discards only what lies outside a stated limit, such as the alignment band.
+A \emph{defined} step is a stated selection rule whose output defines the
+result. An \emph{approximate} step has a known gap to the optimum of the
+model. A \emph{heuristic} step is justified by measurement and not by proof;
+the strand test and the retrieval of V genes are heuristic.
+
+Alignments run on a SIMD kernel that aligns many read--allele pairs at once,
+one pair per lane of a vector register (inter-sequence
+vectorisation~\cite{rognes2011}). The kernel is implemented for AVX-512BW,
+AVX2, NEON and WebAssembly \code{simd128}, with portable lanes as a
+fallback. Every implementation reproduces the scores and tracebacks of a
+scalar implementation of the Gotoh algorithm bit for bit, so the output is
+byte-identical across backends, thread counts and platforms
+(\cref{S-sec:implementation}). \swig{} reads FASTA, FASTQ or AIRR tables and
+writes the AIRR Rearrangement schema~\cite{vanderheiden2018airr} with the
+posteriors. It is available as a command-line program, a Rust library and a
+WebAssembly module.
 
 % ===========================================================================
-\section{Evaluation}
+\section{Evaluation design}
 \label{sec:evaluation}
 
-All reads in this paper are simulated, so that every call can be scored
-against a known answer; none of the results is external biological
-validation (\cref{sec:discussion}). Two independent simulators are used, and
-\swig{}, IgBLAST 1.22 and MiXCR 4.7.0 are compared on the reads of both. The
-numbers in \cref{sec:results} and in the Supplementary Information were
-produced with \swig{} 0.39.7 for this paper. The rhesus panels of
-\cref{sec:genairr} are the IgBench run described below; its human sets are
-the GenAIRR grid behind the D-prior design analysis (\cref{S-sec:dpriors}),
-to which MiXCR 4.7.0 was added for this paper.
+This section describes the data, the scoring rules and the tool settings of
+the comparison. All reads in this paper are simulated, because only for
+simulated reads is the correct assignment of every read known; none of the
+results is an external biological validation (\cref{sec:discussion}). We use
+two independent simulators, GenAIRR and IgSim, which differ in how they
+generate reads and, more importantly, in what they count as a correct call.
+On the reads of both we compare \swig{} 0.39.7 with IgBLAST 1.22 and MiXCR
+4.7.0. The numbers in \cref{sec:results} and in the Supplementary
+Information were produced with \swig{} 0.39.7 for this paper.
 
-\paragraph{GenAIRR.} We use reads simulated by
-GenAIRR 2.3.1~\cite{konstantinovsky2024genairr} in two settings. Through the
-IgBench harness (\url{https://github.com/mashu/IgBench.jl}) we use the
-bundled \code{rhesus\_igh} experiment (rhesus macaque IGH alleles): two
-panels of 50,000 reads with IgM-like and IgG-like S5F~\cite{yaari2013s5f}
-SHM rates, polymerase indel probability 0.003, and a secreted constant
-region placed on the simulated sequence. With GenAIRR's built-in human
-references (IGH from OGRDB~\cite{lees2020ogrdb}: 198 V, 33 D and 7 J
-alleles; IGK 168 V and 8 J; IGL 181 V and 10 J; TRB 98 V, 3 D and 16 J) we
-simulate 11 sets of 10,000 reads (seed 7, forward strand): unmutated; S5F
-mutation at 2, 5 and 10\,\%; and \emph{realistic}: S5F at 5\,\% with a
-5$'$ primer trim of 0--15 and a 3$'$ trim of 0--5 bases, 0--1 polymerase
-indels, 0.2\,\% PCR and 0.2\,\% sequencing errors and 0--2 N calls (for
-TRB, the same artefacts without SHM). The D trim and N/P-length priors were
-designed on the IGH sets of this grid, so four IGH scenarios were simulated
-again from a disjoint part of GenAIRR's random stream (seed 50000) as an
-out-of-sample check (\cref{S-sec:dpriors}). In both settings every tool
-assigns against the same GenAIRR-exported V, D and J FASTA. GenAIRR's truth
-for each segment is a \emph{tie set}: each allele earns a point for every
-read base that matches it at the same germline index as the sampled allele,
-over the segment's true read region, and every allele at the maximum is in
-the set. A call $P$ against truth $G$ scores the Jaccard index
-$|P\cap G|/|P\cup G|$ per read and segment (both empty score 1, one empty
-0), IgBench's allele accuracy, and tables give the mean in \%. One correct
-allele against a two-allele tie therefore scores $\tfrac12$, as does a
-two-allele call against a one-allele truth.
+\subsection{GenAIRR reads and the tie-set score}
+\label{sec:eval-genairr}
 
-\paragraph{IgSim.} \swig{} ships a dependency-free Rust port of the
-generative model and presets of IgSim.jl~\cite{igsimjl}: uniform allele
-choice, exonuclease trims, N additions, random flanks, gated SHM with
-single-base indels, and instrument substitutions, with every read base
-labelled by its germline origin. The presets are \emph{easy} (no SHM),
-\emph{mid} (IgM-like: SHM on 40\,\% of reads at 0.5--7\,\%; 1-nt indels
-switched on for 8\,\% of reads at up to 0.2\,\% per base, so about 2\,\% carry
-one) and \emph{hard} (IgG-like: SHM on 97\,\% of reads, median about 7\,\%;
-indels on 15\,\% at up to 0.4\,\% per base, about 7\,\% carry one); we also run
-the \emph{hard} preset with the SHM rate fixed at 30\,\% on every read to
-probe the extreme.
-The germline is the human IGH set of IMGT/GENE-DB~\cite{giudicelli2005genedb}
-release 202632-7 (480 V, 48 D and 15 J alleles, of which \swig{} merges
-identical sequences to 457, 41 and 15), given to every tool as plain FASTA:
-\swig{} annotates the anchors itself. The simulator draws only V and J alleles
-with a trusted anchor, since a junction truth built on a guessed anchor would
-rest on the annotation it is meant to test. An allele call is correct when it
-is \emph{germline-equivalent} to the truth: the called allele contains the
-trimmed, pre-mutation germline that was simulated, so no method could
-separate the two from the read. Junctions are correct when they equal the
-true Cys104--Trp/Phe118 sequence; junction accuracy is over the reads whose
-two anchor codons are templated in the read (9,953, 8,130 and 4,667 of
-10,000 on \emph{easy}, \emph{mid} and \emph{hard}; 1,441 of 3,000 at 30\,\%
-SHM). Because the trade-off between finding short
-D remnants and leaving D-free junctions without a D can be moved at will, D
-accuracy is always reported together with the share of D-free reads that are
-given a D, and by remnant length.
+We use reads simulated by GenAIRR
+2.3.1~\cite{konstantinovsky2024genairr} in two groups of data sets.
 
-\paragraph{Comparisons and statistics.} Two callers or settings are compared
-on identical reads. For each metric \code{swig evaluate}, which scores any
-AIRR Rearrangement table and so serves every tool alike, computes the
-accuracy difference with its 95\,\% paired Wald interval and an exact
-two-sided McNemar test~\cite{mcnemar1947} on the reads only one of them gets
-right; we report the differences and the McNemar $p$-values.
- Posteriors are scored by reliability bins, the expected
-calibration error~\cite{naeini2015ece}
-$\text{ECE}=\sum_b n_b\,|\bar p_b-\bar e_b|/n$ and the Brier
+\paragraph{Rhesus panels.} The first group comes from the IgBench harness
+(\url{https://github.com/mashu/IgBench.jl}). We use its bundled
+\code{rhesus\_igh} experiment, which simulates from rhesus macaque IGH
+alleles. It consists of two panels of 50,000 reads, one with IgM-like and
+one with IgG-like rates of SHM under the S5F model~\cite{yaari2013s5f}. Both
+panels have a polymerase indel probability of 0.003 and a secreted constant
+region placed on the simulated sequence. We call them the IgM and the IgG
+panel.
+
+\paragraph{Human sets.} For the second group we simulated 11 sets of 10,000
+reads from GenAIRR's built-in human references (seed 7, forward strand). The
+IGH reference, from OGRDB~\cite{lees2020ogrdb}, has 198 V, 33 D and 7 J
+alleles; IGK has 168 V and 8 J alleles, IGL 181 V and 10 J, and TRB 98 V, 3
+D and 16 J. There are five IGH sets: an unmutated set, three sets with S5F
+mutation at 2, 5 and 10\,\%, and a \emph{realistic} set. The realistic set
+combines S5F mutation at 5\,\% with the artefacts of library preparation and
+sequencing: a 5$'$ primer trim of 0--15 bases, a 3$'$ trim of 0--5 bases,
+0--1 polymerase indels, 0.2\,\% PCR errors, 0.2\,\% sequencing errors and
+0--2 N calls. IGK and IGL each have a 5\,\% SHM set and a realistic set. TRB
+has an unmutated set and a realistic set with the same artefacts but without
+SHM.
+
+This grid of human sets is the one behind the design analysis of the D
+priors (\cref{S-sec:dpriors}); MiXCR 4.7.0 was added to it for this paper.
+Because the D trimming and N/P-length priors of \cref{sec:ov-objective} were
+designed on its IGH sets, we simulated four of the IGH scenarios again from
+a disjoint part of GenAIRR's random stream (seed 50000) as an out-of-sample
+check. In both groups, every tool assigns against the same V, D and J FASTA
+files exported from GenAIRR.
+
+\paragraph{Truth and score.} A read does not always determine its allele:
+after trimming and mutation, several alleles can match it equally well.
+GenAIRR therefore records the truth of each segment as a \emph{tie set}.
+Each allele earns a point for every read base, within the true region of the
+segment in the read, that matches the allele at the same germline index as
+in the sampled allele. The tie set contains every allele with the maximal
+number of points. The call of a tool for a segment is likewise a set of
+alleles, $P$. Against the tie set $G$ it scores the Jaccard index
+$|P\cap G|/|P\cup G|$ per read and segment; two empty sets score 1 and a
+single empty set scores 0. This is the allele accuracy of IgBench, and the
+tables give its mean in per cent. The score rewards a tool for reporting
+exactly the alleles that the read supports: one correct allele against a tie
+of two alleles scores $\tfrac12$, and so does a call of two alleles against
+a truth of one.
+
+\paragraph{Scoring MiXCR.} IgBLAST and \swig{} list all co-optimal alleles
+of a segment. MiXCR's AIRR output names a single allele per segment, which
+the Jaccard index cannot credit in full when the truth is a tie. We
+therefore score MiXCR in two ways. Its \emph{AIRR call} is the single allele
+of its AIRR output; this is what IgBench itself scores. Its \emph{tied hits}
+are all the alleles whose alignment score equals MiXCR's top score for the
+segment, which we obtain by exporting every hit with its score
+(\code{exportAlignments}). The tied hits give the fairer comparison with
+IgBLAST and \swig, and the one that is more favourable to MiXCR.
+
+\subsection{IgSim reads and germline-equivalent accuracy}
+\label{sec:eval-igsim}
+
+\paragraph{Simulator and presets.} \swig{} ships a dependency-free Rust port
+of the generative model and presets of IgSim.jl~\cite{igsimjl}. It chooses
+alleles uniformly, trims the segment ends as exonucleases do, adds N
+nucleotides and random flanks, applies SHM and single-base indels, each to a
+preset-dependent share of the reads, and adds instrument substitutions.
+Every read base is labelled with its germline origin. Three presets set the
+level of mutation. The \emph{easy} preset has no SHM. The \emph{mid} preset
+is IgM-like: 40\,\% of the reads carry SHM, at rates of 0.5--7\,\%, and
+1-nt indels are switched on for 8\,\% of the reads at up to 0.2\,\% per
+base, so that about 2\,\% of the reads carry one. The \emph{hard} preset is
+IgG-like: 97\,\% of the reads carry SHM, with a median rate of about 7\,\%,
+and indels are switched on for 15\,\% of the reads at up to 0.4\,\% per
+base, so that about 7\,\% carry one. To probe the extreme, we also run the
+\emph{hard} preset with the SHM rate fixed at 30\,\% on every read.
+
+\paragraph{Germline.} The germline is the human IGH set of
+IMGT/GENE-DB~\cite{giudicelli2005genedb}, release 202632-7. It has 480 V, 48
+D and 15 J alleles, which \swig{} reduces to 457, 41 and 15 by merging
+identical sequences. Every tool receives the set as plain FASTA; \swig{}
+locates the conserved codons Cys104 and Trp/Phe118 of the alleles itself.
+The simulator draws only V and J alleles whose conserved codon was located
+with confidence, because the true junction is defined by these codons: a
+truth built on a guessed position would rest on the annotation that it is
+meant to test.
+
+\paragraph{Correct calls.} An allele call is correct when it is
+\emph{germline-equivalent} to the truth: the called allele contains the
+germline sequence from which the segment was simulated, as it was after
+trimming and before mutation. No method could separate such an allele from
+the true one on the evidence of the read. A junction is correct when it
+equals the true sequence from Cys104 to Trp/Phe118. Junction accuracy is
+computed over the reads in which both conserved codons are templated, that
+is, present in the read as bases copied from the germline: 9,953, 8,130 and
+4,667 of 10,000 reads on \emph{easy}, \emph{mid} and \emph{hard}, and 1,441
+of 3,000 at 30\,\% SHM.
+
+\paragraph{D calls.} D accuracy alone can mislead. A tool that calls a D
+more readily finds more short remnants, but it also calls a D on more
+junctions that have none, and it can move along this trade-off at will. We
+therefore always report D accuracy together with the \emph{spurious D rate}:
+the share of \emph{D-free} reads, those without a D remnant, that
+nevertheless receive a D call. We also report D accuracy by the length of
+the remnant.
+
+\subsection{Tool settings}
+\label{sec:eval-tools}
+
+\paragraph{IgBLAST 1.22.0.} On the rhesus panels, IgBLAST ran with
+\code{-organism rhesus\_monkey}, \code{-ig\_seqtype Ig} and
+\code{-outfmt 19}, with the GenAIRR J auxiliary file and a rhesus IGHC
+region database. On the human GenAIRR sets it ran with
+\code{-organism human}, \code{-ig\_seqtype Ig} (\code{TCR} for TRB) and
+\code{-outfmt 19}, on \code{makeblastdb} databases of the same FASTA files
+and with a J auxiliary file. IGK and IGL have no D, but \code{igblastn}
+requires a D database; it was given the IGH D database, which it does not
+use for these loci. On the IgSim reads, IgBLAST ran with
+\code{-organism human} on custom databases of the IMGT set. Its auxiliary
+file lacked IGHJ5*03 and IGHJ5*04; we added them with the frame and CDR3 end
+of IGHJ5*01, which agree with the conserved codons that \swig{} locates.
+
+\paragraph{MiXCR 4.7.0.} MiXCR ran as IgBench runs it: \code{buildLibrary}
+on the GenAIRR FASTA files, then \code{align} with the
+\code{generic-amplicon} preset and floating alignment boundaries, then
+\code{exportAirr}. The left boundary floats at the start of the V. The right
+boundary floats at the C or, on the human reads, which end in the J, at the
+end of the J. MiXCR requires a licence from MiLaboratories
+(\code{MI\_LICENSE} or a \code{mi.license} file). On the IgSim reads, MiXCR
+ran with the options of the human GenAIRR sets, on a \code{buildLibrary}
+library of the same IMGT FASTA. \code{buildLibrary} drops every sequence
+that contains a wildcard base. Six V alleles of the IMGT set contain 1--4
+unsequenced N bases, and they are the true V of 1.3--1.5\,\% of the reads.
+So that MiXCR could call every allele, these bases were filled in MiXCR's
+copy from the closest allele. On IgSim, MiXCR is scored by its AIRR call,
+because germline-equivalent scoring already credits an allele that the read
+cannot tell apart from the truth.
+
+\paragraph{\swig{} 0.39.7.} \swig{} ran with its default calling profile
+(R-optimized). On the rhesus panels it started from a prepared reference,
+and on the human GenAIRR sets from FASTA files that give the conserved codon
+of each allele in its header. On the IgSim reads it started from plain
+FASTA, as described above.
+
+\subsection{Statistics, hardware and timing}
+\label{sec:eval-stats}
+
+\paragraph{Statistics.} Two tools, or two settings of \swig, are always
+compared on identical reads. The command \code{swig evaluate} scores any
+table in the AIRR Rearrangement format and therefore treats every tool
+alike. For each metric it computes the difference in accuracy with its
+95\,\% paired Wald interval, and an exact two-sided McNemar
+test~\cite{mcnemar1947} on the reads that only one of the two gets right. We
+report the differences and the McNemar $p$-values. Posterior probabilities
+are assessed by their calibration: reads are grouped into bins by their
+reported probability, and we report the expected calibration
+error~\cite{naeini2015ece},
+$\text{ECE}=\sum_b n_b\,|\bar p_b-\bar e_b|/n$, where bin $b$ holds $n_b$ of
+the $n$ reads, $\bar p_b$ is their mean reported probability and
+$\bar e_b$ the observed frequency of the event, together with the Brier
 score~\cite{brier1950}.
 
-\paragraph{Tools and hardware.} On the IgBench panels IgBLAST 1.22.0 was
-run with \code{-organism rhesus\_monkey}, \code{-ig\_seqtype Ig},
-\code{-outfmt 19}, the GenAIRR J auxiliary file and a rhesus IGHC region
-database; on the human GenAIRR sets with \code{-organism human},
-\code{-ig\_seqtype Ig} (\code{TCR} for TRB) and \code{-outfmt 19}, on
-\code{makeblastdb} databases of the same FASTA with a J auxiliary file; for
-IGK and IGL, which have no D, it was given the IGH D database, which
-\code{igblastn} requires but does not use there.
-MiXCR 4.7.0 was run as IgBench runs it: \code{buildLibrary} on the GenAIRR
-FASTAs, then \code{align} with the \code{generic-amplicon} preset and
-floating alignment boundaries (at the V start, and at the C, or on the human
-reads, which end in J, at the J end), then \code{exportAirr}; it requires a
-Mi Laboratory licence (\code{MI\_LICENSE} or a \code{mi.license} file). Its
-AIRR call names a single allele per segment, which the Jaccard score cannot
-credit fully when the truth is a tie, so we also export every hit with its
-score (\code{exportAlignments}) and report MiXCR counting every hit tied with
-its top score (\emph{tied hits}), the fairer comparison with IgBLAST and
-\swig{}, which list co-optimal alleles; IgBench's own MiXCR result is the AIRR
-call. \swig{} 0.39.7 ran with its default (R-optimized) calling profile, from
-a prepared reference on the IgBench panels and from FASTA with each allele's
-anchor in its header on the human sets. On IgSim
-comparisons IgBLAST used \code{-organism human} with custom IMGT databases;
-its auxiliary file lacked IGHJ5*03 and IGHJ5*04, which we added with the
-frame and CDR3 end of IGHJ5*01 (matching \swig{}'s anchors). MiXCR ran with
-the options of the human GenAIRR sets from a \code{buildLibrary} library of
-the same IMGT FASTA. \code{buildLibrary} drops any sequence with a wildcard
-base, so in MiXCR's copy the 1--4 unsequenced N bases of six V alleles, the
-true V of 1.3--1.5\,\% of reads, were filled from the closest allele, and
-MiXCR could call every allele. Germline-equivalent scoring already credits
-an allele that the read cannot tell apart from the truth, so on IgSim MiXCR
-is scored by its AIRR call.
-
-Every run, for accuracy and for speed, used one machine: an Intel Core
-i9-13980HX laptop (eight performance cores with two hardware threads each and
-16 efficiency cores; AVX2, no AVX-512; 62\,GB of memory; Linux, on mains
-power). Timed runs were made one at a time, with the tool's own thread
-option set to 1, 4 or 8 and every command restricted to the performance
-cores, so that the three tools ran on the same cores: on the IgBench panels
-and the human GenAIRR sets they shared the 16 hardware threads of the eight
-performance cores, and for the IgSim timings of \cref{tab:speed} each thread
-had a performance core of its own. The machine ran a desktop session, and
-timed commands had network access, so their times include IgBLAST's usage
-report to NCBI and MiXCR's online licence check. All timings are wall-clock
-times of the whole command (IgBLAST: \code{igblastn}; MiXCR: \code{align},
-Java start-up included; \swig{}: the CLI, reference preparation included)
-unless stated. IgBench GenAIRR runs used eight threads, the human GenAIRR
-sets four.
+\paragraph{Hardware and timing.} Every run, for accuracy and for speed, used
+one machine: a laptop with an Intel Core i9-13980HX processor, which has
+eight performance cores with two hardware threads each and 16 efficiency
+cores and supports AVX2 but not AVX-512. The machine had 62\,GB of memory
+and ran Linux on mains power. Timed runs were made one at a time. Each
+tool's own thread option was set to 1, 4 or 8, and every command was
+restricted to the performance cores, so that the three tools ran on the same
+cores. On the rhesus panels and the human GenAIRR sets, the tools shared the
+16 hardware threads of the eight performance cores; for the IgSim timings of
+\cref{tab:speed}, each thread had a performance core of its own. The rhesus
+panels were run on eight threads and the human GenAIRR sets on four. Unless
+stated otherwise, a timing is the wall-clock time of the whole command:
+\code{igblastn} for IgBLAST; \code{align}, including the start-up of Java,
+for MiXCR; and the command-line program, including the preparation of the
+reference, for \swig. The machine ran a desktop session, and the timed
+commands had network access, so their times include IgBLAST's usage report
+to NCBI and MiXCR's online licence check.
 
 % ===========================================================================
 \section{Results}
 \label{sec:results}
 
-\subsection{Accuracy against ambiguity-aware truth: IgBLAST and MiXCR}
+We first report allele accuracy on the reads of the two simulators
+(\cref{sec:genairr,sec:igsim}), then the behaviour on reads that should
+receive no call (\cref{sec:specificity}), then speed (\cref{sec:speed}), and
+finally the tests of the individual terms of the model
+(\cref{sec:diagnostics}). Differences are given in percentage points
+(points).
+
+\subsection{Allele accuracy on GenAIRR reads}
 \label{sec:genairr}
 
-\paragraph{Rhesus IGH panels (IgBench).} \Cref{tab:genairr,fig:genairr}
-compare the three tools on the IgBench GenAIRR panels. \swig{} has the
-highest V and D score on both IgM and IgG; J is within 0.04 points of
-IgBLAST on IgM and ahead by 0.4 on IgG. The margin is largest for D and grows
-with mutation: 2.2 points over IgBLAST on IgM and 5.9 on IgG. How MiXCR is
-scored matters. Its AIRR call, which IgBench scores, names one allele per
-segment and earns at most $\tfrac12$ against a two-allele tie; it trails
-\swig{} on D by 14.7 and 17.5 points. Counting every hit tied with its top
-score, MiXCR reaches 94.45 and 86.20\,\% on D, 3.6 and 7.0 points below
-\swig{} and 1.4 and 1.2 below IgBLAST, comes within 0.1 points of \swig{} on
-V, and is level with both on J for IgM and between them for IgG.
+\paragraph{Rhesus IGH panels.} On both rhesus panels \swig{} has the highest
+V and D scores of the three tools (\cref{tab:genairr,fig:genairr}). Its J
+score is 0.04 points below IgBLAST's on the IgM panel and 0.4 points above
+it on the IgG panel. The lead of \swig{} is largest for D and grows with
+mutation: 2.2 points over IgBLAST on IgM and 5.9 points on IgG.
+
+The comparison with MiXCR depends on how MiXCR is scored
+(\cref{sec:eval-genairr}). Its AIRR call names one allele per segment and
+earns at most $\tfrac12$ against a tie of two alleles. Scored in this way,
+as in IgBench, MiXCR is 14.7 and 17.5 points below \swig{} on D. With its
+tied hits MiXCR reaches a D score of 94.45\,\% on IgM and 86.20\,\% on IgG,
+which is still 3.6 and 7.0 points below \swig{} and 1.4 and 1.2 points below
+IgBLAST. On V, MiXCR's tied hits come within 0.1 points of \swig. On J they
+are level with both other tools on IgM and lie between them on IgG.
 
 \begin{table}[tbp]
 \centering
-\caption{Accuracy against GenAIRR's ambiguity-aware truth on the IgBench
-rhesus IGH panels (mean Jaccard allele score, \%), 50,000 reads per panel.
-MiXCR 4.7.0 is scored by its AIRR call, as in IgBench, and by its tied hits
-(every hit tied with its top score). Bold: best of each segment across
-tools.}
+\caption{Allele scores on the rhesus IGH panels of IgBench: the mean Jaccard
+index (\%) between each tool's call and GenAIRR's tie set, on 50,000 reads
+per panel. MiXCR 4.7.0 is scored by its AIRR call, as in IgBench, and by its
+tied hits (every hit tied with its top score). Bold marks the best score of
+each segment on each panel.}
 \label{tab:genairr}
 \footnotesize
 \setlength{\tabcolsep}{3pt}
@@ -577,7 +842,7 @@ IgG & 99.77 & 87.36 & 98.98 & 97.87 & 75.77 & 96.76 & 99.73 & 86.20 & 99.18 & \t
   symbolic x coords={V,D,J},
   xtick=data, ymin=70, ymax=101,
   enlarge x limits=0.22,
-  ylabel={allele Jaccard vs sim (\%)},
+  ylabel={mean Jaccard score (\%)},
   tick label style={font=\scriptsize}, label style={font=\small},
   title style={font=\small\bfseries},
   grid=major, grid style={gray!20},
@@ -598,38 +863,47 @@ IgG & 99.77 & 87.36 & 98.98 & 97.87 & 75.77 & 96.76 & 99.73 & 86.20 & 99.18 & \t
 \node[anchor=north] at ($(igbench c1r1.south)!0.5!(igbench c2r1.south)+(0,-0.7cm)$)
   {\pgfplotslegendfromname{igbenchlegend}};
 \end{tikzpicture}
-\caption{IgBench allele-accuracy chart: mean Jaccard score of each tool's
-V, D and J call against GenAIRR's tie set on the rhesus IgM and IgG panels
-(50,000 reads each). MiXCR is shown counting every hit tied with its top
-score (dark green) and by its single AIRR call (light green), which IgBench
-scores; the D gap is the main difference among the tools.}
+\caption{Allele scores on the rhesus IgM and IgG panels (the data of
+\cref{tab:genairr}): the mean Jaccard index between each tool's V, D and J
+call and GenAIRR's tie set, on 50,000 reads per panel. MiXCR is shown with
+its tied hits (dark green) and with its single AIRR call (light green),
+which is what IgBench scores. The tools differ mainly in D.}
 \label{fig:genairr}
 \end{figure}
 
-\paragraph{Human IG and TR sets.} \Cref{tab:genairr-human} extends the
-comparison to the 11 human GenAIRR sets of four loci. \swig{} has the highest
-V, D and J score on every IG set. The margin is again largest for IGH D and
-grows with mutation (\cref{fig:genairr-human}): over IgBLAST from 0.7 points
-on unmutated reads to 6.0 at 10\,\% SHM, and 2.4 on the realistic set; over
-MiXCR's tied hits from 2.3 to 7.8 points, and 4.2 on the realistic set.
-MiXCR's AIRR call scores lower still (IGH D 74.6--87.7\,\%, V
-95.1--99.5\,\%). On TRB \swig{} has the best D (99.9 and 99.5\,\% against at
-most 98.2\,\%) and matches IgBLAST on V, but trails it by 0.04 and 0.05
-points on J: on ten reads of each TRB set the J is trimmed 31--42 bases into its
-germline, past its Trp/Phe codon, and keeps only 8--19 bases, which fall
-below the minimum J hit or fail the V--J pairing rule of the plausibility
-constraints (\cref{S-sec:guards}), so no J is called. The IGH sets include
-the reads the D priors were designed on; on IGH reads disjoint from them
-\swig{} leads both tools on V, D and J in every scenario, IgBLAST on D by
-0.9--6.3 points and MiXCR's tied hits by 2.0--7.7 (\cref{S-tab:oos}).
+\paragraph{Human IG and TR sets.} The 11 human sets extend the comparison to
+four loci (\cref{tab:genairr-human}). On every IG set, \swig{} has the
+highest V, D and J scores. As on the rhesus panels, its lead is largest for
+IGH D and grows with mutation (\cref{fig:genairr-human}). Over IgBLAST the
+lead rises from 0.7 points on unmutated reads to 6.0 points at 10\,\% SHM,
+and it is 2.4 points on the realistic set. Over MiXCR's tied hits it rises
+from 2.3 to 7.8 points, and it is 4.2 points on the realistic set. MiXCR's
+AIRR call scores lower still: on the IGH sets, 74.6--87.7\,\% for D and
+95.1--99.5\,\% for V.
+
+On TRB, \swig{} has the best D score (99.9 and 99.5\,\%, against at most
+98.2\,\% for the other tools) and the same V score as IgBLAST, but its J
+score is 0.04 and 0.05 points below IgBLAST's. The cause is ten reads in
+each TRB set whose J is trimmed 31--42 bases into its germline, past its
+Trp/Phe codon, so that only 8--19 bases of the J remain. Such a remnant
+falls below the minimum J hit or fails the V--J pairing rule of the
+plausibility constraints (\cref{sec:ov-constraints,S-sec:guards}), and
+\swig{} calls no J.
+
+The IGH sets include the reads on which the D priors were designed, so their
+scores could flatter \swig. The out-of-sample reads show that they do not:
+on IGH reads disjoint from the design sets, \swig{} leads both tools on V, D
+and J in every scenario. Its D score is 0.9--6.3 points above IgBLAST's and
+2.0--7.7 points above that of MiXCR's tied hits (\cref{S-tab:oos}).
 
 \begin{table}[tbp]
 \centering
-\caption{Accuracy against GenAIRR's ambiguity-aware truth on human sets
-(mean Jaccard allele score, \%), 10,000 reads per set. MiXCR 4.7.0 counts
-every hit tied with its top score; its AIRR call is in
-\cref{fig:genairr-human} and the text. Bold: best of the segment across
-tools. A dash: the locus has no D.}
+\caption{Allele scores on the human GenAIRR sets: the mean Jaccard index
+(\%) between each tool's call and GenAIRR's tie set, on 10,000 reads per
+set. MiXCR 4.7.0 is scored by its tied hits (every hit tied with its top
+score); its AIRR call is in \cref{fig:genairr-human} and the text. Bold
+marks the best score of each segment on each set. A dash means that the
+locus has no D.}
 \label{tab:genairr-human}
 \footnotesize
 \setlength{\tabcolsep}{3.2pt}
@@ -675,82 +949,113 @@ TRB, realistic   & \textbf{99.94} & 97.65 & \textbf{99.92} & 99.67 & 95.29 & 99.
 \addlegendentry{MiXCR 4.7.0, AIRR call}
 \end{axis}
 \end{tikzpicture}
-\caption{Human IGH D accuracy on GenAIRR reads as SHM increases (mean
-Jaccard score against the truth's tie set; 10,000 reads per rate). MiXCR is
-shown counting every hit tied with its top score and by its single AIRR
-call.}
+\caption{Human IGH D score on GenAIRR reads as the SHM rate increases (the
+mean Jaccard index against GenAIRR's tie sets; 10,000 reads per rate). MiXCR
+is shown with its tied hits and with its single AIRR call.}
 \label{fig:genairr-human}
 \end{figure}
 
-\subsection{Germline-equivalent accuracy, D-free junctions and junctions}
+\subsection{Accuracy on IgSim reads: alleles, spurious D calls and junctions}
 \label{sec:igsim}
 
-\Cref{tab:igsim} compares \swig, IgBLAST and MiXCR on IgSim reads against
-the IMGT human IGH set, read by read. \swig{} calls the V allele correctly
-more often than both on unmutated, IgM-like and IgG-like reads ($p<10^{-6}$
-for each comparison). It calls the D allele correctly more often on
-unmutated and IgG-like reads ($+2.2$ points over IgBLAST and $+4.7$ over
-MiXCR on \emph{hard}, $p<10^{-12}$), and the J allele on IgG-like reads. It
-also gives a D to far fewer D-free junctions (18.4 against 49.4 and
-61.4\,\% on \emph{mid}, 15.8 against 30.8 and 39.3\,\% on \emph{hard}). On
-remnants of 8 or more nucleotides \swig's D is better than both on every
-preset.
+\Cref{tab:igsim} compares the three tools, read by read, on IgSim reads of
+the IMGT human IGH set. The \emph{easy}, \emph{mid} and \emph{hard} presets
+hold unmutated, IgM-like and IgG-like reads (\cref{sec:eval-igsim}).
 
-MiXCR's D is below both other tools on every preset (98.45, 91.42 and
-82.25\,\% on \emph{easy}, \emph{mid} and \emph{hard}). Its V allele
-accuracy is level with IgBLAST's up to IgM-like mutation (99.51 and 98.17
-against 99.47 and 98.06\,\%; $p\ge0.14$) and below both on IgG-like reads,
-where it leaves 167 reads (1.7\,\%) unassigned. At 30\,\% SHM it assigns
-only 900 of 3,000 reads. That is also why it gives a D to the fewest D-free
-junctions there (25.6\,\%): an unassigned read receives no D.
+\paragraph{Alleles.} \swig{} calls the V allele correctly more often than
+both other tools on \emph{easy}, \emph{mid} and \emph{hard} ($p<10^{-6}$ for
+each comparison). It calls the D allele correctly more often on \emph{easy}
+and \emph{hard}: on \emph{hard} its D accuracy is 2.2 points above IgBLAST's
+and 4.7 points above MiXCR's ($p<10^{-12}$). It calls the J allele correctly
+more often on \emph{hard}. The exception is D on \emph{mid}, where IgBLAST
+is 0.5 points ahead of \swig; we explain this lead below.
 
-IgBLAST's 0.5-point higher D accuracy on \emph{mid}
-($p=0.017$) comes entirely from remnants of 1--3 nucleotides (74.3 against
-36.6\,\%), which no method can identify: most D alleles contain so short a
-remnant and are therefore germline-equivalent to it (on \emph{mid}, 36 of the
-48 IMGT D names on average), so a tool that always calls a D is mostly
-credited there, and pays for it on D-free junctions.
+MiXCR's D accuracy is below that of both other tools on every preset: 98.45,
+91.42 and 82.25\,\% on \emph{easy}, \emph{mid} and \emph{hard}. Its V
+accuracy is level with IgBLAST's on \emph{easy} and \emph{mid} (99.51
+against 99.47\,\% and 98.17 against 98.06\,\%; $p\ge0.14$). On \emph{hard}
+it is below both, and MiXCR leaves 167 reads (1.7\,\%) unassigned.
 
-IgBLAST reports more exact junctions (99.94 against 99.53\,\% on \emph{mid},
-98.33 against 96.81\,\% on \emph{hard}); MiXCR's are 99.72 and 96.29\,\%
-exact, between the two on \emph{mid} and below both on \emph{hard}. This is
-the cost of \swig's
-plausibility constraints, which report a junction only from conserved
-anchors that the called V and J alignments actually align: without them
-\swig's junctions are 99.98 and 99.66\,\% exact (\cref{S-tab:ablation}), above
-IgBLAST's. The constraints in turn withhold junctions from reads whose
-anchor codon is not templated in the read (\emph{hard}: 20.9\,\% of such
-reads receive one, against 98.0\,\% without the constraints and 98.5\,\% for
-IgBLAST).
+\paragraph{Spurious D calls.} The tools differ most in how often they call a
+D where there is none. On \emph{mid}, \swig{} gives a D to 18.4\,\% of the
+D-free reads, IgBLAST to 49.4\,\% and MiXCR to 61.4\,\%. On \emph{hard} the
+three rates are 15.8, 30.8 and 39.3\,\%. At the same time, on remnants of 8
+or more nucleotides, the D accuracy of \swig{} is higher than that of both
+tools on every preset.
 
-At a fixed 30\,\% SHM, beyond IgSim's IgG-like regime, the picture is mixed.
-\swig{} keeps a large lead over IgBLAST on D ($+7.3$ points) and J
-($+13.6$), but IgBLAST is better on V allele ($+3.4$) and V gene (95.0
-against 89.7\,\%) and on junctions. MiXCR, which assigns 30\,\% of these
-reads, is below both on every segment. \swig{} leaves 4.4\,\% of these reads uncalled (133 of 3,000),
-106 of them (3.5\,\% of all reads) because its strand test chose the wrong
-strand, as the strand test and seed
-retrieval run out of intact $k$-mers (\cref{sec:discussion}); every read it
-calls is correctly oriented.
+IgBLAST's lead on \emph{mid} is the other side of its readiness to call a
+D. Its D accuracy there is 0.5 points higher than that of \swig{}
+($p=0.017$), and the whole difference comes from remnants of 1--3
+nucleotides, on which IgBLAST is counted correct
+for 74.3\,\% of the reads and \swig{} for 36.6\,\%. No method can identify a
+remnant this short. Most D alleles contain it and are therefore
+germline-equivalent to the truth: on \emph{mid}, 36 of the 48 IMGT D names
+on average. A tool that always calls a D is thus mostly counted correct on
+these reads, and it pays for this on the D-free reads.
+
+\Cref{fig:operating} shows D accuracy and the spurious D rate together. A
+tool can raise its D accuracy by calling a D more often, at the price of a
+higher spurious D rate, so a better method lies higher and further to the
+left. On \emph{hard}, the default of \swig{} is better than IgBLAST on both
+axes: 86.91 against 84.76\,\% D accuracy, and a spurious D rate of 15.8
+against 30.8\,\%. On \emph{mid}, the default has a spurious D rate that is
+31 points lower, for 0.5 points less D accuracy. The trade-off can be moved
+through the prior odds of a D: the calling profile \code{sensitive-d}, which
+raises these odds, is better than IgBLAST on both axes on \emph{mid} as well
+(94.43 against 93.92\,\% D accuracy, 35.0 against 49.4\,\% spurious D).
+MiXCR lies below and to the right of both other tools on both presets, with
+91.42\,\% D accuracy at a spurious D rate of 61.4\,\% on \emph{mid}, and
+82.25 and 39.3\,\% on \emph{hard}. The other \swig{} settings in the figure
+belong to the ablations of \cref{S-sec:ablation}.
+
+\paragraph{Junctions.} IgBLAST reports the exact junction more often than
+\swig: for 99.94 against 99.53\,\% of the reads on \emph{mid}, and for 98.33
+against 96.81\,\% on \emph{hard}. MiXCR's junctions are exact for 99.72 and
+96.29\,\%, between the two on \emph{mid} and below both on \emph{hard}. The
+deficit of \swig{} is the cost of its plausibility constraints, which report
+a junction only when the called V and J alignments cover the conserved
+codons (\cref{sec:ov-constraints}). Without the constraints, \swig's
+junctions are exact for 99.98 and 99.66\,\% of the reads
+(\cref{S-tab:ablation}), more than IgBLAST's. In return, the constraints
+withhold junctions from reads that do not have a complete one. Among the
+\emph{hard} reads with a conserved codon that is not templated, \swig{}
+reports a junction for 20.9\,\%; without the constraints it reports one for
+98.0\,\%, and IgBLAST reports one for 98.5\,\%.
+
+\paragraph{Extreme mutation.} At a fixed SHM rate of 30\,\%, beyond the
+IgG-like regime of the \emph{hard} preset, the picture is mixed. \swig{}
+keeps a large lead over IgBLAST on D ($+7.3$ points) and on J ($+13.6$
+points). IgBLAST is better on the V allele ($+3.4$ points), on the V gene
+(95.0 against 89.7\,\%) and on junctions. \swig{} leaves 133 of the 3,000
+reads (4.4\,\%) uncalled. For 106 of them (3.5\,\% of all reads) its strand
+test chose the wrong strand, because the strand test and the seed retrieval
+run out of intact $k$-mers at this mutation rate (\cref{sec:discussion}).
+Every read that \swig{} does call is correctly oriented. MiXCR assigns only
+900 of the 3,000 reads (30\,\%) and is below both other tools on every
+segment. Its low assignment rate is also why it has the lowest spurious D
+rate there (25.6\,\%): an unassigned read receives no D.
 
 \begin{table}[tbp]
 \centering
-\caption{IgSim reads against the IMGT human IGH set (germline-equivalent
-accuracy, \%), forward strand; 10,000 reads per preset and 3,000 at 30\,\% SHM.
-``D, $\ge 8$'': reads whose D remnant is at least 8\,nt. ``D-free given a
-D'': share of reads without a D remnant that receive a D call (lower is
-better); an unassigned read counts as receiving none. MiXCR 4.7.0 is scored
-by its AIRR call and left 4, 167 and 2,100 reads unassigned on \emph{mid},
-\emph{hard} and at 30\,\% SHM. Bold: best of the three tools and
-significantly better than each of the other two in a paired comparison
-(exact McNemar $p<0.01$); V-gene accuracy was tested separately with the
-same rule.}
+\caption{Accuracy on IgSim reads of the IMGT human IGH set (\%; forward
+strand; 10,000 reads per preset and 3,000 at 30\,\% SHM). The allele and
+gene columns give germline-equivalent accuracy. ``D, $\ge 8$'': D allele
+accuracy on the reads whose D remnant is at least 8\,nt. ``Spurious D'': the
+share of reads without a D remnant that receive a D call (lower is better;
+called ``D-free given a D'' in the Supplementary Information); an unassigned
+read counts as receiving none. ``Junction'': exact junctions among the reads
+in which both conserved codons are templated. MiXCR 4.7.0 is scored by its
+AIRR call and left 4, 167 and 2,100 reads unassigned on \emph{mid},
+\emph{hard} and at 30\,\% SHM. Bold marks a value that is the best of the
+three tools and significantly better than each of the other two in a paired
+comparison (exact McNemar $p<0.01$); V-gene accuracy was tested separately
+with the same rule.}
 \label{tab:igsim}
 \footnotesize
 \setlength{\tabcolsep}{4pt}
 \begin{tabular}{@{}ll rrrrrrr@{}}
 \toprule
-Preset & Tool & V allele & V gene & D allele & D, $\ge 8$ & D-free given a D & J allele & Junction \\
+Preset & Tool & V allele & V gene & D allele & D, $\ge 8$ & Spurious D & J allele & Junction \\
 \midrule
 \multirow{3}{*}{easy}
  & IgBLAST & 99.47 & 99.97 & 99.26 & 99.37 & 0.0 & 99.93 & 100.00 \\
@@ -775,24 +1080,12 @@ Preset & Tool & V allele & V gene & D allele & D, $\ge 8$ & D-free given a D & J
 \end{tabular}
 \end{table}
 
-\Cref{fig:operating} places these D calls on the trade-off between D accuracy
-and D-free specificity, which a tool can move by calling a D more or less
-often. On \emph{hard} the default lies above and to the left of IgBLAST
-(86.91 against 84.76\,\% D accuracy, 15.8 against 30.8\,\% of D-free reads
-given a D). On \emph{mid} it gives a D to 31 points fewer D-free reads for
-0.5 points less D accuracy, and raising the prior odds of a D (calling
-profile \code{sensitive-d}) beats IgBLAST on both axes (94.43 against
-93.92\,\%, 35.0 against 49.4\,\%). MiXCR lies below and to the right of
-both tools on both presets (91.42\,\% D accuracy with 61.4\,\% of D-free
-reads given a D on \emph{mid}, 82.25 and 39.3\,\% on \emph{hard}). The other
-settings in the figure are ablated in \cref{S-sec:ablation}.
-
 \begin{figure}[t]
 \centering
 \begin{tikzpicture}
 \begin{groupplot}[group style={group size=2 by 1,horizontal sep=1.6cm},
   width=0.46\linewidth,height=5.2cm,
-  xlabel={D-free reads given a D (\%)},
+  xlabel={spurious D rate (\% of D-free reads)},
   tick label style={font=\scriptsize},label style={font=\small},title style={font=\small},
   grid=major,grid style={gray!20},xmin=0,xmax=100,every axis plot/.append style={mark size=2.2pt},
   nodes near coords,point meta=explicit symbolic,
@@ -810,48 +1103,63 @@ settings in the figure are ablated in \cref{S-sec:ablation}.
 \addplot[only marks,mark=diamond*,cMix] coordinates {(39.27,82.25)[MiXCR]};
 \end{groupplot}
 \end{tikzpicture}
-\caption{D accuracy against D-free specificity on IgSim reads. Circles are
-\swig{} settings and calling profiles, the triangle is IgBLAST 1.22 and the
-diamond MiXCR 4.7.0. A tool can buy D accuracy by calling a D more often;
-better models lie up and to the left.}
+\caption{D allele accuracy against the spurious D rate on IgSim reads.
+Circles are settings and calling profiles of \swig{} (``default'' is the
+setting of \cref{tab:igsim}; \code{truth} and \code{igblast} are calling
+profiles of \swig, not other tools), the triangle is IgBLAST 1.22 and the
+diamond MiXCR 4.7.0. A tool can buy D accuracy by calling a D more often, so
+better methods lie higher and further to the left.}
 \label{fig:operating}
 \end{figure}
 
-\subsection{Specificity}
+\subsection{Specificity on reads that should receive no call}
 \label{sec:specificity}
 
-\swig{} made no call on 2,000 random reads with the length distribution of
-the \emph{mid} set, and none on 1,000 IGK reads assigned against the IGH
-database: the anchor gate requires a V or J hit at $E\le10^{-3}$. IgBLAST,
-whose default E-value threshold for saving hits is a permissive 20, gave a V to
-1,272 random reads (and a junction to 93) and an IGHV to 997 of the IGK
-reads. Filtering its V hits at $E\le10^{-3}$ removes every random-read call
-but keeps an IGHV on 470 of the 1,000 IGK reads. MiXCR, like \swig, made no
-call on either set.
+A tool should make no call on a read that holds no rearrangement of the loci
+in its database. We tested two sets of such reads: 2,000 random reads with
+the length distribution of the \emph{mid} set, and 1,000 IGK reads assigned
+against the IGH database. \swig{} made no call on either set, because it
+calls a read only when its path contains an anchor, a V or J hit at
+$E\le10^{-3}$ (\cref{sec:ov-objective}). MiXCR also made no call on either
+set. IgBLAST, whose default E-value threshold for saving hits is a
+permissive 20, gave a V to 1,272 of the random reads, and a junction to 93,
+and it gave an IGHV to 997 of the 1,000 IGK reads. Filtering IgBLAST's V
+hits at $E\le10^{-3}$ removes every call on the random reads but still keeps
+an IGHV on 470 of the 1,000 IGK reads.
 
 \subsection{Speed}
 \label{sec:speed}
 
-On the IgBench GenAIRR panels (\cref{fig:igbench-timing}; eight threads,
-scored annotate pass only) \swig{} assigned 16,200--16,500 reads per second,
-3.3--3.6 times MiXCR's 4,600--4,900 and about 50 times IgBLAST's 320--330.
-On nine of the human GenAIRR sets (\cref{S-tab:genairr-speed}; four threads,
-one run each) it assigned 15,400--28,500 reads per second, 86--153 times
-IgBLAST's throughput and 8.3--13.4 times MiXCR's. \Cref{tab:speed} gives
-provisional throughput of the three tools on the 10,000-read IgSim sets on
-one, four and eight threads, as wall clock of the whole command; \swig's
-includes database preparation (25--28\,ms for the IMGT IGH set, every allele
-annotated on load). Each command also has a fixed cost: a one-read run took
-0.05\,s for \swig, 0.4--1.5\,s for IgBLAST (0.05\,s with its usage report
-switched off) and 1.7--4.6\,s for MiXCR across our timing passes. On four
-threads \swig{} assigns 11,100--11,700 reads per second with posteriors, 82
-times IgBLAST's throughput and 12--13 times MiXCR's on the same reads and
-cores, and 14,400--14,800 without them; posteriors add 18--33\,\% to the run
-time. From one thread to eight, \swig's throughput grows 5.6--6.1-fold,
-IgBLAST's 7.4--7.7-fold and MiXCR's 3.7--5.1-fold. On one thread the default
-AVX2 kernel gives 2.3--2.4 times the throughput of the scalar kernel, and
-every SIMD backend and thread count produces byte-identical output
-(\cref{S-sec:kernels}).
+\swig{} had the highest throughput of the three tools on every data set and
+thread count that we timed.
+
+\paragraph{GenAIRR sets.} On the two rhesus panels, on eight threads,
+\swig{} assigned 16,200--16,500 reads per second
+(\cref{fig:igbench-timing}). This is 3.3--3.6 times the throughput of MiXCR
+(4,600--4,900 reads per second) and about 50 times that of IgBLAST
+(320--330). These rates cover only the annotation pass that is scored. On
+nine of the human GenAIRR sets, on four threads and with one run per set,
+\swig{} assigned 15,400--28,500 reads per second, 86--153 times IgBLAST's
+throughput and 8.3--13.4 times MiXCR's (\cref{S-tab:genairr-speed}).
+
+\paragraph{IgSim sets.} \Cref{tab:speed} gives the provisional throughput of
+the three tools on the 10,000-read IgSim sets, on one, four and eight
+threads, as the wall-clock time of the whole command. For \swig{} the whole
+command includes the preparation of the database, which takes 25--28\,ms for
+the IMGT IGH set with every allele annotated on load. Each command also has
+a fixed cost, which we measured with a one-read run: 0.05\,s for \swig;
+0.4--1.5\,s for IgBLAST, or 0.05\,s with its usage report switched off; and
+1.7--4.6\,s for MiXCR across our timing passes. On four threads \swig{}
+assigns 11,100--11,700 reads per second with posteriors, which is 82 times
+IgBLAST's throughput and 12--13 times MiXCR's on the same reads and cores.
+Without posteriors it assigns 14,400--14,800 reads per second on four
+threads; posteriors add 18--33\,\% to the run time.
+
+\paragraph{Scaling and vectorisation.} From one thread to eight, the
+throughput of \swig{} grows 5.6--6.1-fold, that of IgBLAST 7.4--7.7-fold and
+that of MiXCR 3.7--5.1-fold. On one thread, the default AVX2 kernel gives
+2.3--2.4 times the throughput of the scalar kernel. Every SIMD backend and
+every thread count produces byte-identical output (\cref{S-sec:kernels}).
 
 \begin{figure}[t]
 \centering
@@ -881,25 +1189,27 @@ every SIMD backend and thread count produces byte-identical output
 \addlegendentry{IgBLAST (\texttt{igblastn} only)}
 \end{axis}
 \end{tikzpicture}
-\caption{IgBench throughput on the same GenAIRR panels (eight threads on
-the performance cores; reads per second of the scored annotate pass).
-Database/\texttt{buildLibrary} preparation and AIRR export sit outside the
-timed window; wall times were 3.0\,s / 3.1\,s (\swig), 10.8\,s / 10.3\,s
-(MiXCR) and 156\,s / 153\,s (IgBLAST) for IgM / IgG.}
+\caption{Throughput on the two rhesus GenAIRR panels in reads per second
+(eight threads on the performance cores). Only the annotation pass that is
+scored is timed: database preparation (\texttt{buildLibrary} for MiXCR) and
+AIRR export lie outside the timed window. The wall-clock times on IgM and
+IgG were 3.0 and 3.1\,s for \swig, 10.8 and 10.3\,s for MiXCR, and 156 and
+153\,s for IgBLAST.}
 \label{fig:igbench-timing}
 \end{figure}
 
 \begin{table}[tbp]
 \centering
-\caption{Provisional throughput on 10,000 IgSim reads (reads per second;
-wall clock of the whole command; median of three runs; each thread on a
-performance core of its own). Provisional because the machine ran a desktop
-session and the commands had network access: a second pass on \emph{hard}
-with the performance cores shared gave \swig{} and IgBLAST within 7\,\% of
-these times on four and eight threads, and MiXCR, whose Java runtime then had
-spare cores, 16--24\,\% shorter ones; that pass's other MiXCR and IgBLAST runs
-waited on network timeouts and were discarded. One-thread timings of each
-alignment backend are in \cref{S-tab:kernels}.}
+\caption{Provisional throughput on 10,000 IgSim reads in reads per second
+(wall-clock time of the whole command; median of three runs; each thread on
+a performance core of its own). The values are provisional because the
+machine ran a desktop session and the commands had network access. A second
+pass on \emph{hard}, with the performance cores shared, gave \swig{} and
+IgBLAST times within 7\,\% of these on four and eight threads. It gave
+MiXCR, whose Java runtime then had spare cores, times that were 16--24\,\%
+shorter. The other MiXCR and IgBLAST runs of that pass waited on network
+timeouts and were discarded. One-thread timings of each alignment backend
+are in \cref{S-tab:kernels}.}
 \label{tab:speed}
 \footnotesize
 \begin{tabular}{@{}ll rrr@{}}
@@ -922,158 +1232,194 @@ Set & Tool & 1 thread & 4 threads & 8 threads \\
 \subsection{Model diagnostics}
 \label{sec:diagnostics}
 
-The Supplementary Information tests each modelling term on its own; we
-summarise it here. Switching the D trim and N/P priors off costs 0.37 and
-1.08 points of D accuracy on \emph{mid} and \emph{hard}
-(\cref{S-tab:ablation}) and 0.3--3.1 points of IGH D on the human GenAIRR
-sets (\cref{S-fig:dpriors}). On reads that stop at their D or start in CDR3 the
-open-flank cost keeps the right D on 82--94\,\% of reads, while a V followed
-by 100 random bases receives a D on 2.6 and 11.2\,\% of reads, against 88
-and 93\,\% without the cost and the plausibility constraints
-(\cref{S-tab:truncated}). With a D remnant of at least 8 nucleotides the true
-D is almost never outside the search windows (at most 0.04\,\% of reads) or
-covered by the called J (at most 0.14\,\%); the remaining D errors are
-choices between similar alleles on short, mutated remnants
-(\cref{S-tab:derrors}). The posteriors are well calibrated up to IgG-like
-mutation, with an expected calibration error of at most 0.5\,\% for V,
-0.8\,\% for J, 1.9\,\% for the D allele and 1.1\,\% for D presence; at
-30\,\% SHM the V and J posteriors are over-confident
-(\cref{S-tab:calibration,S-fig:calibration}). With a C database the primary
-C call is right on at least 98.5\,\% of reads that show 16 or more
-nucleotides of C (\cref{S-sec:constant-results}).
+The Supplementary Information tests each term of the model on its own
+(\cref{S-sec:supresults}). Its findings are summarised here.
+
+\paragraph{The D priors raise D accuracy.} Switching the D trimming and
+N/P-length priors off costs 0.37 and 1.08 points of D accuracy on \emph{mid}
+and \emph{hard} (\cref{S-tab:ablation}), and 0.3--3.1 points of the IGH D
+score on the human GenAIRR sets (\cref{S-fig:dpriors}).
+
+\paragraph{The open-flank cost separates real from chance Ds on truncated
+reads.} On reads that stop at their D or start in CDR3, \swig{} still calls
+the right D on 82--94\,\% of the reads. A V followed by 100 random bases, in
+contrast, receives a D on 2.6\,\% (\emph{mid}) and 11.2\,\% (\emph{hard}) of
+the reads, against 88 and 93\,\% without the cost and the plausibility
+constraints (\cref{S-tab:truncated}).
+
+\paragraph{The search rarely loses a D.} With a D remnant of at least 8
+nucleotides, the true D is almost never outside the search windows (at most
+0.04\,\% of the reads) and almost never covered by the called J (at most
+0.14\,\%). The D errors that remain are choices between similar alleles on
+short, mutated remnants (\cref{S-tab:derrors}).
+
+\paragraph{The posteriors are well calibrated up to IgG-like mutation.} The
+expected calibration error is at most 0.5\,\% for V, 0.8\,\% for J, 1.9\,\%
+for the D allele and 1.1\,\% for the presence of a D. At 30\,\% SHM the V
+and J posteriors are over-confident
+(\cref{S-tab:calibration,S-fig:calibration}).
+
+\paragraph{The constant region is called reliably.} With a C database, the
+primary C call is right on at least 98.5\,\% of the reads that show 16 or
+more nucleotides of C (\cref{S-sec:constant-results}).
 
 % ===========================================================================
 \FloatBarrier
 \section{Discussion}
 \label{sec:discussion}
 
-\swig{} replaces the sequence of local decisions of a conventional
-annotator with one objective and its exact maximiser. Three consequences
-stand out in the results. First, the failure mode that motivates joint
-placement, a neighbouring segment absorbing a short D, has essentially
-disappeared (\cref{S-tab:derrors}); the D errors that remain are choices
-between similar alleles on short, mutated remnants, where the evidence is
-present but weak. That is a modelling question, and the D trim and N/P
-priors show that modelling, not search, is where further accuracy lies:
-moving two cut-local prior terms into the graph raised human IGH D accuracy
-on GenAIRR reads by up to 3.1 points at no measurable cost in speed
-(\cref{S-fig:dpriors}). Second,
-because every non-alignment term is a log prior odds with a stated
-derivation, the trade-off between finding short D remnants and leaving D-free
-junctions alone is moved by an interpretable prior rather than by ad hoc
-score thresholds: its user-facing knob is the prior odds of a D
-(\cref{fig:operating}). The default operating point also depends on the
-credit $\kappa$, chosen on simulated reads, and on the 4-base D admission
-run. Third, the posterior
-is a by-product of the same recursion and the call is its mode, so the
-reported probabilities describe the call that is reported; they are well
-calibrated up to IgG-like mutation levels.
+A conventional annotator makes a sequence of local decisions. \swig{}
+replaces this sequence with one objective and an algorithm that maximises it
+exactly. The results show three consequences of this design.
 
-The pair of simulators matters. GenAIRR (via IgBench) scores calls against
-tie sets that count only the bases a read actually shows, which rewards
-reporting genuine ties and penalises over-reporting; IgSim scores germline
-equivalence and separates D accuracy from D-free specificity and remnant
-length. On both, the IgBLAST comparison favours \swig{} on V and D up to
-IgG-like mutation, except D on IgSim IgM-like reads, where IgBLAST's lead
-comes from 1--3-nt remnants. MiXCR 4.7.0, the faster of the two established
-tools here, trails \swig{} on V and D on every set of both simulators. On
-GenAIRR, counted by its tied hits, which a tie-set truth needs for a fair
-comparison with tools that report co-optimal alleles, its D gap is
-2.3--7.8 points on human IGH and 3.6--7.0 on the rhesus panels; its single
-AIRR call widens it to 10.8--17.5. On IgSim its D gap is 1.4--4.7 points up
-to IgG-like mutation, and on IgM- and IgG-like reads it gives a D to more
-D-free junctions than either other tool. \swig{} is also faster: 3.3--3.6
-times on the IgBench panels and 8--16 times on the 10,000-read sets of both
-simulators.
-On IgSim, IgBLAST reports more exact junctions because \swig{} withholds a
-junction whose anchor codon its alignments do not reach, and at 30\,\% SHM
-IgBLAST's V calls are better.
+First, the failure that motivates joint placement, a neighbouring segment
+absorbing a short D, has essentially disappeared (\cref{S-tab:derrors}). The
+D errors that remain are choices between similar alleles on short, mutated
+remnants, for which the evidence is present but weak. Reducing them is a
+question of modelling, not of search, and the D priors show what modelling
+can gain: two prior terms, each of which depends on a single cut, were moved
+into the graph and raised the human IGH D score on GenAIRR reads by up to
+3.1 points at no measurable cost in speed (\cref{S-fig:dpriors}).
+
+Second, the trade-off between finding short D remnants and leaving D-free
+junctions without a D is set by an interpretable quantity. Every term of the
+objective other than the alignment evidence is a log prior odds with a
+stated derivation. A user who wants a different trade-off therefore changes
+the prior odds of a D, and not an ad hoc score threshold
+(\cref{fig:operating}). Two further choices also influence the default
+trade-off: the credit $\kappa$, which was chosen on simulated reads, and the
+exact match of four bases that admits a D candidate.
+
+Third, the reported probabilities describe the reported call. The posterior
+is a by-product of the recursion that makes the call, and the call is its
+mode. The probabilities are well calibrated up to IgG-like mutation levels.
+
+The two simulators measure different things, and the comparison leads to the
+same conclusions on both. GenAIRR, through IgBench, scores calls against tie
+sets that count only the bases a read actually shows. This rewards a tool
+for reporting genuine ties and penalises it for reporting more alleles than
+the read supports. IgSim scores germline equivalence, and it separates D
+accuracy from the spurious D rate and from the length of the remnant.
+
+Compared with IgBLAST, \swig{} is more accurate on V and D on both
+simulators up to IgG-like mutation levels. The one exception is D on the
+IgM-like \emph{mid} preset of IgSim, where IgBLAST's lead comes from
+remnants of 1--3 nucleotides. Compared with MiXCR 4.7.0, the faster of the
+two established tools in our measurements, \swig{} is more accurate on V and
+D on every set of both simulators. On GenAIRR, a fair comparison with tools
+that report co-optimal alleles has to count MiXCR's tied hits. Counted in
+this way, MiXCR's D score is 2.3--7.8 points below that of \swig{} on human
+IGH and 3.6--7.0 points below on the rhesus panels; its single AIRR call
+widens the gap to 10.8--17.5 points. On IgSim, MiXCR's D accuracy is
+1.4--4.7 points below that of \swig{} up to IgG-like mutation, and on
+\emph{mid} and \emph{hard} MiXCR gives a D to more D-free reads than either
+of the other tools. \swig{} is also faster than MiXCR: 3.3--3.6 times on the
+rhesus panels and 8--16 times on the 10,000-read sets of both simulators.
+
+IgBLAST is better than \swig{} in two respects. On IgSim it reports more
+exact junctions, because \swig{} withholds a junction when its alignments do
+not reach a conserved codon. And at 30\,\% SHM its V calls are more
+accurate.
 
 \subsection{Limitations}
 
 \begin{itemize}
   \item \emph{All results are on simulated reads.} Both simulators make
-    simplifying assumptions: uniform allele usage, independent trims, no
-    chimeras or long adapters, and in IgSim no hotspot-targeted SHM and no
-    codon-length indels. Several design parameters were measured on
-    simulated reads: the open-flank allowance from simulated junction
-    lengths, the D-cost credit on IgSim, and the D trim and N/P priors from
-    an analysis of the previous release's losses on the human GenAIRR design
-    grid of \cref{S-fig:dpriors}. The priors' means (5, 7 and 8 bases) are
-    generic rather than fitted, and GenAIRR's own trim tables did no better
-    in the prototype; on human GenAIRR reads disjoint from the design sets
-    the priors gained as much (\cref{S-tab:oos}), but both come from one
-    simulator. The IgBench head-to-head (\cref{tab:genairr}) uses a
-    different species and SHM schedule. Validation on real repertoires, for
-    example donors with sequenced germline genotypes, is the most important
-    next step.
-  \item \emph{Comparisons.} We did not compare with partis or IMGT/V-QUEST.
-    MiXCR's tied hits are derived from the hit scores it exports, not an
+    simplifying assumptions: allele usage is uniform, trims are independent,
+    and there are no chimeras or long adapters. IgSim also has no
+    hotspot-targeted SHM and no codon-length indels. Several design
+    parameters were themselves measured on simulated reads: the open-flank
+    allowance from simulated junction lengths, the credit $\kappa$ on IgSim
+    reads, and the D trimming and N/P-length priors from an analysis of the
+    errors that the previous release made on the human GenAIRR grid
+    (\cref{S-fig:dpriors}). The means of these priors (5, 7 and 8 bases) are
+    generic values and were not fitted, and GenAIRR's own trim tables did no
+    better in the prototype. On human GenAIRR reads disjoint from the design
+    sets the priors gained as much (\cref{S-tab:oos}), but those reads come
+    from the same simulator. The rhesus comparison (\cref{tab:genairr}) uses
+    another species and another SHM schedule. Validation on real
+    repertoires, for example from donors whose germline genotypes have been
+    sequenced, is the most important next step.
+  \item \emph{The comparison is incomplete and the timings are provisional.}
+    We did not compare with partis or IMGT/V-QUEST. MiXCR's tied hits are
+    derived by us from the hit scores that MiXCR exports. They are not an
     output mode of MiXCR itself, whose AIRR export names one allele per
     segment. On IgSim, MiXCR's copy of six IMGT V alleles has its N bases
-    filled in, because its library builder rejects them. Throughput was
-    measured on one laptop running a desktop session, with network access.
-    The IgSim timings of \cref{tab:speed} are provisional: in a second pass
-    with the cores shared, the same commands' times differed by up to 7\,\%
-    for \swig{} and IgBLAST and 24\,\% for MiXCR, and on a slow connection
-    MiXCR's network calls held some runs at 74\,s whatever their thread count
-    (those runs were discarded). Other hardware may rank the tools' thread
-    scaling differently.
-  \item \emph{The plausibility constraints are inherited thresholds}, not
-    terms of the likelihood, and the call under them is the best admissible
-    subset optimum rather than an exact maximum over every admissible path.
-    They cost 0.4--2.9 points of junction exactness on simulated reads
-    (\cref{S-tab:ablation}) in exchange for robustness on truncated, chimeric
-    and cross-locus reads that the simulators do not produce. A model of
-    truncation and template switching would price what they forbid.
-  \item \emph{D on D-free junctions.} 16--18\,\% of IgSim reads without a D
-    remnant still receive one, and a chance D within about 30 bases of a
-    truncated read's V is indistinguishable from a real D there
-    (\cref{S-tab:truncated}). On TRB, whose two D genes are short and rarely
-    trimmed as much as the prior expects, the D-cost credit gives D-free
-    reads a D more often.
-  \item \emph{Extreme mutation.} At 30\,\% SHM the strand test and seed
-    retrieval lose intact $k$-mers: 4.4\,\% of reads are left uncalled, most of
-    them (3.5\,\% of all reads) because the wrong strand was chosen, V accuracy falls below IgBLAST's, and
-    the V and J posteriors are
-    over-confident because the true gene is no longer among the candidates.
-  \item \emph{Statistics.} E-values use exact ungapped $\lambda$ and $K$
-    (anti-conservative for gapped scores) and the total database length
-    (conservative for near-identical alleles); they gate hits and are not
-    calibrated $p$-values. One divergence per read assumes uniform mutation
-    across V, D and J.
-  \item \emph{One alignment per D allele and window.} A D allele's optimal
-    local alignment in its window need not be its best clip at the chosen
-    cuts; this is the one remaining approximation of the segmentation model.
+    filled in, because MiXCR's library builder rejects such sequences.
+    Throughput was measured on one laptop that ran a desktop session and had
+    network access. The IgSim timings of \cref{tab:speed} are provisional:
+    in a second pass with the cores shared, the times of the same commands
+    differed by up to 7\,\% for \swig{} and IgBLAST and by up to 24\,\% for
+    MiXCR. On a slow connection, MiXCR's network calls held some runs at
+    74\,s whatever their thread count; those runs were discarded. Other
+    hardware may rank the thread scaling of the tools differently.
+  \item \emph{The plausibility constraints are inherited thresholds.} They
+    were taken over from an earlier aligner (\cref{S-sec:guards}) and are
+    not terms of the likelihood. The call under them is the best result
+    among subsets of the placements, and not an exact maximum over every
+    path that satisfies the constraints. On simulated reads they cost
+    0.4--2.9 points of junction exactness (\cref{S-tab:ablation}). What they
+    give in exchange is robustness on truncated, chimeric and cross-locus
+    reads, which the simulators do not produce. A model of truncation and of
+    template switching would put a price on what the constraints forbid.
+  \item \emph{Spurious D calls remain.} Of the IgSim reads without a D
+    remnant, 16--18\,\% still receive a D. On a truncated read, a chance D
+    within about 30 bases of the V cannot be told from a real D at the same
+    place (\cref{S-tab:truncated}). On TRB, the two D genes are short and
+    are rarely trimmed as much as the prior expects, so the credit $\kappa$
+    gives D-free reads a D more often.
+  \item \emph{Extreme mutation defeats the $k$-mer steps.} At 30\,\% SHM the
+    strand test and the seed retrieval lose intact $k$-mers. \swig{} then
+    leaves 4.4\,\% of the reads uncalled, most of them (3.5\,\% of all
+    reads) because it chose the wrong strand, and its V accuracy falls below
+    IgBLAST's. The V and J posteriors become over-confident, because the
+    true gene is no longer among the candidates.
+  \item \emph{The statistics are approximate.} The E-values use the exact
+    $\lambda$ and $K$ of ungapped alignment, which is anti-conservative for
+    gapped scores, and the total length of the database, which is
+    conservative for near-identical alleles. They gate hits and are not
+    calibrated $p$-values. A single divergence per read assumes that
+    mutation is uniform across V, D and J.
+  \item \emph{Each D allele has one alignment per window.} The decision
+    receives the optimal local alignment of each D allele in its window.
+    Once the cuts are chosen, the part of this alignment that is kept need
+    not be the best alignment of the allele between those cuts. This is the
+    one remaining approximation of the segmentation model.
 \end{itemize}
 
 \subsection{Future work}
 
-The D-presence residual of the posterior tracks junction length, which
-points to an N/P length prior that decides D presence and not only re-ranks
-Ds. Allele usage is uniform in the model; usage priors learned from the
-repertoire itself, iterated with the calls, would matter where one gene
-dominates. Gapped Karlin--Altschul parameters and an effective database size
-can be fitted by simulation. Above all, the model's assumptions need testing
-on real data.
+Three extensions of the model follow from these limitations. First, the
+residual error of the D-presence posterior varies with the length of the
+junction. This points to an N/P-length prior that takes part in deciding
+whether a D is present; the current prior only re-ranks Ds. Second, allele
+usage is uniform in the model. Usage priors learned from the repertoire
+itself, in alternation with the calls, would matter where one gene
+dominates. Third, gapped Karlin--Altschul parameters and an effective
+database size can be fitted by simulation. Above all, the assumptions of the
+model need to be tested on real data.
 
 \section{Conclusion}
 
 \swig{} shows that germline assignment can be posed as one likelihood ratio
-and solved exactly, fast enough for whole repertoires: an exact semi-Markov
-recursion over every pair of cuts between neighbouring segments, priors set
-by the number of hypotheses each segment competes with, alignments scored at
-each read's own mutation rate and posteriors from the same recursion.
-Every search shortcut carries a stated guarantee, and the remaining errors
-are located by construction. On GenAIRR reads it has the best V and D of
-\swig{}, IgBLAST 1.22 and MiXCR 4.7.0 on every rhesus and human set (V level
-with IgBLAST on TRB), and the best J on every human IG set and the rhesus IgG
-panel, also on human IGH reads disjoint from those its D priors were designed
-on; on IgSim reads it leads IgBLAST and MiXCR on V and D up to IgG-like
-mutation (except IgBLAST on IgM-like D, whose lead comes from unidentifiable
-1--3-nt remnants) and trails IgBLAST on junction exactness and on V at
-30\,\% SHM. On the same cores it ran about 50--150 times as fast as IgBLAST
-and 3--16 times as fast as MiXCR.
+and solved exactly, fast enough for whole repertoires. Four elements make
+this possible: an exact semi-Markov recursion over every pair of cuts
+between neighbouring segments; priors set by the number of hypotheses with
+which each segment competes; alignments scored at each read's own mutation
+rate; and posteriors from the same recursion. Every shortcut of the search
+carries a stated guarantee, so the errors that remain can be traced to the
+step at which they arise.
+
+On GenAIRR reads, \swig{} had the best V and D scores of the three tools
+(\swig, IgBLAST 1.22 and MiXCR 4.7.0) on every rhesus and human set, with V
+level with IgBLAST on TRB. It had the best J score on every human IG set and
+on the rhesus IgG panel. The same held on human IGH reads disjoint from
+those on which its D priors were designed. On IgSim reads, \swig{} led
+IgBLAST and MiXCR on V and D up to IgG-like mutation levels, with one
+exception: IgBLAST led on D for IgM-like reads, and that lead comes from
+remnants of 1--3 nucleotides that cannot be identified. \swig{} trailed
+IgBLAST on junction exactness and, at 30\,\% SHM, on V. On the same cores it
+ran about 50--150 times as fast as IgBLAST and 3--16 times as fast as MiXCR.
 
 \section*{Availability}
 
@@ -1081,12 +1427,13 @@ and 3--16 times as fast as MiXCR.
 \url{https://github.com/mashu/swig} (Rust crate in \code{engine/}). It builds
 with \code{cargo build -{}-release} on Rust $\ge 1.89$, has no dependencies,
 and runs on x86-64 and AArch64 and as WebAssembly. The command
-\code{swig -{}-v V.fasta -{}-d D.fasta -{}-j J.fasta reads.fastq} writes AIRR
-Rearrangement TSV; \code{swig simulate} and \code{swig evaluate} reproduce
-the IgSim evaluation for any germline set and any tool's AIRR output. The
-scripts and settings that produce every number in this paper and its
-Supplementary Information are distributed with the source (\code{paper/});
-the three-tool GenAIRR panels are run through IgBench.jl.
+\code{swig -{}-v V.fasta -{}-d D.fasta -{}-j J.fasta reads.fastq} writes an
+AIRR Rearrangement TSV. The commands \code{swig simulate} and
+\code{swig evaluate} reproduce the IgSim evaluation for any germline set and
+for the AIRR output of any tool. The scripts and settings that produce every
+number in this paper and its Supplementary Information are distributed with
+the source (\code{paper/}); the three-tool GenAIRR panels are run through
+IgBench.jl.
 
 
 \section*{Acknowledgements}
