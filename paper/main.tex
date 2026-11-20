@@ -47,7 +47,8 @@ carries a posterior probability. We compared \swig{} 0.39.7 with IgBLAST
 1.22 and MiXCR 4.7.0 on reads from two simulators. On 13 GenAIRR data sets
 (rhesus IGH; human IGH, IGK, IGL and TRB), \swig{} made the most accurate D
 call on every set with a D. On the IGH sets its D accuracy was 0.7--6.0
-percentage points above IgBLAST's and 2.3--7.8 points above MiXCR's. Its V
+percentage points above IgBLAST's and 2.3--7.8 points above MiXCR's, even
+when MiXCR was credited with every allele tied for its best score. Its V
 call was the most accurate on every set except TRB, where it tied with
 IgBLAST, and its J accuracy was within 0.05 points of the best. On IgSim
 reads, \swig{} called V more accurately than both tools up to IgG-like
@@ -342,8 +343,9 @@ ways. \Cref{S-sec:protocol} describes the data sets, the settings of the
 tools and the statistics in full.
 
 GenAIRR~\cite{konstantinovsky2024genairr} records the truth of each segment
-as a tie set: all alleles that match the read equally well once trimming and
-mutation are taken into account. A call, which may itself name several
+as a tie set: the alleles that best match the bases of the read in that
+segment, several when the read cannot tell them apart. A call, which may
+itself name several
 alleles, is scored by the Jaccard index between the called set and the tie
 set. A tool is thus rewarded for reporting exactly the alleles that the read
 supports, and we report the mean of this score in per cent. From GenAIRR we
